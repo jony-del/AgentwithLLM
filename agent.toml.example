@@ -9,6 +9,15 @@ model = "claude-sonnet-4-6"
 permission = "default"        # default | acceptedits | plan | auto | dontask
 provider = "claude"           # claude | fake
 
+# --- Live display (CLI-only, NOT configured here) ----------------------------
+# The terminal trace, token streaming, and extended thinking are controlled by
+# CLI flags, not this file or env vars. They only activate with the interactive
+# ConsoleUI (stdin AND stdout are TTYs); pipes/tests stay silent. Available flags:
+#   --quiet              suppress the live thinking/tool trace (final answer only)
+#   --no-stream          render each turn after it completes (no token-by-token)
+#   --thinking-budget N  enable Claude extended thinking with an N-token budget
+# Permission prompts in the live UI accept: y (once) / a (always this session) / n (deny).
+
 # --- Cross-conversation memory ----------------------------------------------
 # The whole table is optional. `enabled` here can be overridden by AGENT_MEMORY
 # or the --memory / --no-memory CLI flag; the numeric tunables below are only
