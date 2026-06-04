@@ -1,21 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from agent_core.models import ToolRisk, ToolResult
-from agent_core.tools.base import Tool
+from agent_core.tools.base import Tool, WorkspacePathMixin
 
-
-class WorkspacePathMixin:
-    def __init__(self, workspace: str | Path | None = None) -> None:
-        self.workspace = Path(workspace or Path.cwd()).resolve()
-
-    def resolve_workspace_path(self, raw_path: object) -> Path:
-        path = Path(str(raw_path))
-        resolved = (self.workspace / path).resolve() if not path.is_absolute() else path.resolve()
-        if resolved != self.workspace and self.workspace not in resolved.parents:
-            raise ValueError(f"Path escapes workspace: {path}")
-        return resolved
+# Re-exported for backwards compatibility: WorkspacePathMixin now lives in base.py.
+__all__ = ["EchoTool", "ReadTextFileTool", "WorkspacePathMixin", "WriteTextFileTool"]
 
 
 class EchoTool(Tool):
@@ -34,17 +23,33 @@ class EchoTool(Tool):
 
 class ReadTextFileTool(WorkspacePathMixin, Tool):
     name = "read_text_file"
-    description = "Read a UTF-8 text file from the current workspace."
+    description = (
+        "Read a UTF-8 text file from the current workspace. Optionally pass `offset` "
+        "(1-based start line) and/or `limit` (line count) to page through a large document."
+    )
     input_schema = {
         "type": "object",
-        "properties": {"path": {"type": "string"}},
+        "properties": {
+            "path": {"type": "string"},
+            "offset": {"type": "integer", "description": "1-based first line to read (optional)."},
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (optional)."},
+        },
         "required": ["path"],
     }
     risk = ToolRisk.READ
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
-        return ToolResult(name=self.name, content=path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        offset = arguments.get("offset")
+        limit = arguments.get("limit")
+        # No paging requested: return the whole file verbatim (original behavior).
+        if offset is None and limit is None:
+            return ToolResult(name=self.name, content=text)
+        lines = text.splitlines()
+        start = max(int(offset) - 1, 0) if offset is not None else 0
+        end = start + int(limit) if limit is not None else len(lines)
+        return ToolResult(name=self.name, content="\n".join(lines[start:end]))
 
 
 class WriteTextFileTool(WorkspacePathMixin, Tool):

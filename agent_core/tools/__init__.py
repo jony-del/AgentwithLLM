@@ -1,17 +1,32 @@
 from agent_core.tools.adapters import LCPAdapter, MCPAdapter
-from agent_core.tools.base import Tool
+from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.builtin import (
+    EditFileTool,
+    GitDiffTool,
+    ListDirTool,
+    RunCommandTool,
+    RunTestsTool,
+    SearchTextTool,
+)
 from agent_core.tools.demo import EchoTool, ReadTextFileTool, WriteTextFileTool
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 
 __all__ = [
     "EchoTool",
+    "EditFileTool",
+    "GitDiffTool",
     "LCPAdapter",
+    "ListDirTool",
     "MCPAdapter",
     "ReadTextFileTool",
+    "RunCommandTool",
+    "RunTestsTool",
+    "SearchTextTool",
     "Tool",
     "ToolExecutor",
     "ToolRegistry",
+    "WorkspacePathMixin",
     "WriteTextFileTool",
 ]
 

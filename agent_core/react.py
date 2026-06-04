@@ -12,6 +12,14 @@ from agent_core.models import LLMContextTooLongError, Message
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider
 from agent_core.storage import JSONLRunLogger
+from agent_core.tools.builtin import (
+    EditFileTool,
+    GitDiffTool,
+    ListDirTool,
+    RunCommandTool,
+    RunTestsTool,
+    SearchTextTool,
+)
 from agent_core.tools.demo import EchoTool, ReadTextFileTool, WriteTextFileTool
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
@@ -119,9 +127,20 @@ class ReActAgent:
     @staticmethod
     def default_registry() -> ToolRegistry:
         registry = ToolRegistry()
-        registry.register(EchoTool())
-        registry.register(ReadTextFileTool())
-        registry.register(WriteTextFileTool())
+        # Safe (READ) tools first, then mutating (WRITE) and command/test (DANGEROUS)
+        # tools — the permission layer keys off each tool's `risk`.
+        for tool in (
+            EchoTool(),
+            ReadTextFileTool(),
+            ListDirTool(),
+            SearchTextTool(),
+            GitDiffTool(),
+            WriteTextFileTool(),
+            EditFileTool(),
+            RunCommandTool(),
+            RunTestsTool(),
+        ):
+            registry.register(tool)
         return registry
 
     def run(
