@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.catalog import builtin_tool
 
 # Directories that are noise for search/listing and almost never what a user wants
 # to grep through. Skipped when walking the tree.
@@ -50,6 +51,7 @@ def _is_probably_binary(sample: bytes) -> bool:
     return b"\x00" in sample
 
 
+@builtin_tool
 class ListDirTool(WorkspacePathMixin, Tool):
     name = "list_dir"
     description = "List the entries of a directory in the workspace (directories end with '/')."
@@ -71,6 +73,7 @@ class ListDirTool(WorkspacePathMixin, Tool):
         return ToolResult(self.name, "\n".join(lines) if lines else "(empty directory)")
 
 
+@builtin_tool
 class EditFileTool(WorkspacePathMixin, Tool):
     name = "edit_file"
     description = (
@@ -120,6 +123,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
         return ToolResult(self.name, f"Replaced {replaced} occurrence(s) in {path}")
 
 
+@builtin_tool
 class SearchTextTool(WorkspacePathMixin, Tool):
     name = "search_text"
     description = (
@@ -201,6 +205,7 @@ class SearchTextTool(WorkspacePathMixin, Tool):
                 yield index, line
 
 
+@builtin_tool
 class RunCommandTool(WorkspacePathMixin, Tool):
     name = "run_command"
     description = (
@@ -223,6 +228,7 @@ class RunCommandTool(WorkspacePathMixin, Tool):
         return _run_subprocess(self.name, command, cwd=self.workspace, timeout=timeout, shell=True)
 
 
+@builtin_tool
 class GitDiffTool(WorkspacePathMixin, Tool):
     name = "git_diff"
     description = "Show the git diff for the workspace. Set staged=true for the index; pass path to scope it."
@@ -245,6 +251,7 @@ class GitDiffTool(WorkspacePathMixin, Tool):
         return _run_subprocess(self.name, cmd, cwd=self.workspace, timeout=30, shell=False)
 
 
+@builtin_tool
 class RunTestsTool(WorkspacePathMixin, Tool):
     name = "run_tests"
     description = (

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.catalog import builtin_tool
 
 # Re-exported for backwards compatibility: WorkspacePathMixin now lives in base.py.
 __all__ = ["EchoTool", "ReadTextFileTool", "WorkspacePathMixin", "WriteTextFileTool"]
 
 
+@builtin_tool
 class EchoTool(Tool):
     name = "echo"
     description = "Echo text back to the agent."
@@ -21,6 +23,7 @@ class EchoTool(Tool):
         return ToolResult(name=self.name, content=str(arguments.get("text", "")))
 
 
+@builtin_tool
 class ReadTextFileTool(WorkspacePathMixin, Tool):
     name = "read_text_file"
     description = (
@@ -52,6 +55,7 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
         return ToolResult(name=self.name, content="\n".join(lines[start:end]))
 
 
+@builtin_tool
 class WriteTextFileTool(WorkspacePathMixin, Tool):
     name = "write_text_file"
     description = "Write UTF-8 text to a file inside the current workspace."
