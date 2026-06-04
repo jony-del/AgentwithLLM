@@ -1,0 +1,47 @@
+# Example agent.toml — copy to `agent.toml` and edit. All keys are optional;
+# anything omitted falls back to the built-in defaults.
+#
+# Precedence (lowest to highest): built-in defaults -> this file ->
+# AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
+
+# --- Top-level scalars -------------------------------------------------------
+model = "claude-sonnet-4-6"
+permission = "default"        # default | acceptedits | plan | auto | dontask
+provider = "claude"           # claude | fake
+
+# --- Cross-conversation memory ----------------------------------------------
+# The whole table is optional. `enabled` here can be overridden by AGENT_MEMORY
+# or the --memory / --no-memory CLI flag; the numeric tunables below are only
+# configurable via this file.
+[memory]
+enabled = true               # turn recall + extraction on by default
+dir = "memory"                # where memory.jsonl lives (gitignored)
+
+# Recall: how relevant past memories are selected and ranked.
+recall_k = 5                  # how many memories to inject per run
+w_relevance = 1.0             # weight: lexical overlap with the task
+w_importance = 0.5            # weight: stored salience
+w_recency = 0.3               # weight: how recently the memory was used
+recency_decay_per_hour = 0.01 # exponential recency decay rate
+
+# Extraction: distilling durable memories after a run.
+auto_extract = true           # extract automatically when a run completes
+dedup_threshold = 0.85        # skip a new memory this similar to an existing one
+
+# Dreaming: offline consolidation (`python -m agent_core dream`).
+forget_threshold = 0.15       # drop memories whose decayed importance falls below this
+forget_min_access = 1         # ...unless they've been recalled at least this many times
+importance_half_life_days = 14.0  # forgetting curve half-life
+merge_threshold = 0.6         # fuse two memories above this lexical similarity
+synthesize_insights = true    # let the LLM infer higher-level "insight" memories
+
+# --- Single tool-output truncation ------------------------------------------
+# When one tool call's output exceeds these limits, only head+tail (with a
+# "[... omitted N lines ...]" notice) enters the context; the full, untouched
+# output is written to runs/<run>/outputs/ for later retrieval.
+[output]
+max_lines = 100               # truncate when output has more lines than this
+max_chars = 8000              # fallback cap for pathological single-line output
+head_lines = 20               # lines kept from the start
+tail_lines = 20               # lines kept from the end
+spill = true                  # write the full output to disk (false = drop it)

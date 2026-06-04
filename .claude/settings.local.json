@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest -q)",
+      "Bash(python -m agent_core run \"say hi\" --provider fake)",
+      "Bash(python -m agent_core chat --provider fake)",
+      "Bash(python -m agent_core run \"tool: echo this\" --provider fake)",
+      "Bash(python -m agent_core run \"hi\" --provider fake)",
+      "Bash(python -c \"import glob,os,json; f=max\\(glob.glob\\('runs/*.jsonl'\\),key=os.path.getmtime\\); print\\('events:', [r['event'] for r in \\(json.loads\\(l\\) for l in open\\(f,encoding='utf-8'\\)\\)]\\)\")",
+      "Bash(python -m agent_core memory add \"I prefer dark mode and Python 3.11\")",
+      "Bash(python -m agent_core memory add \"I prefer dark mode and Python 3.11 always\")",
+      "Bash(python -m agent_core dream --provider fake --dry-run)",
+      "Bash(python -m agent_core memory list)",
+      "Bash(rm -rf memory)",
+      "Bash(python -m agent_core run \"I work mostly in Rust and Go\" --provider fake)",
+      "Bash(python -m agent_core dream -h)",
+      "Bash(python -m agent_core -h)",
+      "Bash(python -m pytest tests/test_hooks.py -q)"
+    ]
+  }
+}
