@@ -1,6 +1,6 @@
 from agent_core.models import ToolCall
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.tools.demo import EchoTool, WriteTextFileTool
+from agent_core.tools.builtin import EchoTool, WriteTextFileTool
 
 
 def test_plan_mode_dry_runs_write_tools() -> None:

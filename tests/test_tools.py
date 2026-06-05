@@ -5,7 +5,7 @@ import pytest
 from agent_core.hooks import HookPipeline, HookResult
 from agent_core.models import ToolCall
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.tools.demo import EchoTool, ReadTextFileTool, WriteTextFileTool
+from agent_core.tools.builtin import EchoTool, ReadTextFileTool, WriteTextFileTool
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 
