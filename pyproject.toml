@@ -7,6 +7,9 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Optional: the official Model Context Protocol SDK. Only needed to connect to MCP
+# servers (`[mcp.servers.*]` in agent.toml). The core stays dependency-free without it.
+mcp = ["mcp>=1.0"]
 
 [project.scripts]
 agent-core = "agent_core.cli:main"

@@ -153,3 +153,15 @@ def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimi
 
     table = load_agent_toml(config_file).get("output")
     return OutputLimitConfig.from_dict(table if isinstance(table, dict) else None)
+
+
+def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
+    """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
+
+    Returns an empty config (no servers) when the table is absent, so MCP stays off and
+    the ``mcp`` SDK is never imported unless a server is actually configured.
+    """
+    from agent_core.mcp.config import MCPConfig
+
+    table = load_agent_toml(config_file).get("mcp")
+    return MCPConfig.from_dict(table if isinstance(table, dict) else None)

@@ -4,12 +4,18 @@ import argparse
 import sys
 from pathlib import Path
 
-from agent_core.config import resolve_config, resolve_memory_config, resolve_output_config
+from agent_core.config import (
+    resolve_config,
+    resolve_mcp_config,
+    resolve_memory_config,
+    resolve_output_config,
+)
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
 from agent_core.models import LLMTransientError
 from agent_core.providers import ClaudeProvider, FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
+from agent_core.tools.registry import ToolRegistry
 from agent_core.ui import AgentUI, ConsoleUI, NullUI
 
 
@@ -49,7 +55,31 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
     return ConsoleUI() if interactive else NullUI()
 
 
-def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI]:
+def _start_mcp(registry: ToolRegistry):
+    """Connect any configured MCP servers and register their tools, or return ``None``.
+
+    The ``mcp`` SDK is imported lazily and only when ``[mcp.servers.*]`` is non-empty, so
+    the core stays dependency-free. The caller owns the returned manager and must
+    ``close()`` it.
+    """
+    mcp_config = resolve_mcp_config()
+    if not any(server.enabled for server in mcp_config.servers):
+        return None
+    from agent_core.mcp import MCPAdapter, MCPClientManager
+
+    manager = MCPClientManager(mcp_config)
+    try:
+        manager.start()
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "MCP servers are configured in agent.toml but the 'mcp' SDK isn't installed. "
+            'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").'
+        ) from exc
+    registry.register_adapter(MCPAdapter(manager))
+    return manager
+
+
+def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object | None]:
     values = _resolve(args)
     provider = _make_provider(values)
     ui = _make_ui(args)
@@ -61,11 +91,19 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI]:
         thinking_budget=getattr(args, "thinking_budget", None),
         stream=not getattr(args, "no_stream", False),
     )
-    return ReActAgent(provider=provider, config=config, ui=ui), ui
+    registry = ReActAgent.default_registry()
+    manager = _start_mcp(registry)
+    agent = ReActAgent(provider=provider, config=config, tools=registry, ui=ui)
+    return agent, ui, manager
 
 
 def run_command(args: argparse.Namespace) -> int:
-    agent, ui = build_agent(args)
+    try:
+        agent, ui, mcp = build_agent(args)
+    except RuntimeError as exc:
+        # E.g. MCP servers configured without the SDK installed, or a connect failure.
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
     try:
         with KeyInterrupt() as interrupt:
             result = agent.run(args.task, should_cancel=interrupt.is_set)
@@ -73,6 +111,9 @@ def run_command(args: argparse.Namespace) -> int:
         # Covers LLMTransientError (network exhausted retries) and API errors.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
+    finally:
+        if mcp is not None:
+            mcp.close()
     # A live UI already streamed the answer via on_final; only print it ourselves
     # when the run was silent (piped/--quiet) so we don't echo it twice.
     if not ui.is_live:
@@ -82,31 +123,39 @@ def run_command(args: argparse.Namespace) -> int:
 
 
 def chat_command(args: argparse.Namespace) -> int:
-    agent, ui = build_agent(args)
+    try:
+        agent, ui, mcp = build_agent(args)
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
     print("Agent chat. Type /exit to quit. Press Esc during a turn to interrupt.")
-    while True:
-        try:
-            task = input("> ").strip()
-        except EOFError:
-            break
-        if task in {"/exit", "/quit"}:
-            break
-        if not task:
-            continue
-        try:
-            with KeyInterrupt() as interrupt:
-                result = agent.run(task, should_cancel=interrupt.is_set)
-        except LLMTransientError as exc:
-            # A network hiccup must not tear down the whole session: report it and
-            # keep the loop (and the accumulated context) alive for a retry.
-            print(f"[network] {exc}", file=sys.stderr)
-            print("The session is still alive — please send your message again.", file=sys.stderr)
-            continue
-        except RuntimeError as exc:
-            print(f"[error] {exc}", file=sys.stderr)
-            continue
-        if not ui.is_live:
-            print(result.answer)
+    try:
+        while True:
+            try:
+                task = input("> ").strip()
+            except EOFError:
+                break
+            if task in {"/exit", "/quit"}:
+                break
+            if not task:
+                continue
+            try:
+                with KeyInterrupt() as interrupt:
+                    result = agent.run(task, should_cancel=interrupt.is_set)
+            except LLMTransientError as exc:
+                # A network hiccup must not tear down the whole session: report it and
+                # keep the loop (and the accumulated context) alive for a retry.
+                print(f"[network] {exc}", file=sys.stderr)
+                print("The session is still alive — please send your message again.", file=sys.stderr)
+                continue
+            except RuntimeError as exc:
+                print(f"[error] {exc}", file=sys.stderr)
+                continue
+            if not ui.is_live:
+                print(result.answer)
+    finally:
+        if mcp is not None:
+            mcp.close()
     return 0
 
 
@@ -163,6 +212,40 @@ def memory_command(args: argparse.Namespace) -> int:
         print(f"[error] no memory {args.value}", file=sys.stderr)
         return 1
     return 0
+
+
+def mcp_command(args: argparse.Namespace) -> int:
+    """List the tools exposed by the configured MCP servers (a verification aid)."""
+    mcp_config = resolve_mcp_config()
+    if not any(server.enabled for server in mcp_config.servers):
+        print("(no MCP servers configured in agent.toml — see [mcp.servers.*])")
+        return 0
+    from agent_core.mcp import MCPAdapter, MCPClientManager
+
+    manager = MCPClientManager(mcp_config)
+    try:
+        manager.start()
+    except ModuleNotFoundError:
+        print(
+            '[error] the "mcp" SDK isn\'t installed. Install it with: '
+            'pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").',
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as exc:  # noqa: BLE001 - connect/transport failures are user-facing
+        print(f"[error] could not connect MCP servers: {exc}", file=sys.stderr)
+        return 1
+    try:
+        tools = MCPAdapter(manager).list_tools()
+        if not tools:
+            print("(servers connected but exposed no tools)")
+            return 0
+        for tool in sorted(tools, key=lambda t: t.name):
+            summary = tool.description.splitlines()[0] if tool.description else ""
+            print(f"{tool.name}  [{tool.risk.value}]  {summary}")
+        return 0
+    finally:
+        manager.close()
 
 
 def _force_utf8_output() -> None:
@@ -233,6 +316,10 @@ def main(argv: list[str] | None = None) -> int:
     memory_parser.add_argument("action", choices=["list", "add", "forget"])
     memory_parser.add_argument("value", nargs="?", default=None, help="Text for add, id for forget.")
     memory_parser.set_defaults(func=memory_command)
+
+    mcp_parser = subparsers.add_parser("mcp", help="Inspect configured MCP servers and their tools.")
+    mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
+    mcp_parser.set_defaults(func=mcp_command)
 
     args = parser.parse_args(argv)
     return args.func(args)
