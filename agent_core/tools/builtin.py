@@ -51,6 +51,43 @@ def _is_probably_binary(sample: bytes) -> bool:
     return b"\x00" in sample
 
 
+class ExactEditError(Exception):
+    """A precise string-replace could not be applied (empty/duplicate/missing match).
+
+    Carries an ``error_type`` so callers can surface it in ``ToolResult.metadata`` the
+    same way the inline checks used to.
+    """
+
+    def __init__(self, message: str, error_type: str, **metadata: object) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.metadata = metadata
+
+
+def _apply_exact_edit(text: str, old_string: str, new_string: str, replace_all: bool) -> tuple[str, int]:
+    """Apply one exact-string replacement to ``text``; return ``(updated, replaced_count)``.
+
+    Shared by ``edit_file`` (single edit) and ``multi_edit`` (a sequence applied in
+    memory). Raises ``ExactEditError`` if the edit is empty, a no-op, missing, or
+    ambiguous (more than one match without ``replace_all``).
+    """
+    if not old_string:
+        raise ExactEditError("old_string must not be empty", "EmptyMatch")
+    if old_string == new_string:
+        raise ExactEditError("old_string and new_string are identical", "NoOp")
+    count = text.count(old_string)
+    if count == 0:
+        raise ExactEditError("old_string not found in file", "NotFound")
+    if count > 1 and not replace_all:
+        raise ExactEditError(
+            f"old_string is not unique ({count} matches); add surrounding context or pass replace_all=true",
+            "Ambiguous",
+            matches=count,
+        )
+    updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+    return updated, (count if replace_all else 1)
+
+
 @builtin_tool
 class ListDirTool(WorkspacePathMixin, Tool):
     name = "list_dir"
@@ -98,28 +135,15 @@ class EditFileTool(WorkspacePathMixin, Tool):
         new_string = str(arguments["new_string"])
         replace_all = bool(arguments.get("replace_all", False))
 
-        if not old_string:
-            return ToolResult(self.name, "old_string must not be empty", ok=False, metadata={"error_type": "EmptyMatch"})
-        if old_string == new_string:
-            return ToolResult(self.name, "old_string and new_string are identical", ok=False, metadata={"error_type": "NoOp"})
         if not path.exists():
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
 
         text = path.read_text(encoding="utf-8")
-        count = text.count(old_string)
-        if count == 0:
-            return ToolResult(self.name, "old_string not found in file", ok=False, metadata={"error_type": "NotFound"})
-        if count > 1 and not replace_all:
-            return ToolResult(
-                self.name,
-                f"old_string is not unique ({count} matches); add surrounding context or pass replace_all=true",
-                ok=False,
-                metadata={"error_type": "Ambiguous", "matches": count},
-            )
-
-        updated = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+        try:
+            updated, replaced = _apply_exact_edit(text, old_string, new_string, replace_all)
+        except ExactEditError as exc:
+            return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": exc.error_type, **exc.metadata})
         path.write_text(updated, encoding="utf-8")
-        replaced = count if replace_all else 1
         return ToolResult(self.name, f"Replaced {replaced} occurrence(s) in {path}")
 
 
