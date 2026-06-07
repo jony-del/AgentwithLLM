@@ -52,16 +52,16 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 # confirmed in default); set risk per server to "read" or "write" to relax that.
 # Inspect what a server exposes with:  python -m agent_core mcp list
 #
-# stdio transport — launch a server as a subprocess:
-# [mcp.servers.fs]
-# transport = "stdio"
-# command = "python"
-# args = ["-m", "mcp_server_filesystem", "."]
+# # stdio transport — launch a server as a subprocess:
+[mcp.servers.fs]
+transport = "stdio"
+command = "python"
+args = ["-m", "mcp_server_filesystem", "."]
 # # env = { SOME_VAR = "value" }   # extra env layered over the inherited environment
 # # cwd = "."                       # working directory for the subprocess
-# risk = "read"
+risk = "read"
 #
-# Streamable HTTP transport (2025 spec, single endpoint) — connect to a URL:
+# # Streamable HTTP transport (2025 spec, single endpoint) — connect to a URL:
 # [mcp.servers.weather]
 # transport = "streamable-http"
 # url = "http://localhost:8000/mcp"

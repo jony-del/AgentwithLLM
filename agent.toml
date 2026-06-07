@@ -9,6 +9,15 @@ model = "claude-sonnet-4-6"
 permission = "default"        # default | acceptedits | plan | auto | dontask
 provider = "claude"           # claude | fake
 
+# --- Live display (CLI-only, NOT configured here) ----------------------------
+# The terminal trace, token streaming, and extended thinking are controlled by
+# CLI flags, not this file or env vars. They only activate with the interactive
+# ConsoleUI (stdin AND stdout are TTYs); pipes/tests stay silent. Available flags:
+#   --quiet              suppress the live thinking/tool trace (final answer only)
+#   --no-stream          render each turn after it completes (no token-by-token)
+#   --thinking-budget N  enable Claude extended thinking with an N-token budget
+# Permission prompts in the live UI accept: y (once) / a (always this session) / n (deny).
+
 # --- Cross-conversation memory ----------------------------------------------
 # The whole table is optional. `enabled` here can be overridden by AGENT_MEMORY
 # or the --memory / --no-memory CLI flag; the numeric tunables below are only
@@ -34,6 +43,30 @@ forget_min_access = 1         # ...unless they've been recalled at least this ma
 importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
+
+# --- MCP servers (Model Context Protocol) -----------------------------------
+# Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
+# to the agent as "<name>__<tool>" (e.g. fs__read_file). Needs the optional SDK:
+#   pip install "mcp>=1.0"   (or  pip install -e ".[mcp]")
+# Every tool defaults to risk = "dangerous" (so it's denied in auto/dontask and
+# confirmed in default); set risk per server to "read" or "write" to relax that.
+# Inspect what a server exposes with:  python -m agent_core mcp list
+#
+# # stdio transport — launch a server as a subprocess:
+[mcp.servers.fs]
+transport = "stdio"
+command = "python"
+args = ["-m", "mcp_server_filesystem", "."]
+# # env = { SOME_VAR = "value" }   # extra env layered over the inherited environment
+# # cwd = "."                       # working directory for the subprocess
+risk = "read"
+#
+# # Streamable HTTP transport (2025 spec, single endpoint) — connect to a URL:
+# [mcp.servers.weather]
+# transport = "streamable-http"
+# url = "http://localhost:8000/mcp"
+# headers = { Authorization = "Bearer TOKEN" }
+# risk = "write"
 
 # --- Single tool-output truncation ------------------------------------------
 # When one tool call's output exceeds these limits, only head+tail (with a

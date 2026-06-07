@@ -55,6 +55,57 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
     return ConsoleUI() if interactive else NullUI()
 
 
+_MCP_SDK_HINT = (
+    "MCP servers are configured in agent.toml but the 'mcp' SDK isn't installed. "
+    'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").'
+)
+
+
+def _describe_mcp_error(exc: BaseException) -> str:
+    """Flatten an exception into a readable one-liner.
+
+    anyio wraps a server's transport/handshake failure in an ``ExceptionGroup`` (often
+    nested), so ``str(exc)`` is just "unhandled errors in a TaskGroup". Walk down to the
+    leaf causes — e.g. ``McpError: Connection closed`` when a stdio server process exits
+    immediately (a bad command/args, or the server program isn't installed).
+    """
+    leaves: list[str] = []
+
+    def walk(error: BaseException) -> None:
+        nested = getattr(error, "exceptions", None)
+        if nested:
+            for sub in nested:
+                walk(sub)
+        else:
+            leaves.append(f"{type(error).__name__}: {error}")
+
+    walk(exc)
+    # dict.fromkeys de-dups while preserving order.
+    return "; ".join(dict.fromkeys(leaves)) or f"{type(exc).__name__}: {exc}"
+
+
+def _connect_mcp(mcp_config):
+    """Start a manager for the configured servers, raising a clean RuntimeError on failure.
+
+    Missing SDK (an unwrapped ``ModuleNotFoundError`` from the lazy ``import mcp``) and a
+    connect/handshake failure (an anyio ``ExceptionGroup``) both become a readable
+    ``RuntimeError`` so callers can report it without leaking a raw traceback.
+    """
+    from agent_core.mcp import MCPClientManager
+
+    manager = MCPClientManager(mcp_config)
+    try:
+        manager.start()
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(_MCP_SDK_HINT) from exc
+    except Exception as exc:  # noqa: BLE001 - anyio ExceptionGroup et al. → one clean message
+        raise RuntimeError(
+            f"could not connect MCP servers: {_describe_mcp_error(exc)} "
+            "(check each server's command/args and that the server program is installed)"
+        ) from exc
+    return manager
+
+
 def _start_mcp(registry: ToolRegistry):
     """Connect any configured MCP servers and register their tools, or return ``None``.
 
@@ -65,16 +116,9 @@ def _start_mcp(registry: ToolRegistry):
     mcp_config = resolve_mcp_config()
     if not any(server.enabled for server in mcp_config.servers):
         return None
-    from agent_core.mcp import MCPAdapter, MCPClientManager
+    from agent_core.mcp import MCPAdapter
 
-    manager = MCPClientManager(mcp_config)
-    try:
-        manager.start()
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "MCP servers are configured in agent.toml but the 'mcp' SDK isn't installed. "
-            'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").'
-        ) from exc
+    manager = _connect_mcp(mcp_config)
     registry.register_adapter(MCPAdapter(manager))
     return manager
 
@@ -220,20 +264,12 @@ def mcp_command(args: argparse.Namespace) -> int:
     if not any(server.enabled for server in mcp_config.servers):
         print("(no MCP servers configured in agent.toml — see [mcp.servers.*])")
         return 0
-    from agent_core.mcp import MCPAdapter, MCPClientManager
+    from agent_core.mcp import MCPAdapter
 
-    manager = MCPClientManager(mcp_config)
     try:
-        manager.start()
-    except ModuleNotFoundError:
-        print(
-            '[error] the "mcp" SDK isn\'t installed. Install it with: '
-            'pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").',
-            file=sys.stderr,
-        )
-        return 1
-    except Exception as exc:  # noqa: BLE001 - connect/transport failures are user-facing
-        print(f"[error] could not connect MCP servers: {exc}", file=sys.stderr)
+        manager = _connect_mcp(mcp_config)
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
         return 1
     try:
         tools = MCPAdapter(manager).list_tools()

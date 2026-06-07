@@ -180,6 +180,21 @@ def test_flatten_content_notes_non_text_blocks() -> None:
     assert _flatten_content(None) == ""
 
 
+# --- error reporting -----------------------------------------------------------
+
+
+def test_describe_mcp_error_unwraps_nested_exception_groups() -> None:
+    from agent_core.cli import _describe_mcp_error
+
+    # anyio nests the real cause inside (possibly several) ExceptionGroups.
+    leaf = RuntimeError("Connection closed")
+    grouped = ExceptionGroup("outer", [ExceptionGroup("inner", [leaf])])
+    assert _describe_mcp_error(grouped) == "RuntimeError: Connection closed"
+
+    # A plain exception is described as-is.
+    assert _describe_mcp_error(ValueError("nope")) == "ValueError: nope"
+
+
 # --- integration (requires the optional `mcp` SDK and a real subprocess) --------
 
 _SERVER = '''
