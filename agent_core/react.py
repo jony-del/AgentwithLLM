@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from agent_core.compression import CompressionConfig, CompressionPipeline
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
-from agent_core.models import LLMContextTooLongError, Message
+from agent_core.models import LLMContextTooLongError, Message, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider
+from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
@@ -38,7 +39,11 @@ class ReActConfig:
     run_dir: str = "runs"
     system_prompt: str = (
         "You are a ReAct agent. Reason briefly, call tools when useful, "
-        "and return a final answer when the task is complete."
+        "and return a final answer when the task is complete. "
+        "For non-trivial, multi-step tasks, call update_todos first to lay out a plan, "
+        "then keep it current — mark one item in_progress at a time and complete it before "
+        "moving on. For self-contained sub-investigations, consider dispatch_agent to run "
+        "them in a fresh context."
     )
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -72,6 +77,17 @@ class ReActAgent:
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         self.compression = CompressionPipeline(self.config.compression)
         self.ui = ui or NullUI()
+        # Per-run shared state for session-aware tools (planning, sub-agents). The
+        # registry may have been built before this agent existed (the CLI path), so we
+        # rebind every session-aware tool to *this* session below.
+        self.session = SessionContext(
+            workspace=Path.cwd().resolve(),
+            subagent_factory=self._spawn_subagent,
+            ui_notify=self.ui.on_todos,
+        )
+        for tool in self.registry.list():
+            if isinstance(tool, SessionAwareMixin):
+                tool.bind_session(self.session)
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
         permissions = PermissionPolicy(
@@ -258,3 +274,36 @@ class ReActAgent:
             "thinking_budget": self.config.thinking_budget,
             "stream": self.config.stream,
         }
+
+    def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
+        """Run a sub-task in a fresh ``ReActAgent`` and return only its final answer.
+
+        Injected into ``SessionContext.subagent_factory`` so the ``dispatch_agent`` tool
+        can fan out work to a child with a clean context. The child reuses this agent's
+        provider and scalar config but gets a narrowed tool set (``read_only`` = READ
+        tools only; ``full`` = READ+WRITE) and — crucially — **never** the
+        ``dispatch_agent`` tool itself, so sub-agents can't recurse. A depth ceiling is a
+        second guard. The child runs silently (``NullUI``) and writes its own run log.
+        """
+        if self.session.depth >= self.session.max_depth:
+            return "[dispatch_agent] max sub-agent depth reached; refusing to spawn deeper."
+        sub_registry = ToolRegistry()
+        for tool in default_tools(workspace=self.session.workspace):
+            if getattr(tool, "name", "") == "dispatch_agent":
+                continue  # prevent recursive fan-out
+            if preset == "read_only" and tool.risk is not ToolRisk.READ:
+                continue
+            if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
+                continue  # never hand a child arbitrary command execution implicitly
+            sub_registry.register(tool)
+        # Disable memory in the child so a sub-task doesn't recall/extract on its own.
+        child_config = replace(self.config, memory=replace(self.config.memory, enabled=False))
+        child = ReActAgent(
+            provider=self.provider,
+            config=child_config,
+            tools=sub_registry,
+            ui=NullUI(),
+        )
+        child.session.depth = self.session.depth + 1
+        child.session.max_depth = self.session.max_depth
+        return child.run(task).answer

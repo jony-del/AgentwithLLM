@@ -17,6 +17,7 @@ import importlib
 import pkgutil
 from pathlib import Path
 
+from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.tools.base import Tool, WorkspacePathMixin
 
 # Populated by the @builtin_tool decorator as tool modules are imported.
@@ -51,15 +52,22 @@ def builtin_tool_classes() -> list[type[Tool]]:
     return list(_BUILTIN)
 
 
-def default_tools(workspace: str | Path | None = None) -> list[Tool]:
+def default_tools(
+    workspace: str | Path | None = None,
+    session: SessionContext | None = None,
+) -> list[Tool]:
     """Instantiate the default tool set.
 
-    Workspace-scoped tools (``WorkspacePathMixin`` subclasses) receive ``workspace``
-    when one is given; workspace-agnostic tools (e.g. ``echo``) are built with no args.
+    Session-aware tools (``SessionAwareMixin`` subclasses) receive ``session`` (or a
+    placeholder if none is given — ``ReActAgent`` rebinds them later). Workspace-scoped
+    tools (``WorkspacePathMixin`` subclasses) receive ``workspace`` when one is given;
+    workspace-agnostic tools (e.g. ``echo``) are built with no args.
     """
     tools: list[Tool] = []
     for cls in builtin_tool_classes():
-        if workspace is not None and issubclass(cls, WorkspacePathMixin):
+        if issubclass(cls, SessionAwareMixin):
+            tools.append(cls(session) if session is not None else cls())  # type: ignore[call-arg]
+        elif workspace is not None and issubclass(cls, WorkspacePathMixin):
             tools.append(cls(workspace))  # type: ignore[call-arg]
         else:
             tools.append(cls())

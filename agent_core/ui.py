@@ -53,6 +53,9 @@ class AgentUI:
     def on_final(self, answer: str) -> None:
         """The model returned no tool calls — this is the final answer."""
 
+    def on_todos(self, todos: list[Any]) -> None:
+        """The task-planning tool (``update_todos``) rewrote the to-do list."""
+
     def on_stopped(self, reason: str, human: str) -> None:
         """A safety-net guard (cancel / max_steps / deadline) ended the run."""
 
@@ -197,6 +200,18 @@ class ConsoleUI(AgentUI):
             return
         self._emit(self._style("● answer", _GREEN))
         self._emit(answer)
+
+    def on_todos(self, todos: list[Any]) -> None:
+        self._close_block()
+        if not todos:
+            return
+        self._emit(self._style("☰ plan", _CYAN))
+        marks = {"pending": "○", "in_progress": "◐", "completed": "●"}
+        colors = {"pending": _DIM, "in_progress": _YELLOW, "completed": _GREEN}
+        for todo in todos:
+            status = getattr(todo, "status", "pending")
+            content = getattr(todo, "content", str(todo))
+            self._emit(self._style(f"  {marks.get(status, '○')} {content}", colors.get(status, _DIM)))
 
     def on_stopped(self, reason: str, human: str) -> None:
         self._close_block()
