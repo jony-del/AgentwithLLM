@@ -68,6 +68,40 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 # url = "http://localhost:8000/mcp"
 # headers = { Authorization = "Bearer TOKEN" }
 # risk = "write"
+#
+# --- Popular community servers (uncomment + install to enable) ---------------
+# These are Node-based; they run via `npx -y <pkg>` (needs Node/npm on PATH) and
+# are NOT in the `mcp-servers` extra (that extra only carries the pip git/fetch/time
+# servers). Each needs its own setup (tokens, paths) — see the package's README.
+#
+# # GitHub: repos, issues, PRs, code search. Needs a personal access token.
+# [mcp.servers.github]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-github"]
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..." }
+# risk = "write"
+#
+# # Playwright: drive a real browser (navigate, click, screenshot, scrape).
+# [mcp.servers.playwright]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@playwright/mcp@latest"]
+# risk = "dangerous"
+#
+# # SQLite: query/inspect a local database file.
+# [mcp.servers.sqlite]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "mcp-server-sqlite-npx", "./app.db"]
+# risk = "write"
+#
+# # Sequential-thinking: a structured step-by-step reasoning scratchpad.
+# [mcp.servers.sequential-thinking]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+# risk = "read"
 
 [mcp.servers.git]
 transport = "stdio"
