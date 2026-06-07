@@ -296,7 +296,7 @@ def _force_utf8_output() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_output()
-    parser = argparse.ArgumentParser(prog="agent-core")
+    parser = argparse.ArgumentParser(prog="polaris")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(subparser: argparse.ArgumentParser) -> None:
@@ -357,6 +357,17 @@ def main(argv: list[str] | None = None) -> int:
     mcp_parser = subparsers.add_parser("mcp", help="Inspect configured MCP servers and their tools.")
     mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
     mcp_parser.set_defaults(func=mcp_command)
+
+    # Default to `chat` when invoked with no subcommand, so a bare `polaris`
+    # (like `claude`/`codex`) drops straight into an interactive session. This also
+    # applies when only flags are given (e.g. `polaris --provider fake`), since the
+    # leading token is then a flag rather than a command. `-h`/`--help` still shows the
+    # top-level help, and a non-flag, non-command token falls through to argparse's
+    # usual "invalid choice" error.
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or (argv[0].startswith("-") and argv[0] not in {"-h", "--help"}):
+        argv = ["chat", *argv]
 
     args = parser.parse_args(argv)
     return args.func(args)

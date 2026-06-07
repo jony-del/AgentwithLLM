@@ -20,7 +20,7 @@ mcp-servers = [
     "mcp-server-time",
 ]
 [project.scripts]
-agent-core = "agent_core.cli:main"
+polaris = "agent_core.cli:main"
 
 # Pin packaging to the source package only. Without this, setuptools' flat-layout
 # auto-discovery also picks up runtime dirs created at run time (runs/, memory/) and
