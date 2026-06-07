@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A minimal, dependency-free Python ReAct agent framework (Python >= 3.11). The standard library is the only runtime dependency of the core — the Claude provider uses `urllib`, not the `anthropic` SDK. Keep it that way unless explicitly asked to add a dependency. The **one** opt-in exception is the MCP support, behind two extras: `mcp` (just the official SDK — `pip install -e ".[mcp]"`) and `mcp-servers` (the SDK plus a few reference servers: git/fetch/time). The SDK is imported lazily and only when `[mcp.servers.*]` is configured, so the core stays importable and dependency-free without it.
+A dependency-free Python ReAct agent framework (Python >= 3.11). The standard library is the only runtime dependency of the core — the Claude provider uses `urllib`, not the `anthropic` SDK. Keep it that way unless explicitly asked to add a dependency. The **one** opt-in exception is the MCP support, behind two extras: `mcp` (just the official SDK — `pip install -e ".[mcp]"`) and `mcp-servers` (the SDK plus a few reference servers: git/fetch/time). The SDK is imported lazily and only when `[mcp.servers.*]` is configured, so the core stays importable and dependency-free without it.
 
 ## Commands
 

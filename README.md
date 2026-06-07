@@ -1,6 +1,6 @@
-# Agent with Mini LLM
+# Agent with LLM
 
-A small Python ReAct agent framework skeleton with:
+A Python ReAct agent framework with:
 
 - Claude API provider
 - ReAct loop

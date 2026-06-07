@@ -1,4 +1,4 @@
-"""Minimal Python ReAct agent framework."""
+"""Python ReAct agent framework."""
 
 from agent_core.react import ReActAgent, ReActConfig
 

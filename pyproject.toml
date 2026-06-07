@@ -1,7 +1,7 @@
 [project]
-name = "agent-with-mini-llm"
+name = "agent-with-llm"
 version = "0.1.0"
-description = "A minimal Python ReAct agent framework with Claude, tools, hooks, permissions, and compression."
+description = "A Python ReAct agent framework with Claude, tools, hooks, permissions, and compression."
 requires-python = ">=3.11"
 dependencies = []
 
@@ -14,7 +14,7 @@ mcp = ["mcp>=1.0"]
 # box (git / fetch / time). Self-references the `mcp` extra above so the SDK pin stays in
 # one place. Pulls heavier deps (gitpython, requests, lxml, ...).
 mcp-servers = [
-    "agent-with-mini-llm[mcp]",
+    "agent-with-llm[mcp]",
     "mcp-server-git",
     "mcp-server-fetch",
     "mcp-server-time",
