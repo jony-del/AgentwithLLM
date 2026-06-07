@@ -7,6 +7,11 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Web access tools (web_fetch / web_search). Imported lazily inside the tools, so the
+# core stays importable without this extra; install with: pip install -e ".[web]".
+# ddgs is the keyless default search backend; Brave/Tavily are used instead when their
+# API key env var is set (no extra dep — they go over httpx).
+web = ["httpx>=0.27", "markdownify>=0.11", "beautifulsoup4>=4.12", "ddgs>=6.0"]
 # Just the official MCP SDK — all the core needs to connect to MCP servers configured
 # in agent.toml. Imported lazily, so the core stays dependency-free without this extra.
 mcp = ["mcp>=1.0"]
