@@ -7,12 +7,27 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-# Optional: the official Model Context Protocol SDK. Only needed to connect to MCP
-# servers (`[mcp.servers.*]` in agent.toml). The core stays dependency-free without it.
+# Just the official MCP SDK — all the core needs to connect to MCP servers configured
+# in agent.toml. Imported lazily, so the core stays dependency-free without this extra.
 mcp = ["mcp>=1.0"]
-
+# The SDK plus a few official reference servers you can point agent.toml at out of the
+# box (git / fetch / time). Self-references the `mcp` extra above so the SDK pin stays in
+# one place. Pulls heavier deps (gitpython, requests, lxml, ...).
+mcp-servers = [
+    "agent-with-mini-llm[mcp]",
+    "mcp-server-git",
+    "mcp-server-fetch",
+    "mcp-server-time",
+]
 [project.scripts]
 agent-core = "agent_core.cli:main"
+
+# Pin packaging to the source package only. Without this, setuptools' flat-layout
+# auto-discovery also picks up runtime dirs created at run time (runs/, memory/) and
+# aborts with "Multiple top-level packages discovered". The glob keeps every agent_core
+# subpackage (tools, providers, memory, mcp, ...) while excluding those output dirs.
+[tool.setuptools.packages.find]
+include = ["agent_core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

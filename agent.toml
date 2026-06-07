@@ -53,13 +53,13 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 # Inspect what a server exposes with:  python -m agent_core mcp list
 #
 # # stdio transport — launch a server as a subprocess:
-[mcp.servers.fs]
-transport = "stdio"
-command = "python"
-args = ["-m", "mcp_server_filesystem", "."]
+# [mcp.servers.fs]
+# transport = "stdio"
+# command = "python"
+# args = ["-m", "mcp_server_filesystem", "."]
 # # env = { SOME_VAR = "value" }   # extra env layered over the inherited environment
 # # cwd = "."                       # working directory for the subprocess
-risk = "read"
+# risk = "read"
 #
 # # Streamable HTTP transport (2025 spec, single endpoint) — connect to a URL:
 # [mcp.servers.weather]
@@ -67,6 +67,25 @@ risk = "read"
 # url = "http://localhost:8000/mcp"
 # headers = { Authorization = "Bearer TOKEN" }
 # risk = "write"
+
+[mcp.servers.git]
+transport = "stdio"
+command = "python"
+args = ["-m", "mcp_server_git", "--repository", "."]
+risk = "write"
+
+[mcp.servers.fetch]
+transport = "stdio"
+command = "python"
+args = ["-m", "mcp_server_fetch"]
+env = { PYTHONIOENCODING = "utf-8" }
+risk = "read"
+
+[mcp.servers.time]
+transport = "stdio"
+command = "python"
+args = ["-m", "mcp_server_time", "--local-timezone=Asia/Shanghai"]
+risk = "read"
 
 # --- Single tool-output truncation ------------------------------------------
 # When one tool call's output exceeds these limits, only head+tail (with a

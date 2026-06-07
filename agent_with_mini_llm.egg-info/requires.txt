@@ -1,0 +1,12 @@
+
+[dev]
+pytest>=8.0
+
+[mcp]
+mcp>=1.0
+
+[mcp-servers]
+agent-with-mini-llm[mcp]
+mcp-server-git
+mcp-server-fetch
+mcp-server-time

@@ -15,7 +15,17 @@
       "Bash(python -m agent_core run \"I work mostly in Rust and Go\" --provider fake)",
       "Bash(python -m agent_core dream -h)",
       "Bash(python -m agent_core -h)",
-      "Bash(python -m pytest tests/test_hooks.py -q)"
+      "Bash(python -m pytest tests/test_hooks.py -q)",
+      "PowerShell(Write-Output \"==== env python exists? ====\"; Test-Path \"D:\\\\Anaconda3\\\\envs\\\\AgentwithMiniLLM\\\\python.exe\"; Write-Output \"==== PATH \\(first entries\\) ====\"; \\($env:PATH -split ';'\\) | Select-Object -First 12; Write-Output \"==== is mcp importable by BASE python? ====\"; & \"D:\\\\anaconda3\\\\python.exe\" -c \"import mcp, sys; print\\('base sees mcp at:', mcp.__file__\\)\" 2>&1 | Select-Object -First 3; Write-Output \"==== is mcp importable by ENV python? ====\"; & \"D:\\\\Anaconda3\\\\envs\\\\AgentwithMiniLLM\\\\python.exe\" -c \"import mcp, sys; print\\('env sees mcp at:', mcp.__file__\\)\" 2>&1 | Select-Object -First 3)",
+      "PowerShell(Write-Output \"CONDA_PREFIX = $env:CONDA_PREFIX\"; \\(Get-Command python\\).Source; Write-Output \"==== checking deps ====\"; python -c \"import iniconfig; print\\('iniconfig OK', iniconfig.__version__\\)\" 2>&1 | Select-Object -First 1; python -c \"import pygments; print\\('pygments OK', pygments.__version__\\)\" 2>&1 | Select-Object -First 1; python -c \"import pytest; print\\('pytest OK', pytest.__version__\\)\" 2>&1 | Select-Object -First 1)",
+      "PowerShell(\\(Get-Command python\\).Source; python -c \"import importlib.util; print\\('find_spec mcp =', importlib.util.find_spec\\('mcp'\\) is not None\\)\"; python -m pytest tests/test_mcp.py -v -rs 2>&1 | Select-String -Pattern \"PASSED|SKIPPED|skipped|roundtrip\")",
+      "Bash(sed -n '/mcp-servers/,/\\\\]/p' pyproject.toml)",
+      "Bash(python -m pip list)",
+      "PowerShell(python -m pip install -e \".[mcp-servers]\" 2>&1 | Select-Object -Last 15)",
+      "PowerShell(python -m pytest tests/test_mcp.py -rs 2>&1 | Select-Object -Last 20)",
+      "PowerShell(python -m pytest 2>&1 | Select-Object -Last 8; Write-Output \"==== mcp list ====\"; python -m agent_core mcp list 2>&1 | Select-Object -First 30)",
+      "PowerShell(pytest *)",
+      "PowerShell(Get-Command *)"
     ]
   }
 }

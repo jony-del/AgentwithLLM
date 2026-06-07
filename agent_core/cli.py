@@ -57,7 +57,8 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
 
 _MCP_SDK_HINT = (
     "MCP servers are configured in agent.toml but the 'mcp' SDK isn't installed. "
-    'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]").'
+    'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]"; '
+    'use ".[mcp-servers]" to also get the reference git/fetch/time servers).'
 )
 
 
