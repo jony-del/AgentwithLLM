@@ -6,4 +6,5 @@ venv/
 runs/
 memory/
 *.egg-info/
+.env
 
