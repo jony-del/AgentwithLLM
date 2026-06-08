@@ -5,7 +5,7 @@
 # AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
 
 # --- Top-level scalars -------------------------------------------------------
-model = "claude-sonnet-4-6"
+model = "claude-haiku-4-5-20251001"
 permission = "default"        # default | acceptedits | plan | auto | dontask
 provider = "claude"           # claude | fake
 
