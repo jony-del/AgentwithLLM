@@ -21,9 +21,9 @@ from agent_core.ui import AgentUI, NullUI
 
 @dataclass(slots=True)
 class ReActConfig:
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-haiku-4-5-20251001"
     temperature: float = 0.2
-    max_tokens: int = 1024
+    max_tokens: int = 2048
     # No fixed step cap by default: like Claude Code, the loop runs until the model
     # stops requesting tools. Set an int only if you want a hard ceiling on tool turns.
     max_steps: int | None = None
@@ -31,7 +31,7 @@ class ReActConfig:
     max_wall_seconds: float = 300.0
     # Extended-thinking token budget for the Claude provider. None disables thinking
     # (default); a positive int enables it and is passed through _provider_config().
-    thinking_budget: int | None = None
+    thinking_budget: int | None = 4096
     # Stream tokens to a live UI as they arrive. Only takes effect when the UI is
     # live (ConsoleUI); NullUI never streams. CLI exposes this via --no-stream.
     stream: bool = True

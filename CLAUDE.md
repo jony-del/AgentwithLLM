@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A Python ReAct agent framework (Python >= 3.11) growing toward Claude-Code-level capability. **The goal is a feature-rich, high-performance agent; adding a third-party dependency is fine when a capability needs it** (this supersedes the project's earlier "zero-dependency core" rule). The pattern, though, is to keep the *core* lean and importable without optional extras, and put heavier capabilities behind **opt-in extras with lazy imports** (so `import agent_core` never requires them):
+A Python ReAct agent framework (Python >= 3.11) growing toward Claude-Code-level capability. **The goal is a feature-rich, high-performance agent; adding a third-party dependency is fine when a capability needs it**. The pattern, though, is to keep the *core* lean and importable without optional extras, and put heavier capabilities behind **opt-in extras with lazy imports** (so `import agent_core` never requires them):
 
 - `mcp` — the official MCP SDK (`pip install -e ".[mcp]"`); imported lazily only when `[mcp.servers.*]` is configured.
 - `mcp-servers` — the SDK plus pip reference servers (git/fetch/time).
