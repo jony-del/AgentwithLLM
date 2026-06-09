@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Allowed to-do states, mirroring Claude Code's TodoWrite.
 VALID_TODO_STATUS = frozenset({"pending", "in_progress", "completed"})
@@ -78,6 +79,10 @@ class SessionContext:
     workspace: Path = field(default_factory=lambda: Path.cwd().resolve())
     todos: TodoStore = field(default_factory=TodoStore)
     subagent_factory: Callable[[str, str], str] | None = None
+    teammate_factory: Callable[[str, str, str, str | None, str], str] | None = None
+    team_store: Any | None = None
+    agent_name: str = "leader"
+    team_id: str | None = None
     ui_notify: Callable[[list[Todo]], None] | None = None
     depth: int = 0
     max_depth: int = 1

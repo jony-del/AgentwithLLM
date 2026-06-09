@@ -1,7 +1,7 @@
 from agent_core.agents.multi import MultiAgentCoordinator
 from agent_core.models import ToolRisk
 from agent_core.providers import FakeProvider
-from agent_core.react import ReActAgent
+from agent_core.react import ReActAgent, ReActConfig
 from agent_core.session import SessionContext
 from agent_core.tools.subagent import DispatchAgentTool
 
@@ -60,8 +60,8 @@ def test_dispatch_is_write_risk() -> None:
 # --- end-to-end through a real (fake-provider) agent -------------------------
 
 
-def test_agent_spawns_subagent_with_deterministic_answer() -> None:
-    agent = ReActAgent(provider=FakeProvider())
+def test_agent_spawns_subagent_with_deterministic_answer(tmp_path) -> None:
+    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(run_dir=str(tmp_path)))
     # FakeProvider answers a plain task with "Final answer: <task>".
     answer = agent._spawn_subagent("explore the repo", "read_only")
     assert answer == "Final answer: explore the repo"

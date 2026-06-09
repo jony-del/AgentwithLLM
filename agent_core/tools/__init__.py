@@ -14,6 +14,15 @@ from agent_core.tools.builtin import (
 )
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.team import (
+    TaskCreateTool,
+    TaskUpdateTool,
+    TeamCreateTool,
+    TeamInboxReadTool,
+    TeamMessageSendTool,
+    TeamStatusTool,
+    TeammateSpawnTool,
+)
 
 __all__ = [
     "EchoTool",
@@ -26,6 +35,13 @@ __all__ = [
     "RunCommandTool",
     "RunTestsTool",
     "SearchTextTool",
+    "TaskCreateTool",
+    "TaskUpdateTool",
+    "TeamCreateTool",
+    "TeamInboxReadTool",
+    "TeamMessageSendTool",
+    "TeamStatusTool",
+    "TeammateSpawnTool",
     "Tool",
     "ToolExecutor",
     "ToolRegistry",
@@ -35,4 +51,3 @@ __all__ = [
     "builtin_tool_classes",
     "default_tools",
 ]
-

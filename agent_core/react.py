@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+from agent_core.agents.team import TeamStore
 from agent_core.compression import CompressionConfig, CompressionPipeline
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
@@ -16,6 +18,7 @@ from agent_core.storage import JSONLRunLogger
 from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.ui import AgentUI, NullUI
 
 
@@ -43,7 +46,9 @@ class ReActConfig:
         "For non-trivial, multi-step tasks, call update_todos first to lay out a plan, "
         "then keep it current — mark one item in_progress at a time and complete it before "
         "moving on. For self-contained sub-investigations, consider dispatch_agent to run "
-        "them in a fresh context."
+        "them in a fresh context. For work that needs a team of cooperating agents, use "
+        "the team tools explicitly: team_create, task_create, teammate_spawn, task_update, "
+        "and team_status."
     )
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -69,6 +74,7 @@ class ReActAgent:
         memory_store: MemoryStore | None = None,
         retriever: MemoryRetriever | None = None,
         extractor: MemoryExtractor | None = None,
+        team_store: TeamStore | None = None,
         ui: AgentUI | None = None,
     ) -> None:
         self.provider = provider
@@ -77,12 +83,15 @@ class ReActAgent:
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         self.compression = CompressionPipeline(self.config.compression)
         self.ui = ui or NullUI()
+        self.team_store = team_store or TeamStore(Path(self.config.run_dir) / "teams")
         # Per-run shared state for session-aware tools (planning, sub-agents). The
         # registry may have been built before this agent existed (the CLI path), so we
         # rebind every session-aware tool to *this* session below.
         self.session = SessionContext(
             workspace=Path.cwd().resolve(),
             subagent_factory=self._spawn_subagent,
+            teammate_factory=self._spawn_teammate,
+            team_store=self.team_store,
             ui_notify=self.ui.on_todos,
         )
         for tool in self.registry.list():
@@ -288,9 +297,19 @@ class ReActAgent:
         if self.session.depth >= self.session.max_depth:
             return "[dispatch_agent] max sub-agent depth reached; refusing to spawn deeper."
         sub_registry = ToolRegistry()
+        excluded = {
+            "dispatch_agent",
+            "team_create",
+            "task_create",
+            "teammate_spawn",
+            "task_update",
+            "team_status",
+            "team_inbox_read",
+            "team_message_send",
+        }
         for tool in default_tools(workspace=self.session.workspace):
-            if getattr(tool, "name", "") == "dispatch_agent":
-                continue  # prevent recursive fan-out
+            if getattr(tool, "name", "") in excluded:
+                continue  # prevent recursive fan-out and team orchestration from ordinary sub-agents
             if preset == "read_only" and tool.risk is not ToolRisk.READ:
                 continue
             if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
@@ -302,8 +321,88 @@ class ReActAgent:
             provider=self.provider,
             config=child_config,
             tools=sub_registry,
+            team_store=self.team_store,
             ui=NullUI(),
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
         return child.run(task).answer
+
+    def _spawn_teammate(
+        self,
+        team_id: str,
+        name: str,
+        role: str,
+        task_id: str | None = None,
+        preset: str = "read_only",
+    ) -> str:
+        """Run one teammate turn inside a file-backed team workspace."""
+        if self.session.depth >= self.session.max_depth:
+            return "[teammate_spawn] max sub-agent depth reached; refusing to spawn deeper."
+
+        store = self.team_store
+        store.add_member(team_id, name, role)
+        team = store.get_team(team_id)
+        assigned_tasks = [
+            task
+            for task in store.list_tasks(team_id)
+            if task.get("owner") == name and task.get("status") != "completed"
+        ]
+        focus_task = store.get_task(team_id, task_id) if task_id else None
+
+        sub_registry = ToolRegistry()
+        excluded = {"dispatch_agent", "team_create", "task_create", "teammate_spawn", "team_status"}
+        for tool in default_tools(workspace=self.session.workspace):
+            tool_name = getattr(tool, "name", "")
+            if tool_name in excluded:
+                continue
+            if tool_name == "task_update":
+                sub_registry.register(tool)
+                continue
+            if preset == "read_only" and tool.risk is not ToolRisk.READ:
+                continue
+            if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
+                continue
+            sub_registry.register(tool)
+        sub_registry.register(TeamInboxReadTool())
+        sub_registry.register(TeamMessageSendTool())
+
+        child_config = replace(
+            self.config,
+            permission="auto",
+            memory=replace(self.config.memory, enabled=False),
+        )
+        child = ReActAgent(
+            provider=self.provider,
+            config=child_config,
+            tools=sub_registry,
+            team_store=store,
+            ui=NullUI(),
+        )
+        child.session.depth = self.session.depth + 1
+        child.session.max_depth = self.session.max_depth
+        child.session.agent_name = name
+        child.session.team_id = team_id
+        prompt = self._teammate_prompt(team, name, role, focus_task, assigned_tasks)
+        return child.run(prompt).answer
+
+    @staticmethod
+    def _teammate_prompt(
+        team: dict[str, object],
+        name: str,
+        role: str,
+        focus_task: dict[str, object] | None,
+        assigned_tasks: list[dict[str, object]],
+    ) -> str:
+        task_block = focus_task if focus_task is not None else assigned_tasks
+        return (
+            f"You are teammate '{name}' in team '{team['id']}'.\n"
+            f"Role: {role}\n"
+            f"Team goal: {team['goal']}\n"
+            f"Leader: {team['leader']}\n"
+            "Use team_inbox_read to read your inbox. Work only on tasks assigned to you "
+            "or tasks you explicitly claim with task_update. When you finish or become "
+            "blocked, call task_update with the new status and then call team_message_send "
+            "to notify the leader.\n"
+            f"Current task context:\n{json.dumps(task_block, ensure_ascii=False, indent=2, default=str)}"
+        )

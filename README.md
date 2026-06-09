@@ -37,6 +37,31 @@ python -m agent_core run "Use the echo tool"
 python -m agent_core chat
 ```
 
+## Agent teams
+
+The agent can coordinate a file-backed team through built-in tools. The leader
+uses tools explicitly rather than a CLI subcommand or `agent.toml` preset:
+
+1. `team_create` creates shared team config, a shared task list, and the leader inbox.
+2. `task_create` adds work to the team task list.
+3. `teammate_spawn` creates or reuses a teammate and runs one teammate work turn.
+4. `task_update` assigns, claims, progresses, blocks, or completes tasks.
+5. Teammates use `team_inbox_read`, `task_update`, and `team_message_send` to read
+   assignments, update owned tasks, and notify the leader.
+6. `team_status` summarizes team config, tasks, members, and recent events.
+
+Team runtime state lives under `runs/teams/<team_id>/` (gitignored):
+
+```text
+team.json              shared team config
+tasks.json             shared task list
+inbox/<agent>.jsonl    one inbox file per teammate
+events.jsonl           append-only team activity log
+```
+
+Task list and inbox writes use sidecar file locks, so multiple agents can append
+messages or update shared task state without interleaving JSON writes.
+
 ## Cross-conversation memory
 
 By default the agent is stateless: each run starts fresh. Opt into memory and it will
