@@ -44,6 +44,13 @@ importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
 
+# --- Tool concurrency -------------------------------------------------------
+# Same-turn tool calls run concurrently when their declared resources do not
+# conflict. Disable this to force the old strictly serial execution path.
+[concurrency]
+parallel_tools = true         # false = execute tool calls one at a time
+max_tool_workers = 4          # worker threads for one independent wave
+
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
 # to the agent as "<name>__<tool>" (e.g. fs__read_file). Needs the optional SDK:

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from agent_core.models import ToolRisk, ToolResult
-from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.catalog import builtin_tool
 
 # Directories that are noise for search/listing and almost never what a user wants
@@ -99,6 +99,9 @@ class ListDirTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         target = self.resolve_workspace_path(arguments.get("path", "."))
         if not target.exists():
@@ -128,6 +131,9 @@ class EditFileTool(WorkspacePathMixin, Tool):
         "required": ["path", "old_string", "new_string"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
@@ -167,6 +173,9 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         "required": ["pattern"],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
@@ -266,6 +275,10 @@ class GitDiffTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        raw_path = arguments.get("path", ".")
+        return ConcurrencySpec((self.workspace_lock(raw_path, "read", subtree=True),))
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         cmd = ["git", "diff"]
         if arguments.get("staged"):
@@ -341,6 +354,9 @@ class EchoTool(Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec()
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         return ToolResult(name=self.name, content=str(arguments.get("text", "")))
 
@@ -362,6 +378,9 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
         "required": ["path"],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments["path"], "read"),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
@@ -390,6 +409,9 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
         "required": ["path", "content"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])

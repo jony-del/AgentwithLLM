@@ -40,6 +40,7 @@ def test_check_url_safe_allows_public_ip_literal() -> None:
 
 
 def test_web_fetch_converts_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web, "_check_url_safe", lambda url: None)
     monkeypatch.setattr(web, "_fetch_url", lambda url: ("https://ex.com/final", "text/html; charset=utf-8", "<h1>Hi</h1>"))
     monkeypatch.setattr(web, "_html_to_markdown", lambda html: "# Hi")
     result = WebFetchTool().run({"url": "https://ex.com"})
@@ -49,6 +50,7 @@ def test_web_fetch_converts_html(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_web_fetch_plain_text_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web, "_check_url_safe", lambda url: None)
     monkeypatch.setattr(web, "_fetch_url", lambda url: ("https://ex.com/x.txt", "text/plain", "raw body"))
     result = WebFetchTool().run({"url": "https://ex.com/x.txt"})
     assert result.ok
@@ -56,6 +58,7 @@ def test_web_fetch_plain_text_passthrough(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_web_fetch_truncates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web, "_check_url_safe", lambda url: None)
     monkeypatch.setattr(web, "_fetch_url", lambda url: ("https://ex.com", "text/plain", "x" * 100))
     result = WebFetchTool().run({"url": "https://ex.com", "max_chars": 10})
     assert result.metadata["truncated"] is True

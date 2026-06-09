@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from agent_core.config import (
+    resolve_concurrency_config,
     resolve_config,
     resolve_mcp_config,
     resolve_memory_config,
@@ -128,6 +129,7 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
     values = _resolve(args)
     provider = _make_provider(values)
     ui = _make_ui(args)
+    concurrency = resolve_concurrency_config()
     config = ReActConfig(
         model=values["model"],
         permission=values["permission"],
@@ -135,6 +137,8 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         output=resolve_output_config(),
         thinking_budget=getattr(args, "thinking_budget", None),
         stream=not getattr(args, "no_stream", False),
+        parallel_tools=bool(concurrency["parallel_tools"]),
+        max_tool_workers=int(concurrency["max_tool_workers"]),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
@@ -259,6 +263,54 @@ def memory_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def health_command(args: argparse.Namespace) -> int:
+    """Check the health status of the agent system."""
+    print("Agent System Health Check")
+    print("=" * 40)
+    
+    # Check configuration
+    try:
+        config = resolve_config()
+        print("✓ Configuration loaded successfully")
+    except Exception as e:
+        print(f"✗ Configuration error: {e}")
+        return 1
+    
+    # Check provider
+    try:
+        provider = _make_provider({"model": args.model, "provider": args.provider})
+        print(f"✓ Provider initialized: {type(provider).__name__}")
+    except Exception as e:
+        print(f"✗ Provider error: {e}")
+        return 1
+    
+    # Check tool registry
+    try:
+        registry = ToolRegistry()
+        tool_count = len(registry.list_tools())
+        print(f"✓ Tool registry loaded: {tool_count} tools available")
+    except Exception as e:
+        print(f"✗ Tool registry error: {e}")
+        return 1
+    
+    # Check memory if enabled
+    try:
+        memory_config = _memory_config(args)
+        if memory_config.enabled:
+            store = _open_store(memory_config)
+            memory_count = len(store.all())
+            print(f"✓ Memory store accessible: {memory_count} memories stored")
+        else:
+            print("○ Memory disabled")
+    except Exception as e:
+        print(f"✗ Memory error: {e}")
+        return 1
+    
+    print("=" * 40)
+    print("All systems operational!")
+    return 0
+
+
 def mcp_command(args: argparse.Namespace) -> int:
     """List the tools exposed by the configured MCP servers (a verification aid)."""
     mcp_config = resolve_mcp_config()
@@ -357,6 +409,10 @@ def main(argv: list[str] | None = None) -> int:
     mcp_parser = subparsers.add_parser("mcp", help="Inspect configured MCP servers and their tools.")
     mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
     mcp_parser.set_defaults(func=mcp_command)
+
+    health_parser = subparsers.add_parser("health", help="Check the health status of the agent system.")
+    add_common(health_parser)
+    health_parser.set_defaults(func=health_command)
 
     # Default to `chat` when invoked with no subcommand, so a bare `polaris`
     # (like `claude`/`codex`) drops straight into an interactive session. This also

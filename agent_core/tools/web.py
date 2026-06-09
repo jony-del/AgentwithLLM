@@ -19,7 +19,7 @@ import socket
 from urllib.parse import urljoin, urlparse
 
 from agent_core.models import ToolRisk, ToolResult
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, Tool
 from agent_core.tools.catalog import builtin_tool
 
 _USER_AGENT = "AgentwithLLM/0.1 (+https://github.com/) web_fetch"
@@ -186,6 +186,9 @@ class WebFetchTool(Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec()
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         url = str(arguments.get("url", "")).strip()
         max_chars = int(arguments.get("max_chars", _DEFAULT_MAX_CHARS))
@@ -234,6 +237,9 @@ class WebSearchTool(Tool):
         "required": ["query"],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec()
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         query = str(arguments.get("query", "")).strip()

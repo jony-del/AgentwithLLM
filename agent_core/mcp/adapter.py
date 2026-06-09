@@ -5,7 +5,7 @@ from typing import Any
 from agent_core.mcp.config import MCPServerConfig
 from agent_core.models import ToolResult, ToolRisk
 from agent_core.tools.adapters import ToolAdapter
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 
 _RISK = {
     "read": ToolRisk.READ,
@@ -51,6 +51,13 @@ class MCPTool(Tool):
         self._manager = manager
         self._server = server.name
         self._remote = descriptor.name
+
+    def concurrency_spec(self, arguments: dict[str, Any]) -> ConcurrencySpec:
+        if self.risk is ToolRisk.READ:
+            # MCP sessions are long-lived async streams behind a sync wrapper; keep
+            # calls to the same server serialized unless the client proves otherwise.
+            return ConcurrencySpec((ResourceLock("mcp", self._server, "write"),))
+        return ConcurrencySpec(exclusive=True)
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:

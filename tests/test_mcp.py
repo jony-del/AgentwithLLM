@@ -1,5 +1,7 @@
 import importlib.util
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,10 @@ _HAS_MCP = importlib.util.find_spec("mcp") is not None
 from agent_core.config import resolve_mcp_config
 from agent_core.mcp.adapter import MCPAdapter, MCPTool, _flatten_content
 from agent_core.mcp.config import MCPConfig, MCPServerConfig
-from agent_core.models import ToolRisk
+from agent_core.models import ToolCall, ToolRisk
+from agent_core.permissions import PermissionMode, PermissionPolicy
+from agent_core.tools.executor import ToolExecutor
+from agent_core.tools.registry import ToolRegistry
 
 
 # --- config parsing (no SDK, no servers needed) --------------------------------
@@ -131,6 +136,27 @@ class _FakeManager:
         return self._result
 
 
+class _SlowManager(_FakeManager):
+    def __init__(self, delay=0.1):
+        super().__init__([])
+        self.delay = delay
+        self._lock = threading.Lock()
+        self.active_by_server = {}
+        self.max_active_by_server = {}
+
+    def call_tool(self, server, tool, arguments, timeout=None):
+        with self._lock:
+            active = self.active_by_server.get(server, 0) + 1
+            self.active_by_server[server] = active
+            self.max_active_by_server[server] = max(self.max_active_by_server.get(server, 0), active)
+        try:
+            time.sleep(self.delay)
+            return _Result([_Block(text=f"{server}:{tool}")], isError=False)
+        finally:
+            with self._lock:
+                self.active_by_server[server] -= 1
+
+
 def test_adapter_prefixes_names_and_maps_risk() -> None:
     fs = MCPServerConfig(name="fs", risk="read")
     db = MCPServerConfig(name="db")  # default risk = dangerous
@@ -178,6 +204,20 @@ def test_tool_uses_default_schema_when_descriptor_has_none() -> None:
 def test_flatten_content_notes_non_text_blocks() -> None:
     assert _flatten_content([_Block(text="hi"), _Block(text=None, type="image")]) == "hi\n[image block]"
     assert _flatten_content(None) == ""
+
+
+def test_read_mcp_tools_on_same_server_are_serialized() -> None:
+    manager = _SlowManager()
+    server = MCPServerConfig(name="s", risk="read")
+    registry = ToolRegistry()
+    registry.register(MCPTool(manager, server, _Descriptor("a")))
+    registry.register(MCPTool(manager, server, _Descriptor("b")))
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+
+    results = executor.execute_many([ToolCall("s__a"), ToolCall("s__b")])
+
+    assert [result.content for result in results] == ["s:a", "s:b"]
+    assert manager.max_active_by_server["s"] == 1
 
 
 # --- error reporting -----------------------------------------------------------

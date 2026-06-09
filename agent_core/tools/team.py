@@ -6,7 +6,7 @@ from typing import Any
 from agent_core.agents.team import TeamError, TeamPermissionError, TeamStore
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 
 _PRESETS = {"read_only", "full"}
@@ -18,6 +18,10 @@ def _render(payload: object) -> str:
 
 def _team_id(arguments: dict[str, object], fallback: str | None) -> str:
     return str(arguments.get("team_id") or fallback or "").strip()
+
+
+def _resource_id(*parts: object) -> str:
+    return ":".join(str(part or "_").strip() or "_" for part in parts)
 
 
 def _store(tool_name: str, maybe_store: object | None) -> TeamStore | ToolResult:
@@ -60,6 +64,14 @@ class TeamCreateTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.WRITE
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec(
+            (
+                ResourceLock("session", "team_context", "write"),
+                ResourceLock("team_create", "global", "write"),
+            )
+        )
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
@@ -93,6 +105,15 @@ class TaskCreateTool(SessionAwareMixin, Tool):
         "required": ["team_id", "title", "description"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        return ConcurrencySpec(
+            (
+                ResourceLock("session", "team_context", "write"),
+                ResourceLock("team_tasks", team_id or "_", "write"),
+            )
+        )
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
@@ -136,6 +157,22 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         "required": ["team_id", "name", "role"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        name = str(arguments.get("name", "")).strip()
+        task_id = str(arguments["task_id"]).strip() if arguments.get("task_id") else None
+        preset = str(arguments.get("tool_preset", "read_only"))
+        if preset not in _PRESETS:
+            preset = "read_only"
+        fs_mode = "write" if preset == "full" else "read"
+        locks = [
+            ResourceLock("member", _resource_id(team_id, name), "write"),
+            ResourceLock("fs", str(self.session.workspace.resolve()), fs_mode, subtree=True),
+        ]
+        if task_id:
+            locks.append(ResourceLock("task", _resource_id(team_id, task_id), "write"))
+        return ConcurrencySpec(tuple(locks))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         factory = self.session.teammate_factory
@@ -188,6 +225,14 @@ class TaskUpdateTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.WRITE
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        task_id = str(arguments.get("task_id", "")).strip()
+        locks = [ResourceLock("task", _resource_id(team_id, task_id), "write")]
+        if arguments.get("owner"):
+            locks.append(ResourceLock("member", _resource_id(team_id, arguments["owner"]), "write"))
+        return ConcurrencySpec(tuple(locks))
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
@@ -232,6 +277,10 @@ class TeamStatusTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        return ConcurrencySpec((ResourceLock("team_status", team_id or "_", "read"),))
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
@@ -256,6 +305,11 @@ class TeamInboxReadTool(SessionAwareMixin, Tool):
         "required": [],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        mode = "write" if bool(arguments.get("unread_only", True)) else "read"
+        return ConcurrencySpec((ResourceLock("member", _resource_id(team_id, self.session.agent_name), mode),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
@@ -288,6 +342,13 @@ class TeamMessageSendTool(SessionAwareMixin, Tool):
         "required": ["to", "content"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        team_id = _team_id(arguments, self.session.team_id)
+        locks = [ResourceLock("member", _resource_id(team_id, arguments.get("to", "")), "write")]
+        if arguments.get("task_id"):
+            locks.append(ResourceLock("task", _resource_id(team_id, arguments["task_id"]), "read"))
+        return ConcurrencySpec(tuple(locks))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)

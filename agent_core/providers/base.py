@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Protocol, runtime_checkable
 
@@ -38,3 +39,26 @@ class LLMProvider(ABC):
         same fully-assembled result either way.
         """
 
+
+class SynchronizedProvider(LLMProvider):
+    """Serialize access to a provider instance shared across parent/child agents."""
+
+    def __init__(self, inner: LLMProvider, lock: threading.RLock | None = None) -> None:
+        self.inner = inner
+        self._lock = lock or threading.RLock()
+
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        config: dict[str, Any],
+        stream: StreamHandler | None = None,
+    ) -> LLMResult:
+        with self._lock:
+            return self.inner.complete(messages, tools, config, stream=stream)
+
+
+def synchronized_provider(provider: LLMProvider) -> LLMProvider:
+    if isinstance(provider, SynchronizedProvider):
+        return provider
+    return SynchronizedProvider(provider)

@@ -8,7 +8,7 @@ fan-out-to-many path.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -36,7 +36,8 @@ class MultiAgentCoordinator:
         results: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.agents))) as pool:
             futures = {pool.submit(agent.run, task): agent.name for agent in self.agents}
-            for future, name in futures.items():
+            for future in as_completed(futures):
+                name = futures[future]
                 try:
                     results[name] = future.result()
                 except Exception as exc:  # noqa: BLE001 - isolate one child's failure

@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_core.models import ToolRisk, ToolResult
-from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
@@ -44,6 +44,9 @@ class GlobTool(WorkspacePathMixin, Tool):
         "required": ["pattern"],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
@@ -106,6 +109,9 @@ class MultiEditTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
+
     def run(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         edits = arguments.get("edits")
@@ -156,6 +162,16 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
         "required": ["patch"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        try:
+            files = _parse_unified_diff(str(arguments.get("patch", "")))
+        except _PatchError:
+            return ConcurrencySpec((self.workspace_lock(".", "write", subtree=True),))
+        if not files:
+            return ConcurrencySpec((self.workspace_lock(".", "write", subtree=True),))
+        locks = tuple(self.workspace_lock(target, "write") for target, _, _ in files)
+        return ConcurrencySpec(locks)
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         patch_text = str(arguments.get("patch", ""))

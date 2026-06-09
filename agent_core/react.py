@@ -12,7 +12,7 @@ from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import LLMProvider
+from agent_core.providers.base import LLMProvider, synchronized_provider
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.catalog import default_tools
@@ -38,6 +38,10 @@ class ReActConfig:
     # Stream tokens to a live UI as they arrive. Only takes effect when the UI is
     # live (ConsoleUI); NullUI never streams. CLI exposes this via --no-stream.
     stream: bool = True
+    # Tools returned in the same model turn may run concurrently when their declared
+    # resources do not conflict.
+    parallel_tools: bool = True
+    max_tool_workers: int = 4
     permission: PermissionMode | str = PermissionMode.DEFAULT
     run_dir: str = "runs"
     system_prompt: str = (
@@ -48,7 +52,9 @@ class ReActConfig:
         "moving on. For self-contained sub-investigations, consider dispatch_agent to run "
         "them in a fresh context. For work that needs a team of cooperating agents, use "
         "the team tools explicitly: team_create, task_create, teammate_spawn, task_update, "
-        "and team_status."
+        "and team_status. Multiple tool calls in the same turn may run concurrently when "
+        "their resources are independent; if an action needs the output from a previous "
+        "tool call, wait until the next turn to request it."
     )
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -77,7 +83,7 @@ class ReActAgent:
         team_store: TeamStore | None = None,
         ui: AgentUI | None = None,
     ) -> None:
-        self.provider = provider
+        self.provider = synchronized_provider(provider)
         self.config = config or ReActConfig()
         self.registry = tools or self.default_registry()
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
@@ -115,6 +121,8 @@ class ReActAgent:
             ),
             self.logger,
             self.ui,
+            parallel_tools=self.config.parallel_tools,
+            max_workers=self.config.max_tool_workers,
         )
         self.memory_store, self.retriever, self.extractor = self._build_memory(
             memory_store, retriever, extractor
@@ -230,10 +238,10 @@ class ReActAgent:
             # Intermediate turn: show the reasoning that precedes the tool calls.
             self.ui.on_reasoning(result.content)
 
-            for tool_call in result.tool_calls:
-                if cancelled():
-                    return self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
-                tool_result = self.executor.execute(tool_call)
+            if cancelled():
+                return self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
+            tool_results = self.executor.execute_many(result.tool_calls, should_cancel=cancelled)
+            for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 messages.append(
                     Message(

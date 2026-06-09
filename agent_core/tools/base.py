@@ -1,10 +1,36 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_core.models import ToolRisk, ToolResult
+
+LockMode = Literal["read", "write"]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceLock:
+    """A logical resource a tool call reads or writes.
+
+    ``namespace`` separates unrelated resource kinds. ``key`` identifies the resource
+    within that namespace. When ``subtree`` is true, the key also covers children
+    beneath it; this is mostly used for workspace directory locks.
+    """
+
+    namespace: str
+    key: str
+    mode: LockMode
+    subtree: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencySpec:
+    """How a tool call may be scheduled relative to other calls in the same turn."""
+
+    locks: tuple[ResourceLock, ...] = ()
+    exclusive: bool = False
 
 
 class WorkspacePathMixin:
@@ -25,6 +51,9 @@ class WorkspacePathMixin:
             raise ValueError(f"Path escapes workspace: {path}")
         return resolved
 
+    def workspace_lock(self, raw_path: object, mode: LockMode, *, subtree: bool = False) -> ResourceLock:
+        return ResourceLock("fs", str(self.resolve_workspace_path(raw_path)), mode, subtree=subtree)
+
 
 class Tool(ABC):
     name: str
@@ -39,7 +68,14 @@ class Tool(ABC):
             "input_schema": self.input_schema,
         }
 
+    def concurrency_spec(self, arguments: dict[str, Any]) -> ConcurrencySpec:
+        """Return the resources touched by this concrete call.
+
+        The default is intentionally conservative: tools that do not declare their
+        resources run one at a time in original order.
+        """
+        return ConcurrencySpec(exclusive=True)
+
     @abstractmethod
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the tool."""
-

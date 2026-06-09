@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from agent_core.config import load_dotenv, resolve_config
+from agent_core.config import load_dotenv, resolve_concurrency_config, resolve_config
 
 
 def test_load_dotenv_sets_missing_environment_variables(tmp_path: Path, monkeypatch) -> None:
@@ -53,3 +53,19 @@ def test_cli_values_override_dotenv_values(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert values["model"] == "claude-from-cli"
+
+
+def test_resolve_concurrency_config_from_toml(tmp_path: Path) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        """
+        [concurrency]
+        parallel_tools = false
+        max_tool_workers = 0
+        """,
+        encoding="utf-8",
+    )
+
+    values = resolve_concurrency_config(config_file)
+
+    assert values == {"parallel_tools": False, "max_tool_workers": 1}

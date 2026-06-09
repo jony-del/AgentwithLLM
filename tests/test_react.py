@@ -30,6 +30,26 @@ class ToolIdProvider:
         return LLMResult("done", stop_reason="end")
 
 
+class MultiToolProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.second_turn_messages = []
+
+    def complete(self, messages, tools, config, stream=None) -> LLMResult:
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                "Calling tools",
+                tool_calls=[
+                    ToolCall("echo", {"text": "first"}, id="toolu_1"),
+                    ToolCall("echo", {"text": "second"}, id="toolu_2"),
+                ],
+                stop_reason="tool_use",
+            )
+        self.second_turn_messages = list(messages)
+        return LLMResult("done", stop_reason="end")
+
+
 def test_react_returns_final_answer_without_tools(tmp_path: Path) -> None:
     logger = JSONLRunLogger(tmp_path)
     agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger)
@@ -76,3 +96,20 @@ def test_react_preserves_tool_call_id_in_messages(tmp_path: Path) -> None:
     tool_message = next(message for message in result.messages if message.role == "tool")
     assert assistant_message.metadata["tool_calls"][0]["id"] == "toolu_123"
     assert tool_message.metadata["tool_call_id"] == "toolu_123"
+
+
+def test_react_appends_multiple_tool_results_in_tool_call_order(tmp_path: Path) -> None:
+    provider = MultiToolProvider()
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(run_dir=str(tmp_path), permission="auto", memory=MemoryConfig(enabled=False))
+    agent = ReActAgent(provider, config, logger=logger)
+
+    result = agent.run("hello")
+
+    tool_messages = [message for message in result.messages if message.role == "tool"]
+    assert [message.content for message in tool_messages] == ["echo: first", "echo: second"]
+    assert [message.metadata["tool_call_id"] for message in tool_messages] == ["toolu_1", "toolu_2"]
+    assert [message.metadata["tool_call_id"] for message in provider.second_turn_messages if message.role == "tool"] == [
+        "toolu_1",
+        "toolu_2",
+    ]

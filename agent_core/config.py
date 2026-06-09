@@ -155,6 +155,19 @@ def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimi
     return OutputLimitConfig.from_dict(table if isinstance(table, dict) else None)
 
 
+def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
+    """Resolve resource-level tool concurrency settings from ``[concurrency]``."""
+    table = load_agent_toml(config_file).get("concurrency")
+    values = {"parallel_tools": True, "max_tool_workers": 4}
+    if not isinstance(table, dict):
+        return values
+    if "parallel_tools" in table:
+        values["parallel_tools"] = coerce_to_type(bool, table["parallel_tools"])
+    if "max_tool_workers" in table:
+        values["max_tool_workers"] = max(1, coerce_to_type(int, table["max_tool_workers"]))
+    return values
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

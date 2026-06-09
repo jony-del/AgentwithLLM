@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_core.agents.team import TeamPermissionError, TeamStore
+from agent_core.agents.team import FileLock, TeamPermissionError, TeamStore
 from agent_core.models import LLMResult, ToolCall, ToolRisk
+from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, StreamHandler
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.session import SessionContext
 from agent_core.tools.catalog import default_tools
+from agent_core.tools.executor import ToolExecutor
+from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import (
     TaskCreateTool,
     TaskUpdateTool,
@@ -50,6 +54,22 @@ def test_inbox_writes_are_file_locked_under_concurrency(tmp_path: Path) -> None:
     assert len(messages) == 50
     assert len({message["id"] for message in messages}) == 50
     assert all(message["to"] == "worker" for message in messages)
+
+
+def test_event_reads_are_file_locked_against_writers(tmp_path: Path) -> None:
+    store = TeamStore(tmp_path)
+    team = store.create_team("alpha", "coordinate")
+    team_id = team["id"]
+    events = store._events_file(team_id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with FileLock(store._lock_file(events)):
+            future = pool.submit(store.read_events, team_id)
+            time.sleep(0.05)
+            assert not future.done()
+        records = future.result(timeout=1)
+
+    assert records[-1]["event"] == "team_created"
 
 
 def test_task_update_enforces_owner_permissions_and_claiming(tmp_path: Path) -> None:
@@ -127,6 +147,49 @@ def test_teammate_spawn_tool_uses_session_factory() -> None:
     assert result.ok
     assert result.content == "spawned"
     assert calls == [("team_abc", "worker", "researcher", "task_1", "full")]
+
+
+def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> None:
+    def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+        time.sleep(0.15)
+        return f"{name}:{task_id}"
+
+    registry = ToolRegistry()
+    registry.register(TeammateSpawnTool(SessionContext(workspace=tmp_path, teammate_factory=factory)))
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+
+    start = time.perf_counter()
+    results = executor.execute_many(
+        [
+            ToolCall("teammate_spawn", {"team_id": "team_a", "name": "alice", "role": "r", "task_id": "task_1"}),
+            ToolCall("teammate_spawn", {"team_id": "team_a", "name": "bob", "role": "r", "task_id": "task_2"}),
+        ]
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.28
+    assert [result.content for result in results] == ["alice:task_1", "bob:task_2"]
+
+
+def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
+    def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+        time.sleep(0.15)
+        return f"{name}:{task_id}"
+
+    registry = ToolRegistry()
+    registry.register(TeammateSpawnTool(SessionContext(workspace=tmp_path, teammate_factory=factory)))
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+
+    start = time.perf_counter()
+    executor.execute_many(
+        [
+            ToolCall("teammate_spawn", {"team_id": "team_a", "name": "alice", "role": "r", "task_id": "task_1"}),
+            ToolCall("teammate_spawn", {"team_id": "team_a", "name": "bob", "role": "r", "task_id": "task_1"}),
+        ]
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed >= 0.28
 
 
 def test_teammate_only_tools_are_not_in_default_tool_set() -> None:

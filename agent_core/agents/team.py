@@ -317,7 +317,9 @@ class TeamStore:
         }
 
     def read_events(self, team_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        events = self._read_jsonl(self._events_file(team_id))
+        path = self._events_file(team_id)
+        with FileLock(self._lock_file(path)):
+            events = self._read_jsonl(path)
         return events[-limit:]
 
     # --- path helpers ------------------------------------------------------

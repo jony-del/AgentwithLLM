@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 
 _PRESETS = {"read_only", "full"}
@@ -43,6 +43,13 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         "required": ["task"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        preset = str(arguments.get("tool_preset", "read_only"))
+        if preset not in _PRESETS:
+            preset = "read_only"
+        mode = "write" if preset == "full" else "read"
+        return ConcurrencySpec((ResourceLock("fs", str(self.session.workspace.resolve()), mode, subtree=True),))
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         task = str(arguments.get("task", "")).strip()

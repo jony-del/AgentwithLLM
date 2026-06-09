@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 
 
@@ -45,6 +45,10 @@ class UpdateTodosTool(SessionAwareMixin, Tool):
         "required": ["todos"],
     }
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        # This tool notifies the UI from its body, so keep it on the serial path.
+        return ConcurrencySpec((ResourceLock("session", "todos", "write"),), exclusive=True)
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         todos = arguments.get("todos")
