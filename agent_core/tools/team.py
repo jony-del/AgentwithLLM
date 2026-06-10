@@ -200,6 +200,36 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
             metadata={"team_id": team_id, "teammate": name, "task_id": task_id, "preset": preset},
         )
 
+    async def arun(self, arguments: dict[str, object]) -> ToolResult:
+        """Run one teammate turn on the current event loop so teammates overlap.
+
+        Mirrors :meth:`run` but awaits the async teammate factory directly.
+        """
+        factory = self.session.ateammate_factory
+        if factory is None:
+            return ToolResult(
+                self.name,
+                "Team teammates are not available in this context.",
+                ok=False,
+                metadata={"error_type": "Unavailable"},
+            )
+        team_id = _team_id(arguments, self.session.team_id)
+        name = str(arguments.get("name", "")).strip()
+        role = str(arguments.get("role", "")).strip()
+        task_id = str(arguments["task_id"]).strip() if arguments.get("task_id") else None
+        preset = str(arguments.get("tool_preset", "read_only"))
+        if preset not in _PRESETS:
+            preset = "read_only"
+        try:
+            answer = await factory(team_id, name, role, task_id, preset)
+        except Exception as exc:  # noqa: BLE001
+            return _team_error(self.name, exc)
+        return ToolResult(
+            self.name,
+            answer,
+            metadata={"team_id": team_id, "teammate": name, "task_id": task_id, "preset": preset},
+        )
+
 
 @builtin_tool
 class TaskUpdateTool(SessionAwareMixin, Tool):

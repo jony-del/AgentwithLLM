@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import json
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import LLMProvider, synchronized_provider
+from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.catalog import default_tools
@@ -42,6 +43,11 @@ class ReActConfig:
     # resources do not conflict.
     parallel_tools: bool = True
     max_tool_workers: int = 4
+    # Cap on simultaneous in-flight LLM API calls across the whole multi-agent
+    # fan-out (leader + concurrent children), enforced by the shared provider gate.
+    max_api_concurrency: int = 8
+    # Sustained API request ceiling per minute across that same fan-out; 0 = unlimited.
+    api_rate_limit_per_min: int = 0
     permission: PermissionMode | str = PermissionMode.DEFAULT
     run_dir: str = "runs"
     system_prompt: str = (
@@ -83,8 +89,16 @@ class ReActAgent:
         team_store: TeamStore | None = None,
         ui: AgentUI | None = None,
     ) -> None:
-        self.provider = synchronized_provider(provider)
         self.config = config or ReActConfig()
+        # Wrap the provider in a shared, bounded concurrency gate (idempotent): the
+        # top-level agent creates it from config, and children spawned with
+        # ``provider=self.provider`` reuse the same gate, so the whole fan-out shares
+        # one budget. Config must be set first so the knobs below resolve.
+        self.provider = gated_provider(
+            provider,
+            max_concurrency=self.config.max_api_concurrency,
+            rate_limit=self.config.api_rate_limit_per_min,
+        )
         self.registry = tools or self.default_registry()
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         self.compression = CompressionPipeline(self.config.compression)
@@ -97,6 +111,8 @@ class ReActAgent:
             workspace=Path.cwd().resolve(),
             subagent_factory=self._spawn_subagent,
             teammate_factory=self._spawn_teammate,
+            asubagent_factory=self._aspawn_subagent,
+            ateammate_factory=self._aspawn_teammate,
             team_store=self.team_store,
             ui_notify=self.ui.on_todos,
         )
@@ -163,11 +179,33 @@ class ReActAgent:
         task: str,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AgentRunResult:
+        """Synchronous entry point — a thin shim over :meth:`arun`.
+
+        Drives the async loop to completion on a fresh event loop. If a loop is
+        already running (e.g. inside another coroutine), call :meth:`arun` directly
+        instead; ``asyncio.run`` cannot be nested.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "ReActAgent.run() cannot be called while an event loop is running; "
+                "await ReActAgent.arun() instead."
+            )
+        return asyncio.run(self.arun(task, should_cancel))
+
+    async def arun(
+        self,
+        task: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AgentRunResult:
         messages = [
             Message("system", self.config.system_prompt),
             Message("user", task),
         ]
-        self.logger.write("user", {"content": task})
+        self.logger.write("user", {"content": task, **self._trace_fields()})
         self._recall(task, messages)
 
         cancelled = should_cancel or (lambda: False)
@@ -195,16 +233,18 @@ class ReActAgent:
             sink = self.ui if (self.ui.is_live and self.config.stream) else None
             self.ui.on_turn_start()
             try:
-                result = self.provider.complete(
-                    messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink
+                result = await self.provider.acomplete(
+                    messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
+                    should_cancel=cancelled,
                 )
             except LLMContextTooLongError:
                 messages, events = self.compression.reactive_compact(messages)
                 for event in events:
                     self.logger.write("compression", {**asdict(event), "reactive": True})
                 self.ui.on_turn_start()
-                result = self.provider.complete(
-                    messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink
+                result = await self.provider.acomplete(
+                    messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
+                    should_cancel=cancelled,
                 )
 
             self.logger.write(
@@ -240,7 +280,7 @@ class ReActAgent:
 
             if cancelled():
                 return self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
-            tool_results = self.executor.execute_many(result.tool_calls, should_cancel=cancelled)
+            tool_results = await self.executor.aexecute_many(result.tool_calls, should_cancel=cancelled)
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 messages.append(
@@ -292,15 +332,26 @@ class ReActAgent:
             "stream": self.config.stream,
         }
 
-    def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
-        """Run a sub-task in a fresh ``ReActAgent`` and return only its final answer.
+    def _trace_fields(self) -> dict[str, object]:
+        """Tracing metadata stamped on a run's opening log event.
 
-        Injected into ``SessionContext.subagent_factory`` so the ``dispatch_agent`` tool
-        can fan out work to a child with a clean context. The child reuses this agent's
-        provider and scalar config but gets a narrowed tool set (``read_only`` = READ
-        tools only; ``full`` = READ+WRITE) and — crucially — **never** the
-        ``dispatch_agent`` tool itself, so sub-agents can't recurse. A depth ceiling is a
-        second guard. The child runs silently (``NullUI``) and writes its own run log.
+        Lets concurrent fan-out be reconstructed from ``runs/*.jsonl``: a child's log
+        carries the ``parent_run_id`` that spawned it plus its agent/team identity.
+        """
+        return {
+            "agent_name": self.session.agent_name,
+            "team_id": self.session.team_id,
+            "parent_run_id": self.session.parent_run_id,
+        }
+
+    def _make_subagent_child(self, preset: str) -> "ReActAgent | str":
+        """Build the ``dispatch_agent`` child (or a refusal string at the depth ceiling).
+
+        The child reuses this agent's gated provider and scalar config but gets a
+        narrowed tool set (``read_only`` = READ tools; ``full`` = READ+WRITE) and —
+        crucially — **never** the ``dispatch_agent`` tool itself, so sub-agents can't
+        recurse. A depth ceiling is a second guard. The child runs silently (``NullUI``)
+        and writes its own run log, tagged with this agent's run id as parent.
         """
         if self.session.depth >= self.session.max_depth:
             return "[dispatch_agent] max sub-agent depth reached; refusing to spawn deeper."
@@ -334,17 +385,32 @@ class ReActAgent:
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
+        child.session.parent_run_id = self.logger.run_id
+        return child
+
+    def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
+        """Sync ``dispatch_agent`` factory (used on the sync executor path)."""
+        child = self._make_subagent_child(preset)
+        if isinstance(child, str):
+            return child
         return child.run(task).answer
 
-    def _spawn_teammate(
+    async def _aspawn_subagent(self, task: str, preset: str = "read_only") -> str:
+        """Async ``dispatch_agent`` factory — awaits the child on the shared event loop."""
+        child = self._make_subagent_child(preset)
+        if isinstance(child, str):
+            return child
+        return (await child.arun(task)).answer
+
+    def _make_teammate_child(
         self,
         team_id: str,
         name: str,
         role: str,
-        task_id: str | None = None,
-        preset: str = "read_only",
-    ) -> str:
-        """Run one teammate turn inside a file-backed team workspace."""
+        task_id: str | None,
+        preset: str,
+    ) -> "tuple[ReActAgent, str] | str":
+        """Build a teammate child and its prompt (or a refusal string at the ceiling)."""
         if self.session.depth >= self.session.max_depth:
             return "[teammate_spawn] max sub-agent depth reached; refusing to spawn deeper."
 
@@ -391,8 +457,39 @@ class ReActAgent:
         child.session.max_depth = self.session.max_depth
         child.session.agent_name = name
         child.session.team_id = team_id
+        child.session.parent_run_id = self.logger.run_id
         prompt = self._teammate_prompt(team, name, role, focus_task, assigned_tasks)
+        return child, prompt
+
+    def _spawn_teammate(
+        self,
+        team_id: str,
+        name: str,
+        role: str,
+        task_id: str | None = None,
+        preset: str = "read_only",
+    ) -> str:
+        """Sync teammate factory — runs one teammate turn in a file-backed team workspace."""
+        built = self._make_teammate_child(team_id, name, role, task_id, preset)
+        if isinstance(built, str):
+            return built
+        child, prompt = built
         return child.run(prompt).answer
+
+    async def _aspawn_teammate(
+        self,
+        team_id: str,
+        name: str,
+        role: str,
+        task_id: str | None = None,
+        preset: str = "read_only",
+    ) -> str:
+        """Async teammate factory — awaits the teammate turn on the shared event loop."""
+        built = self._make_teammate_child(team_id, name, role, task_id, preset)
+        if isinstance(built, str):
+            return built
+        child, prompt = built
+        return (await child.arun(prompt)).answer
 
     @staticmethod
     def _teammate_prompt(

@@ -14,7 +14,7 @@ callable, so there is no import cycle.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,9 +80,16 @@ class SessionContext:
     todos: TodoStore = field(default_factory=TodoStore)
     subagent_factory: Callable[[str, str], str] | None = None
     teammate_factory: Callable[[str, str, str, str | None, str], str] | None = None
+    # Async counterparts used on the concurrent (``arun``) path so that several
+    # children's API calls overlap on one event loop instead of serializing.
+    asubagent_factory: Callable[[str, str], Awaitable[str]] | None = None
+    ateammate_factory: Callable[[str, str, str, str | None, str], Awaitable[str]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None
+    # Run id of the agent that spawned this one, for reconstructing concurrent
+    # fan-out from the per-run JSONL logs. ``None`` for the top-level agent.
+    parent_run_id: str | None = None
     ui_notify: Callable[[list[Todo]], None] | None = None
     depth: int = 0
     max_depth: int = 1

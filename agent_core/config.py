@@ -156,15 +156,37 @@ def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimi
 
 
 def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
-    """Resolve resource-level tool concurrency settings from ``[concurrency]``."""
+    """Resolve concurrency settings from ``[concurrency]``, then env, then CLI.
+
+    Covers both resource-level tool scheduling (``parallel_tools`` /
+    ``max_tool_workers``) and the shared LLM API-call gate (``max_api_concurrency`` /
+    ``api_rate_limit_per_min``). Precedence: defaults → ``agent.toml`` → env
+    (``AGENT_MAX_API_CONCURRENCY`` / ``AGENT_API_RATE_LIMIT``). CLI flags, when given,
+    are layered on by the caller.
+    """
     table = load_agent_toml(config_file).get("concurrency")
-    values = {"parallel_tools": True, "max_tool_workers": 4}
-    if not isinstance(table, dict):
-        return values
-    if "parallel_tools" in table:
-        values["parallel_tools"] = coerce_to_type(bool, table["parallel_tools"])
-    if "max_tool_workers" in table:
-        values["max_tool_workers"] = max(1, coerce_to_type(int, table["max_tool_workers"]))
+    values = {
+        "parallel_tools": True,
+        "max_tool_workers": 4,
+        "max_api_concurrency": 8,
+        "api_rate_limit_per_min": 0,
+    }
+    if isinstance(table, dict):
+        if "parallel_tools" in table:
+            values["parallel_tools"] = coerce_to_type(bool, table["parallel_tools"])
+        if "max_tool_workers" in table:
+            values["max_tool_workers"] = max(1, coerce_to_type(int, table["max_tool_workers"]))
+        if "max_api_concurrency" in table:
+            values["max_api_concurrency"] = max(1, coerce_to_type(int, table["max_api_concurrency"]))
+        if "api_rate_limit_per_min" in table:
+            values["api_rate_limit_per_min"] = max(0, coerce_to_type(int, table["api_rate_limit_per_min"]))
+
+    env_concurrency = os.getenv("AGENT_MAX_API_CONCURRENCY")
+    if env_concurrency is not None:
+        values["max_api_concurrency"] = max(1, coerce_to_type(int, env_concurrency))
+    env_rate = os.getenv("AGENT_API_RATE_LIMIT")
+    if env_rate is not None:
+        values["api_rate_limit_per_min"] = max(0, coerce_to_type(int, env_rate))
     return values
 
 

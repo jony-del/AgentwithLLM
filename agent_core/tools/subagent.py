@@ -72,3 +72,30 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
             return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
         return ToolResult(self.name, answer, metadata={"preset": preset})
+
+    async def arun(self, arguments: dict[str, object]) -> ToolResult:
+        """Spawn the child on the current event loop so siblings' API calls overlap.
+
+        Mirrors :meth:`run` but awaits the async sub-agent factory directly instead of
+        offloading the sync one to a thread (which would spin a separate loop + gate).
+        """
+        task = str(arguments.get("task", "")).strip()
+        if not task:
+            return ToolResult(self.name, "task must not be empty", ok=False, metadata={"error_type": "BadArgs"})
+        preset = str(arguments.get("tool_preset", "read_only"))
+        if preset not in _PRESETS:
+            preset = "read_only"
+
+        factory = self.session.asubagent_factory
+        if factory is None:
+            return ToolResult(
+                self.name,
+                "Sub-agents are not available in this context.",
+                ok=False,
+                metadata={"error_type": "Unavailable"},
+            )
+        try:
+            answer = await factory(task, preset)
+        except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
+            return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
+        return ToolResult(self.name, answer, metadata={"preset": preset})

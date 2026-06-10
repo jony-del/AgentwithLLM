@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import threading
+import asyncio
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from agent_core.models import LLMResult, Message
@@ -39,13 +41,92 @@ class LLMProvider(ABC):
         same fully-assembled result either way.
         """
 
+    async def acomplete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        config: dict[str, Any],
+        stream: StreamHandler | None = None,
+    ) -> LLMResult:
+        """Async counterpart to :meth:`complete`.
 
-class SynchronizedProvider(LLMProvider):
-    """Serialize access to a provider instance shared across parent/child agents."""
+        The default offloads the blocking sync call to a worker thread so any
+        provider works on the async path without changes. Providers with a native
+        async transport (see ``ClaudeProvider``) override this to run real
+        concurrent requests over one connection pool.
+        """
+        return await asyncio.to_thread(self.complete, messages, tools, config, stream)
 
-    def __init__(self, inner: LLMProvider, lock: threading.RLock | None = None) -> None:
+
+class _TokenBucket:
+    """Async token-bucket rate limiter shared across concurrent ``acomplete`` calls.
+
+    ``rate_per_min`` of ``0`` disables limiting entirely. Tokens refill continuously
+    at ``rate_per_min / 60`` per second up to a burst capacity of roughly one second's
+    worth of requests, so a brief burst passes freely while the sustained rate is
+    capped — which is exactly the pressure the higher API concurrency introduces.
+    """
+
+    def __init__(self, rate_per_min: float) -> None:
+        self.rate_per_sec = max(0.0, rate_per_min) / 60.0
+        self.capacity = max(1.0, self.rate_per_sec)
+        self._tokens = self.capacity
+        self._updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        if self.rate_per_sec <= 0:
+            return
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._updated) * self.rate_per_sec)
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate_per_sec
+                await asyncio.sleep(wait)
+
+
+class ProviderGate:
+    """Shared, cancel-aware concurrency limiter for provider API calls.
+
+    Bounds how many ``acomplete`` calls are in flight at once (semaphore) and how
+    fast they may be issued (token bucket). One gate is created at the top-level
+    agent and reused by every child via :func:`gated_provider`, so the whole
+    multi-agent fan-out shares a single budget.
+
+    The asyncio primitives are created lazily on first use so they bind to the
+    running event loop rather than whatever loop (if any) existed at construction.
+    """
+
+    def __init__(self, max_concurrency: int = 8, rate_limit: float = 0) -> None:
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.rate_limit = max(0.0, float(rate_limit))
+        self._semaphore: asyncio.Semaphore | None = None
+        self._bucket: _TokenBucket | None = None
+
+    def _ensure(self) -> tuple[asyncio.Semaphore, _TokenBucket]:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        if self._bucket is None:
+            self._bucket = _TokenBucket(self.rate_limit)
+        return self._semaphore, self._bucket
+
+
+class GatedProvider(LLMProvider):
+    """Wrap a provider so concurrent children share one bounded API-call budget.
+
+    Replaces the old blanket ``RLock`` serialization: the sync ``complete`` path is
+    a straight delegate (no gating — it has no event loop), while ``acomplete``
+    acquires the shared semaphore and rate-limit token before issuing the call, so
+    N concurrent children run up to ``max_concurrency`` at a time instead of one.
+    """
+
+    def __init__(self, inner: LLMProvider, gate: ProviderGate | None = None) -> None:
         self.inner = inner
-        self._lock = lock or threading.RLock()
+        self.gate = gate or ProviderGate()
 
     def complete(
         self,
@@ -54,11 +135,43 @@ class SynchronizedProvider(LLMProvider):
         config: dict[str, Any],
         stream: StreamHandler | None = None,
     ) -> LLMResult:
-        with self._lock:
-            return self.inner.complete(messages, tools, config, stream=stream)
+        return self.inner.complete(messages, tools, config, stream=stream)
+
+    async def acomplete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        config: dict[str, Any],
+        stream: StreamHandler | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> LLMResult:
+        if should_cancel is not None and should_cancel():
+            raise asyncio.CancelledError("provider call cancelled before start")
+        semaphore, bucket = self.gate._ensure()
+        async with semaphore:
+            if should_cancel is not None and should_cancel():
+                raise asyncio.CancelledError("provider call cancelled before start")
+            await bucket.acquire()
+            inner_acomplete = getattr(self.inner, "acomplete", None)
+            if inner_acomplete is not None:
+                return await inner_acomplete(messages, tools, config, stream)
+            # Duck-typed providers (e.g. test doubles) may only define sync complete.
+            return await asyncio.to_thread(self.inner.complete, messages, tools, config, stream)
 
 
-def synchronized_provider(provider: LLMProvider) -> LLMProvider:
-    if isinstance(provider, SynchronizedProvider):
+def gated_provider(
+    provider: LLMProvider,
+    *,
+    max_concurrency: int = 8,
+    rate_limit: float = 0,
+) -> LLMProvider:
+    """Wrap ``provider`` in a shared :class:`GatedProvider`, idempotently.
+
+    A provider that is already gated is returned unchanged, so children spawned with
+    ``provider=self.provider`` reuse the leader's single gate (and its budget). The
+    ``max_concurrency`` / ``rate_limit`` knobs therefore take effect only at the
+    top-level agent, which is exactly where the gate is first created.
+    """
+    if isinstance(provider, GatedProvider):
         return provider
-    return SynchronizedProvider(provider)
+    return GatedProvider(provider, ProviderGate(max_concurrency=max_concurrency, rate_limit=rate_limit))

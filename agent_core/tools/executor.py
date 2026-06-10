@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -119,6 +120,83 @@ class ToolExecutor:
                 raise RuntimeError(f"missing tool result at index {index}")
             completed.append(result)
         return completed
+
+    async def aexecute_many(
+        self,
+        tool_calls: list[ToolCall],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[ToolResult]:
+        """Async twin of :meth:`execute_many` used by ``ReActAgent.arun``.
+
+        Reuses the same preparation, wave partitioning, permission, and hook logic.
+        Per wave, calls run via ``asyncio.gather``: async-native tools (dispatch /
+        teammate) run directly on the loop so children's API calls overlap, while
+        ordinary sync tools are offloaded to threads — bounded by ``max_workers`` so
+        the previous thread ceiling still holds.
+        """
+        if not tool_calls:
+            return []
+        if not self.parallel_tools:
+            # No concurrency requested: keep the sync sequential path, off the loop.
+            return await asyncio.to_thread(self._execute_sequential, tool_calls, should_cancel)
+
+        sync_semaphore = asyncio.Semaphore(self.max_workers)
+        results: list[ToolResult | None] = [None] * len(tool_calls)
+        runnable: list[_PreparedCall] = []
+        for index, tool_call in enumerate(tool_calls):
+            if should_cancel is not None and should_cancel():
+                results[index] = self._finish(tool_call, self._cancelled_result(tool_call.name), "cancelled")
+                continue
+            prepared = self._prepare(index, tool_call)
+            if isinstance(prepared, ToolResult):
+                results[index] = prepared
+            else:
+                runnable.append(prepared)
+
+        for wave in self._waves(runnable):
+            if should_cancel is not None and should_cancel():
+                for prepared in wave:
+                    results[prepared.index] = self._finish(
+                        prepared.tool_call, self._cancelled_result(prepared.tool.name), "cancelled"
+                    )
+                continue
+            wave_results = await asyncio.gather(
+                *(self._arun_tool(prepared, sync_semaphore) for prepared in wave)
+            )
+            for prepared, result in zip(wave, wave_results, strict=True):
+                results[prepared.index] = result
+
+        completed: list[ToolResult] = []
+        for index, result in enumerate(results):
+            if result is None:
+                raise RuntimeError(f"missing tool result at index {index}")
+            completed.append(result)
+        return completed
+
+    async def _arun_tool(self, prepared: _PreparedCall, sync_semaphore: asyncio.Semaphore) -> ToolResult:
+        if type(prepared.tool).arun is not Tool.arun:
+            # Async-native tool (spawns child agents): run on the loop so concurrent
+            # children share one event loop and the provider gate bounds API calls.
+            result = await self._arun_async_tool(prepared)
+        else:
+            async with sync_semaphore:
+                result = await asyncio.to_thread(self._run_tool, prepared)
+        return self._post_and_finish(prepared, result)
+
+    async def _arun_async_tool(self, prepared: _PreparedCall) -> ToolResult:
+        try:
+            return await prepared.tool.arun(prepared.tool_call.arguments)
+        except Exception as exc:  # noqa: BLE001 - mirror _run_tool: surface as a failed result
+            return ToolResult(
+                prepared.tool.name,
+                f"Tool error: {exc}",
+                ok=False,
+                metadata={"error_type": type(exc).__name__},
+            )
+
+    @staticmethod
+    def _cancelled_result(name: str) -> ToolResult:
+        return ToolResult(name, "Tool skipped: cancelled", ok=False, metadata={"error_type": "Cancelled"})
 
     def _execute_sequential(
         self,

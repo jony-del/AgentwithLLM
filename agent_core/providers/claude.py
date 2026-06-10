@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -32,6 +33,28 @@ _RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _MAX_RETRY_AFTER = 60.0
 
 
+class _StreamAccumulator:
+    """Mutable assembly state for one streamed response, shared by sync + async consumers."""
+
+    def __init__(self) -> None:
+        self.text_parts: list[str] = []
+        self.thinking_parts: list[str] = []
+        self.thinking_blocks: list[dict[str, Any]] = []
+        self.tool_calls: list[ToolCall] = []
+        self.stop_reason: str | None = None
+        self.blocks: dict[int, dict[str, Any]] = {}
+
+    def result(self) -> LLMResult:
+        return LLMResult(
+            content="\n".join(part for part in self.text_parts if part),
+            tool_calls=self.tool_calls,
+            stop_reason=self.stop_reason,
+            raw={},
+            thinking="\n".join(part for part in self.thinking_parts if part),
+            thinking_blocks=self.thinking_blocks,
+        )
+
+
 def _default_retry_notice(message: str) -> None:
     # ASCII only on purpose: this may print before the CLI reconfigures stderr to
     # UTF-8, and we must not reintroduce the very UnicodeEncodeError we just fixed.
@@ -60,6 +83,14 @@ class ClaudeProvider(LLMProvider):
         self._sleep = sleep
         self._on_retry = on_retry
         self._rng = random.Random()
+        # Lazily-created async transport (see ``acomplete``). The client is bound to
+        # the event loop it was created on; a new top-level ``asyncio.run`` (e.g. each
+        # chat turn) gets a fresh client so we never reuse a pool from a closed loop.
+        self._aclient: Any = None
+        self._aclient_loop: Any = None
+        # Test seam: an httpx transport (e.g. MockTransport) injected before the first
+        # async call. Production leaves this None and uses httpx's default transport.
+        self._atransport: Any = None
 
     def complete(
         self,
@@ -83,15 +114,112 @@ class ClaudeProvider(LLMProvider):
         payload = self._send_with_retry(request, timeout)
         return self._parse_response(payload)
 
-    def _build_request(
+    # --- async transport (httpx) ------------------------------------------
+
+    async def acomplete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        config: dict[str, Any],
+        stream: StreamHandler | None = None,
+    ) -> LLMResult:
+        """Async counterpart to :meth:`complete` over a shared ``httpx.AsyncClient``.
+
+        Each call builds, sends, retries, and (optionally) streams independently, so
+        many can run concurrently over one connection pool. Retry/backoff policy and
+        error mapping mirror the sync path exactly; only the transport differs.
+        """
+        if not self.api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
+
+        import httpx  # lazy: keeps ``import agent_core`` light (CLAUDE.md invariant)
+
+        streaming = stream is not None and config.get("stream", True)
+        client = await self._aget_client()
+        body = self._build_body(messages, tools, config, streaming=streaming)
+        timeout = config.get("timeout", 60)
+        url = f"{self.base_url}/v1/messages"
+
+        if not streaming:
+            async def send_once() -> dict[str, Any]:
+                response = await client.post(url, json=body, headers=self._headers(), timeout=timeout)
+                if response.status_code >= 400:
+                    raise httpx.HTTPStatusError("error", request=response.request, response=response)
+                return response.json()
+
+            payload = await self._arequest_with_retry(send_once)
+            return self._parse_response(payload)
+
+        # Streaming: retry only the connection setup (send + status). Once the body is
+        # streaming we never retry — a mid-stream break surfaces as LLMTransientError so
+        # we never reprint half-streamed output (mirrors the sync ``_open_stream`` split).
+        async def open_stream():
+            request = client.build_request("POST", url, json=body, headers=self._headers(), timeout=timeout)
+            response = await client.send(request, stream=True)
+            if response.status_code >= 400:
+                await response.aread()
+                await response.aclose()
+                raise httpx.HTTPStatusError("error", request=request, response=response)
+            return response
+
+        response = await self._arequest_with_retry(open_stream)
+        try:
+            return await self._aconsume_stream(response, stream)
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            raise LLMTransientError(
+                f"Claude API stream interrupted: {self._describe_network_error(exc)}"
+            ) from exc
+        finally:
+            await response.aclose()
+
+    async def _aget_client(self):
+        import httpx
+
+        loop = asyncio.get_running_loop()
+        if self._aclient is None or self._aclient_loop is not loop:
+            self._aclient = httpx.AsyncClient(timeout=None, transport=self._atransport)
+            self._aclient_loop = loop
+        return self._aclient
+
+    async def _arequest_with_retry(self, op):
+        """Async twin of :meth:`_request_with_retry`: bounded backoff on transient faults."""
+        import httpx
+
+        attempt = 0
+        while True:
+            try:
+                return await op()
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                code = response.status_code
+                error_text = response.text
+                if code in _RETRYABLE_STATUS and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, self._parse_retry_after(response.headers.get("Retry-After")))
+                    self._announce_retry(attempt, delay, f"HTTP {code}")
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+                raise self._http_error(code, error_text) from exc
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                if attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, None)
+                    self._announce_retry(attempt, delay, self._describe_network_error(exc))
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+                raise LLMTransientError(
+                    f"Network error talking to the Claude API after {attempt + 1} attempt(s): "
+                    f"{self._describe_network_error(exc)}"
+                ) from exc
+
+    def _build_body(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         streaming: bool = False,
-    ) -> urllib.request.Request:
-        if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
+    ) -> dict[str, Any]:
+        """Build the Anthropic Messages request body (pure; shared by sync + async)."""
         system, anthropic_messages = self._format_messages(messages)
         body: dict[str, Any] = {
             "model": config.get("model", "claude-sonnet-4-6"),
@@ -106,15 +234,29 @@ class ClaudeProvider(LLMProvider):
             body["system"] = system
         if tools:
             body["tools"] = tools
+        return body
 
+    def _headers(self) -> dict[str, str]:
+        return {
+            "content-type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+    def _build_request(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        config: dict[str, Any],
+        streaming: bool = False,
+    ) -> urllib.request.Request:
+        if not self.api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
+        body = self._build_body(messages, tools, config, streaming=streaming)
         return urllib.request.Request(
             f"{self.base_url}/v1/messages",
             data=json.dumps(body).encode("utf-8"),
-            headers={
-                "content-type": "application/json",
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-            },
+            headers=self._headers(),
             method="POST",
         )
 
@@ -217,7 +359,10 @@ class ClaudeProvider(LLMProvider):
 
     @staticmethod
     def _retry_after(exc: urllib.error.HTTPError) -> float | None:
-        value = exc.headers.get("Retry-After") if exc.headers else None
+        return ClaudeProvider._parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> float | None:
         if not value:
             return None
         value = value.strip()
@@ -391,39 +536,45 @@ class ClaudeProvider(LLMProvider):
         accumulated by ``index`` and frozen on ``content_block_stop`` into the same
         shape ``_parse_response`` produces, so the rest of the agent is unaffected.
         """
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        thinking_blocks: list[dict[str, Any]] = []
-        tool_calls: list[ToolCall] = []
-        stop_reason: str | None = None
-        blocks: dict[int, dict[str, Any]] = {}
-
+        acc = _StreamAccumulator()
         for event in self._iter_sse_events(raw_lines):
-            etype = event.get("type")
-            if etype == "content_block_start":
-                blocks[event.get("index")] = self._start_block(event.get("content_block", {}))
-            elif etype == "content_block_delta":
-                self._apply_delta(blocks.get(event.get("index")), event.get("delta", {}), stream)
-            elif etype == "content_block_stop":
-                self._finalize_block(
-                    blocks.get(event.get("index")), text_parts, thinking_parts, thinking_blocks, tool_calls
-                )
-            elif etype == "message_delta":
-                stop_reason = event.get("delta", {}).get("stop_reason") or stop_reason
-            elif etype == "error":
-                err = event.get("error", {})
-                raise LLMTransientError(
-                    f"Claude streaming error {err.get('type', 'unknown')}: {err.get('message', '')}"
-                )
+            self._handle_sse_event(event, acc, stream)
+        return acc.result()
 
-        return LLMResult(
-            content="\n".join(part for part in text_parts if part),
-            tool_calls=tool_calls,
-            stop_reason=stop_reason,
-            raw={},
-            thinking="\n".join(part for part in thinking_parts if part),
-            thinking_blocks=thinking_blocks,
-        )
+    async def _aconsume_stream(self, response, stream: StreamHandler) -> LLMResult:
+        """Async twin of :meth:`_consume_stream` over an httpx streaming response.
+
+        Identical block assembly — only the line iteration is async (``aiter_lines``).
+        A transport break here propagates to ``acomplete`` as ``LLMTransientError``;
+        it is never retried, so half-streamed output is never reprinted.
+        """
+        acc = _StreamAccumulator()
+        async for event in self._aiter_sse_events(response.aiter_lines()):
+            self._handle_sse_event(event, acc, stream)
+        return acc.result()
+
+    def _handle_sse_event(self, event: dict[str, Any], acc: "_StreamAccumulator", stream: StreamHandler) -> None:
+        """Dispatch one parsed SSE event into the accumulator (shared sync + async)."""
+        etype = event.get("type")
+        if etype == "content_block_start":
+            acc.blocks[event.get("index")] = self._start_block(event.get("content_block", {}))
+        elif etype == "content_block_delta":
+            self._apply_delta(acc.blocks.get(event.get("index")), event.get("delta", {}), stream)
+        elif etype == "content_block_stop":
+            self._finalize_block(
+                acc.blocks.get(event.get("index")),
+                acc.text_parts,
+                acc.thinking_parts,
+                acc.thinking_blocks,
+                acc.tool_calls,
+            )
+        elif etype == "message_delta":
+            acc.stop_reason = event.get("delta", {}).get("stop_reason") or acc.stop_reason
+        elif etype == "error":
+            err = event.get("error", {})
+            raise LLMTransientError(
+                f"Claude streaming error {err.get('type', 'unknown')}: {err.get('message', '')}"
+            )
 
     @staticmethod
     def _start_block(content_block: dict[str, Any]) -> dict[str, Any]:
@@ -488,31 +639,53 @@ class ClaudeProvider(LLMProvider):
             tool_calls.append(ToolCall(id=block.get("id"), name=block.get("name", ""), arguments=arguments))
 
     @staticmethod
-    def _iter_sse_events(raw_lines):
-        """Yield parsed JSON event objects from a raw SSE line stream.
+    def _sse_feed(raw, data_parts: list[str]) -> dict[str, Any] | None:
+        """Feed one raw SSE line into ``data_parts``; return a parsed frame on a blank line.
 
-        SSE frames are separated by blank lines; we accumulate ``data:`` payloads
-        and dispatch on the blank line. ``event:`` lines and ``:`` keepalive
-        comments are ignored — each Anthropic frame's JSON carries its own ``type``.
+        Shared by the sync and async iterators so the SSE framing rules live in one
+        place. ``event:`` lines and ``:`` keepalive comments are ignored — each
+        Anthropic frame's JSON carries its own ``type``.
         """
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
+        line = line.rstrip("\n").rstrip("\r")
+        if line == "":
+            if data_parts:
+                payload = "".join(data_parts)
+                data_parts.clear()
+                try:
+                    return json.loads(payload)
+                except json.JSONDecodeError:
+                    return None
+            return None
+        if line.startswith(":"):
+            return None  # SSE comment / ping keepalive
+        if line.startswith("data:"):
+            data_parts.append(line[len("data:"):].lstrip())
+        # "event:" lines are intentionally ignored; we rely on the JSON "type".
+        return None
+
+    @classmethod
+    def _iter_sse_events(cls, raw_lines):
+        """Yield parsed JSON event objects from a raw (sync) SSE line stream."""
         data_parts: list[str] = []
         for raw in raw_lines:
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
-            line = line.rstrip("\n").rstrip("\r")
-            if line == "":
-                if data_parts:
-                    payload = "".join(data_parts)
-                    data_parts = []
-                    try:
-                        yield json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                continue
-            if line.startswith(":"):
-                continue  # SSE comment / ping keepalive
-            if line.startswith("data:"):
-                data_parts.append(line[len("data:"):].lstrip())
-            # "event:" lines are intentionally ignored; we rely on the JSON "type".
+            event = cls._sse_feed(raw, data_parts)
+            if event is not None:
+                yield event
+        if data_parts:  # flush a trailing frame with no closing blank line
+            try:
+                yield json.loads("".join(data_parts))
+            except json.JSONDecodeError:
+                pass
+
+    @classmethod
+    async def _aiter_sse_events(cls, raw_lines):
+        """Yield parsed JSON event objects from an async SSE line stream (httpx)."""
+        data_parts: list[str] = []
+        async for raw in raw_lines:
+            event = cls._sse_feed(raw, data_parts)
+            if event is not None:
+                yield event
         if data_parts:  # flush a trailing frame with no closing blank line
             try:
                 yield json.loads("".join(data_parts))

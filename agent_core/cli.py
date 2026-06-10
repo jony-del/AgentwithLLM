@@ -130,6 +130,11 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
     provider = _make_provider(values)
     ui = _make_ui(args)
     concurrency = resolve_concurrency_config()
+    cli_api_concurrency = getattr(args, "max_api_concurrency", None)
+    max_api_concurrency = (
+        max(1, int(cli_api_concurrency)) if cli_api_concurrency is not None
+        else int(concurrency["max_api_concurrency"])
+    )
     config = ReActConfig(
         model=values["model"],
         permission=values["permission"],
@@ -139,6 +144,8 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         stream=not getattr(args, "no_stream", False),
         parallel_tools=bool(concurrency["parallel_tools"]),
         max_tool_workers=int(concurrency["max_tool_workers"]),
+        max_api_concurrency=max_api_concurrency,
+        api_rate_limit_per_min=int(concurrency["api_rate_limit_per_min"]),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
@@ -381,6 +388,13 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             metavar="TOKENS",
             help="Enable Claude extended thinking with this token budget (claude provider).",
+        )
+        subparser.add_argument(
+            "--max-api-concurrency",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Cap simultaneous in-flight LLM API calls across the multi-agent fan-out.",
         )
 
     run_parser = subparsers.add_parser("run")

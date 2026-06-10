@@ -68,4 +68,9 @@ def test_resolve_concurrency_config_from_toml(tmp_path: Path) -> None:
 
     values = resolve_concurrency_config(config_file)
 
-    assert values == {"parallel_tools": False, "max_tool_workers": 1}
+    assert values == {
+        "parallel_tools": False,
+        "max_tool_workers": 1,
+        "max_api_concurrency": 8,
+        "api_rate_limit_per_min": 0,
+    }

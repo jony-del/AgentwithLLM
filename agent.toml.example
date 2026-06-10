@@ -48,8 +48,13 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 # Same-turn tool calls run concurrently when their declared resources do not
 # conflict. Disable this to force the old strictly serial execution path.
 [concurrency]
-parallel_tools = true         # false = execute tool calls one at a time
-max_tool_workers = 4          # worker threads for one independent wave
+parallel_tools = true          # false = execute tool calls one at a time
+max_tool_workers = 10          # worker threads for one independent wave
+# When several sub-agents/teammates run at once, their LLM API calls now overlap.
+# These bound the shared budget across the whole fan-out (env: AGENT_MAX_API_CONCURRENCY,
+# AGENT_API_RATE_LIMIT; CLI: --max-api-concurrency).
+max_api_concurrency = 8        # max simultaneous in-flight LLM API calls
+api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools

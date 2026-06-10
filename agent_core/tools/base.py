@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,3 +80,13 @@ class Tool(ABC):
     @abstractmethod
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the tool."""
+
+    async def arun(self, arguments: dict[str, Any]) -> ToolResult:
+        """Async execution entry point used by the concurrent executor path.
+
+        The default offloads the blocking :meth:`run` to a worker thread so ordinary
+        tools need no changes. Tools that spawn child agents (dispatch / teammate)
+        override this to ``await`` an async factory directly on the event loop, which
+        is what lets multiple children's API calls overlap.
+        """
+        return await asyncio.to_thread(self.run, arguments)

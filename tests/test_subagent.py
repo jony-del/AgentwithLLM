@@ -1,3 +1,4 @@
+import asyncio
 import threading
 import time
 
@@ -123,12 +124,22 @@ def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
     assert elapsed >= 0.28
 
 
-def test_parallel_subagents_serialize_shared_provider_access(tmp_path) -> None:
+def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
+    """Two children dispatched in one turn now overlap their API calls.
+
+    The shared provider gate bounds concurrency (default cap 8) rather than
+    serializing on a mutex, so ``max_active`` exceeds 1 (real parallelism) while
+    staying within the cap.
+    """
+
     class TrackingProvider:
         def __init__(self) -> None:
             self._lock = threading.Lock()
             self.active = 0
             self.max_active = 0
+
+        async def acomplete(self, messages, tools, config, stream=None) -> LLMResult:
+            return await asyncio.to_thread(self.complete, messages, tools, config, stream)
 
         def complete(self, messages, tools, config, stream=None) -> LLMResult:
             with self._lock:
@@ -169,7 +180,7 @@ def test_parallel_subagents_serialize_shared_provider_access(tmp_path) -> None:
     result = agent.run("parent task")
 
     assert result.answer == "parent done"
-    assert provider.max_active == 1
+    assert 1 < provider.max_active <= agent.config.max_api_concurrency
 
 
 # --- end-to-end through a real (fake-provider) agent -------------------------
