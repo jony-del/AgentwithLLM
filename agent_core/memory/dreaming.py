@@ -53,18 +53,34 @@ class Dreamer:
         involved here, so a dry run has no side effects on the store at all.
         """
         report = DreamReport(scanned=len(self.store))
-        now = time.time()
+        survivors = self._consolidate(report)
+        insights = self._synthesize_insights(survivors, report)
+        if commit:
+            self.store.replace_all([*survivors, *insights])
+        return report
 
+    async def adream(self, *, commit: bool = True) -> DreamReport:
+        """Async counterpart to :meth:`dream`.
+
+        The decay/merge stages are pure and reused as-is; only insight synthesis differs,
+        going through ``acomplete`` so an in-loop caller shares the provider gate and does
+        not block the event loop. The offline ``polaris dream`` CLI stays on :meth:`dream`.
+        """
+        report = DreamReport(scanned=len(self.store))
+        survivors = self._consolidate(report)
+        insights = await self._asynthesize_insights(survivors, report)
+        if commit:
+            self.store.replace_all([*survivors, *insights])
+        return report
+
+    def _consolidate(self, report: DreamReport) -> list[MemoryRecord]:
+        """Run the two pure (no-LLM) stages: forgetting curve, then duplicate merge."""
+        now = time.time()
         # Work on copies so the stages' in-place mutation never touches the stored
         # objects until (and unless) we commit — keeping dry runs side-effect-free.
         snapshot = [replace(record, tags=list(record.tags)) for record in self.store.all()]
         survivors = self._decay_and_forget(snapshot, now, report)
-        survivors = self._merge_duplicates(survivors, report)
-        insights = self._synthesize_insights(survivors, report)
-
-        if commit:
-            self.store.replace_all([*survivors, *insights])
-        return report
+        return self._merge_duplicates(survivors, report)
 
     # --- stage 1: forgetting curve --------------------------------------------
 
@@ -132,22 +148,42 @@ class Dreamer:
     # --- stage 3: insight synthesis (the "dream") -----------------------------
 
     def _synthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
-        if not self.config.synthesize_insights or self.provider is None or len(survivors) < 2:
+        request = self._build_insight_request(survivors)
+        if request is None:
             return []
-        listing = "\n".join(f"- [{record.kind}] {record.content}" for record in survivors)
-        request = [
-            Message("system", _INSIGHT_SYSTEM_PROMPT),
-            Message("user", f"Existing memories:\n{listing}"),
-        ]
         try:
             result = self.provider.complete(request, [], self.provider_config)
         except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
             report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
             return []
+        return self._records_from_insight_text(result.content, survivors, report)
 
+    async def _asynthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
+        request = self._build_insight_request(survivors)
+        if request is None:
+            return []
+        try:
+            result = await self.provider.acomplete(request, [], self.provider_config)
+        except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
+            report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
+            return []
+        return self._records_from_insight_text(result.content, survivors, report)
+
+    def _build_insight_request(self, survivors: list[MemoryRecord]) -> list[Message] | None:
+        if not self.config.synthesize_insights or self.provider is None or len(survivors) < 2:
+            return None
+        listing = "\n".join(f"- [{record.kind}] {record.content}" for record in survivors)
+        return [
+            Message("system", _INSIGHT_SYSTEM_PROMPT),
+            Message("user", f"Existing memories:\n{listing}"),
+        ]
+
+    def _records_from_insight_text(
+        self, text: str, survivors: list[MemoryRecord], report: DreamReport
+    ) -> list[MemoryRecord]:
         insights: list[MemoryRecord] = []
         existing = survivors
-        for item in parse_memory_items(result.content):
+        for item in parse_memory_items(text):
             content = str(item.get("content", "")).strip()
             if not content:
                 continue

@@ -272,7 +272,7 @@ class ReActAgent:
             if not result.tool_calls:
                 self.ui.on_final(result.content)
                 self.logger.write("final", {"answer": result.content})
-                self._extract_memories(messages)
+                await self._aextract_memories(messages)
                 return AgentRunResult(result.content, messages, step, self.logger.run_id)
 
             # Intermediate turn: show the reasoning that precedes the tool calls.
@@ -312,11 +312,29 @@ class ReActAgent:
         self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
 
     def _extract_memories(self, messages: list[Message]) -> None:
-        """After a completed run, distil durable memories. Best-effort; never raises."""
+        """After a completed run, distil durable memories. Best-effort; never raises.
+
+        Retained as the synchronous entry point for any sync caller; the async loop
+        uses :meth:`_aextract_memories` so the extraction call flows through the gate.
+        """
         if self.extractor is None or not self.config.memory.auto_extract:
             return
         try:
             stored = self.extractor.extract(messages, source_run_id=self.logger.run_id)
+        except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
+            self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        if stored:
+            self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
+
+    async def _aextract_memories(self, messages: list[Message]) -> None:
+        """Async extraction at natural termination — goes through ``acomplete`` (and thus
+        the shared ``GatedProvider``) without blocking the event loop. Best-effort; never
+        raises: a failed extraction must not sink an otherwise completed run."""
+        if self.extractor is None or not self.config.memory.auto_extract:
+            return
+        try:
+            stored = await self.extractor.aextract(messages, source_run_id=self.logger.run_id)
         except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
             self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
             return

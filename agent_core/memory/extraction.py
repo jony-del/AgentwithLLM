@@ -63,17 +63,37 @@ class MemoryExtractor:
         self.provider_config = provider_config or {}
 
     def extract(self, messages: list[Message], source_run_id: str | None = None) -> list[MemoryRecord]:
+        request = self._build_request(messages)
+        if request is None:
+            return []
+        result = self.provider.complete(request, [], self.provider_config)
+        return self._store_items(parse_memory_items(result.content), source_run_id)
+
+    async def aextract(self, messages: list[Message], source_run_id: str | None = None) -> list[MemoryRecord]:
+        """Async counterpart to :meth:`extract`.
+
+        Identical to ``extract`` except the LLM call goes through ``acomplete``, so when
+        invoked from the agent's async loop it flows through the shared ``GatedProvider``
+        (concurrency cap + rate limit) instead of blocking the event loop on a sync call.
+        ``should_cancel`` is intentionally not forwarded: only ``GatedProvider`` accepts
+        it, and post-run extraction is best-effort regardless.
+        """
+        request = self._build_request(messages)
+        if request is None:
+            return []
+        result = await self.provider.acomplete(request, [], self.provider_config)
+        return self._store_items(parse_memory_items(result.content), source_run_id)
+
+    def _build_request(self, messages: list[Message]) -> list[Message] | None:
         transcript = self._transcript(messages)
         if not transcript:
-            return []
-
-        request = [
+            return None
+        return [
             Message("system", _EXTRACTION_SYSTEM_PROMPT),
             Message("user", f"Conversation transcript:\n{transcript}"),
         ]
-        result = self.provider.complete(request, [], self.provider_config)
-        items = parse_memory_items(result.content)
 
+    def _store_items(self, items: list[dict[str, Any]], source_run_id: str | None) -> list[MemoryRecord]:
         stored: list[MemoryRecord] = []
         for item in items:
             content = str(item.get("content", "")).strip()

@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 
@@ -5,6 +6,7 @@ from agent_core.memory.config import MemoryConfig
 from agent_core.memory.dreaming import Dreamer
 from agent_core.memory.store import MemoryStore
 from agent_core.providers import FakeProvider
+from agent_core.providers.base import gated_provider
 
 
 def _store(tmp_path: Path) -> MemoryStore:
@@ -79,6 +81,37 @@ def test_dry_run_reports_without_mutating(tmp_path: Path) -> None:
     assert len(store) == 2
     assert {round(r.importance, 2) for r in store.all()} == {0.8, 0.6}
     assert all(r.kind != "insight" for r in store.all())
+
+
+def test_adream_synthesizes_insight_through_gate(tmp_path: Path) -> None:
+    """adream mirrors dream (same stages) but synthesises insight via acomplete."""
+    store = _store(tmp_path)
+    store.add("user lives in Tokyo", importance=0.5)
+    store.add("user codes primarily in Rust", importance=0.5)
+
+    report = asyncio.run(Dreamer(store, MemoryConfig(), provider=gated_provider(FakeProvider())).adream())
+
+    assert report.merged == 0
+    assert report.forgotten == 0
+    assert report.insights_added == 1
+    insights = [r for r in store.all() if r.kind == "insight"]
+    assert len(insights) == 1
+
+
+def test_adream_dry_run_matches_dream(tmp_path: Path) -> None:
+    """adream and dream produce the same report on identical state (dry run, no mutation)."""
+    def fresh(tag: str) -> MemoryStore:
+        store = MemoryStore(tmp_path / f"{tag}.jsonl")
+        store.add("python tooling tips", importance=0.8)
+        store.add("python tooling tricks", importance=0.6)
+        return store
+
+    sync_report = Dreamer(fresh("sync"), MemoryConfig(), provider=FakeProvider()).dream(commit=False)
+    async_report = asyncio.run(Dreamer(fresh("async"), MemoryConfig(), provider=FakeProvider()).adream(commit=False))
+
+    assert async_report.merged == sync_report.merged == 1
+    assert async_report.forgotten == sync_report.forgotten
+    assert async_report.insights_added == sync_report.insights_added
 
 
 def test_decayed_importance_is_persisted(tmp_path: Path) -> None:
