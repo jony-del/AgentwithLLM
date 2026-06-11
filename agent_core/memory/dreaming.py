@@ -44,33 +44,20 @@ class Dreamer:
         self.provider = provider
         self.provider_config = provider_config or {}
 
-    def dream(self, *, commit: bool = True) -> DreamReport:
+    async def dream(self, *, commit: bool = True) -> DreamReport:
         """Run the consolidation pass and return a report.
 
-        With ``commit=False`` (dry run) the report is computed exactly as normal but
-        nothing is persisted — the store is left untouched, so callers can preview
-        what dreaming *would* do. Note ``recall``-style access bookkeeping is not
-        involved here, so a dry run has no side effects on the store at all.
+        The decay/merge stages are pure in-memory work; insight synthesis goes through
+        the gated ``complete`` so an in-loop caller shares the provider gate, and the commit
+        rewrite runs off the loop inside the store. With ``commit=False`` (dry run)
+        the report is computed exactly as normal but nothing is persisted — the store
+        is left untouched, so callers can preview what dreaming *would* do.
         """
         report = DreamReport(scanned=len(self.store))
         survivors = self._consolidate(report)
-        insights = self._synthesize_insights(survivors, report)
+        insights = await self._synthesize_insights(survivors, report)
         if commit:
-            self.store.replace_all([*survivors, *insights])
-        return report
-
-    async def adream(self, *, commit: bool = True) -> DreamReport:
-        """Async counterpart to :meth:`dream`.
-
-        The decay/merge stages are pure and reused as-is; only insight synthesis differs,
-        going through ``acomplete`` so an in-loop caller shares the provider gate and does
-        not block the event loop. The offline ``polaris dream`` CLI stays on :meth:`dream`.
-        """
-        report = DreamReport(scanned=len(self.store))
-        survivors = self._consolidate(report)
-        insights = await self._asynthesize_insights(survivors, report)
-        if commit:
-            self.store.replace_all([*survivors, *insights])
+            await self.store.replace_all([*survivors, *insights])
         return report
 
     def _consolidate(self, report: DreamReport) -> list[MemoryRecord]:
@@ -147,23 +134,12 @@ class Dreamer:
 
     # --- stage 3: insight synthesis (the "dream") -----------------------------
 
-    def _synthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
+    async def _synthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
         request = self._build_insight_request(survivors)
         if request is None:
             return []
         try:
-            result = self.provider.complete(request, [], self.provider_config)
-        except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
-            report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
-            return []
-        return self._records_from_insight_text(result.content, survivors, report)
-
-    async def _asynthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
-        request = self._build_insight_request(survivors)
-        if request is None:
-            return []
-        try:
-            result = await self.provider.acomplete(request, [], self.provider_config)
+            result = await self.provider.complete(request, [], self.provider_config)
         except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
             report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
             return []

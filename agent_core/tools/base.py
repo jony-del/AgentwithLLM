@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -77,16 +77,22 @@ class Tool(ABC):
         """
         return ConcurrencySpec(exclusive=True)
 
-    @abstractmethod
-    def run(self, arguments: dict[str, Any]) -> ToolResult:
-        """Execute the tool."""
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        """Execute the tool — the single (async) execution entry point.
 
-    async def arun(self, arguments: dict[str, Any]) -> ToolResult:
-        """Async execution entry point used by the concurrent executor path.
-
-        The default offloads the blocking :meth:`run` to a worker thread so ordinary
-        tools need no changes. Tools that spawn child agents (dispatch / teammate)
-        override this to ``await`` an async factory directly on the event loop, which
-        is what lets multiple children's API calls overlap.
+        The default offloads the blocking :meth:`_invoke` to a worker thread so
+        ordinary tools stay simple synchronous code without ever blocking the event
+        loop. Async-native tools (those that spawn child agents or use an async
+        transport) override ``run`` directly; the executor detects the override and
+        awaits them on the loop so their work can overlap.
         """
-        return await asyncio.to_thread(self.run, arguments)
+        return await asyncio.to_thread(self._invoke, arguments)
+
+    def _invoke(self, arguments: dict[str, Any]) -> ToolResult:
+        """Blocking implementation hook for ordinary tools (internal detail).
+
+        Runs on a worker thread via the default :meth:`run`, bounded by the
+        executor's ``max_workers`` semaphore. Tools implement either this or an
+        async ``run`` override — never both.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must implement _invoke() or override run()")

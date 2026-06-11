@@ -42,20 +42,20 @@ class RecordingUI(NullUI):
         return "always"
 
 
-def test_default_ui_is_null_and_silent(tmp_path: Path) -> None:
+async def test_default_ui_is_null_and_silent(tmp_path: Path) -> None:
     agent = ReActAgent(FakeProvider(), _config(tmp_path))
     assert isinstance(agent.ui, NullUI)
     # A NullUI run still works end-to-end and emits nothing observable.
-    result = agent.run("hello")
+    result = await agent.run("hello")
     assert "Final answer" in result.answer
 
 
-def test_ui_emits_events_in_order(tmp_path: Path) -> None:
+async def test_ui_emits_events_in_order(tmp_path: Path) -> None:
     ui = RecordingUI()
     logger = JSONLRunLogger(tmp_path)
     agent = ReActAgent(FakeProvider(), _config(tmp_path), logger=logger, ui=ui)
 
-    agent.run("please use tool: echo")
+    await agent.run("please use tool: echo")
 
     kinds = [kind for kind, _ in ui.events]
     assert kinds == ["reasoning", "tool_call", "tool_result", "final"]
@@ -63,13 +63,13 @@ def test_ui_emits_events_in_order(tmp_path: Path) -> None:
     assert ui.events[-1][0] == "final"
 
 
-def test_always_allow_via_ui_grants_write_permission(tmp_path: Path) -> None:
+async def test_always_allow_via_ui_grants_write_permission(tmp_path: Path) -> None:
     # The RecordingUI answers "always"; default permission mode would otherwise ask
     # for the write tool. The run completes (tool not denied), proving the prompter
     # path is exercised and grants permission.
     ui = RecordingUI()
     agent = ReActAgent(FakeProvider(), _config(tmp_path), ui=ui)
-    result = agent.run("please use tool: write_text_file")
+    result = await agent.run("please use tool: write_text_file")
     assert "observation" in result.answer.lower()
 
 
@@ -90,10 +90,10 @@ class _RecordingStream:
         pass
 
 
-def test_fake_provider_streams_chunks_matching_content() -> None:
+async def test_fake_provider_streams_chunks_matching_content() -> None:
     sink = _RecordingStream()
     provider = FakeProvider()
-    result = provider.complete([Message("user", "say hi please")], [], {}, stream=sink)
+    result = await provider.complete([Message("user", "say hi please")], [], {}, stream=sink)
     # The streamed chunks reassemble exactly into the returned content.
     assert "".join(sink.text) == result.content
     assert len(sink.text) > 1  # actually chunked, not one blob

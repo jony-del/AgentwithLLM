@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -43,7 +44,16 @@ class FileLock:
         if os.name == "nt":
             import msvcrt  # type: ignore[import-not-found]
 
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_LOCK, 1)
+            # LK_LOCK retries once per second and gives up after ~10s with EDEADLK
+            # ("Resource deadlock avoided") — under many concurrent workers that's
+            # plain contention, not deadlock. Poll the non-blocking variant on a
+            # short interval instead, waiting indefinitely like fcntl.flock.
+            while True:
+                try:
+                    msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.005)
         else:
             import fcntl  # type: ignore[import-not-found]
 
@@ -72,9 +82,82 @@ class TeamStore:
     def __init__(self, root: str | Path = Path("runs") / "teams") -> None:
         self.root = Path(root)
 
-    # --- public operations -------------------------------------------------
+    # --- public operations (async) ------------------------------------------
+    # Each call offloads its blocking implementation (FileLock + JSON file IO) to
+    # a worker thread so the event loop never blocks; the ``*.lock`` sidecar files
+    # remain the real cross-thread/cross-process mutual exclusion.
 
-    def create_team(self, name: str, goal: str, leader_name: str = "leader") -> dict[str, Any]:
+    async def create_team(self, name: str, goal: str, leader_name: str = "leader") -> dict[str, Any]:
+        return await asyncio.to_thread(self._create_team_sync, name, goal, leader_name)
+
+    async def get_team(self, team_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_team_sync, team_id)
+
+    async def add_member(self, team_id: str, name: str, role: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._add_member_sync, team_id, name, role)
+
+    async def create_task(
+        self,
+        team_id: str,
+        title: str,
+        description: str,
+        owner: str | None = None,
+        priority: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._create_task_sync, team_id, title, description, owner, priority)
+
+    async def list_tasks(self, team_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_tasks_sync, team_id)
+
+    async def get_task(self, team_id: str, task_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._get_task_sync, team_id, task_id)
+
+    async def update_task(
+        self,
+        team_id: str,
+        task_id: str,
+        actor: str,
+        *,
+        status: str | None = None,
+        owner: str | None = None,
+        note: str | None = None,
+        result: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        def call() -> tuple[dict[str, Any], str | None]:
+            return self._update_task_sync(team_id, task_id, actor, status=status, owner=owner, note=note, result=result)
+
+        return await asyncio.to_thread(call)
+
+    async def send_message(
+        self,
+        team_id: str,
+        from_name: str,
+        to: str,
+        content: str,
+        *,
+        task_id: str | None = None,
+        kind: str | None = None,
+    ) -> dict[str, Any]:
+        def call() -> dict[str, Any]:
+            return self._send_message_sync(team_id, from_name, to, content, task_id=task_id, kind=kind)
+
+        return await asyncio.to_thread(call)
+
+    async def read_inbox(self, team_id: str, agent_name: str, *, unread_only: bool = True) -> list[dict[str, Any]]:
+        def call() -> list[dict[str, Any]]:
+            return self._read_inbox_sync(team_id, agent_name, unread_only=unread_only)
+
+        return await asyncio.to_thread(call)
+
+    async def status(self, team_id: str, recent_events: int = 20) -> dict[str, Any]:
+        return await asyncio.to_thread(self._status_sync, team_id, recent_events)
+
+    async def read_events(self, team_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._read_events_sync, team_id, limit)
+
+    # --- blocking implementations (worker-thread internals) ------------------
+
+    def _create_team_sync(self, name: str, goal: str, leader_name: str = "leader") -> dict[str, Any]:
         name = name.strip()
         goal = goal.strip()
         leader_name = self._validate_agent_name(leader_name or "leader")
@@ -112,14 +195,14 @@ class TeamStore:
         self._append_event(team_id, "team_created", {"leader": leader_name, "goal": goal})
         return team
 
-    def get_team(self, team_id: str) -> dict[str, Any]:
+    def _get_team_sync(self, team_id: str) -> dict[str, Any]:
         path = self._team_file(team_id)
         if not path.exists():
             raise TeamError(f"unknown team: {team_id}")
         with FileLock(self._lock_file(path)):
             return self._read_json(path)
 
-    def add_member(self, team_id: str, name: str, role: str) -> dict[str, Any]:
+    def _add_member_sync(self, team_id: str, name: str, role: str) -> dict[str, Any]:
         name = self._validate_agent_name(name)
         role = role.strip()
         if not role:
@@ -146,7 +229,7 @@ class TeamStore:
         self._append_event(team_id, "member_added", {"name": name, "role": role})
         return team
 
-    def create_task(
+    def _create_task_sync(
         self,
         team_id: str,
         title: str,
@@ -184,18 +267,18 @@ class TeamStore:
         self._append_event(team_id, "task_created", {"task_id": task["id"], "owner": owner})
         return task
 
-    def list_tasks(self, team_id: str) -> list[dict[str, Any]]:
+    def _list_tasks_sync(self, team_id: str) -> list[dict[str, Any]]:
         path = self._tasks_file(team_id)
         with FileLock(self._lock_file(path)):
             return list(self._read_json(path).get("tasks", []))
 
-    def get_task(self, team_id: str, task_id: str) -> dict[str, Any]:
-        for task in self.list_tasks(team_id):
+    def _get_task_sync(self, team_id: str, task_id: str) -> dict[str, Any]:
+        for task in self._list_tasks_sync(team_id):
             if task.get("id") == task_id:
                 return task
         raise TeamError(f"unknown task: {task_id}")
 
-    def update_task(
+    def _update_task_sync(
         self,
         team_id: str,
         task_id: str,
@@ -214,7 +297,7 @@ class TeamStore:
             if status not in TASK_STATUSES:
                 raise TeamError(f"invalid task status: {status}")
 
-        team = self.get_team(team_id)
+        team = self._get_team_sync(team_id)
         leader = team["leader"]
         path = self._tasks_file(team_id)
         assigned_to: str | None = None
@@ -261,7 +344,7 @@ class TeamStore:
         )
         return updated, assigned_to
 
-    def send_message(
+    def _send_message_sync(
         self,
         team_id: str,
         from_name: str,
@@ -277,7 +360,7 @@ class TeamStore:
         if not content:
             raise TeamError("message content must not be empty")
         if task_id:
-            self.get_task(team_id, task_id)
+            self._get_task_sync(team_id, task_id)
         message = {
             "id": f"msg_{uuid.uuid4().hex[:12]}",
             "team_id": team_id,
@@ -296,7 +379,7 @@ class TeamStore:
         self._append_event(team_id, "message_sent", {"message_id": message["id"], "from": from_name, "to": to})
         return message
 
-    def read_inbox(self, team_id: str, agent_name: str, *, unread_only: bool = True) -> list[dict[str, Any]]:
+    def _read_inbox_sync(self, team_id: str, agent_name: str, *, unread_only: bool = True) -> list[dict[str, Any]]:
         agent_name = self._validate_known_member(team_id, agent_name)
         inbox = self._inbox_file(team_id, agent_name)
         cursor = self._cursor_file(team_id, agent_name)
@@ -309,14 +392,14 @@ class TeamStore:
             self._write_cursor(cursor, len(messages))
             return unread
 
-    def status(self, team_id: str, recent_events: int = 20) -> dict[str, Any]:
+    def _status_sync(self, team_id: str, recent_events: int = 20) -> dict[str, Any]:
         return {
-            "team": self.get_team(team_id),
-            "tasks": self.list_tasks(team_id),
-            "recent_events": self.read_events(team_id, limit=recent_events),
+            "team": self._get_team_sync(team_id),
+            "tasks": self._list_tasks_sync(team_id),
+            "recent_events": self._read_events_sync(team_id, limit=recent_events),
         }
 
-    def read_events(self, team_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def _read_events_sync(self, team_id: str, limit: int = 20) -> list[dict[str, Any]]:
         path = self._events_file(team_id)
         with FileLock(self._lock_file(path)):
             events = self._read_jsonl(path)
@@ -367,7 +450,7 @@ class TeamStore:
 
     def _validate_known_member(self, team_id: str, raw: str) -> str:
         name = self._validate_agent_name(raw)
-        team = self.get_team(team_id)
+        team = self._get_team_sync(team_id)
         if name not in team.get("members", {}):
             raise TeamError(f"unknown team member: {name}")
         return name

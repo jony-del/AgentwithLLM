@@ -102,7 +102,7 @@ class ListDirTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         target = self.resolve_workspace_path(arguments.get("path", "."))
         if not target.exists():
             return ToolResult(self.name, f"No such path: {target}", ok=False, metadata={"error_type": "NotFound"})
@@ -135,7 +135,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         old_string = str(arguments["old_string"])
         new_string = str(arguments["new_string"])
@@ -177,7 +177,7 @@ class SearchTextTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
         base = self.resolve_workspace_path(arguments.get("path", "."))
         glob = arguments.get("glob")
@@ -255,7 +255,7 @@ class RunCommandTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.DANGEROUS
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         command = str(arguments["command"])
         timeout = min(int(arguments.get("timeout", 30)), _MAX_COMMAND_TIMEOUT)
         return _run_subprocess(self.name, command, cwd=self.workspace, timeout=timeout, shell=True)
@@ -279,7 +279,7 @@ class GitDiffTool(WorkspacePathMixin, Tool):
         raw_path = arguments.get("path", ".")
         return ConcurrencySpec((self.workspace_lock(raw_path, "read", subtree=True),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         cmd = ["git", "diff"]
         if arguments.get("staged"):
             cmd.append("--staged")
@@ -306,7 +306,7 @@ class RunTestsTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.DANGEROUS
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         cmd = [sys.executable, "-m", "pytest"]
         if arguments.get("target"):
             cmd.append(str(arguments["target"]))
@@ -357,7 +357,7 @@ class EchoTool(Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         return ToolResult(name=self.name, content=str(arguments.get("text", "")))
 
 
@@ -382,7 +382,7 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "read"),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         text = path.read_text(encoding="utf-8")
         offset = arguments.get("offset")
@@ -413,7 +413,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(arguments.get("content", "")), encoding="utf-8")

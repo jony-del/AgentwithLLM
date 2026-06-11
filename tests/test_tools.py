@@ -42,7 +42,7 @@ class PathSleepTool(Tool):
             )
         )
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         time.sleep(float(arguments.get("delay", 0.1)))
         return ToolResult(self.name, str(arguments.get("label", arguments["path"])))
 
@@ -59,7 +59,7 @@ class DangerousCountingTool(Tool):
     def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
         return ConcurrencySpec()
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         self.calls += 1
         return ToolResult(self.name, "ran")
 
@@ -76,7 +76,7 @@ class WriteCountingTool(Tool):
     def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
         return ConcurrencySpec()
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         self.calls += 1
         return ToolResult(self.name, "ran")
 
@@ -95,24 +95,24 @@ class StateAppendTool(Tool):
         self.spec_snapshots.append(tuple(self.state))
         return ConcurrencySpec()
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         value = str(arguments["value"])
         self.state.append(value)
         return ToolResult(self.name, value)
 
 
-def test_executor_returns_failed_result_for_unknown_tool() -> None:
+async def test_executor_returns_failed_result_for_unknown_tool() -> None:
     registry = ToolRegistry()
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
 
-    result = executor.execute(ToolCall("missing_tool"))
+    result = (await executor.execute_many([ToolCall("missing_tool")]))[0]
 
     assert not result.ok
     assert result.name == "missing_tool"
     assert result.metadata["error_type"] == "UnknownTool"
 
 
-def test_executor_uses_tool_call_rewritten_by_pre_hook() -> None:
+async def test_executor_uses_tool_call_rewritten_by_pre_hook() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
     executor = ToolExecutor(
@@ -121,20 +121,20 @@ def test_executor_uses_tool_call_rewritten_by_pre_hook() -> None:
         HookPipeline(pre_hooks=[RewriteToEchoHook()]),
     )
 
-    result = executor.execute(ToolCall("missing_tool"))
+    result = (await executor.execute_many([ToolCall("missing_tool")]))[0]
 
     assert result.ok
     assert result.name == "echo"
     assert result.content == "rewritten"
 
 
-def test_execute_many_runs_independent_read_tools_concurrently() -> None:
+async def test_execute_many_runs_independent_read_tools_concurrently() -> None:
     registry = ToolRegistry()
     registry.register(PathSleepTool())
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [
             ToolCall("path_sleep", {"path": "a.txt", "mode": "read", "delay": 0.2, "label": "a"}),
             ToolCall("path_sleep", {"path": "a.txt", "mode": "read", "delay": 0.2, "label": "b"}),
@@ -146,12 +146,12 @@ def test_execute_many_runs_independent_read_tools_concurrently() -> None:
     assert [result.content for result in results] == ["a", "b"]
 
 
-def test_execute_many_preserves_input_order_not_completion_order() -> None:
+async def test_execute_many_preserves_input_order_not_completion_order() -> None:
     registry = ToolRegistry()
     registry.register(PathSleepTool())
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [
             ToolCall("path_sleep", {"path": "a.txt", "mode": "read", "delay": 0.15, "label": "slow"}),
             ToolCall("path_sleep", {"path": "b.txt", "mode": "read", "delay": 0.01, "label": "fast"}),
@@ -161,13 +161,13 @@ def test_execute_many_preserves_input_order_not_completion_order() -> None:
     assert [result.content for result in results] == ["slow", "fast"]
 
 
-def test_execute_many_serializes_conflicting_file_locks() -> None:
+async def test_execute_many_serializes_conflicting_file_locks() -> None:
     registry = ToolRegistry()
     registry.register(PathSleepTool())
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    executor.execute_many(
+    await executor.execute_many(
         [
             ToolCall("path_sleep", {"path": "same.txt", "mode": "read", "delay": 0.15}),
             ToolCall("path_sleep", {"path": "same.txt", "mode": "write", "delay": 0.15}),
@@ -176,7 +176,7 @@ def test_execute_many_serializes_conflicting_file_locks() -> None:
     same_file_elapsed = time.perf_counter() - start
 
     start = time.perf_counter()
-    executor.execute_many(
+    await executor.execute_many(
         [
             ToolCall("path_sleep", {"path": "a.txt", "mode": "write", "delay": 0.15}),
             ToolCall("path_sleep", {"path": "b.txt", "mode": "write", "delay": 0.15}),
@@ -188,7 +188,7 @@ def test_execute_many_serializes_conflicting_file_locks() -> None:
     assert different_file_elapsed < 0.28
 
 
-def test_execute_many_uses_rewritten_call_for_resource_locks() -> None:
+async def test_execute_many_uses_rewritten_call_for_resource_locks() -> None:
     registry = ToolRegistry()
     registry.register(PathSleepTool())
     executor = ToolExecutor(
@@ -199,7 +199,7 @@ def test_execute_many_uses_rewritten_call_for_resource_locks() -> None:
     )
 
     start = time.perf_counter()
-    executor.execute_many(
+    await executor.execute_many(
         [
             ToolCall("path_sleep", {"path": "a.txt", "mode": "write", "delay": 0.15}),
             ToolCall("path_sleep", {"path": "b.txt", "mode": "write", "delay": 0.15}),
@@ -210,7 +210,7 @@ def test_execute_many_uses_rewritten_call_for_resource_locks() -> None:
     assert elapsed >= 0.28
 
 
-def test_execute_many_handles_denied_dry_run_and_unknown_without_running() -> None:
+async def test_execute_many_handles_denied_dry_run_and_unknown_without_running() -> None:
     registry = ToolRegistry()
     dangerous = DangerousCountingTool()
     write = WriteCountingTool()
@@ -218,7 +218,7 @@ def test_execute_many_handles_denied_dry_run_and_unknown_without_running() -> No
     registry.register(write)
 
     denied_executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
-    denied = denied_executor.execute_many(
+    denied = await denied_executor.execute_many(
         [ToolCall("missing"), ToolCall("dangerous_count"), ToolCall("write_count")]
     )
     assert [result.name for result in denied] == ["missing", "dangerous_count", "write_count"]
@@ -229,12 +229,12 @@ def test_execute_many_handles_denied_dry_run_and_unknown_without_running() -> No
     assert write.calls == 1
 
     dry_run_executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.PLAN))
-    dry_run = dry_run_executor.execute_many([ToolCall("write_count")])
+    dry_run = await dry_run_executor.execute_many([ToolCall("write_count")])
     assert dry_run[0].content.startswith("Dry-run:")
     assert write.calls == 1
 
 
-def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:
+async def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:
     registry = ToolRegistry()
     tool = StateAppendTool()
     registry.register(tool)
@@ -245,7 +245,7 @@ def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:
         max_workers=2,
     )
 
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [
             ToolCall("state_append", {"value": "first"}),
             ToolCall("state_append", {"value": "second"}),
@@ -257,12 +257,12 @@ def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:
     assert tool.spec_snapshots == [(), ("first",)]
 
 
-def test_execute_many_cancelled_returns_one_result_per_input() -> None:
+async def test_execute_many_cancelled_returns_one_result_per_input() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [ToolCall("echo", {"text": "a"}), ToolCall("missing")],
         should_cancel=lambda: True,
     )
@@ -271,17 +271,17 @@ def test_execute_many_cancelled_returns_one_result_per_input() -> None:
     assert [result.metadata["error_type"] for result in results] == ["Cancelled", "Cancelled"]
 
 
-def test_file_tools_resolve_paths_inside_workspace(tmp_path: Path) -> None:
+async def test_file_tools_resolve_paths_inside_workspace(tmp_path: Path) -> None:
     writer = WriteTextFileTool(tmp_path)
     reader = ReadTextFileTool(tmp_path)
 
-    writer.run({"path": "nested/example.txt", "content": "hello"})
+    await writer.run({"path": "nested/example.txt", "content": "hello"})
 
-    assert reader.run({"path": "nested/example.txt"}).content == "hello"
+    assert (await reader.run({"path": "nested/example.txt"})).content == "hello"
 
 
-def test_file_tools_reject_paths_outside_workspace(tmp_path: Path) -> None:
+async def test_file_tools_reject_paths_outside_workspace(tmp_path: Path) -> None:
     writer = WriteTextFileTool(tmp_path)
 
     with pytest.raises(ValueError, match="escapes workspace"):
-        writer.run({"path": "../outside.txt", "content": "nope"})
+        await writer.run({"path": "../outside.txt", "content": "nope"})

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from agent_core.mcp.config import MCPServerConfig
@@ -33,11 +34,13 @@ def _flatten_content(content: Any) -> str:
 
 
 class MCPTool(Tool):
-    """Wrap a single MCP server tool as a synchronous :class:`Tool`.
+    """Wrap a single MCP server tool as an async-native :class:`Tool`.
 
     The tool is registered as ``"<server>__<tool>"`` to avoid cross-server name
     collisions, and inherits the server's configured ``risk`` (default DANGEROUS) so the
-    permission layer gates it correctly.
+    permission layer gates it correctly. The manager bridges to the MCP SDK's own
+    background event loop; the blocking wait on that bridge runs on a worker thread
+    so this loop never blocks.
     """
 
     def __init__(self, manager: Any, server: MCPServerConfig, descriptor: Any) -> None:
@@ -59,9 +62,11 @@ class MCPTool(Tool):
             return ConcurrencySpec((ResourceLock("mcp", self._server, "write"),))
         return ConcurrencySpec(exclusive=True)
 
-    def run(self, arguments: dict[str, Any]) -> ToolResult:
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
-            result = self._manager.call_tool(self._server, self._remote, arguments)
+            # ``call_tool`` blocks on a future from the manager's background loop;
+            # park that wait on a worker thread.
+            result = await asyncio.to_thread(self._manager.call_tool, self._server, self._remote, arguments)
         except Exception as exc:  # noqa: BLE001 - surface transport/timeout errors as a failed result
             return ToolResult(self.name, f"MCP tool error: {exc}", ok=False)
         text = _flatten_content(getattr(result, "content", None))

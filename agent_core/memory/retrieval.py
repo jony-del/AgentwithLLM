@@ -31,7 +31,7 @@ class MemoryRetriever:
             + self.config.w_recency * recency
         )
 
-    def recall(self, query: str, k: int | None = None, *, touch: bool = True) -> list[MemoryRecord]:
+    async def recall(self, query: str, k: int | None = None, *, touch: bool = True) -> list[MemoryRecord]:
         """Return up to ``k`` memories most salient to ``query``, best first.
 
         Memories with zero lexical relevance are excluded entirely — importance and
@@ -56,9 +56,9 @@ class MemoryRetriever:
         top = [record for _, record in scored[:k]]
         if touch:
             for record in top:
-                self.store.touch(record.id, flush=False)
+                await self.store.touch(record.id, flush=False)
             if top:
-                self.store.flush()
+                await self.store.flush()
         return top
 
     @staticmethod

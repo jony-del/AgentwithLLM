@@ -10,49 +10,49 @@ def _store(tmp_path: Path) -> MemoryStore:
     return MemoryStore(tmp_path / "memory.jsonl")
 
 
-def test_relevant_memory_ranks_above_irrelevant(tmp_path: Path) -> None:
+async def test_relevant_memory_ranks_above_irrelevant(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.add("the user prefers dark mode in the editor", kind="preference")
-    store.add("the user lives in a coastal city", kind="fact")
+    await store.add("the user prefers dark mode in the editor", kind="preference")
+    await store.add("the user lives in a coastal city", kind="fact")
 
-    recalled = MemoryRetriever(store).recall("what theme does the editor use?")
+    recalled = await MemoryRetriever(store).recall("what theme does the editor use?")
     assert recalled
     assert "dark mode" in recalled[0].content
 
 
-def test_irrelevant_query_recalls_nothing(tmp_path: Path) -> None:
+async def test_irrelevant_query_recalls_nothing(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.add("the user prefers dark mode")
-    assert MemoryRetriever(store).recall("quantum chromodynamics lattice") == []
+    await store.add("the user prefers dark mode")
+    assert await MemoryRetriever(store).recall("quantum chromodynamics lattice") == []
 
 
-def test_importance_breaks_ties(tmp_path: Path) -> None:
+async def test_importance_breaks_ties(tmp_path: Path) -> None:
     store = _store(tmp_path)
     # Same words → equal relevance & recency; importance decides the order.
-    low = store.add("python tooling notes", importance=0.2)
-    high = store.add("python tooling notes", importance=0.9)
+    low = await store.add("python tooling notes", importance=0.2)
+    high = await store.add("python tooling notes", importance=0.9)
 
-    recalled = MemoryRetriever(store).recall("python tooling", k=2)
+    recalled = await MemoryRetriever(store).recall("python tooling", k=2)
     assert [r.id for r in recalled] == [high.id, low.id]
 
 
-def test_recall_touches_returned_records(tmp_path: Path) -> None:
+async def test_recall_touches_returned_records(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    record = store.add("user uses VS Code")
+    record = await store.add("user uses VS Code")
     assert record.access_count == 0
 
-    MemoryRetriever(store).recall("which editor does the user use")
+    await MemoryRetriever(store).recall("which editor does the user use")
     assert store.get(record.id).access_count == 1
 
 
-def test_recency_boosts_recent_memory(tmp_path: Path) -> None:
+async def test_recency_boosts_recent_memory(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    old = store.add("alpha beta gamma", importance=0.5)
-    new = store.add("alpha beta gamma", importance=0.5)
+    old = await store.add("alpha beta gamma", importance=0.5)
+    new = await store.add("alpha beta gamma", importance=0.5)
     # Make `old` look stale; recency should then favour `new`.
     old.last_accessed_at = time.time() - 3600 * 24 * 30
-    store.update(old)
+    await store.update(old)
 
     config = MemoryConfig(w_relevance=0.0, w_importance=0.0, w_recency=1.0)
-    recalled = MemoryRetriever(store, config).recall("alpha beta", k=2)
+    recalled = await MemoryRetriever(store, config).recall("alpha beta", k=2)
     assert recalled[0].id == new.id

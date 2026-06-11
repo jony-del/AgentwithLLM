@@ -111,8 +111,6 @@ class ReActAgent:
             workspace=Path.cwd().resolve(),
             subagent_factory=self._spawn_subagent,
             teammate_factory=self._spawn_teammate,
-            asubagent_factory=self._aspawn_subagent,
-            ateammate_factory=self._aspawn_teammate,
             team_store=self.team_store,
             ui_notify=self.ui.on_todos,
         )
@@ -174,39 +172,22 @@ class ReActAgent:
             registry.register(tool)
         return registry
 
-    def run(
+    async def run(
         self,
         task: str,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AgentRunResult:
-        """Synchronous entry point — a thin shim over :meth:`arun`.
+        """Drive the ReAct loop to completion and return the final answer.
 
-        Drives the async loop to completion on a fresh event loop. If a loop is
-        already running (e.g. inside another coroutine), call :meth:`arun` directly
-        instead; ``asyncio.run`` cannot be nested.
+        The single (async) entry point: synchronous callers wrap the coroutine in
+        one top-level ``asyncio.run(agent.run(task))``; async callers just await it.
         """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError(
-                "ReActAgent.run() cannot be called while an event loop is running; "
-                "await ReActAgent.arun() instead."
-            )
-        return asyncio.run(self.arun(task, should_cancel))
-
-    async def arun(
-        self,
-        task: str,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> AgentRunResult:
         messages = [
             Message("system", self.config.system_prompt),
             Message("user", task),
         ]
-        self.logger.write("user", {"content": task, **self._trace_fields()})
-        self._recall(task, messages)
+        await self.logger.write("user", {"content": task, **self._trace_fields()})
+        await self._recall(task, messages)
 
         cancelled = should_cancel or (lambda: False)
         deadline = time.monotonic() + self.config.max_wall_seconds
@@ -218,36 +199,36 @@ class ReActAgent:
             # cancel signal (e.g. the user pressing Esc), an optional hard step ceiling,
             # and a wall-clock deadline that bounds the whole run.
             if cancelled():
-                return self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
+                return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
             if self.config.max_steps is not None and step >= self.config.max_steps:
-                return self._stopped(messages, step, "max_steps", "reaching max_steps")
+                return await self._stopped(messages, step, "max_steps", "reaching max_steps")
             if time.monotonic() > deadline:
-                return self._stopped(messages, step, "deadline", "reaching the wall-clock deadline")
+                return await self._stopped(messages, step, "deadline", "reaching the wall-clock deadline")
             step += 1
 
             messages, events = self.compression.maybe_auto_compact(messages)
             for event in events:
-                self.logger.write("compression", asdict(event))
+                await self.logger.write("compression", asdict(event))
 
             # Stream tokens to the UI only when it is live and streaming is enabled.
             sink = self.ui if (self.ui.is_live and self.config.stream) else None
             self.ui.on_turn_start()
             try:
-                result = await self.provider.acomplete(
+                result = await self.provider.complete(
                     messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
                     should_cancel=cancelled,
                 )
             except LLMContextTooLongError:
                 messages, events = self.compression.reactive_compact(messages)
                 for event in events:
-                    self.logger.write("compression", {**asdict(event), "reactive": True})
+                    await self.logger.write("compression", {**asdict(event), "reactive": True})
                 self.ui.on_turn_start()
-                result = await self.provider.acomplete(
+                result = await self.provider.complete(
                     messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
                     should_cancel=cancelled,
                 )
 
-            self.logger.write(
+            await self.logger.write(
                 "llm",
                 {
                     "content": result.content,
@@ -271,16 +252,16 @@ class ReActAgent:
             # Natural termination: the model stopped requesting tools, so this is the answer.
             if not result.tool_calls:
                 self.ui.on_final(result.content)
-                self.logger.write("final", {"answer": result.content})
-                await self._aextract_memories(messages)
+                await self.logger.write("final", {"answer": result.content})
+                await self._extract_memories(messages)
                 return AgentRunResult(result.content, messages, step, self.logger.run_id)
 
             # Intermediate turn: show the reasoning that precedes the tool calls.
             self.ui.on_reasoning(result.content)
 
             if cancelled():
-                return self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
-            tool_results = await self.executor.aexecute_many(result.tool_calls, should_cancel=cancelled)
+                return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
+            tool_results = await self.executor.execute_many(result.tool_calls, should_cancel=cancelled)
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 messages.append(
@@ -292,54 +273,38 @@ class ReActAgent:
                     )
                 )
 
-    def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
+    async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
         answer = f"Stopped after {human} without a final answer."
         self.ui.on_stopped(reason, human)
-        self.logger.write("final", {"answer": answer, "stopped": reason})
+        await self.logger.write("final", {"answer": answer, "stopped": reason})
         return AgentRunResult(answer, messages, step, self.logger.run_id)
 
-    def _recall(self, task: str, messages: list[Message]) -> None:
+    async def _recall(self, task: str, messages: list[Message]) -> None:
         """Inject relevant past memories as a pinned system block before the task."""
         if self.retriever is None:
             return
-        recalled = self.retriever.recall(task)
+        recalled = await self.retriever.recall(task)
         if not recalled:
             return
         block = self.retriever.format_block(recalled)
         # Right after the main system prompt, before the user task, tagged so
         # extraction skips it and context_collapse keeps it pinned.
         messages.insert(1, Message("system", block, metadata={"memory": "recall"}))
-        self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
+        await self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
 
-    def _extract_memories(self, messages: list[Message]) -> None:
-        """After a completed run, distil durable memories. Best-effort; never raises.
-
-        Retained as the synchronous entry point for any sync caller; the async loop
-        uses :meth:`_aextract_memories` so the extraction call flows through the gate.
-        """
-        if self.extractor is None or not self.config.memory.auto_extract:
-            return
-        try:
-            stored = self.extractor.extract(messages, source_run_id=self.logger.run_id)
-        except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
-            self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
-            return
-        if stored:
-            self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
-
-    async def _aextract_memories(self, messages: list[Message]) -> None:
-        """Async extraction at natural termination — goes through ``acomplete`` (and thus
+    async def _extract_memories(self, messages: list[Message]) -> None:
+        """Extraction at natural termination — goes through ``complete`` (and thus
         the shared ``GatedProvider``) without blocking the event loop. Best-effort; never
         raises: a failed extraction must not sink an otherwise completed run."""
         if self.extractor is None or not self.config.memory.auto_extract:
             return
         try:
-            stored = await self.extractor.aextract(messages, source_run_id=self.logger.run_id)
+            stored = await self.extractor.extract(messages, source_run_id=self.logger.run_id)
         except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
-            self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
+            await self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
             return
         if stored:
-            self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
+            await self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
 
     def _provider_config(self) -> dict[str, object]:
         return {
@@ -406,21 +371,14 @@ class ReActAgent:
         child.session.parent_run_id = self.logger.run_id
         return child
 
-    def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
-        """Sync ``dispatch_agent`` factory (used on the sync executor path)."""
+    async def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
+        """``dispatch_agent`` factory — awaits the child on the shared event loop."""
         child = self._make_subagent_child(preset)
         if isinstance(child, str):
             return child
-        return child.run(task).answer
+        return (await child.run(task)).answer
 
-    async def _aspawn_subagent(self, task: str, preset: str = "read_only") -> str:
-        """Async ``dispatch_agent`` factory — awaits the child on the shared event loop."""
-        child = self._make_subagent_child(preset)
-        if isinstance(child, str):
-            return child
-        return (await child.arun(task)).answer
-
-    def _make_teammate_child(
+    async def _make_teammate_child(
         self,
         team_id: str,
         name: str,
@@ -433,14 +391,14 @@ class ReActAgent:
             return "[teammate_spawn] max sub-agent depth reached; refusing to spawn deeper."
 
         store = self.team_store
-        store.add_member(team_id, name, role)
-        team = store.get_team(team_id)
+        await store.add_member(team_id, name, role)
+        team = await store.get_team(team_id)
         assigned_tasks = [
             task
-            for task in store.list_tasks(team_id)
+            for task in await store.list_tasks(team_id)
             if task.get("owner") == name and task.get("status") != "completed"
         ]
-        focus_task = store.get_task(team_id, task_id) if task_id else None
+        focus_task = await store.get_task(team_id, task_id) if task_id else None
 
         sub_registry = ToolRegistry()
         excluded = {"dispatch_agent", "team_create", "task_create", "teammate_spawn", "team_status"}
@@ -479,7 +437,7 @@ class ReActAgent:
         prompt = self._teammate_prompt(team, name, role, focus_task, assigned_tasks)
         return child, prompt
 
-    def _spawn_teammate(
+    async def _spawn_teammate(
         self,
         team_id: str,
         name: str,
@@ -487,27 +445,12 @@ class ReActAgent:
         task_id: str | None = None,
         preset: str = "read_only",
     ) -> str:
-        """Sync teammate factory — runs one teammate turn in a file-backed team workspace."""
-        built = self._make_teammate_child(team_id, name, role, task_id, preset)
+        """Teammate factory — awaits the teammate turn on the shared event loop."""
+        built = await self._make_teammate_child(team_id, name, role, task_id, preset)
         if isinstance(built, str):
             return built
         child, prompt = built
-        return child.run(prompt).answer
-
-    async def _aspawn_teammate(
-        self,
-        team_id: str,
-        name: str,
-        role: str,
-        task_id: str | None = None,
-        preset: str = "read_only",
-    ) -> str:
-        """Async teammate factory — awaits the teammate turn on the shared event loop."""
-        built = self._make_teammate_child(team_id, name, role, task_id, preset)
-        if isinstance(built, str):
-            return built
-        child, prompt = built
-        return (await child.arun(prompt)).answer
+        return (await child.run(prompt)).answer
 
     @staticmethod
     def _teammate_prompt(

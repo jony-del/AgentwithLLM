@@ -50,7 +50,7 @@ class UpdateTodosTool(SessionAwareMixin, Tool):
         # This tool notifies the UI from its body, so keep it on the serial path.
         return ConcurrencySpec((ResourceLock("session", "todos", "write"),), exclusive=True)
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         todos = arguments.get("todos")
         if not isinstance(todos, list):
             return ToolResult(self.name, "todos must be a list", ok=False, metadata={"error_type": "BadArgs"})

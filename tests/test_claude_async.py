@@ -1,4 +1,4 @@
-"""Async (httpx) transport tests for ClaudeProvider.acomplete."""
+"""Transport (httpx) tests for ClaudeProvider.complete."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from agent_core.providers.claude import ClaudeProvider
 
 def _provider(handler, **kwargs) -> ClaudeProvider:
     provider = ClaudeProvider(api_key="test-key", **kwargs)
-    provider._atransport = httpx.MockTransport(handler)
+    provider._transport = httpx.MockTransport(handler)
     return provider
 
 
@@ -32,14 +32,10 @@ class _Recorder:
         pass
 
 
-def _run(coro):
-    return asyncio.run(coro)
-
-
 # --- non-streaming -----------------------------------------------------------
 
 
-def test_acomplete_non_streaming_parses_response() -> None:
+async def test_complete_non_streaming_parses_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["x-api-key"] == "test-key"
         body = json.loads(request.content)
@@ -53,25 +49,25 @@ def test_acomplete_non_streaming_parses_response() -> None:
         )
 
     provider = _provider(handler)
-    result = _run(provider.acomplete([Message("user", "hi")], [], {"model": "claude-test", "stream": False}))
+    result = await provider.complete([Message("user", "hi")], [], {"model": "claude-test", "stream": False})
     assert isinstance(result, LLMResult)
     assert result.content == "Hello there"
     assert result.stop_reason == "end_turn"
 
 
-def test_acomplete_context_too_long_maps_error() -> None:
+async def test_complete_context_too_long_maps_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error": {"message": "prompt is too long: too many tokens"}})
 
     provider = _provider(handler)
     with pytest.raises(LLMContextTooLongError):
-        _run(provider.acomplete([Message("user", "hi")], [], {"stream": False}))
+        await provider.complete([Message("user", "hi")], [], {"stream": False})
 
 
 # --- retry / backoff ---------------------------------------------------------
 
 
-def test_acomplete_retries_on_429(monkeypatch) -> None:
+async def test_complete_retries_on_429(monkeypatch) -> None:
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -88,13 +84,33 @@ def test_acomplete_retries_on_429(monkeypatch) -> None:
         return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
 
     provider = _provider(handler, max_retries=2)
-    result = _run(provider.acomplete([Message("user", "hi")], [], {"stream": False}))
+    result = await provider.complete([Message("user", "hi")], [], {"stream": False})
     assert result.content == "ok"
     assert calls["n"] == 2
     assert len(sleeps) == 1  # one backoff between the two attempts
 
 
-def test_acomplete_honors_retry_after_header(monkeypatch) -> None:
+async def test_complete_retries_transient_transport_error_then_succeeds(monkeypatch) -> None:
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
+
+    provider = _provider(handler, max_retries=2)
+    result = await provider.complete([Message("user", "hi")], [], {"stream": False})
+    assert result.content == "ok"
+    assert calls["n"] == 2
+
+
+async def test_complete_honors_retry_after_header(monkeypatch) -> None:
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -111,11 +127,11 @@ def test_acomplete_honors_retry_after_header(monkeypatch) -> None:
         return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
 
     provider = _provider(handler, max_retries=2)
-    _run(provider.acomplete([Message("user", "hi")], [], {"stream": False}))
+    await provider.complete([Message("user", "hi")], [], {"stream": False})
     assert sleeps == [2.0]  # honored the server-supplied delay exactly
 
 
-def test_acomplete_raises_transient_after_retries_exhausted(monkeypatch) -> None:
+async def test_complete_raises_transient_after_retries_exhausted(monkeypatch) -> None:
     async def fake_sleep(delay: float) -> None:
         pass
 
@@ -126,7 +142,23 @@ def test_acomplete_raises_transient_after_retries_exhausted(monkeypatch) -> None
 
     provider = _provider(handler, max_retries=1)
     with pytest.raises(LLMTransientError):
-        _run(provider.acomplete([Message("user", "hi")], [], {"stream": False}))
+        await provider.complete([Message("user", "hi")], [], {"stream": False})
+
+
+async def test_complete_non_retryable_status_raises_immediately() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(401, json={"error": {"message": "invalid api key"}})
+
+    provider = _provider(handler, max_retries=3)
+    with pytest.raises(RuntimeError) as exc_info:
+        await provider.complete([Message("user", "hi")], [], {"stream": False})
+
+    assert calls["n"] == 1  # not retried
+    assert "401" in str(exc_info.value)
+    assert not isinstance(exc_info.value, LLMTransientError)
 
 
 # --- streaming ---------------------------------------------------------------
@@ -146,20 +178,20 @@ _SSE = (
 )
 
 
-def test_acomplete_streaming_assembles_and_pushes_deltas() -> None:
+async def test_complete_streaming_assembles_and_pushes_deltas() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert json.loads(request.content)["stream"] is True
         return httpx.Response(200, content=_SSE.encode("utf-8"))
 
     provider = _provider(handler)
     recorder = _Recorder()
-    result = _run(provider.acomplete([Message("user", "hi")], [], {"stream": True}, stream=recorder))
+    result = await provider.complete([Message("user", "hi")], [], {"stream": True}, stream=recorder)
     assert result.content == "Hello world"
     assert result.stop_reason == "end_turn"
     assert recorder.text == "Hello world"  # deltas were streamed live
 
 
-def test_acomplete_streaming_error_event_is_transient() -> None:
+async def test_complete_streaming_error_event_is_transient() -> None:
     sse = 'data: {"type":"error","error":{"type":"overloaded_error","message":"boom"}}\n\n'
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -167,4 +199,4 @@ def test_acomplete_streaming_error_event_is_transient() -> None:
 
     provider = _provider(handler)
     with pytest.raises(LLMTransientError):
-        _run(provider.acomplete([Message("user", "hi")], [], {"stream": True}, stream=_Recorder()))
+        await provider.complete([Message("user", "hi")], [], {"stream": True}, stream=_Recorder())

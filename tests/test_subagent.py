@@ -18,46 +18,54 @@ from agent_core.tools.subagent import DispatchAgentTool
 # --- DispatchAgentTool (unit, with a stub factory) ---------------------------
 
 
-def test_dispatch_passes_task_and_preset_to_factory() -> None:
+async def test_dispatch_passes_task_and_preset_to_factory() -> None:
     calls: list = []
 
-    def factory(task: str, preset: str) -> str:
+    async def factory(task: str, preset: str) -> str:
         calls.append((task, preset))
         return f"done: {task}"
 
     tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
-    result = tool.run({"task": "research X", "tool_preset": "full"})
+    result = await tool.run({"task": "research X", "tool_preset": "full"})
     assert result.ok
     assert result.content == "done: research X"
     assert result.metadata["preset"] == "full"
     assert calls == [("research X", "full")]
 
 
-def test_dispatch_defaults_to_read_only() -> None:
+async def test_dispatch_defaults_to_read_only() -> None:
     seen: list = []
-    tool = DispatchAgentTool(SessionContext(subagent_factory=lambda t, p: seen.append(p) or "ok"))
-    tool.run({"task": "do a thing"})
+
+    async def factory(task: str, preset: str) -> str:
+        seen.append(preset)
+        return "ok"
+
+    tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
+    await tool.run({"task": "do a thing"})
     assert seen == ["read_only"]
 
 
-def test_dispatch_rejects_empty_task() -> None:
-    tool = DispatchAgentTool(SessionContext(subagent_factory=lambda t, p: "x"))
-    result = tool.run({"task": "   "})
+async def test_dispatch_rejects_empty_task() -> None:
+    async def factory(task: str, preset: str) -> str:
+        return "x"
+
+    tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
+    result = await tool.run({"task": "   "})
     assert not result.ok
     assert result.metadata["error_type"] == "BadArgs"
 
 
-def test_dispatch_unavailable_without_factory() -> None:
-    result = DispatchAgentTool(SessionContext()).run({"task": "anything"})
+async def test_dispatch_unavailable_without_factory() -> None:
+    result = await DispatchAgentTool(SessionContext()).run({"task": "anything"})
     assert not result.ok
     assert result.metadata["error_type"] == "Unavailable"
 
 
-def test_dispatch_captures_child_error() -> None:
-    def boom(task: str, preset: str) -> str:
+async def test_dispatch_captures_child_error() -> None:
+    async def boom(task: str, preset: str) -> str:
         raise RuntimeError("kaboom")
 
-    result = DispatchAgentTool(SessionContext(subagent_factory=boom)).run({"task": "t"})
+    result = await DispatchAgentTool(SessionContext(subagent_factory=boom)).run({"task": "t"})
     assert not result.ok
     assert "kaboom" in result.content
 
@@ -75,14 +83,14 @@ class WorkspaceWriteSleepTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         time.sleep(float(arguments.get("delay", 0.15)))
         return ToolResult(self.name, "wrote")
 
 
-def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
-    def factory(task: str, preset: str) -> str:
-        time.sleep(0.15)
+async def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
+    async def factory(task: str, preset: str) -> str:
+        await asyncio.sleep(0.15)
         return f"{preset}:{task}"
 
     registry = ToolRegistry()
@@ -90,7 +98,7 @@ def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [
             ToolCall("dispatch_agent", {"task": "a"}),
             ToolCall("dispatch_agent", {"task": "b"}),
@@ -102,9 +110,9 @@ def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
     assert [result.content for result in results] == ["read_only:a", "read_only:b"]
 
 
-def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
-    def factory(task: str, preset: str) -> str:
-        time.sleep(0.15)
+async def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
+    async def factory(task: str, preset: str) -> str:
+        await asyncio.sleep(0.15)
         return f"{preset}:{task}"
 
     registry = ToolRegistry()
@@ -113,7 +121,7 @@ def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    executor.execute_many(
+    await executor.execute_many(
         [
             ToolCall("dispatch_agent", {"task": "a", "tool_preset": "full"}),
             ToolCall("workspace_write_sleep", {"path": "nested/file.txt", "delay": 0.15}),
@@ -124,7 +132,7 @@ def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
     assert elapsed >= 0.28
 
 
-def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
+async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
     """Two children dispatched in one turn now overlap their API calls.
 
     The shared provider gate bounds concurrency (default cap 8) rather than
@@ -138,10 +146,10 @@ def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
             self.active = 0
             self.max_active = 0
 
-        async def acomplete(self, messages, tools, config, stream=None) -> LLMResult:
-            return await asyncio.to_thread(self.complete, messages, tools, config, stream)
+        async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+            return await asyncio.to_thread(self._complete_sync, messages, tools, config, stream)
 
-        def complete(self, messages, tools, config, stream=None) -> LLMResult:
+        def _complete_sync(self, messages, tools, config, stream=None) -> LLMResult:
             with self._lock:
                 self.active += 1
                 self.max_active = max(self.max_active, self.active)
@@ -177,7 +185,7 @@ def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
         ),
     )
 
-    result = agent.run("parent task")
+    result = await agent.run("parent task")
 
     assert result.answer == "parent done"
     assert 1 < provider.max_active <= agent.config.max_api_concurrency
@@ -186,10 +194,10 @@ def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> None:
 # --- end-to-end through a real (fake-provider) agent -------------------------
 
 
-def test_agent_spawns_subagent_with_deterministic_answer(tmp_path) -> None:
+async def test_agent_spawns_subagent_with_deterministic_answer(tmp_path) -> None:
     agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(run_dir=str(tmp_path)))
     # FakeProvider answers a plain task with "Final answer: <task>".
-    answer = agent._spawn_subagent("explore the repo", "read_only")
+    answer = await agent._spawn_subagent("explore the repo", "read_only")
     assert answer == "Final answer: explore the repo"
 
 
@@ -209,51 +217,56 @@ def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
     assert "glob" in names_read_only and "search_text" in names_read_only
 
 
-def test_dispatch_depth_ceiling_refuses() -> None:
+async def test_dispatch_depth_ceiling_refuses() -> None:
     agent = ReActAgent(provider=FakeProvider())
     agent.session.depth = agent.session.max_depth  # already at the limit
-    answer = agent._spawn_subagent("go deeper", "read_only")
+    answer = await agent._spawn_subagent("go deeper", "read_only")
     assert "max sub-agent depth" in answer
 
 
 # --- MultiAgentCoordinator ---------------------------------------------------
 
 
-def test_coordinator_runs_all_and_isolates_failure() -> None:
+async def test_coordinator_runs_all_and_isolates_failure() -> None:
     class Ok:
         name = "ok"
 
-        def run(self, task: str) -> str:
+        async def run(self, task: str) -> str:
             return f"ok:{task}"
 
     class Bad:
         name = "bad"
 
-        def run(self, task: str) -> str:
+        async def run(self, task: str) -> str:
             raise ValueError("nope")
 
-    results = MultiAgentCoordinator([Ok(), Bad()]).run_all("go")
+    results = await MultiAgentCoordinator([Ok(), Bad()]).run_all("go")
     assert results["ok"] == "ok:go"
     assert "nope" in results["bad"]
 
 
-def test_coordinator_records_results_as_agents_complete() -> None:
+async def test_coordinator_overlaps_agents_and_keeps_declared_order() -> None:
     class Slow:
         name = "slow"
 
-        def run(self, task: str) -> str:
-            time.sleep(0.05)
+        async def run(self, task: str) -> str:
+            await asyncio.sleep(0.05)
             return f"slow:{task}"
 
     class Fast:
         name = "fast"
 
-        def run(self, task: str) -> str:
+        async def run(self, task: str) -> str:
             return f"fast:{task}"
 
-    results = MultiAgentCoordinator([Slow(), Fast()]).run_all("go")
-    assert list(results) == ["fast", "slow"]
+    start = time.perf_counter()
+    results = await MultiAgentCoordinator([Slow(), Fast()]).run_all("go")
+    elapsed = time.perf_counter() - start
+    # Answers keep the agents' declared order regardless of completion order.
+    assert list(results) == ["slow", "fast"]
+    assert results == {"slow": "slow:go", "fast": "fast:go"}
+    assert elapsed < 0.5  # ran concurrently, not back to back
 
 
-def test_coordinator_empty() -> None:
-    assert MultiAgentCoordinator([]).run_all("x") == {}
+async def test_coordinator_empty() -> None:
+    assert await MultiAgentCoordinator([]).run_all("x") == {}

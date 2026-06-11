@@ -48,7 +48,7 @@ class GlobTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
         base = self.resolve_workspace_path(arguments.get("path", "."))
         max_results = int(arguments.get("max_results", _MAX_GLOB_RESULTS))
@@ -112,7 +112,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         edits = arguments.get("edits")
         if not isinstance(edits, list) or not edits:
@@ -173,7 +173,7 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
         locks = tuple(self.workspace_lock(target, "write") for target, _, _ in files)
         return ConcurrencySpec(locks)
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         patch_text = str(arguments.get("patch", ""))
         try:
             files = _parse_unified_diff(patch_text)

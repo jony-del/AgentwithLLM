@@ -169,29 +169,29 @@ def test_adapter_prefixes_names_and_maps_risk() -> None:
     assert tools["db__query"].risk is ToolRisk.DANGEROUS  # default
 
 
-def test_tool_run_flattens_text_and_marks_ok() -> None:
+async def test_tool_run_flattens_text_and_marks_ok() -> None:
     server = MCPServerConfig(name="s", risk="read")
     result = _Result([_Block(text="line1"), _Block(text="line2")], isError=False)
     manager = _FakeManager([], result=result)
     tool = MCPTool(manager, server, _Descriptor("t"))
 
-    out = tool.run({"a": 1})
+    out = await tool.run({"a": 1})
     assert out.ok is True
     assert out.content == "line1\nline2"
     assert out.metadata["mcp_server"] == "s"
     assert manager.calls == [("s", "t", {"a": 1})]  # remote name, not the prefixed name
 
 
-def test_tool_run_maps_is_error_to_not_ok() -> None:
+async def test_tool_run_maps_is_error_to_not_ok() -> None:
     manager = _FakeManager([], result=_Result([_Block(text="boom")], isError=True))
     tool = MCPTool(manager, MCPServerConfig(name="s"), _Descriptor("t"))
-    assert tool.run({}).ok is False
+    assert (await tool.run({})).ok is False
 
 
-def test_tool_run_exception_becomes_failed_result() -> None:
+async def test_tool_run_exception_becomes_failed_result() -> None:
     manager = _FakeManager([], error=TimeoutError("slow"))
     tool = MCPTool(manager, MCPServerConfig(name="s"), _Descriptor("t"))
-    out = tool.run({})
+    out = await tool.run({})
     assert out.ok is False
     assert "MCP tool error" in out.content
 
@@ -206,7 +206,7 @@ def test_flatten_content_notes_non_text_blocks() -> None:
     assert _flatten_content(None) == ""
 
 
-def test_read_mcp_tools_on_same_server_are_serialized() -> None:
+async def test_read_mcp_tools_on_same_server_are_serialized() -> None:
     manager = _SlowManager()
     server = MCPServerConfig(name="s", risk="read")
     registry = ToolRegistry()
@@ -214,7 +214,7 @@ def test_read_mcp_tools_on_same_server_are_serialized() -> None:
     registry.register(MCPTool(manager, server, _Descriptor("b")))
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
-    results = executor.execute_many([ToolCall("s__a"), ToolCall("s__b")])
+    results = await executor.execute_many([ToolCall("s__a"), ToolCall("s__b")])
 
     assert [result.content for result in results] == ["s:a", "s:b"]
     assert manager.max_active_by_server["s"] == 1
@@ -254,7 +254,7 @@ if __name__ == "__main__":
 
 
 @pytest.mark.skipif(not _HAS_MCP, reason="the optional `mcp` SDK is not installed")
-def test_stdio_roundtrip_through_manager(tmp_path: Path) -> None:
+async def test_stdio_roundtrip_through_manager(tmp_path: Path) -> None:
     from agent_core.mcp.client import MCPClientManager
 
     server_file = tmp_path / "srv.py"
@@ -280,7 +280,7 @@ def test_stdio_roundtrip_through_manager(tmp_path: Path) -> None:
         assert "t__echo" in tools
         assert tools["t__echo"].risk is ToolRisk.READ
 
-        out = tools["t__echo"].run({"text": "hello mcp"})
+        out = await tools["t__echo"].run({"text": "hello mcp"})
         assert out.ok is True
         assert out.content == "hello mcp"
     finally:

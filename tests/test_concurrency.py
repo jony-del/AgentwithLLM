@@ -20,7 +20,7 @@ from agent_core.tools.registry import ToolRegistry
 
 
 class _AsyncTracker:
-    """Provider whose ``acomplete`` records peak concurrency."""
+    """Provider whose ``complete`` records peak concurrency."""
 
     def __init__(self, delay: float = 0.02) -> None:
         self.delay = delay
@@ -29,7 +29,7 @@ class _AsyncTracker:
         self.calls = 0
         self._lock = asyncio.Lock()
 
-    async def acomplete(self, messages, tools, config, stream=None) -> LLMResult:
+    async def complete(self, messages, tools, config, stream=None) -> LLMResult:
         async with self._lock:
             self.calls += 1
             self.active += 1
@@ -41,9 +41,6 @@ class _AsyncTracker:
             async with self._lock:
                 self.active -= 1
 
-    def complete(self, messages, tools, config, stream=None) -> LLMResult:  # pragma: no cover
-        raise NotImplementedError
-
 
 # --- gate: bounded overlap ---------------------------------------------------
 
@@ -53,7 +50,7 @@ def test_gate_caps_concurrency() -> None:
     provider = gated_provider(inner, max_concurrency=2)
 
     async def drive() -> None:
-        await asyncio.gather(*(provider.acomplete([], [], {}) for _ in range(8)))
+        await asyncio.gather(*(provider.complete([], [], {}) for _ in range(8)))
 
     asyncio.run(drive())
     assert inner.calls == 8
@@ -65,7 +62,7 @@ def test_gate_allows_overlap_under_default_cap() -> None:
     provider = gated_provider(inner)  # default cap 8
 
     async def drive() -> None:
-        await asyncio.gather(*(provider.acomplete([], [], {}) for _ in range(4)))
+        await asyncio.gather(*(provider.complete([], [], {}) for _ in range(4)))
 
     asyncio.run(drive())
     assert inner.max_active == 4  # all four ran at once
@@ -80,22 +77,6 @@ def test_gated_provider_is_idempotent() -> None:
     assert once.gate.max_concurrency == 3
 
 
-def test_gate_falls_back_to_sync_complete_for_duck_typed_provider() -> None:
-    class SyncOnly:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def complete(self, messages, tools, config, stream=None) -> LLMResult:
-            self.calls += 1
-            return LLMResult("sync", stop_reason="end")
-
-    inner = SyncOnly()
-    provider = gated_provider(inner, max_concurrency=2)
-    result = asyncio.run(provider.acomplete([], [], {}))
-    assert result.content == "sync"
-    assert inner.calls == 1
-
-
 # --- cancel-aware gate -------------------------------------------------------
 
 
@@ -105,7 +86,7 @@ def test_gate_refuses_to_start_after_cancel() -> None:
 
     async def drive() -> None:
         with pytest.raises(asyncio.CancelledError):
-            await provider.acomplete([], [], {}, should_cancel=lambda: True)
+            await provider.complete([], [], {}, should_cancel=lambda: True)
 
     asyncio.run(drive())
     assert inner.calls == 0  # the inner provider was never invoked
@@ -143,24 +124,21 @@ def test_token_bucket_unlimited_when_zero() -> None:
 # --- partial failure isolation ----------------------------------------------
 
 
-def test_coordinator_arun_all_isolates_failure() -> None:
+async def test_coordinator_run_all_isolates_failure() -> None:
     class Ok:
         name = "ok"
 
-        async def arun(self, task: str) -> str:
+        async def run(self, task: str) -> str:
             await asyncio.sleep(0.01)
             return f"ok:{task}"
 
     class Bad:
         name = "bad"
 
-        async def arun(self, task: str) -> str:
+        async def run(self, task: str) -> str:
             raise ValueError("nope")
 
-        def run(self, task: str) -> str:  # pragma: no cover - arun is preferred
-            raise ValueError("nope")
-
-    results = asyncio.run(MultiAgentCoordinator([Ok(), Bad()]).arun_all("go"))
+    results = await MultiAgentCoordinator([Ok(), Bad()]).run_all("go")
     assert results["ok"] == "ok:go"
     assert "nope" in results["bad"]
 
@@ -182,7 +160,7 @@ class _ConcurrentReadTool(Tool):
     def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
         return ConcurrencySpec((ResourceLock("fs", str(arguments["key"]), "read"),))
 
-    def run(self, arguments: dict) -> ToolResult:
+    def _invoke(self, arguments: dict) -> ToolResult:
         with _ConcurrentReadTool._lock:
             _ConcurrentReadTool.active += 1
             _ConcurrentReadTool.max_active = max(_ConcurrentReadTool.max_active, _ConcurrentReadTool.active)
@@ -194,7 +172,7 @@ class _ConcurrentReadTool(Tool):
                 _ConcurrentReadTool.active -= 1
 
 
-def test_aexecute_many_respects_max_tool_workers() -> None:
+async def test_execute_many_respects_max_tool_workers() -> None:
     _ConcurrentReadTool.active = 0
     _ConcurrentReadTool.max_active = 0
     registry = ToolRegistry()
@@ -202,7 +180,7 @@ def test_aexecute_many_respects_max_tool_workers() -> None:
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     calls = [ToolCall("concurrent_read", {"key": f"k{i}"}) for i in range(6)]
-    results = asyncio.run(executor.aexecute_many(calls))
+    results = await executor.execute_many(calls)
 
     assert len(results) == 6
     assert all(r.ok for r in results)
@@ -212,18 +190,16 @@ def test_aexecute_many_respects_max_tool_workers() -> None:
 # --- logger: concurrent writes stay well-formed ------------------------------
 
 
-def test_logger_concurrent_writes_are_atomic(tmp_path) -> None:
+async def test_logger_concurrent_writes_are_atomic(tmp_path) -> None:
     logger = JSONLRunLogger(run_dir=str(tmp_path), run_id="concurrent")
 
-    def writer(index: int) -> None:
+    async def writer(index: int) -> None:
         for n in range(50):
-            logger.write("event", {"i": index, "n": n})
+            await logger.write("event", {"i": index, "n": n})
 
-    threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    # Each write lands on a worker thread; the internal threading.Lock keeps the
+    # overlapping appends atomic.
+    await asyncio.gather(*(writer(i) for i in range(8)))
 
     lines = logger.path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 8 * 50

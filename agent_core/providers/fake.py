@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import time
 from typing import Any
 
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCall
@@ -18,7 +18,7 @@ class FakeProvider(LLMProvider):
         self.stream_delay = stream_delay
         self.calls = 0
 
-    def complete(
+    async def complete(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
@@ -33,7 +33,7 @@ class FakeProvider(LLMProvider):
         # Stream the answer text in whitespace chunks so the live UI can render it
         # token-by-token, mirroring a real SSE stream — without needing an API key.
         if stream is not None and result.content and not result.tool_calls:
-            self._stream_text(result.content, stream)
+            await self._stream_text(result.content, stream)
         return result
 
     def _compute(self, messages: list[Message]) -> LLMResult:
@@ -55,12 +55,12 @@ class FakeProvider(LLMProvider):
             )
         return LLMResult(content=f"Final answer: {last}", stop_reason="end")
 
-    def _stream_text(self, text: str, stream: StreamHandler) -> None:
+    async def _stream_text(self, text: str, stream: StreamHandler) -> None:
         chunks = text.split(" ")
         for index, chunk in enumerate(chunks):
             stream.on_text_delta(chunk if index == 0 else " " + chunk)
             if self.stream_delay:
-                time.sleep(self.stream_delay)
+                await asyncio.sleep(self.stream_delay)
 
     @staticmethod
     def _maybe_memory_response(messages: list[Message]) -> str | None:

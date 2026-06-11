@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,45 +27,47 @@ from agent_core.tools.team import (
 )
 
 
-def test_team_create_builds_config_tasks_and_leader_inbox(tmp_path: Path) -> None:
+async def test_team_create_builds_config_tasks_and_leader_inbox(tmp_path: Path) -> None:
     store = TeamStore(tmp_path)
-    team = store.create_team("alpha", "ship the feature", "lead")
+    team = await store.create_team("alpha", "ship the feature", "lead")
 
     team_dir = tmp_path / team["id"]
     assert (team_dir / "team.json").exists()
     assert (team_dir / "tasks.json").exists()
     assert (team_dir / "inbox" / "lead.jsonl").exists()
-    assert store.list_tasks(team["id"]) == []
-    assert store.get_team(team["id"])["leader"] == "lead"
+    assert await store.list_tasks(team["id"]) == []
+    assert (await store.get_team(team["id"]))["leader"] == "lead"
 
 
-def test_inbox_writes_are_file_locked_under_concurrency(tmp_path: Path) -> None:
+async def test_inbox_writes_are_file_locked_under_concurrency(tmp_path: Path) -> None:
     store = TeamStore(tmp_path)
-    team = store.create_team("alpha", "coordinate")
+    team = await store.create_team("alpha", "coordinate")
     team_id = team["id"]
-    store.add_member(team_id, "worker", "researcher")
+    await store.add_member(team_id, "worker", "researcher")
 
-    def send(index: int) -> None:
-        store.send_message(team_id, "leader", "worker", f"message {index}")
+    # 50 concurrent sends: each offloads to a worker thread inside the store, so
+    # the sidecar FileLock is what keeps appends atomic.
+    await asyncio.gather(
+        *(store.send_message(team_id, "leader", "worker", f"message {index}") for index in range(50))
+    )
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(send, range(50)))
-
-    messages = store.read_inbox(team_id, "worker", unread_only=False)
+    messages = await store.read_inbox(team_id, "worker", unread_only=False)
     assert len(messages) == 50
     assert len({message["id"] for message in messages}) == 50
     assert all(message["to"] == "worker" for message in messages)
 
 
-def test_event_reads_are_file_locked_against_writers(tmp_path: Path) -> None:
+async def test_event_reads_are_file_locked_against_writers(tmp_path: Path) -> None:
     store = TeamStore(tmp_path)
-    team = store.create_team("alpha", "coordinate")
+    team = await store.create_team("alpha", "coordinate")
     team_id = team["id"]
     events = store._events_file(team_id)
 
+    # Exercises the blocking internal directly: the FileLock held here must make a
+    # concurrent reader (on its own thread) wait until the lock is released.
     with ThreadPoolExecutor(max_workers=1) as pool:
         with FileLock(store._lock_file(events)):
-            future = pool.submit(store.read_events, team_id)
+            future = pool.submit(store._read_events_sync, team_id)
             time.sleep(0.05)
             assert not future.done()
         records = future.result(timeout=1)
@@ -72,76 +75,76 @@ def test_event_reads_are_file_locked_against_writers(tmp_path: Path) -> None:
     assert records[-1]["event"] == "team_created"
 
 
-def test_task_update_enforces_owner_permissions_and_claiming(tmp_path: Path) -> None:
+async def test_task_update_enforces_owner_permissions_and_claiming(tmp_path: Path) -> None:
     store = TeamStore(tmp_path)
-    team = store.create_team("alpha", "coordinate")
+    team = await store.create_team("alpha", "coordinate")
     team_id = team["id"]
-    store.add_member(team_id, "alice", "researcher")
-    store.add_member(team_id, "bob", "reviewer")
-    task = store.create_task(team_id, "inspect", "inspect code")
+    await store.add_member(team_id, "alice", "researcher")
+    await store.add_member(team_id, "bob", "reviewer")
+    task = await store.create_task(team_id, "inspect", "inspect code")
 
-    updated, assigned_to = store.update_task(team_id, task["id"], "leader", owner="alice")
+    updated, assigned_to = await store.update_task(team_id, task["id"], "leader", owner="alice")
     assert assigned_to == "alice"
     assert updated["owner"] == "alice"
     assert updated["status"] == "assigned"
 
     with pytest.raises(TeamPermissionError):
-        store.update_task(team_id, task["id"], "bob", status="completed")
+        await store.update_task(team_id, task["id"], "bob", status="completed")
 
-    updated, _ = store.update_task(team_id, task["id"], "alice", status="completed", result="done")
+    updated, _ = await store.update_task(team_id, task["id"], "alice", status="completed", result="done")
     assert updated["status"] == "completed"
     assert updated["result"] == "done"
 
-    unowned = store.create_task(team_id, "claim me", "unowned task")
-    claimed, _ = store.update_task(team_id, unowned["id"], "bob", status="in_progress")
+    unowned = await store.create_task(team_id, "claim me", "unowned task")
+    claimed, _ = await store.update_task(team_id, unowned["id"], "bob", status="in_progress")
     assert claimed["owner"] == "bob"
     assert claimed["status"] == "in_progress"
 
 
-def test_inbox_unread_cursor_advances(tmp_path: Path) -> None:
+async def test_inbox_unread_cursor_advances(tmp_path: Path) -> None:
     store = TeamStore(tmp_path)
-    team = store.create_team("alpha", "coordinate")
+    team = await store.create_team("alpha", "coordinate")
     team_id = team["id"]
-    store.add_member(team_id, "worker", "researcher")
-    store.send_message(team_id, "leader", "worker", "first")
-    store.send_message(team_id, "leader", "worker", "second")
+    await store.add_member(team_id, "worker", "researcher")
+    await store.send_message(team_id, "leader", "worker", "first")
+    await store.send_message(team_id, "leader", "worker", "second")
 
-    assert len(store.read_inbox(team_id, "worker")) == 2
-    assert store.read_inbox(team_id, "worker") == []
-    assert len(store.read_inbox(team_id, "worker", unread_only=False)) == 2
+    assert len(await store.read_inbox(team_id, "worker")) == 2
+    assert await store.read_inbox(team_id, "worker") == []
+    assert len(await store.read_inbox(team_id, "worker", unread_only=False)) == 2
 
 
-def test_team_tools_create_tasks_assign_and_message(tmp_path: Path) -> None:
+async def test_team_tools_create_tasks_assign_and_message(tmp_path: Path) -> None:
     session = SessionContext(team_store=TeamStore(tmp_path))
-    created = TeamCreateTool(session).run({"name": "alpha", "goal": "coordinate", "leader_name": "lead"})
+    created = await TeamCreateTool(session).run({"name": "alpha", "goal": "coordinate", "leader_name": "lead"})
     assert created.ok
     team_id = created.metadata["team_id"]
     assert session.team_id == team_id
     assert session.agent_name == "lead"
 
-    session.team_store.add_member(team_id, "worker", "researcher")
-    task = TaskCreateTool(session).run(
+    await session.team_store.add_member(team_id, "worker", "researcher")
+    task = await TaskCreateTool(session).run(
         {"team_id": team_id, "title": "inspect", "description": "inspect code"}
     )
     assert task.ok
     task_id = task.metadata["task_id"]
 
-    assigned = TaskUpdateTool(session).run({"team_id": team_id, "task_id": task_id, "owner": "worker"})
+    assigned = await TaskUpdateTool(session).run({"team_id": team_id, "task_id": task_id, "owner": "worker"})
     assert assigned.ok
-    messages = session.team_store.read_inbox(team_id, "worker")
+    messages = await session.team_store.read_inbox(team_id, "worker")
     assert messages[0]["kind"] == "assignment"
     assert "Task assigned" in messages[0]["content"]
 
 
-def test_teammate_spawn_tool_uses_session_factory() -> None:
+async def test_teammate_spawn_tool_uses_session_factory() -> None:
     calls: list[tuple[str, str, str, str | None, str]] = []
 
-    def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
         calls.append((team_id, name, role, task_id, preset))
         return "spawned"
 
     session = SessionContext(teammate_factory=factory)
-    result = TeammateSpawnTool(session).run(
+    result = await TeammateSpawnTool(session).run(
         {"team_id": "team_abc", "name": "worker", "role": "researcher", "task_id": "task_1", "tool_preset": "full"}
     )
     assert result.ok
@@ -149,9 +152,9 @@ def test_teammate_spawn_tool_uses_session_factory() -> None:
     assert calls == [("team_abc", "worker", "researcher", "task_1", "full")]
 
 
-def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> None:
-    def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
-        time.sleep(0.15)
+async def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> None:
+    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+        await asyncio.sleep(0.15)
         return f"{name}:{task_id}"
 
     registry = ToolRegistry()
@@ -159,7 +162,7 @@ def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> 
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    results = executor.execute_many(
+    results = await executor.execute_many(
         [
             ToolCall("teammate_spawn", {"team_id": "team_a", "name": "alice", "role": "r", "task_id": "task_1"}),
             ToolCall("teammate_spawn", {"team_id": "team_a", "name": "bob", "role": "r", "task_id": "task_2"}),
@@ -171,9 +174,9 @@ def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> 
     assert [result.content for result in results] == ["alice:task_1", "bob:task_2"]
 
 
-def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
-    def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
-        time.sleep(0.15)
+async def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
+    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+        await asyncio.sleep(0.15)
         return f"{name}:{task_id}"
 
     registry = ToolRegistry()
@@ -181,7 +184,7 @@ def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
     executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
 
     start = time.perf_counter()
-    executor.execute_many(
+    await executor.execute_many(
         [
             ToolCall("teammate_spawn", {"team_id": "team_a", "name": "alice", "role": "r", "task_id": "task_1"}),
             ToolCall("teammate_spawn", {"team_id": "team_a", "name": "bob", "role": "r", "task_id": "task_1"}),
@@ -207,7 +210,7 @@ class _CompletingTeamProvider(LLMProvider):
         self.task_id = task_id
         self.calls = 0
 
-    def complete(
+    async def complete(
         self,
         messages,
         tools: list[dict[str, Any]],
@@ -245,12 +248,12 @@ class _CompletingTeamProvider(LLMProvider):
         return LLMResult(content="worker final", stop_reason="end")
 
 
-def test_react_spawn_teammate_can_update_task_and_message_leader(tmp_path: Path) -> None:
+async def test_react_spawn_teammate_can_update_task_and_message_leader(tmp_path: Path) -> None:
     store = TeamStore(tmp_path / "teams")
-    team = store.create_team("alpha", "coordinate")
+    team = await store.create_team("alpha", "coordinate")
     team_id = team["id"]
-    store.add_member(team_id, "worker", "researcher")
-    task = store.create_task(team_id, "inspect", "inspect code", owner="worker")
+    await store.add_member(team_id, "worker", "researcher")
+    task = await store.create_task(team_id, "inspect", "inspect code", owner="worker")
     provider = _CompletingTeamProvider(team_id, task["id"])
     agent = ReActAgent(
         provider,
@@ -258,10 +261,10 @@ def test_react_spawn_teammate_can_update_task_and_message_leader(tmp_path: Path)
         team_store=store,
     )
 
-    answer = agent._spawn_teammate(team_id, "worker", "researcher", task["id"])
+    answer = await agent._spawn_teammate(team_id, "worker", "researcher", task["id"])
 
     assert answer == "worker final"
-    assert store.get_task(team_id, task["id"])["status"] == "completed"
-    leader_messages = store.read_inbox(team_id, "leader")
+    assert (await store.get_task(team_id, task["id"]))["status"] == "completed"
+    leader_messages = await store.read_inbox(team_id, "leader")
     assert leader_messages[-1]["kind"] == "completion"
     assert leader_messages[-1]["content"] == "done"

@@ -72,12 +72,12 @@ class TeamCreateTool(SessionAwareMixin, Tool):
             )
         )
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         try:
-            team = store.create_team(
+            team = await store.create_team(
                 str(arguments.get("name", "")),
                 str(arguments.get("goal", "")),
                 str(arguments.get("leader_name", "leader") or "leader"),
@@ -115,13 +115,13 @@ class TaskCreateTool(SessionAwareMixin, Tool):
             )
         )
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         try:
-            task = store.create_task(
+            task = await store.create_task(
                 team_id,
                 str(arguments.get("title", "")),
                 str(arguments.get("description", "")),
@@ -174,38 +174,9 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
             locks.append(ResourceLock("task", _resource_id(team_id, task_id), "write"))
         return ConcurrencySpec(tuple(locks))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        """Run one teammate turn on the current event loop so teammates overlap."""
         factory = self.session.teammate_factory
-        if factory is None:
-            return ToolResult(
-                self.name,
-                "Team teammates are not available in this context.",
-                ok=False,
-                metadata={"error_type": "Unavailable"},
-            )
-        team_id = _team_id(arguments, self.session.team_id)
-        name = str(arguments.get("name", "")).strip()
-        role = str(arguments.get("role", "")).strip()
-        task_id = str(arguments["task_id"]).strip() if arguments.get("task_id") else None
-        preset = str(arguments.get("tool_preset", "read_only"))
-        if preset not in _PRESETS:
-            preset = "read_only"
-        try:
-            answer = factory(team_id, name, role, task_id, preset)
-        except Exception as exc:  # noqa: BLE001
-            return _team_error(self.name, exc)
-        return ToolResult(
-            self.name,
-            answer,
-            metadata={"team_id": team_id, "teammate": name, "task_id": task_id, "preset": preset},
-        )
-
-    async def arun(self, arguments: dict[str, object]) -> ToolResult:
-        """Run one teammate turn on the current event loop so teammates overlap.
-
-        Mirrors :meth:`run` but awaits the async teammate factory directly.
-        """
-        factory = self.session.ateammate_factory
         if factory is None:
             return ToolResult(
                 self.name,
@@ -263,14 +234,14 @@ class TaskUpdateTool(SessionAwareMixin, Tool):
             locks.append(ResourceLock("member", _resource_id(team_id, arguments["owner"]), "write"))
         return ConcurrencySpec(tuple(locks))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         actor = self.session.agent_name
         try:
-            task, assigned_to = store.update_task(
+            task, assigned_to = await store.update_task(
                 team_id,
                 str(arguments.get("task_id", "")),
                 actor,
@@ -280,7 +251,7 @@ class TaskUpdateTool(SessionAwareMixin, Tool):
                 result=str(arguments["result"]) if arguments.get("result") is not None else None,
             )
             if assigned_to and assigned_to != actor:
-                store.send_message(
+                await store.send_message(
                     team_id,
                     actor,
                     assigned_to,
@@ -311,13 +282,13 @@ class TeamStatusTool(SessionAwareMixin, Tool):
         team_id = _team_id(arguments, self.session.team_id)
         return ConcurrencySpec((ResourceLock("team_status", team_id or "_", "read"),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         try:
-            status = store.status(team_id, int(arguments.get("recent_events", 20)))
+            status = await store.status(team_id, int(arguments.get("recent_events", 20)))
         except Exception as exc:  # noqa: BLE001
             return _team_error(self.name, exc)
         return ToolResult(self.name, _render(status), metadata={"team_id": team_id})
@@ -341,13 +312,13 @@ class TeamInboxReadTool(SessionAwareMixin, Tool):
         mode = "write" if bool(arguments.get("unread_only", True)) else "read"
         return ConcurrencySpec((ResourceLock("member", _resource_id(team_id, self.session.agent_name), mode),))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         try:
-            messages = store.read_inbox(
+            messages = await store.read_inbox(
                 team_id,
                 self.session.agent_name,
                 unread_only=bool(arguments.get("unread_only", True)),
@@ -380,13 +351,13 @@ class TeamMessageSendTool(SessionAwareMixin, Tool):
             locks.append(ResourceLock("task", _resource_id(team_id, arguments["task_id"]), "read"))
         return ConcurrencySpec(tuple(locks))
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         store = _store(self.name, self.session.team_store)
         if isinstance(store, ToolResult):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         try:
-            message = store.send_message(
+            message = await store.send_message(
                 team_id,
                 self.session.agent_name,
                 str(arguments.get("to", "")),

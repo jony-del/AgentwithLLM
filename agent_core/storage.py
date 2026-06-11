@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -14,15 +15,22 @@ class JSONLRunLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         self.path = self.run_dir / f"{self.run_id}.jsonl"
-        # Guards interleaved writes when ordinary tools run in worker threads while the
-        # async loop also logs. Each child agent gets its own logger/file, so this only
-        # serializes one agent's own records — no cross-file contention.
+        # Guards interleaved writes across the worker threads ``write`` offloads to.
+        # Each child agent gets its own logger/file, so this only serializes one
+        # agent's own records — no cross-file contention.
         self._lock = threading.Lock()
 
-    def write(self, event: str, payload: dict[str, Any]) -> None:
+    async def write(self, event: str, payload: dict[str, Any]) -> None:
+        """Append one event without blocking the event loop.
+
+        The actual locked file append runs on a worker thread; the ``threading.Lock``
+        keeps concurrent appends (from overlapping ``to_thread`` workers) atomic.
+        """
         record = {"ts": time.time(), "event": event, **payload}
+        await asyncio.to_thread(self._write_sync, record)
+
+    def _write_sync(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         with self._lock:
             with self.path.open("a", encoding="utf-8") as file:
                 file.write(line)
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -16,12 +17,20 @@ class MemoryStore:
     *mutable* (importance decays, access counts grow, dreaming merges them). So the
     store keeps the authoritative state in memory and persists with an atomic
     rewrite via :meth:`flush`; individual mutating calls flush by default.
+
+    Mutating methods are async: the disk rewrite runs on a worker thread (so the
+    event loop never blocks on file IO) and an ``asyncio.Lock`` serializes flushes —
+    a full-file rewrite is not concurrency-safe, so concurrent mutations are made
+    to wait their turn. In-memory reads stay synchronous.
     """
 
     def __init__(self, path: str | Path = "memory/memory.jsonl") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, MemoryRecord] = {}
+        # Created lazily so the lock binds to the running event loop, not whatever
+        # loop (if any) existed at construction.
+        self._flush_lock: asyncio.Lock | None = None
         self._load()
 
     def _load(self) -> None:
@@ -51,7 +60,7 @@ class MemoryStore:
 
     # --- writes ---------------------------------------------------------------
 
-    def add(
+    async def add(
         self,
         content: str,
         *,
@@ -70,21 +79,21 @@ class MemoryStore:
         )
         self._records[record.id] = record
         if flush:
-            self.flush()
+            await self.flush()
         return record
 
-    def update(self, record: MemoryRecord, *, flush: bool = True) -> None:
+    async def update(self, record: MemoryRecord, *, flush: bool = True) -> None:
         self._records[record.id] = record
         if flush:
-            self.flush()
+            await self.flush()
 
-    def delete(self, record_id: str, *, flush: bool = True) -> bool:
+    async def delete(self, record_id: str, *, flush: bool = True) -> bool:
         existed = self._records.pop(record_id, None) is not None
         if existed and flush:
-            self.flush()
+            await self.flush()
         return existed
 
-    def touch(self, record_id: str, *, flush: bool = True) -> None:
+    async def touch(self, record_id: str, *, flush: bool = True) -> None:
         """Record that a memory was recalled: bump access count + recency.
 
         Recall reinforces a memory, which in turn protects it from being forgotten
@@ -96,18 +105,29 @@ class MemoryStore:
         record.access_count += 1
         record.last_accessed_at = time.time()
         if flush:
-            self.flush()
+            await self.flush()
 
-    def replace_all(self, records: list[MemoryRecord], *, flush: bool = True) -> None:
+    async def replace_all(self, records: list[MemoryRecord], *, flush: bool = True) -> None:
         """Swap the entire contents (used by dreaming to commit a consolidated set)."""
         self._records = {record.id: record for record in records}
         if flush:
-            self.flush()
+            await self.flush()
 
-    def flush(self) -> None:
-        """Atomically rewrite the backing file (temp file + os.replace)."""
+    async def flush(self) -> None:
+        """Atomically rewrite the backing file off the event loop, one flush at a time."""
+        if self._flush_lock is None:
+            self._flush_lock = asyncio.Lock()
+        async with self._flush_lock:
+            # Snapshot on the loop so the worker thread never races a mutation.
+            lines = [
+                json.dumps(record.to_dict(), ensure_ascii=False, default=str)
+                for record in self._records.values()
+            ]
+            await asyncio.to_thread(self._flush_sync, lines)
+
+    def _flush_sync(self, lines: list[str]) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as file:
-            for record in self._records.values():
-                file.write(json.dumps(record.to_dict(), ensure_ascii=False, default=str) + "\n")
+            for line in lines:
+                file.write(line + "\n")
         os.replace(tmp, self.path)

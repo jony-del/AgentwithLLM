@@ -9,7 +9,6 @@ fan-out-to-many path.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,50 +16,28 @@ from typing import Protocol
 class SubAgent(Protocol):
     name: str
 
-    def run(self, task: str) -> str:
+    async def run(self, task: str) -> str:
         ...
 
 
 @dataclass(slots=True)
 class MultiAgentCoordinator:
     agents: list[SubAgent]
-    max_workers: int = 4
 
-    def run_all(self, task: str) -> dict[str, str]:
+    async def run_all(self, task: str) -> dict[str, str]:
         """Run every agent on ``task`` concurrently; return ``{name: answer}``.
 
-        A child raising is captured as an ``[error] ...`` string rather than failing the
-        whole batch, so one bad sub-agent doesn't sink the others.
-        """
-        if not self.agents:
-            return {}
-        results: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.agents))) as pool:
-            futures = {pool.submit(agent.run, task): agent.name for agent in self.agents}
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    results[name] = future.result()
-                except Exception as exc:  # noqa: BLE001 - isolate one child's failure
-                    results[name] = f"[error] {type(exc).__name__}: {exc}"
-        return results
-
-    async def arun_all(self, task: str) -> dict[str, str]:
-        """Async twin of :meth:`run_all`: run every agent on ``task`` concurrently.
-
-        Each agent's API calls overlap on one event loop (bounded by the shared
-        provider gate). One child raising is captured as ``[error] ...`` rather than
-        failing the batch, mirroring the sync path.
+        Each agent's API calls overlap on one event loop, bounded by the shared
+        provider gate. A child raising is captured as an ``[error] ...`` string
+        rather than failing the whole batch, so one bad sub-agent doesn't sink
+        the others. Answers keep the agents' declared order.
         """
         if not self.agents:
             return {}
 
         async def run_one(agent: SubAgent) -> str:
             try:
-                arun = getattr(agent, "arun", None)
-                if arun is not None:
-                    return await arun(task)
-                return await asyncio.to_thread(agent.run, task)
+                return await agent.run(task)
             except Exception as exc:  # noqa: BLE001 - isolate one child's failure
                 return f"[error] {type(exc).__name__}: {exc}"
 

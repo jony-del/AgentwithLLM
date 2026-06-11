@@ -50,7 +50,7 @@ def test_builtin_tool_decorator_registers_and_returns() -> None:
         input_schema = {"type": "object", "properties": {}}
         risk = ToolRisk.READ
 
-        def run(self, arguments: dict) -> ToolResult:
+        def _invoke(self, arguments: dict) -> ToolResult:
             return ToolResult(self.name, "ok")
 
     before = len(catalog._BUILTIN)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -153,6 +154,33 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
     return agent, ui, manager
 
 
+async def _async_input(prompt: str) -> str | None:
+    """Read one stdin line without blocking the event loop; ``None`` on EOF.
+
+    A plain ``asyncio.to_thread(input, ...)`` would leave a non-daemon worker
+    thread stuck in ``input()`` if the user hits Ctrl-C at the prompt, and the
+    loop shutdown would then join (hang on) it. A daemon thread resolving a
+    future via ``call_soon_threadsafe`` keeps Ctrl-C an immediate exit.
+    """
+    import threading
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str | None] = loop.create_future()
+
+    def read() -> None:
+        try:
+            line: str | None = input(prompt)
+        except EOFError:
+            line = None
+        try:
+            loop.call_soon_threadsafe(lambda: future.done() or future.set_result(line))
+        except RuntimeError:
+            pass  # loop already closed (e.g. Ctrl-C tore the session down)
+
+    threading.Thread(target=read, daemon=True, name="chat-input").start()
+    return await future
+
+
 def run_command(args: argparse.Namespace) -> int:
     try:
         agent, ui, mcp = build_agent(args)
@@ -160,9 +188,13 @@ def run_command(args: argparse.Namespace) -> int:
         # E.g. MCP servers configured without the SDK installed, or a connect failure.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
-    try:
+
+    async def run_once():
         with KeyInterrupt() as interrupt:
-            result = agent.run(args.task, should_cancel=interrupt.is_set)
+            return await agent.run(args.task, should_cancel=interrupt.is_set)
+
+    try:
+        result = asyncio.run(run_once())
     except RuntimeError as exc:
         # Covers LLMTransientError (network exhausted retries) and API errors.
         print(f"[error] {exc}", file=sys.stderr)
@@ -185,19 +217,22 @@ def chat_command(args: argparse.Namespace) -> int:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
     print("Agent chat. Type /exit to quit. Press Esc during a turn to interrupt.")
-    try:
+
+    async def session() -> None:
+        # One event loop for the whole chat: every turn shares the same provider
+        # gate, httpx pool, and asyncio primitives instead of rebinding per turn.
         while True:
-            try:
-                task = input("> ").strip()
-            except EOFError:
+            task = await _async_input("> ")
+            if task is None:  # EOF
                 break
+            task = task.strip()
             if task in {"/exit", "/quit"}:
                 break
             if not task:
                 continue
             try:
                 with KeyInterrupt() as interrupt:
-                    result = agent.run(task, should_cancel=interrupt.is_set)
+                    result = await agent.run(task, should_cancel=interrupt.is_set)
             except LLMTransientError as exc:
                 # A network hiccup must not tear down the whole session: report it and
                 # keep the loop (and the accumulated context) alive for a retry.
@@ -209,6 +244,9 @@ def chat_command(args: argparse.Namespace) -> int:
                 continue
             if not ui.is_live:
                 print(result.answer)
+
+    try:
+        asyncio.run(session())
     finally:
         if mcp is not None:
             mcp.close()
@@ -226,7 +264,7 @@ def dream_command(args: argparse.Namespace) -> int:
     store = _open_store(config)
     dreamer = Dreamer(store, config, _make_provider(values), {"model": values["model"]})
     try:
-        report = dreamer.dream(commit=not args.dry_run)
+        report = asyncio.run(dreamer.dream(commit=not args.dry_run))
     except RuntimeError as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
@@ -255,14 +293,14 @@ def memory_command(args: argparse.Namespace) -> int:
         if not args.value:
             print("[error] `memory add` needs text", file=sys.stderr)
             return 1
-        record = store.add(args.value, kind="fact", importance=0.6)
+        record = asyncio.run(store.add(args.value, kind="fact", importance=0.6))
         print(f"Added {record.id}")
         return 0
     if args.action == "forget":
         if not args.value:
             print("[error] `memory forget` needs an id", file=sys.stderr)
             return 1
-        if store.delete(args.value):
+        if asyncio.run(store.delete(args.value)):
             print(f"Forgot {args.value}")
             return 0
         print(f"[error] no memory {args.value}", file=sys.stderr)

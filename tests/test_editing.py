@@ -9,28 +9,28 @@ from agent_core.tools.editing import ApplyPatchTool, GlobTool, MultiEditTool
 # --- glob --------------------------------------------------------------------
 
 
-def test_glob_matches_recursively(tmp_path: Path) -> None:
+async def test_glob_matches_recursively(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x", encoding="utf-8")
     (tmp_path / "b.py").write_text("y", encoding="utf-8")
     (tmp_path / "c.md").write_text("z", encoding="utf-8")
-    out = GlobTool(tmp_path).run({"pattern": "**/*.py"}).content
+    out = (await GlobTool(tmp_path).run({"pattern": "**/*.py"})).content
     assert "src/a.py" in out
     assert "b.py" in out
     assert "c.md" not in out
 
 
-def test_glob_skips_ignored_dirs(tmp_path: Path) -> None:
+async def test_glob_skips_ignored_dirs(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "x.py").write_text("x", encoding="utf-8")
     (tmp_path / "keep.py").write_text("y", encoding="utf-8")
-    out = GlobTool(tmp_path).run({"pattern": "**/*.py"}).content
+    out = (await GlobTool(tmp_path).run({"pattern": "**/*.py"})).content
     assert "keep.py" in out
     assert ".git" not in out
 
 
-def test_glob_no_match(tmp_path: Path) -> None:
-    assert GlobTool(tmp_path).run({"pattern": "**/*.zzz"}).content == "No files matched."
+async def test_glob_no_match(tmp_path: Path) -> None:
+    assert (await GlobTool(tmp_path).run({"pattern": "**/*.zzz"})).content == "No files matched."
 
 
 def test_glob_is_read_risk() -> None:
@@ -40,10 +40,10 @@ def test_glob_is_read_risk() -> None:
 # --- multi_edit --------------------------------------------------------------
 
 
-def test_multi_edit_applies_in_order(tmp_path: Path) -> None:
+async def test_multi_edit_applies_in_order(tmp_path: Path) -> None:
     f = tmp_path / "f.txt"
     f.write_text("alpha beta gamma", encoding="utf-8")
-    result = MultiEditTool(tmp_path).run(
+    result = await MultiEditTool(tmp_path).run(
         {
             "path": "f.txt",
             "edits": [
@@ -56,10 +56,10 @@ def test_multi_edit_applies_in_order(tmp_path: Path) -> None:
     assert f.read_text(encoding="utf-8") == "ALPHA beta GAMMA"
 
 
-def test_multi_edit_sees_previous_edit(tmp_path: Path) -> None:
+async def test_multi_edit_sees_previous_edit(tmp_path: Path) -> None:
     f = tmp_path / "f.txt"
     f.write_text("one", encoding="utf-8")
-    result = MultiEditTool(tmp_path).run(
+    result = await MultiEditTool(tmp_path).run(
         {
             "path": "f.txt",
             "edits": [
@@ -72,10 +72,10 @@ def test_multi_edit_sees_previous_edit(tmp_path: Path) -> None:
     assert f.read_text(encoding="utf-8") == "three"
 
 
-def test_multi_edit_is_atomic_on_failure(tmp_path: Path) -> None:
+async def test_multi_edit_is_atomic_on_failure(tmp_path: Path) -> None:
     f = tmp_path / "f.txt"
     f.write_text("keep me", encoding="utf-8")
-    result = MultiEditTool(tmp_path).run(
+    result = await MultiEditTool(tmp_path).run(
         {
             "path": "f.txt",
             "edits": [
@@ -89,9 +89,9 @@ def test_multi_edit_is_atomic_on_failure(tmp_path: Path) -> None:
     assert f.read_text(encoding="utf-8") == "keep me"  # unchanged — nothing written
 
 
-def test_multi_edit_requires_nonempty_list(tmp_path: Path) -> None:
+async def test_multi_edit_requires_nonempty_list(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("x", encoding="utf-8")
-    result = MultiEditTool(tmp_path).run({"path": "f.txt", "edits": []})
+    result = await MultiEditTool(tmp_path).run({"path": "f.txt", "edits": []})
     assert not result.ok
     assert result.metadata["error_type"] == "BadArgs"
 
@@ -99,7 +99,7 @@ def test_multi_edit_requires_nonempty_list(tmp_path: Path) -> None:
 # --- apply_patch -------------------------------------------------------------
 
 
-def test_apply_patch_modifies_file(tmp_path: Path) -> None:
+async def test_apply_patch_modifies_file(tmp_path: Path) -> None:
     f = tmp_path / "greet.py"
     f.write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
     patch = (
@@ -110,12 +110,12 @@ def test_apply_patch_modifies_file(tmp_path: Path) -> None:
         "-    return 'hi'\n"
         "+    return 'hello'\n"
     )
-    result = ApplyPatchTool(tmp_path).run({"patch": patch})
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
     assert result.ok, result.content
     assert f.read_text(encoding="utf-8") == "def greet():\n    return 'hello'\n"
 
 
-def test_apply_patch_creates_new_file(tmp_path: Path) -> None:
+async def test_apply_patch_creates_new_file(tmp_path: Path) -> None:
     patch = (
         "--- /dev/null\n"
         "+++ b/new.txt\n"
@@ -123,12 +123,12 @@ def test_apply_patch_creates_new_file(tmp_path: Path) -> None:
         "+line one\n"
         "+line two\n"
     )
-    result = ApplyPatchTool(tmp_path).run({"patch": patch})
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
     assert result.ok, result.content
     assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "line one\nline two\n"
 
 
-def test_apply_patch_rejects_when_context_missing(tmp_path: Path) -> None:
+async def test_apply_patch_rejects_when_context_missing(tmp_path: Path) -> None:
     f = tmp_path / "f.py"
     f.write_text("original content\n", encoding="utf-8")
     patch = (
@@ -138,13 +138,13 @@ def test_apply_patch_rejects_when_context_missing(tmp_path: Path) -> None:
         "-totally different line\n"
         "+replacement\n"
     )
-    result = ApplyPatchTool(tmp_path).run({"patch": patch})
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
     assert not result.ok
     assert result.metadata["error_type"] == "HunkFailed"
     assert f.read_text(encoding="utf-8") == "original content\n"  # untouched
 
 
-def test_apply_patch_is_atomic_across_files(tmp_path: Path) -> None:
+async def test_apply_patch_is_atomic_across_files(tmp_path: Path) -> None:
     good = tmp_path / "good.txt"
     good.write_text("aaa\n", encoding="utf-8")
     bad = tmp_path / "bad.txt"
@@ -161,7 +161,7 @@ def test_apply_patch_is_atomic_across_files(tmp_path: Path) -> None:
         "-missing\n"
         "+XXX\n"
     )
-    result = ApplyPatchTool(tmp_path).run({"patch": patch})
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
     assert not result.ok
     # The first file must NOT have been written because the second hunk failed.
     assert good.read_text(encoding="utf-8") == "aaa\n"

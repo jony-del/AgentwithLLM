@@ -4,11 +4,7 @@ import asyncio
 import json
 import os
 import random
-import ssl
 import sys
-import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -71,7 +67,6 @@ class ClaudeProvider(LLMProvider):
         initial_backoff: float = 0.5,
         max_backoff: float = 8.0,
         backoff_multiplier: float = 2.0,
-        sleep: Callable[[float], None] = time.sleep,
         on_retry: Callable[[str], None] | None = _default_retry_notice,
     ) -> None:
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -80,54 +75,28 @@ class ClaudeProvider(LLMProvider):
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff
         self.backoff_multiplier = backoff_multiplier
-        self._sleep = sleep
         self._on_retry = on_retry
         self._rng = random.Random()
-        # Lazily-created async transport (see ``acomplete``). The client is bound to
-        # the event loop it was created on; a new top-level ``asyncio.run`` (e.g. each
-        # chat turn) gets a fresh client so we never reuse a pool from a closed loop.
-        self._aclient: Any = None
-        self._aclient_loop: Any = None
+        # Lazily-created transport (see ``complete``). The client is bound to the
+        # event loop it was created on; a new top-level ``asyncio.run`` gets a fresh
+        # client so we never reuse a pool from a closed loop.
+        self._client: Any = None
+        self._client_loop: Any = None
         # Test seam: an httpx transport (e.g. MockTransport) injected before the first
-        # async call. Production leaves this None and uses httpx's default transport.
-        self._atransport: Any = None
+        # call. Production leaves this None and uses httpx's default transport.
+        self._transport: Any = None
 
-    def complete(
+    async def complete(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         stream: StreamHandler | None = None,
     ) -> LLMResult:
-        if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
-
-        streaming = stream is not None and config.get("stream", True)
-        request = self._build_request(messages, tools, config, streaming=streaming)
-        timeout = config.get("timeout", 60)
-        if streaming:
-            response = self._open_stream(request, timeout)
-            try:
-                return self._consume_stream(response, stream)
-            finally:
-                response.close()
-        payload = self._send_with_retry(request, timeout)
-        return self._parse_response(payload)
-
-    # --- async transport (httpx) ------------------------------------------
-
-    async def acomplete(
-        self,
-        messages: list[Message],
-        tools: list[dict[str, Any]],
-        config: dict[str, Any],
-        stream: StreamHandler | None = None,
-    ) -> LLMResult:
-        """Async counterpart to :meth:`complete` over a shared ``httpx.AsyncClient``.
+        """Send one Messages API request over a shared ``httpx.AsyncClient``.
 
         Each call builds, sends, retries, and (optionally) streams independently, so
-        many can run concurrently over one connection pool. Retry/backoff policy and
-        error mapping mirror the sync path exactly; only the transport differs.
+        many can run concurrently over one connection pool.
         """
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
@@ -135,7 +104,7 @@ class ClaudeProvider(LLMProvider):
         import httpx  # lazy: keeps ``import agent_core`` light (CLAUDE.md invariant)
 
         streaming = stream is not None and config.get("stream", True)
-        client = await self._aget_client()
+        client = await self._get_client()
         body = self._build_body(messages, tools, config, streaming=streaming)
         timeout = config.get("timeout", 60)
         url = f"{self.base_url}/v1/messages"
@@ -147,12 +116,12 @@ class ClaudeProvider(LLMProvider):
                     raise httpx.HTTPStatusError("error", request=response.request, response=response)
                 return response.json()
 
-            payload = await self._arequest_with_retry(send_once)
+            payload = await self._request_with_retry(send_once)
             return self._parse_response(payload)
 
         # Streaming: retry only the connection setup (send + status). Once the body is
         # streaming we never retry — a mid-stream break surfaces as LLMTransientError so
-        # we never reprint half-streamed output (mirrors the sync ``_open_stream`` split).
+        # we never reprint half-streamed output.
         async def open_stream():
             request = client.build_request("POST", url, json=body, headers=self._headers(), timeout=timeout)
             response = await client.send(request, stream=True)
@@ -162,9 +131,9 @@ class ClaudeProvider(LLMProvider):
                 raise httpx.HTTPStatusError("error", request=request, response=response)
             return response
 
-        response = await self._arequest_with_retry(open_stream)
+        response = await self._request_with_retry(open_stream)
         try:
-            return await self._aconsume_stream(response, stream)
+            return await self._consume_stream(response, stream)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise LLMTransientError(
                 f"Claude API stream interrupted: {self._describe_network_error(exc)}"
@@ -172,17 +141,23 @@ class ClaudeProvider(LLMProvider):
         finally:
             await response.aclose()
 
-    async def _aget_client(self):
+    async def _get_client(self):
         import httpx
 
         loop = asyncio.get_running_loop()
-        if self._aclient is None or self._aclient_loop is not loop:
-            self._aclient = httpx.AsyncClient(timeout=None, transport=self._atransport)
-            self._aclient_loop = loop
-        return self._aclient
+        if self._client is None or self._client_loop is not loop:
+            self._client = httpx.AsyncClient(timeout=None, transport=self._transport)
+            self._client_loop = loop
+        return self._client
 
-    async def _arequest_with_retry(self, op):
-        """Async twin of :meth:`_request_with_retry`: bounded backoff on transient faults."""
+    async def _request_with_retry(self, op):
+        """Run ``op`` with bounded exponential backoff on transient faults.
+
+        A retryable HTTP status or a transient transport error backs off and tries
+        again; once retries are exhausted, or for any non-retryable error, it raises —
+        context-overflow as ``LLMContextTooLongError``, transient failures as
+        ``LLMTransientError``, and other API errors as ``RuntimeError``.
+        """
         import httpx
 
         attempt = 0
@@ -243,23 +218,6 @@ class ClaudeProvider(LLMProvider):
             "anthropic-version": "2023-06-01",
         }
 
-    def _build_request(
-        self,
-        messages: list[Message],
-        tools: list[dict[str, Any]],
-        config: dict[str, Any],
-        streaming: bool = False,
-    ) -> urllib.request.Request:
-        if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
-        body = self._build_body(messages, tools, config, streaming=streaming)
-        return urllib.request.Request(
-            f"{self.base_url}/v1/messages",
-            data=json.dumps(body).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
-        )
-
     @staticmethod
     def _apply_thinking(body: dict[str, Any], thinking_budget: Any) -> None:
         """Enable extended thinking in-place when a positive budget is requested.
@@ -274,58 +232,6 @@ class ClaudeProvider(LLMProvider):
         body["temperature"] = 1
         body["max_tokens"] = max(body.get("max_tokens", 0), thinking_budget + 1024)
 
-    def _send_once(self, request: urllib.request.Request, timeout: float) -> dict[str, Any]:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-
-    def _send_with_retry(self, request: urllib.request.Request, timeout: float) -> dict[str, Any]:
-        """Send a non-streaming request, retrying only transient faults."""
-        return self._request_with_retry(lambda: self._send_once(request, timeout))
-
-    def _open_stream(self, request: urllib.request.Request, timeout: float):
-        """Open a streaming connection, retrying only connection-setup faults.
-
-        Once the 200 event-stream is open we hand the response to ``_consume_stream``;
-        a break *mid-stream* (after tokens were shown) is not retried — it surfaces
-        as ``LLMTransientError`` so we never reprint half-streamed output.
-        """
-        return self._request_with_retry(lambda: urllib.request.urlopen(request, timeout=timeout))
-
-    def _request_with_retry(self, op):
-        """Run ``op`` with bounded exponential backoff on transient faults.
-
-        A retryable HTTP status or a transient transport error (SSL EOF, reset,
-        timeout, …) backs off and tries again; once retries are exhausted, or for
-        any non-retryable error, it raises — context-overflow as
-        ``LLMContextTooLongError``, transient failures as ``LLMTransientError``,
-        and other API errors as ``RuntimeError``.
-        """
-        attempt = 0
-        while True:
-            try:
-                return op()
-            except urllib.error.HTTPError as exc:
-                # HTTPError is a URLError subclass, so it must be handled first.
-                error_text = exc.read().decode("utf-8", errors="replace")
-                if exc.code in _RETRYABLE_STATUS and attempt < self.max_retries:
-                    delay = self._retry_delay(attempt, self._retry_after(exc))
-                    self._announce_retry(attempt, delay, f"HTTP {exc.code}")
-                    self._sleep(delay)
-                    attempt += 1
-                    continue
-                raise self._http_error(exc.code, error_text) from exc
-            except (urllib.error.URLError, ssl.SSLError, TimeoutError, ConnectionError) as exc:
-                if self._is_retryable_network_error(exc) and attempt < self.max_retries:
-                    delay = self._retry_delay(attempt, None)
-                    self._announce_retry(attempt, delay, self._describe_network_error(exc))
-                    self._sleep(delay)
-                    attempt += 1
-                    continue
-                raise LLMTransientError(
-                    f"Network error talking to the Claude API after {attempt + 1} attempt(s): "
-                    f"{self._describe_network_error(exc)}"
-                ) from exc
-
     def _http_error(self, code: int, text: str) -> Exception:
         lowered = text.lower()
         if code == 400 and ("context" in lowered or "token" in lowered):
@@ -333,16 +239,6 @@ class ClaudeProvider(LLMProvider):
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"Claude API error {code} after retries: {text}")
         return RuntimeError(f"Claude API error {code}: {text}")
-
-    @staticmethod
-    def _is_retryable_network_error(exc: BaseException) -> bool:
-        if isinstance(exc, (TimeoutError, ssl.SSLError, ConnectionError)):
-            return True
-        if isinstance(exc, urllib.error.URLError):
-            # The underlying reason is what actually failed (DNS, reset, SSL, timeout).
-            # All of these are transport-level and worth one more attempt.
-            return isinstance(exc.reason, (TimeoutError, ssl.SSLError, ConnectionError, OSError))
-        return False
 
     @staticmethod
     def _describe_network_error(exc: BaseException) -> str:
@@ -356,10 +252,6 @@ class ClaudeProvider(LLMProvider):
         # concurrent clients don't retry in lockstep (thundering herd).
         cap = min(self.max_backoff, self.initial_backoff * (self.backoff_multiplier ** attempt))
         return self._rng.uniform(0, cap)
-
-    @staticmethod
-    def _retry_after(exc: urllib.error.HTTPError) -> float | None:
-        return ClaudeProvider._parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> float | None:
@@ -528,28 +420,17 @@ class ClaudeProvider(LLMProvider):
 
     # --- streaming (Server-Sent Events) -----------------------------------
 
-    def _consume_stream(self, raw_lines, stream: StreamHandler) -> LLMResult:
-        """Assemble an ``LLMResult`` from the SSE event stream, pushing deltas live.
+    async def _consume_stream(self, response, stream: StreamHandler) -> LLMResult:
+        """Assemble an ``LLMResult`` from an httpx SSE streaming response.
 
-        ``raw_lines`` is any iterable of SSE lines (bytes or str) — the open HTTP
-        response in production, a synthetic list in tests. Content blocks are
-        accumulated by ``index`` and frozen on ``content_block_stop`` into the same
-        shape ``_parse_response`` produces, so the rest of the agent is unaffected.
+        Content blocks are accumulated by ``index`` and frozen on
+        ``content_block_stop`` into the same shape ``_parse_response`` produces, so
+        the rest of the agent is unaffected. A transport break here propagates to
+        ``complete`` as ``LLMTransientError``; it is never retried, so half-streamed
+        output is never reprinted.
         """
         acc = _StreamAccumulator()
-        for event in self._iter_sse_events(raw_lines):
-            self._handle_sse_event(event, acc, stream)
-        return acc.result()
-
-    async def _aconsume_stream(self, response, stream: StreamHandler) -> LLMResult:
-        """Async twin of :meth:`_consume_stream` over an httpx streaming response.
-
-        Identical block assembly — only the line iteration is async (``aiter_lines``).
-        A transport break here propagates to ``acomplete`` as ``LLMTransientError``;
-        it is never retried, so half-streamed output is never reprinted.
-        """
-        acc = _StreamAccumulator()
-        async for event in self._aiter_sse_events(response.aiter_lines()):
+        async for event in self._iter_sse_events(response.aiter_lines()):
             self._handle_sse_event(event, acc, stream)
         return acc.result()
 
@@ -642,9 +523,8 @@ class ClaudeProvider(LLMProvider):
     def _sse_feed(raw, data_parts: list[str]) -> dict[str, Any] | None:
         """Feed one raw SSE line into ``data_parts``; return a parsed frame on a blank line.
 
-        Shared by the sync and async iterators so the SSE framing rules live in one
-        place. ``event:`` lines and ``:`` keepalive comments are ignored — each
-        Anthropic frame's JSON carries its own ``type``.
+        ``event:`` lines and ``:`` keepalive comments are ignored — each Anthropic
+        frame's JSON carries its own ``type``.
         """
         line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
         line = line.rstrip("\n").rstrip("\r")
@@ -665,21 +545,7 @@ class ClaudeProvider(LLMProvider):
         return None
 
     @classmethod
-    def _iter_sse_events(cls, raw_lines):
-        """Yield parsed JSON event objects from a raw (sync) SSE line stream."""
-        data_parts: list[str] = []
-        for raw in raw_lines:
-            event = cls._sse_feed(raw, data_parts)
-            if event is not None:
-                yield event
-        if data_parts:  # flush a trailing frame with no closing blank line
-            try:
-                yield json.loads("".join(data_parts))
-            except json.JSONDecodeError:
-                pass
-
-    @classmethod
-    async def _aiter_sse_events(cls, raw_lines):
+    async def _iter_sse_events(cls, raw_lines):
         """Yield parsed JSON event objects from an async SSE line stream (httpx)."""
         data_parts: list[str] = []
         async for raw in raw_lines:

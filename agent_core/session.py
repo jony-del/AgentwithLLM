@@ -78,12 +78,10 @@ class SessionContext:
 
     workspace: Path = field(default_factory=lambda: Path.cwd().resolve())
     todos: TodoStore = field(default_factory=TodoStore)
-    subagent_factory: Callable[[str, str], str] | None = None
-    teammate_factory: Callable[[str, str, str, str | None, str], str] | None = None
-    # Async counterparts used on the concurrent (``arun``) path so that several
-    # children's API calls overlap on one event loop instead of serializing.
-    asubagent_factory: Callable[[str, str], Awaitable[str]] | None = None
-    ateammate_factory: Callable[[str, str, str, str | None, str], Awaitable[str]] | None = None
+    # Async factories: children are awaited on the shared event loop so several
+    # children's API calls overlap (bounded by the shared provider gate).
+    subagent_factory: Callable[[str, str], Awaitable[str]] | None = None
+    teammate_factory: Callable[[str, str, str, str | None, str], Awaitable[str]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None

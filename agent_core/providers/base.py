@@ -27,7 +27,7 @@ class StreamHandler(Protocol):
 
 class LLMProvider(ABC):
     @abstractmethod
-    def complete(
+    async def complete(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
@@ -39,27 +39,16 @@ class LLMProvider(ABC):
         When ``stream`` is given and the provider supports it, token deltas are
         pushed to the handler as they arrive; the returned ``LLMResult`` is the
         same fully-assembled result either way.
-        """
 
-    async def acomplete(
-        self,
-        messages: list[Message],
-        tools: list[dict[str, Any]],
-        config: dict[str, Any],
-        stream: StreamHandler | None = None,
-    ) -> LLMResult:
-        """Async counterpart to :meth:`complete`.
-
-        The default offloads the blocking sync call to a worker thread so any
-        provider works on the async path without changes. Providers with a native
-        async transport (see ``ClaudeProvider``) override this to run real
-        concurrent requests over one connection pool.
+        Providers backed by a blocking SDK should wrap the blocking call as an
+        internal detail — ``await asyncio.to_thread(self._blocking_call, ...)`` —
+        so the event loop keeps breathing; providers with a native async transport
+        (see ``ClaudeProvider``) run real concurrent requests over one pool.
         """
-        return await asyncio.to_thread(self.complete, messages, tools, config, stream)
 
 
 class _TokenBucket:
-    """Async token-bucket rate limiter shared across concurrent ``acomplete`` calls.
+    """Async token-bucket rate limiter shared across concurrent ``complete`` calls.
 
     ``rate_per_min`` of ``0`` disables limiting entirely. Tokens refill continuously
     at ``rate_per_min / 60`` per second up to a burst capacity of roughly one second's
@@ -92,7 +81,7 @@ class _TokenBucket:
 class ProviderGate:
     """Shared, cancel-aware concurrency limiter for provider API calls.
 
-    Bounds how many ``acomplete`` calls are in flight at once (semaphore) and how
+    Bounds how many ``complete`` calls are in flight at once (semaphore) and how
     fast they may be issued (token bucket). One gate is created at the top-level
     agent and reused by every child via :func:`gated_provider`, so the whole
     multi-agent fan-out shares a single budget.
@@ -118,26 +107,16 @@ class ProviderGate:
 class GatedProvider(LLMProvider):
     """Wrap a provider so concurrent children share one bounded API-call budget.
 
-    Replaces the old blanket ``RLock`` serialization: the sync ``complete`` path is
-    a straight delegate (no gating — it has no event loop), while ``acomplete``
-    acquires the shared semaphore and rate-limit token before issuing the call, so
-    N concurrent children run up to ``max_concurrency`` at a time instead of one.
+    ``complete`` acquires the shared semaphore and rate-limit token before issuing
+    the call, so N concurrent children run up to ``max_concurrency`` at a time
+    instead of one.
     """
 
     def __init__(self, inner: LLMProvider, gate: ProviderGate | None = None) -> None:
         self.inner = inner
         self.gate = gate or ProviderGate()
 
-    def complete(
-        self,
-        messages: list[Message],
-        tools: list[dict[str, Any]],
-        config: dict[str, Any],
-        stream: StreamHandler | None = None,
-    ) -> LLMResult:
-        return self.inner.complete(messages, tools, config, stream=stream)
-
-    async def acomplete(
+    async def complete(
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
@@ -152,11 +131,7 @@ class GatedProvider(LLMProvider):
             if should_cancel is not None and should_cancel():
                 raise asyncio.CancelledError("provider call cancelled before start")
             await bucket.acquire()
-            inner_acomplete = getattr(self.inner, "acomplete", None)
-            if inner_acomplete is not None:
-                return await inner_acomplete(messages, tools, config, stream)
-            # Duck-typed providers (e.g. test doubles) may only define sync complete.
-            return await asyncio.to_thread(self.inner.complete, messages, tools, config, stream)
+            return await self.inner.complete(messages, tools, config, stream)
 
 
 def gated_provider(

@@ -59,7 +59,7 @@ There is no lint/format tooling configured.
 
 ## Code Map
 
-- `agent_core/react.py`: central `ReActAgent.run()` loop.
+- `agent_core/react.py`: central `ReActAgent.run()` loop (async).
 - `agent_core/models.py`: dataclass contracts between layers:
   `Message`, `ToolCall`, `ToolResult`, `LLMResult`.
 - `agent_core/providers/`: LLM providers. `FakeProvider` is deterministic for
@@ -80,7 +80,7 @@ There is no lint/format tooling configured.
 
 ## Agent Loop
 
-`ReActAgent.run()` is the central loop:
+`async ReActAgent.run()` is the central loop:
 
 1. Auto-compact history if needed.
 2. Call the configured `LLMProvider`.
@@ -92,8 +92,35 @@ Do not design the agent around a small fixed step cap. A capable coding agent
 often needs many tool turns. Prefer explicit safety guards: cooperative
 cancellation, optional `max_steps`, wall-clock limits, and clear stop reasons.
 
-The provider's `complete()` method may stream deltas to a UI, but it must still
-return one fully assembled `LLMResult`.
+The provider's `async complete()` method may stream deltas to a UI, but it must
+still return one fully assembled `LLMResult`.
+
+## Async Execution Model
+
+The codebase is async-only: every public execution API is `async def` with a
+clean name (`run`, `complete`, `execute_many`, `extract`, `dream`) — there are
+no sync twins and no `a`-prefixed variants. Synchronous callers wrap the top
+level once: `asyncio.run(agent.run(task))`; the CLI does exactly one
+`asyncio.run` per command (`chat` keeps one event loop for the whole session).
+
+Blocking work exists only as an internal implementation detail, never as public
+API:
+
+- Ordinary blocking tools implement the sync `_invoke()` hook; the base
+  `Tool.run()` offloads it via `asyncio.to_thread`, throttled by the executor's
+  `max_workers` semaphore. Async-native tools (subagent/teammate dispatch, team
+  tools, MCP) override `async def run()` and execute on the event loop.
+- Stores and the run logger (`MemoryStore`, `TeamStore`, `JSONLRunLogger`)
+  expose async methods whose disk IO runs in `_xxx_sync` internals on worker
+  threads; `MemoryStore` serializes its whole-file rewrites with an
+  `asyncio.Lock`, `TeamStore` keeps `FileLock` for cross-process exclusion.
+- Concurrency budgets: `GatedProvider` (semaphore + token bucket) bounds API
+  calls across the whole multi-agent fan-out; wave partitioning in
+  `ToolExecutor` serializes tools whose declared resources conflict.
+- Providers backed by a blocking SDK must wrap the call in
+  `asyncio.to_thread(...)` inside their own `complete`.
+- Never call blocking IO directly from a coroutine; never add `asyncio.run`
+  inside library code (CLI entry points only).
 
 ## Important Invariants
 
@@ -106,6 +133,9 @@ return one fully assembled `LLMResult`.
   as MCP, web access, browser control, LSP, vector stores, and remote runtimes.
 - Every tool must set the correct `ToolRisk`: `READ`, `WRITE`, or `DANGEROUS`.
   Permission behavior depends on this.
+- Tools implement either the blocking `_invoke()` hook or an async `run()`
+  override — never both. The executor detects an overridden `run` and awaits it
+  on the loop instead of the thread-offload path.
 - Workspace-scoped tools should use `WorkspacePathMixin`; do not allow absolute
   path or `..` escapes.
 - Tools self-register with `@builtin_tool`. Adding a built-in tool should not

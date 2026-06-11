@@ -189,7 +189,7 @@ class WebFetchTool(Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         url = str(arguments.get("url", "")).strip()
         max_chars = int(arguments.get("max_chars", _DEFAULT_MAX_CHARS))
         if not url:
@@ -241,7 +241,7 @@ class WebSearchTool(Tool):
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()
 
-    def run(self, arguments: dict[str, object]) -> ToolResult:
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         query = str(arguments.get("query", "")).strip()
         max_results = int(arguments.get("max_results", 5))
         if not query:
