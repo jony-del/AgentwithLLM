@@ -19,7 +19,7 @@ class ToolIdProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
         self.calls += 1
         if self.calls == 1:
             return LLMResult(
@@ -35,7 +35,7 @@ class MultiToolProvider:
         self.calls = 0
         self.second_turn_messages = []
 
-    async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
         self.calls += 1
         if self.calls == 1:
             return LLMResult(
@@ -72,6 +72,53 @@ async def test_run_stops_when_cancelled(tmp_path: Path) -> None:
     result = await agent.run("please use tool: echo", should_cancel=lambda: True)
     assert "interrupt" in result.answer.lower()
     assert result.steps == 0
+
+
+async def test_run_stops_when_provider_gate_sees_cancel(tmp_path: Path) -> None:
+    calls = 0
+
+    def cancel_after_loop_guard() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > 1
+
+    logger = JSONLRunLogger(tmp_path)
+    agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger)
+
+    result = await agent.run("hello", should_cancel=cancel_after_loop_guard)
+
+    assert "interrupt" in result.answer.lower()
+    assert result.steps == 1
+
+
+class _CancelDuringTurnProvider:
+    """Final-answer (no-tool) provider that trips an interrupt flag while 'thinking'.
+
+    Simulates the user pressing Esc *during* the model turn: the flag is still
+    False at the loop-top guard and the provider gate (so the call dispatches and
+    returns normally), and only becomes True by the time the loop re-polls after
+    ``complete()`` returns. Before the post-turn re-poll existed, this Esc was
+    silently swallowed and the run completed as if nothing happened.
+    """
+
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.interrupted = True
+        return LLMResult("Final answer: hi", stop_reason="end")
+
+
+async def test_run_honors_cancel_pressed_during_final_answer_turn(tmp_path: Path) -> None:
+    provider = _CancelDuringTurnProvider()
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(run_dir=str(tmp_path), memory=MemoryConfig(enabled=False))
+    agent = ReActAgent(provider, config, logger=logger)
+
+    result = await agent.run("hello", should_cancel=lambda: provider.interrupted)
+
+    assert "interrupt" in result.answer.lower()
+    assert "Final answer" not in result.answer
 
 
 async def test_reactive_compact_retries_after_context_error(tmp_path: Path) -> None:

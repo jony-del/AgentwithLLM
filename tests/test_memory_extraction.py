@@ -17,7 +17,7 @@ class StubProvider:
         self.content = content
         self.calls = 0
 
-    async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
         self.calls += 1
         return LLMResult(content=self.content)
 

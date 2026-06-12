@@ -179,7 +179,7 @@ def run_command(args: argparse.Namespace) -> int:
         return 1
 
     async def run_once():
-        with KeyInterrupt() as interrupt:
+        with KeyInterrupt(confirm=True) as interrupt:
             return await agent.run(args.task, should_cancel=interrupt.is_set)
 
     try:
@@ -205,7 +205,7 @@ def chat_command(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
-    print("Agent chat. Type /exit to quit. Press Esc during a turn to interrupt.")
+    print("Agent chat. Type /exit to quit. Press Esc, then y, during a turn to interrupt.")
 
     async def session() -> None:
         # One event loop for the whole chat: every turn shares the same provider
@@ -220,7 +220,7 @@ def chat_command(args: argparse.Namespace) -> int:
             if not task:
                 continue
             try:
-                with KeyInterrupt() as interrupt:
+                with KeyInterrupt(confirm=True) as interrupt:
                     result = await agent.run(task, should_cancel=interrupt.is_set)
             except LLMTransientError as exc:
                 # A network hiccup must not tear down the whole session: report it and

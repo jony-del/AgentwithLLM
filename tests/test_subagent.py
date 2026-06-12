@@ -146,7 +146,7 @@ async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> No
             self.active = 0
             self.max_active = 0
 
-        async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+        async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
             return await asyncio.to_thread(self._complete_sync, messages, tools, config, stream)
 
         def _complete_sync(self, messages, tools, config, stream=None) -> LLMResult:

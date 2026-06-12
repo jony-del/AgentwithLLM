@@ -33,12 +33,18 @@ class LLMProvider(ABC):
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         stream: StreamHandler | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
         """Return the next assistant response.
 
         When ``stream`` is given and the provider supports it, token deltas are
         pushed to the handler as they arrive; the returned ``LLMResult`` is the
         same fully-assembled result either way.
+
+        ``should_cancel`` is the loop's cooperative-cancel probe (e.g. the user
+        pressing Esc). A streaming provider should poll it as deltas arrive and
+        raise ``asyncio.CancelledError`` when it fires, so a long response can be
+        interrupted promptly instead of only at the next turn boundary.
 
         Providers backed by a blocking SDK should wrap the blocking call as an
         internal detail — ``await asyncio.to_thread(self._blocking_call, ...)`` —
@@ -131,6 +137,14 @@ class GatedProvider(LLMProvider):
             if should_cancel is not None and should_cancel():
                 raise asyncio.CancelledError("provider call cancelled before start")
             await bucket.acquire()
+            # Forward the cancel probe so a streaming provider can poll it as
+            # deltas arrive (Esc interrupts mid-response, not just at turn
+            # boundaries). Only pass it through when present, so minimal providers
+            # whose ``complete`` omits the kwarg keep working unchanged.
+            if should_cancel is not None:
+                return await self.inner.complete(
+                    messages, tools, config, stream, should_cancel=should_cancel
+                )
             return await self.inner.complete(messages, tools, config, stream)
 
 

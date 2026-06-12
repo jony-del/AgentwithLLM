@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from typing import Any
 
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCall
@@ -24,6 +25,7 @@ class FakeProvider(LLMProvider):
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         stream: StreamHandler | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
         self.calls += 1
         if self.fail_once_context and self.calls == 1:
@@ -33,7 +35,7 @@ class FakeProvider(LLMProvider):
         # Stream the answer text in whitespace chunks so the live UI can render it
         # token-by-token, mirroring a real SSE stream — without needing an API key.
         if stream is not None and result.content and not result.tool_calls:
-            await self._stream_text(result.content, stream)
+            await self._stream_text(result.content, stream, should_cancel)
         return result
 
     def _compute(self, messages: list[Message]) -> LLMResult:
@@ -55,9 +57,16 @@ class FakeProvider(LLMProvider):
             )
         return LLMResult(content=f"Final answer: {last}", stop_reason="end")
 
-    async def _stream_text(self, text: str, stream: StreamHandler) -> None:
+    async def _stream_text(
+        self,
+        text: str,
+        stream: StreamHandler,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
         chunks = text.split(" ")
         for index, chunk in enumerate(chunks):
+            if should_cancel is not None and should_cancel():
+                raise asyncio.CancelledError("fake stream cancelled by user")
             stream.on_text_delta(chunk if index == 0 else " " + chunk)
             if self.stream_delay:
                 await asyncio.sleep(self.stream_delay)

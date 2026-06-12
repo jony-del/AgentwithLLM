@@ -218,15 +218,33 @@ class ReActAgent:
                     messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
                     should_cancel=cancelled,
                 )
+            except asyncio.CancelledError:
+                if cancelled():
+                    return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
+                raise
             except LLMContextTooLongError:
                 messages, events = self.compression.reactive_compact(messages)
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
                 self.ui.on_turn_start()
-                result = await self.provider.complete(
-                    messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
-                    should_cancel=cancelled,
-                )
+                try:
+                    result = await self.provider.complete(
+                        messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
+                        should_cancel=cancelled,
+                    )
+                except asyncio.CancelledError:
+                    if cancelled():
+                        return await self._stopped(
+                            messages, step, "interrupted", "being interrupted by the user (Esc)"
+                        )
+                    raise
+
+            # Re-poll after the turn completes: an Esc pressed *during* the model
+            # call (including a single-turn final answer that requests no tools, and
+            # the non-streaming path where deltas can't be polled) is honored here at
+            # the next safe point instead of being silently swallowed.
+            if cancelled():
+                return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
 
             await self.logger.write(
                 "llm",

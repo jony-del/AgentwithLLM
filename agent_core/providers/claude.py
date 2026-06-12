@@ -94,11 +94,14 @@ class ClaudeProvider(LLMProvider):
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         stream: StreamHandler | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
         """Send one Messages API request over a shared ``httpx.AsyncClient``.
 
         Each call builds, sends, retries, and (optionally) streams independently, so
-        many can run concurrently over one connection pool.
+        many can run concurrently over one connection pool. ``should_cancel`` is
+        polled as streamed deltas arrive so a long response can be interrupted
+        (Esc) promptly rather than only at the next turn boundary.
         """
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
@@ -133,7 +136,7 @@ class ClaudeProvider(LLMProvider):
 
         response = await self._request_with_retry(open_stream)
         try:
-            return await self._consume_stream(response, stream)
+            return await self._consume_stream(response, stream, should_cancel)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise LLMTransientError(
                 f"Claude API stream interrupted: {self._describe_network_error(exc)}"
@@ -416,7 +419,12 @@ class ClaudeProvider(LLMProvider):
 
     # --- streaming (Server-Sent Events) -----------------------------------
 
-    async def _consume_stream(self, response, stream: StreamHandler) -> LLMResult:
+    async def _consume_stream(
+        self,
+        response,
+        stream: StreamHandler,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> LLMResult:
         """Assemble an ``LLMResult`` from an httpx SSE streaming response.
 
         Content blocks are accumulated by ``index`` and frozen on
@@ -424,9 +432,15 @@ class ClaudeProvider(LLMProvider):
         the rest of the agent is unaffected. A transport break here propagates to
         ``complete`` as ``LLMTransientError``; it is never retried, so half-streamed
         output is never reprinted.
+
+        ``should_cancel`` is polled before each event so the user (Esc) can abort a
+        long response mid-stream; when it fires we raise ``asyncio.CancelledError``,
+        which the agent loop turns into a clean "interrupted" stop.
         """
         acc = _StreamAccumulator()
         async for event in self._iter_sse_events(response.aiter_lines()):
+            if should_cancel is not None and should_cancel():
+                raise asyncio.CancelledError("Claude stream cancelled by user")
             self._handle_sse_event(event, acc, stream)
         return acc.result()
 

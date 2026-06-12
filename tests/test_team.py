@@ -216,6 +216,7 @@ class _CompletingTeamProvider(LLMProvider):
         tools: list[dict[str, Any]],
         config: dict[str, Any],
         stream: StreamHandler | None = None,
+        should_cancel=None,
     ) -> LLMResult:
         self.calls += 1
         if self.calls == 1:

@@ -191,6 +191,38 @@ async def test_complete_streaming_assembles_and_pushes_deltas() -> None:
     assert recorder.text == "Hello world"  # deltas were streamed live
 
 
+async def test_streaming_cancel_aborts_mid_stream() -> None:
+    """A cancel that fires while streaming raises CancelledError and stops early.
+
+    The probe returns True only after the first text delta, so we prove the stream
+    is interrupted partway (Esc mid-response) rather than running to completion.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_SSE.encode("utf-8"))
+
+    provider = _provider(handler)
+    recorder = _Recorder()
+    fire_after = {"deltas": 0}
+
+    def should_cancel() -> bool:
+        # Only trip once at least one delta has been delivered to the UI.
+        return fire_after["deltas"] >= 1
+
+    original = recorder.on_text_delta
+
+    def counting_delta(text: str) -> None:
+        original(text)
+        fire_after["deltas"] += 1
+
+    recorder.on_text_delta = counting_delta  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await provider.complete(
+            [Message("user", "hi")], [], {"stream": True}, stream=recorder, should_cancel=should_cancel
+        )
+    assert recorder.text == "Hello"  # interrupted before the " world" delta
+
+
 async def test_complete_streaming_error_event_is_transient() -> None:
     sse = 'data: {"type":"error","error":{"type":"overloaded_error","message":"boom"}}\n\n'
 
