@@ -190,6 +190,46 @@ def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[s
     return values
 
 
+def resolve_limits_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
+    """Resolve the run-level safety limits from ``[limits]``, then env.
+
+    Covers the wall-clock deadline and optional hard step cap that bound a whole
+    ``ReActAgent.run()`` (the fan-out shares one wall budget). Precedence:
+    defaults → ``agent.toml`` → env (``AGENT_MAX_WALL_SECONDS`` / ``AGENT_MAX_STEPS``).
+    CLI flags, when given, are layered on by the caller.
+
+    Convention: ``0`` (or absent) means *disabled* for ``max_wall_seconds`` and
+    ``max_steps``, surfaced as ``None`` so an uncapped run relies on cooperative
+    cancel alone. ``soft_deadline_fraction`` keeps the ``ReActConfig`` default
+    unless overridden.
+    """
+
+    def _none_if_zero(value: Any) -> Any:
+        return None if value is None or value <= 0 else value
+
+    table = load_agent_toml(config_file).get("limits")
+    values: dict[str, Any] = {
+        "max_wall_seconds": 1800.0,
+        "max_steps": None,
+        "soft_deadline_fraction": 0.9,
+    }
+    if isinstance(table, dict):
+        if "max_wall_seconds" in table:
+            values["max_wall_seconds"] = _none_if_zero(coerce_to_type(float, table["max_wall_seconds"]))
+        if "max_steps" in table:
+            values["max_steps"] = _none_if_zero(coerce_to_type(int, table["max_steps"]))
+        if "soft_deadline_fraction" in table:
+            values["soft_deadline_fraction"] = coerce_to_type(float, table["soft_deadline_fraction"])
+
+    env_wall = os.getenv("AGENT_MAX_WALL_SECONDS")
+    if env_wall is not None:
+        values["max_wall_seconds"] = _none_if_zero(coerce_to_type(float, env_wall))
+    env_steps = os.getenv("AGENT_MAX_STEPS")
+    if env_steps is not None:
+        values["max_steps"] = _none_if_zero(coerce_to_type(int, env_steps))
+    return values
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

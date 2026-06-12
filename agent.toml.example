@@ -44,6 +44,19 @@ importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
 
+# --- Run-level safety limits ------------------------------------------------
+# Bound a whole `run()`. The wall-clock budget is SHARED across the sub-agent
+# fan-out (leader + children), not refreshed per child. Cooperative cancel (Esc)
+# is the primary interactive control; these are the runaway/stuck safety net.
+# Overridable by env (AGENT_MAX_WALL_SECONDS, AGENT_MAX_STEPS) and CLI flags
+# (--max-wall-seconds, --max-steps). For both caps, 0 means "disabled".
+[limits]
+max_wall_seconds = 1800        # whole-run wall-clock budget in seconds; 0 = no limit
+max_steps = 0                  # hard ceiling on tool turns; 0 = no cap
+# Fraction of the wall budget after which a one-time "wrap up now" nudge is injected
+# so the model can return a useful partial answer before the hard stop. >= 1 disables it.
+soft_deadline_fraction = 0.9
+
 # --- Tool concurrency -------------------------------------------------------
 # Same-turn tool calls run concurrently when their declared resources do not
 # conflict. Disable this to force the old strictly serial execution path.

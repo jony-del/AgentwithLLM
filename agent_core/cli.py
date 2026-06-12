@@ -8,6 +8,7 @@ from pathlib import Path
 from agent_core.config import (
     resolve_concurrency_config,
     resolve_config,
+    resolve_limits_config,
     resolve_mcp_config,
     resolve_memory_config,
     resolve_output_config,
@@ -125,6 +126,19 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         max(1, int(cli_api_concurrency)) if cli_api_concurrency is not None
         else int(concurrency["max_api_concurrency"])
     )
+    # Run-level safety limits: [limits]/env resolved here, CLI flags layered on top.
+    # A CLI value of 0 disables the cap (None), mirroring the toml/env convention.
+    limits = resolve_limits_config()
+    cli_wall = getattr(args, "max_wall_seconds", None)
+    max_wall_seconds = (
+        (None if cli_wall <= 0 else float(cli_wall)) if cli_wall is not None
+        else limits["max_wall_seconds"]
+    )
+    cli_steps = getattr(args, "max_steps", None)
+    max_steps = (
+        (None if cli_steps <= 0 else int(cli_steps)) if cli_steps is not None
+        else limits["max_steps"]
+    )
     config = ReActConfig(
         model=values["model"],
         permission=values["permission"],
@@ -136,6 +150,9 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         max_tool_workers=int(concurrency["max_tool_workers"]),
         max_api_concurrency=max_api_concurrency,
         api_rate_limit_per_min=int(concurrency["api_rate_limit_per_min"]),
+        max_wall_seconds=max_wall_seconds,
+        max_steps=max_steps,
+        soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
@@ -422,6 +439,20 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             metavar="N",
             help="Cap simultaneous in-flight LLM API calls across the multi-agent fan-out.",
+        )
+        subparser.add_argument(
+            "--max-wall-seconds",
+            type=float,
+            default=None,
+            metavar="SECONDS",
+            help="Wall-clock budget for the whole run (shared by sub-agents); 0 disables it.",
+        )
+        subparser.add_argument(
+            "--max-steps",
+            type=int,
+            default=None,
+            metavar="N",
+            help="Hard ceiling on tool turns; 0 (or omitted) means no cap.",
         )
 
     run_parser = subparsers.add_parser("run")

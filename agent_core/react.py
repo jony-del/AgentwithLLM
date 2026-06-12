@@ -22,6 +22,13 @@ from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.ui import AgentUI, NullUI
 
+# Injected once as a system message when the run crosses its soft deadline, so the
+# model can land a useful final answer before the hard wall-clock stop discards work.
+WRAPUP_TEXT = (
+    "You are almost out of time for this task. Stop calling tools now and reply with "
+    "your best final answer based on what you have so far, noting anything left undone."
+)
+
 
 @dataclass(slots=True)
 class ReActConfig:
@@ -31,8 +38,15 @@ class ReActConfig:
     # No fixed step cap by default: like Claude Code, the loop runs until the model
     # stops requesting tools. Set an int only if you want a hard ceiling on tool turns.
     max_steps: int | None = None
-    # Wall-clock safety net so a runaway/stuck loop can't hang forever; tune as needed.
-    max_wall_seconds: float = 300.0
+    # Wall-clock safety net so a runaway/stuck loop can't hang forever. Configurable
+    # via the [limits] toml table, AGENT_MAX_WALL_SECONDS, or --max-wall-seconds.
+    # None disables the wall cap entirely (cooperative Esc-cancel still applies);
+    # the whole sub-agent fan-out shares one budget (see run()'s deadline param).
+    max_wall_seconds: float | None = 1800.0
+    # Fraction of the run's wall budget after which a one-time "wrap up now" nudge is
+    # injected, so the model can return a useful partial answer before the hard stop.
+    # 1.0 (or any value >= 1) disables the nudge; ignored when there is no wall cap.
+    soft_deadline_fraction: float = 0.9
     # Extended-thinking token budget for the Claude provider. None disables thinking
     # (default); a positive int enables it and is passed through _provider_config().
     thinking_budget: int | None = 4096
@@ -90,6 +104,10 @@ class ReActAgent:
         ui: AgentUI | None = None,
     ) -> None:
         self.config = config or ReActConfig()
+        # Effective monotonic deadline of the in-flight run(), shared with children
+        # spawned by the sub-agent/teammate factories so the whole fan-out is bounded
+        # by one budget. Set at the top of run(); None when no run is active or uncapped.
+        self._active_deadline: float | None = None
         # Wrap the provider in a shared, bounded concurrency gate (idempotent): the
         # top-level agent creates it from config, and children spawned with
         # ``provider=self.provider`` reuse the same gate, so the whole fan-out shares
@@ -176,11 +194,18 @@ class ReActAgent:
         self,
         task: str,
         should_cancel: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> AgentRunResult:
         """Drive the ReAct loop to completion and return the final answer.
 
         The single (async) entry point: synchronous callers wrap the coroutine in
         one top-level ``asyncio.run(agent.run(task))``; async callers just await it.
+
+        ``deadline`` is a ``time.monotonic()`` timestamp shared by an enclosing run:
+        sub-agents/teammates inherit the parent's deadline so the whole fan-out is
+        bounded by one wall-clock budget instead of each child getting a fresh one.
+        When ``None``, the deadline is derived from ``config.max_wall_seconds`` (and
+        is itself ``None`` when that is unset, disabling the wall cap).
         """
         messages = [
             Message("system", self.config.system_prompt),
@@ -190,7 +215,17 @@ class ReActAgent:
         await self._recall(task, messages)
 
         cancelled = should_cancel or (lambda: False)
-        deadline = time.monotonic() + self.config.max_wall_seconds
+        start = time.monotonic()
+        if deadline is None and self.config.max_wall_seconds is not None:
+            deadline = start + self.config.max_wall_seconds
+        # Stash for the sub-agent/teammate factories so children share this budget.
+        self._active_deadline = deadline
+        # Soft deadline: a fraction of *this run's* window (not max_wall_seconds, which
+        # may differ from the inherited budget), after which we nudge the model once.
+        soft_threshold: float | None = None
+        if deadline is not None and self.config.soft_deadline_fraction < 1.0:
+            soft_threshold = start + (deadline - start) * self.config.soft_deadline_fraction
+        wrapup_sent = False
         step = 0
         while True:
             # The natural exit below — the model returning no tool calls — is the primary
@@ -202,8 +237,15 @@ class ReActAgent:
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
             if self.config.max_steps is not None and step >= self.config.max_steps:
                 return await self._stopped(messages, step, "max_steps", "reaching max_steps")
-            if time.monotonic() > deadline:
-                return await self._stopped(messages, step, "deadline", "reaching the wall-clock deadline")
+            if deadline is not None:
+                now = time.monotonic()
+                if now > deadline:
+                    return await self._stopped(messages, step, "deadline", "reaching the wall-clock deadline")
+                # One-time soft nudge so the model can wrap up before the hard stop.
+                if soft_threshold is not None and not wrapup_sent and now >= soft_threshold:
+                    messages.append(Message("system", WRAPUP_TEXT, metadata={"deadline_wrapup": True}))
+                    await self.logger.write("deadline_wrapup", {"step": step})
+                    wrapup_sent = True
             step += 1
 
             messages, events = self.compression.maybe_auto_compact(messages)
@@ -394,7 +436,7 @@ class ReActAgent:
         child = self._make_subagent_child(preset)
         if isinstance(child, str):
             return child
-        return (await child.run(task)).answer
+        return (await child.run(task, deadline=self._active_deadline)).answer
 
     async def _make_teammate_child(
         self,
@@ -468,7 +510,7 @@ class ReActAgent:
         if isinstance(built, str):
             return built
         child, prompt = built
-        return (await child.run(prompt)).answer
+        return (await child.run(prompt, deadline=self._active_deadline)).answer
 
     @staticmethod
     def _teammate_prompt(
