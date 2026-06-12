@@ -224,15 +224,22 @@ class ConsoleUI(AgentUI):
         self._emit(self._style("⚠ permission required", _YELLOW))
         self._emit(f"  tool: {tool_name}  ({risk_tag})")
         self._emit(f"  args: {self._format_args(arguments, full=True)}")
-        try:
-            answer = input("Allow? [y/once · a/always · N/deny] ").strip().lower()
-        except EOFError:
-            return "deny"
-        if answer in {"a", "always"}:
-            return "always"
-        if answer in {"y", "yes", "once"}:
-            return "once"
-        return "deny"
+        # Every outcome must be a deliberate keystroke: an unrecognised key *and* a
+        # bare Enter both re-prompt, so a stray/empty input can never silently deny a
+        # tool. Only EOF (closed/piped stdin) denies without asking — there is no one
+        # to answer, so a non-interactive caller fails closed instead of hanging.
+        while True:
+            try:
+                answer = input("Allow? [y/once · a/always · n/deny] ").strip().lower()
+            except EOFError:
+                return "deny"
+            if answer in {"a", "always"}:
+                return "always"
+            if answer in {"y", "yes", "once"}:
+                return "once"
+            if answer in {"n", "no", "deny"}:
+                return "deny"
+            self._emit(self._style("  ? didn't catch that — type y, a, or n", _YELLOW))
 
     @staticmethod
     def _format_args(arguments: dict[str, Any], full: bool = False) -> str:
