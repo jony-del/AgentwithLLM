@@ -17,7 +17,8 @@ nonessential capabilities should live behind extras and be imported lazily at
 the point of use.
 
 - `import agent_core` must not require optional heavy dependencies.
-- Current extras include `mcp`, `mcp-servers`, and `web`.
+- There are no current extras: runtime, MCP reference-server, and test deps are
+  all core, so `pip install -e .` yields a fully working agent.
 - Provider SDK choices should not leak into the core abstractions.
 
 Prefer local project patterns over new abstractions, but optimize for the long
@@ -47,7 +48,7 @@ polaris run "Say hello" --provider fake --no-stream
 polaris run "Say hello" --provider fake --quiet
 
 # Tests
-pip install -e ".[dev]"
+pip install -e .
 pytest
 pytest tests/test_react.py
 pytest tests/test_react.py::test_react_executes_demo_tool
@@ -128,9 +129,11 @@ API:
   contracts. Change them deliberately and update affected tests.
 - Preserve `LLMResult.thinking_blocks` and their signatures. Claude's API needs
   prior thinking blocks when extended thinking and tool use span turns.
-- Keep optional dependencies out of the core import path unless they are small,
-  stable, and broadly useful. Use extras plus lazy imports for capabilities such
-  as MCP, web access, browser control, LSP, vector stores, and remote runtimes.
+- MCP and web access are now core dependencies, imported normally. Keep other
+  optional dependencies out of the core import path unless they are small,
+  stable, and broadly useful: use extras plus lazy imports for *future*
+  heavyweight capabilities such as browser control, LSP, vector stores, and
+  remote runtimes.
 - Every tool must set the correct `ToolRisk`: `READ`, `WRITE`, or `DANGEROUS`.
   Permission behavior depends on this.
 - Tools implement either the blocking `_invoke()` hook or an async `run()`

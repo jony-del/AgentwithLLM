@@ -58,9 +58,8 @@ api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
-# to the agent as "<name>__<tool>" (e.g. fs__read_file). Needs the optional SDK:
-#   pip install -e ".[mcp]"            # just the SDK (enough for your own servers)
-#   pip install -e ".[mcp-servers]"    # SDK + the official git/fetch/time servers
+# to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official
+# git/fetch/time reference servers are core deps, available by default.
 # Every tool defaults to risk = "dangerous" (so it's denied in auto/dontask and
 # confirmed in default); set risk per server to "read" or "write" to relax that.
 # Inspect what a server exposes with:  python -m agent_core mcp list

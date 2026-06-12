@@ -46,8 +46,8 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
-# to the agent as "<name>__<tool>" (e.g. fs__read_file). Needs the optional SDK:
-#   pip install "mcp>=1.0"   (or  pip install -e ".[mcp]")
+# to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK is a core dep,
+# available by default.
 # Every tool defaults to risk = "dangerous" (so it's denied in auto/dontask and
 # confirmed in default); set risk per server to "read" or "write" to relax that.
 # Inspect what a server exposes with:  python -m agent_core mcp list

@@ -57,13 +57,6 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
     return ConsoleUI() if interactive else NullUI()
 
 
-_MCP_SDK_HINT = (
-    "MCP servers are configured in agent.toml but the 'mcp' SDK isn't installed. "
-    'Install it with: pip install "mcp>=1.0"  (or  pip install -e ".[mcp]"; '
-    'use ".[mcp-servers]" to also get the reference git/fetch/time servers).'
-)
-
-
 def _describe_mcp_error(exc: BaseException) -> str:
     """Flatten an exception into a readable one-liner.
 
@@ -90,8 +83,7 @@ def _describe_mcp_error(exc: BaseException) -> str:
 def _connect_mcp(mcp_config):
     """Start a manager for the configured servers, raising a clean RuntimeError on failure.
 
-    Missing SDK (an unwrapped ``ModuleNotFoundError`` from the lazy ``import mcp``) and a
-    connect/handshake failure (an anyio ``ExceptionGroup``) both become a readable
+    A connect/handshake failure (an anyio ``ExceptionGroup``) becomes a readable
     ``RuntimeError`` so callers can report it without leaking a raw traceback.
     """
     from agent_core.mcp import MCPClientManager
@@ -99,8 +91,6 @@ def _connect_mcp(mcp_config):
     manager = MCPClientManager(mcp_config)
     try:
         manager.start()
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(_MCP_SDK_HINT) from exc
     except Exception as exc:  # noqa: BLE001 - anyio ExceptionGroup et al. → one clean message
         raise RuntimeError(
             f"could not connect MCP servers: {_describe_mcp_error(exc)} "
@@ -112,9 +102,8 @@ def _connect_mcp(mcp_config):
 def _start_mcp(registry: ToolRegistry):
     """Connect any configured MCP servers and register their tools, or return ``None``.
 
-    The ``mcp`` SDK is imported lazily and only when ``[mcp.servers.*]`` is non-empty, so
-    the core stays dependency-free. The caller owns the returned manager and must
-    ``close()`` it.
+    Only connects when ``[mcp.servers.*]`` is non-empty. The caller owns the returned
+    manager and must ``close()`` it.
     """
     mcp_config = resolve_mcp_config()
     if not any(server.enabled for server in mcp_config.servers):
@@ -185,7 +174,7 @@ def run_command(args: argparse.Namespace) -> int:
     try:
         agent, ui, mcp = build_agent(args)
     except RuntimeError as exc:
-        # E.g. MCP servers configured without the SDK installed, or a connect failure.
+        # E.g. an MCP server failed to connect.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
 
