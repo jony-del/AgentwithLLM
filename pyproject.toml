@@ -3,30 +3,23 @@ name = "agent-with-llm"
 version = "0.1.0"
 description = "A Python ReAct agent framework with Claude, tools, hooks, permissions, and compression."
 requires-python = ">=3.11"
-# httpx powers the async Claude transport (concurrent API calls across the multi-agent
-# fan-out). It is still imported lazily inside ClaudeProvider, so importing agent_core
-# never imports httpx until a real async request is made.
-dependencies = ["httpx>=0.27"]
-
-[project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
-# Web access tools (web_fetch / web_search). Imported lazily inside the tools, so the
-# core stays importable without this extra; install with: pip install -e ".[web]".
-# ddgs is the keyless default search backend; Brave/Tavily are used instead when their
-# API key env var is set (no extra dep — they go over httpx).
-web = ["httpx>=0.27", "markdownify>=0.11", "beautifulsoup4>=4.12", "ddgs>=6.0"]
-# Just the official MCP SDK — all the core needs to connect to MCP servers configured
-# in agent.toml. Imported lazily, so the core stays dependency-free without this extra.
-mcp = ["mcp>=1.0"]
-# The SDK plus a few official reference servers you can point agent.toml at out of the
-# box (git / fetch / time). Self-references the `mcp` extra above so the SDK pin stays in
-# one place. Pulls heavier deps (gitpython, requests, lxml, ...).
-mcp-servers = [
-    "agent-with-llm[mcp]",
+# All runtime, MCP reference-server, and test deps are core, so `pip install -e .`
+# yields a fully working agent with no extras to remember. ddgs is the keyless default
+# search backend; Brave/Tavily are used instead when their API key env var is set (no
+# extra dep — they go over httpx).
+dependencies = [
+    "httpx>=0.27",
+    "markdownify>=0.11",
+    "beautifulsoup4>=4.12",
+    "ddgs>=6.0",
+    "mcp>=1.0",
     "mcp-server-git",
     "mcp-server-fetch",
     "mcp-server-time",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
+
 [project.scripts]
 polaris = "agent_core.cli:main"
 

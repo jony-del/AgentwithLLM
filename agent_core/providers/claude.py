@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+import httpx
+
 from agent_core.models import (
     LLMContextTooLongError,
     LLMResult,
@@ -101,8 +103,6 @@ class ClaudeProvider(LLMProvider):
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
 
-        import httpx  # lazy: keeps ``import agent_core`` light (CLAUDE.md invariant)
-
         streaming = stream is not None and config.get("stream", True)
         client = await self._get_client()
         body = self._build_body(messages, tools, config, streaming=streaming)
@@ -142,8 +142,6 @@ class ClaudeProvider(LLMProvider):
             await response.aclose()
 
     async def _get_client(self):
-        import httpx
-
         loop = asyncio.get_running_loop()
         if self._client is None or self._client_loop is not loop:
             self._client = httpx.AsyncClient(timeout=None, transport=self._transport)
@@ -158,8 +156,6 @@ class ClaudeProvider(LLMProvider):
         context-overflow as ``LLMContextTooLongError``, transient failures as
         ``LLMTransientError``, and other API errors as ``RuntimeError``.
         """
-        import httpx
-
         attempt = 0
         while True:
             try:

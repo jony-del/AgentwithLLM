@@ -1,9 +1,7 @@
 """Web access tools: ``web_fetch`` (URL → markdown) and ``web_search``.
 
-These are the first tools to take third-party dependencies (httpx / beautifulsoup4 /
-markdownify / ddgs). To keep the core importable without the ``web`` extra, every
-third-party import is **lazy** (inside the network seam functions), so merely importing
-this module — which catalog discovery does at startup — never requires the extra.
+These tools take third-party dependencies (httpx / beautifulsoup4 / markdownify /
+ddgs), which are core deps imported normally at module top.
 
 Network egress is guarded against SSRF: ``_check_url_safe`` rejects non-http(s) schemes
 and any host that resolves to a loopback/private/link-local/reserved address, and the
@@ -18,6 +16,11 @@ import os
 import socket
 from urllib.parse import urljoin, urlparse
 
+import httpx
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+from markdownify import markdownify
+
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.tools.base import ConcurrencySpec, Tool
 from agent_core.tools.catalog import builtin_tool
@@ -26,10 +29,6 @@ _USER_AGENT = "AgentwithLLM/0.1 (+https://github.com/) web_fetch"
 _DEFAULT_MAX_CHARS = 20_000
 _DEFAULT_TIMEOUT = 20.0
 _MAX_REDIRECTS = 5
-_MISSING_DEPS = (
-    'web tools need the "web" extra — install with: pip install -e ".[web]" '
-    "(httpx, beautifulsoup4, markdownify, ddgs)."
-)
 
 
 class WebError(Exception):
@@ -69,17 +68,15 @@ def _check_url_safe(url: str) -> None:
             raise WebError(f"refusing to fetch internal/private address {ip} (host '{host}')", "SSRF")
 
 
-# --- network seams (lazy imports; monkeypatched in tests) ------------------------
+# --- network seams (monkeypatched in tests) --------------------------------------
 
 
 def _fetch_url(url: str, *, timeout: float = _DEFAULT_TIMEOUT, max_hops: int = _MAX_REDIRECTS) -> tuple[str, str, str]:
     """Fetch ``url``, following redirects manually and re-checking each hop for SSRF.
 
     Returns ``(final_url, content_type, text)``. Raises ``WebError`` on an unsafe or
-    failing request, or ``ImportError`` if httpx isn't installed.
+    failing request.
     """
-    import httpx  # lazy: only needed when the tool actually runs
-
     headers = {"User-Agent": _USER_AGENT}
     current = url
     with httpx.Client(follow_redirects=False, timeout=timeout, headers=headers) as client:
@@ -97,10 +94,7 @@ def _fetch_url(url: str, *, timeout: float = _DEFAULT_TIMEOUT, max_hops: int = _
 
 
 def _html_to_markdown(html: str) -> str:
-    """Strip scripts/styles and convert HTML to markdown. Lazy bs4 + markdownify."""
-    from bs4 import BeautifulSoup
-    from markdownify import markdownify
-
+    """Strip scripts/styles and convert HTML to markdown."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
@@ -108,12 +102,7 @@ def _html_to_markdown(html: str) -> str:
 
 
 def _search_ddgs(query: str, max_results: int) -> list[dict]:
-    """Keyless DuckDuckGo search. Handles both the new ``ddgs`` and old package name."""
-    try:
-        from ddgs import DDGS
-    except ImportError:  # older releases shipped as duckduckgo_search
-        from duckduckgo_search import DDGS
-
+    """Keyless DuckDuckGo search."""
     rows = DDGS().text(query, max_results=max_results)
     return [
         {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")}
@@ -122,8 +111,6 @@ def _search_ddgs(query: str, max_results: int) -> list[dict]:
 
 
 def _search_brave(query: str, max_results: int, api_key: str) -> list[dict]:
-    import httpx
-
     response = httpx.get(
         "https://api.search.brave.com/res/v1/web/search",
         params={"q": query, "count": max_results},
@@ -139,8 +126,6 @@ def _search_brave(query: str, max_results: int, api_key: str) -> list[dict]:
 
 
 def _search_tavily(query: str, max_results: int, api_key: str) -> list[dict]:
-    import httpx
-
     response = httpx.post(
         "https://api.tavily.com/search",
         json={"api_key": api_key, "query": query, "max_results": max_results},
@@ -202,17 +187,12 @@ class WebFetchTool(Tool):
             return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": exc.error_type})
         try:
             final_url, content_type, text = _fetch_url(url)
-        except ImportError:
-            return ToolResult(self.name, _MISSING_DEPS, ok=False, metadata={"error_type": "MissingDeps"})
         except WebError as exc:
             return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": exc.error_type})
         except Exception as exc:  # noqa: BLE001 - network/parse errors → readable result
             return ToolResult(self.name, f"Fetch failed: {type(exc).__name__}: {exc}", ok=False, metadata={"error_type": "FetchError"})
 
-        try:
-            body = _html_to_markdown(text) if "html" in content_type.lower() else text.strip()
-        except ImportError:
-            return ToolResult(self.name, _MISSING_DEPS, ok=False, metadata={"error_type": "MissingDeps"})
+        body = _html_to_markdown(text) if "html" in content_type.lower() else text.strip()
         truncated = len(body) > max_chars
         if truncated:
             body = body[:max_chars] + "\n\n[... truncated ...]"
@@ -248,8 +228,6 @@ class WebSearchTool(Tool):
             return ToolResult(self.name, "query must not be empty", ok=False, metadata={"error_type": "BadArgs"})
         try:
             backend, results = _select_search(query, max_results)
-        except ImportError:
-            return ToolResult(self.name, _MISSING_DEPS, ok=False, metadata={"error_type": "MissingDeps"})
         except Exception as exc:  # noqa: BLE001 - backend/network errors → readable result
             return ToolResult(self.name, f"Search failed: {type(exc).__name__}: {exc}", ok=False, metadata={"error_type": "SearchError"})
 

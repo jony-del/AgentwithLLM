@@ -1,14 +1,7 @@
-import importlib.util
 import sys
 import threading
 import time
 from pathlib import Path
-
-import pytest
-
-# The unit tests below run without the optional SDK (agent_core.mcp imports it lazily);
-# only the integration test at the end needs it installed.
-_HAS_MCP = importlib.util.find_spec("mcp") is not None
 
 from agent_core.config import resolve_mcp_config
 from agent_core.mcp.adapter import MCPAdapter, MCPTool, _flatten_content
@@ -253,7 +246,6 @@ if __name__ == "__main__":
 '''
 
 
-@pytest.mark.skipif(not _HAS_MCP, reason="the optional `mcp` SDK is not installed")
 async def test_stdio_roundtrip_through_manager(tmp_path: Path) -> None:
     from agent_core.mcp.client import MCPClientManager
 
