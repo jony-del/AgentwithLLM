@@ -25,7 +25,8 @@
       "PowerShell(python -m pytest tests/test_mcp.py -rs 2>&1 | Select-Object -Last 20)",
       "PowerShell(python -m pytest 2>&1 | Select-Object -Last 8; Write-Output \"==== mcp list ====\"; python -m agent_core mcp list 2>&1 | Select-Object -First 30)",
       "PowerShell(pytest *)",
-      "PowerShell(Get-Command *)"
+      "PowerShell(Get-Command *)",
+      "Bash(grep -E '^src/[^/]+$')"
     ]
   }
 }

@@ -5,26 +5,31 @@ repository and evolve it toward a capable coding/automation agent.
 
 ## Project
 
-This is a Python ReAct agent framework (Python >= 3.11) growing toward an
-advanced coding agent in the spirit of Claude Code and Codex.
+A Python ReAct agent framework (Python >= 3.11) growing toward an advanced
+coding agent in the spirit of Claude Code and Codex: it should reason over
+tasks, use tools safely, modify code, preserve useful context, and stay
+debuggable.
 
-The goal is a feature-rich, high-performance agent that can reason over tasks,
-use tools safely, modify code, preserve useful context, and remain debuggable.
+Dependency philosophy:
 
-Keep the core path lean: small, stable dependencies that are broadly useful may
-belong in core; heavyweight, external-system, platform-sensitive, or
-nonessential capabilities should live behind extras and be imported lazily at
-the point of use.
+- `import agent_core` MUST succeed without any optional/heavy dependency at
+  import time.
+- There are currently no extras — runtime, MCP reference-server, and test deps
+  are all core, so `pip install -e .` yields a fully working agent.
+- Capabilities that are *enabled* load eagerly: import and initialize their deps
+  at startup, NOT lazily at first use. (See the eager-loading invariant below;
+  this supersedes any older "behind extras / lazy import" guidance.)
+- Provider SDK choices MUST NOT leak into the core abstractions.
 
-- `import agent_core` must not require optional heavy dependencies.
-- There are no current extras: runtime, MCP reference-server, and test deps are
-  all core, so `pip install -e .` yields a fully working agent.
-- Provider SDK choices should not leak into the core abstractions.
+Prefer existing project patterns over new abstractions, but optimize for the
+long-term shape of a serious agent: clear contracts, safe tool execution,
+observability, testability.
 
-Prefer local project patterns over new abstractions, but optimize for the long
-term shape of a serious agent: clear contracts, safe tool execution,
-observability, testability, and graceful degradation when optional capabilities
-are unavailable.
+## Environment
+
+Primary dev environment is **Windows + PowerShell**. Command blocks below are
+PowerShell (`$env:NAME="..."`). Use OS-appropriate paths; there is no
+lint/format tooling configured (don't reach for ruff/black/mypy).
 
 ## Commands
 
@@ -35,14 +40,14 @@ are unavailable.
 polaris run "Say hello without tools" --provider fake
 python -m agent_core run "Say hello without tools" --provider fake
 
-# Interactive chat loop
+# Interactive chat loop (one event loop for the whole session)
 polaris chat --provider fake
 
 # Use the real Claude API
 $env:ANTHROPIC_API_KEY="your-key"
 polaris run "Use the echo tool" --provider claude --model claude-haiku-4-5-20251001
 
-# Live display flags
+# Live display flags (CLI-only)
 polaris run "Think, then answer" --provider claude --thinking-budget 1024
 polaris run "Say hello" --provider fake --no-stream
 polaris run "Say hello" --provider fake --quiet
@@ -55,29 +60,50 @@ pytest tests/test_react.py::test_react_executes_demo_tool
 ```
 
 `pyproject.toml` exposes the `polaris` console script and sets
-`pythonpath = ["."]`, so tests can import `agent_core` without installation.
-There is no lint/format tooling configured.
+`pythonpath = ["."]`, so tests import `agent_core` without installation.
 
 ## Code Map
 
+Core loop & contracts:
 - `agent_core/react.py`: central `ReActAgent.run()` loop (async).
-- `agent_core/models.py`: dataclass contracts between layers:
-  `Message`, `ToolCall`, `ToolResult`, `LLMResult`.
-- `agent_core/providers/`: LLM providers. `FakeProvider` is deterministic for
-  tests and demos. `ClaudeProvider` maps messages/tools to the Anthropic
-  Messages API, supports streaming, and preserves extended-thinking blocks.
-- `agent_core/tools/`: tool base classes, registry, executor, built-ins, editing
-  tools, web tools, planning, and subagent dispatch.
+- `agent_core/models.py`: cross-layer dataclasses `Message`, `ToolCall`,
+  `ToolResult`, `LLMResult`.
+- `agent_core/session.py`: per-run state shared with session-aware tools.
+- `agent_core/interrupt.py`: `KeyInterrupt` — background Esc watcher exposing a
+  cooperative cancellation flag the loop polls at safe points (no-op on
+  non-TTY/CI).
+- `agent_core/compression.py`: proactive and reactive context compaction.
+
+Providers:
+- `agent_core/providers/`: `FakeProvider` (deterministic, for tests/demos) and
+  `ClaudeProvider` (maps messages/tools to the Anthropic Messages API, streams,
+  preserves extended-thinking blocks). `base.py` is the shared interface.
+
+Tools:
+- `agent_core/tools/base.py`: `Tool` base, `ToolRisk`, mixins
+  (`WorkspacePathMixin`, `SessionAwareMixin`).
+- `agent_core/tools/catalog.py`: `@builtin_tool` self-registration +
+  `discover()`/`default_tools()`.
+- `agent_core/tools/registry.py`, `executor.py`, `adapters.py`: registry,
+  `ToolExecutor` (wave partitioning, `max_workers`), and adapter base.
+- `agent_core/tools/builtin.py`, `editing.py`, `web.py`, `planning.py`: built-in,
+  file-editing, web, and planning tools.
+- `agent_core/tools/subagent.py`, `team.py`: sub-agent dispatch and team tools.
+
+Multi-agent:
+- `agent_core/agents/multi.py`: `MultiAgentCoordinator`/`SubAgent` parallel
+  fan-out over one task.
+- `agent_core/agents/team.py`: `TeamStore`/`FileLock` shared-state coordination.
+
+Cross-cutting:
+- `agent_core/cli.py`: argparse CLI (real entry for `polaris` / `__main__`).
 - `agent_core/permissions.py`: permission modes and risk decisions.
 - `agent_core/hooks.py`: pre/post tool execution hooks.
-- `agent_core/compression.py`: proactive and reactive context compaction.
-- `agent_core/config.py`: config resolution from defaults, `agent.toml`, env,
-  and CLI flags.
+- `agent_core/config.py`: config resolution (defaults → `agent.toml` → env → CLI).
 - `agent_core/memory/`: optional cross-conversation memory.
-- `agent_core/mcp/`: MCP client, config, and tool adapter.
-- `agent_core/ui.py`: live terminal UI event sink.
-- `agent_core/storage.py`: JSONL run logging.
-- `agent_core/session.py`: per-run state shared with session-aware tools.
+- `agent_core/mcp/`: MCP client, config, tool adapter.
+- `agent_core/ui.py`: live terminal UI event sink (`NullUI`/`ConsoleUI`).
+- `agent_core/storage.py`: JSONL run logging (inspect a run under `runs/`).
 
 ## Agent Loop
 
@@ -89,110 +115,78 @@ There is no lint/format tooling configured.
 4. Execute tool calls through `ToolExecutor`.
 5. Append tool observations as `tool` messages and continue.
 
-Do not design the agent around a small fixed step cap. A capable coding agent
-often needs many tool turns. Prefer explicit safety guards: cooperative
-cancellation, optional `max_steps`, wall-clock limits, and clear stop reasons.
-
-The provider's `async complete()` method may stream deltas to a UI, but it must
-still return one fully assembled `LLMResult`.
+Do NOT design around a small fixed step cap — a capable coding agent often needs
+many tool turns. Use explicit safety guards instead: cooperative cancellation
+(`KeyInterrupt`/Esc, checked at turn boundaries and around tool calls), optional
+`max_steps`, and a wall-clock deadline. A run's `deadline` is shared with
+sub-agents/teammates so the whole fan-out is bounded by one budget (see
+`react.py`); crossing the soft deadline injects a message so the model can land a
+final answer before the hard stop. Stop reasons are explicit.
 
 ## Async Execution Model
 
-The codebase is async-only: every public execution API is `async def` with a
-clean name (`run`, `complete`, `execute_many`, `extract`, `dream`) — there are
-no sync twins and no `a`-prefixed variants. Synchronous callers wrap the top
-level once: `asyncio.run(agent.run(task))`; the CLI does exactly one
-`asyncio.run` per command (`chat` keeps one event loop for the whole session).
+Async-only: every public execution API is `async def` (`run`, `complete`,
+`execute_many`, `extract`, `dream`) — no sync twins, no `a`-prefixed variants.
+`asyncio.run` appears ONLY at CLI entry points, never in library code (the CLI
+does exactly one per command; `chat` keeps one loop for the session).
 
-Blocking work exists only as an internal implementation detail, never as public
-API:
+Blocking work is an internal detail, never public API:
 
-- Ordinary blocking tools implement the sync `_invoke()` hook; the base
-  `Tool.run()` offloads it via `asyncio.to_thread`, throttled by the executor's
-  `max_workers` semaphore. Async-native tools (subagent/teammate dispatch, team
-  tools, MCP) override `async def run()` and execute on the event loop.
-- Stores and the run logger (`MemoryStore`, `TeamStore`, `JSONLRunLogger`)
-  expose async methods whose disk IO runs in `_xxx_sync` internals on worker
-  threads; `MemoryStore` serializes its whole-file rewrites with an
-  `asyncio.Lock`, `TeamStore` keeps `FileLock` for cross-process exclusion.
+- Ordinary blocking tools implement `_invoke()`; the base `Tool.run()` offloads
+  it via `asyncio.to_thread`, throttled by the executor's `max_workers`.
+- Stores/logger (`MemoryStore`, `TeamStore`, `JSONLRunLogger`) expose async
+  methods whose disk IO runs in `_xxx_sync` internals on worker threads.
 - Concurrency budgets: `GatedProvider` (semaphore + token bucket) bounds API
-  calls across the whole multi-agent fan-out; wave partitioning in
-  `ToolExecutor` serializes tools whose declared resources conflict.
-- Providers backed by a blocking SDK must wrap the call in
-  `asyncio.to_thread(...)` inside their own `complete`.
-- Never call blocking IO directly from a coroutine; never add `asyncio.run`
-  inside library code (CLI entry points only).
+  calls across the fan-out; `ToolExecutor` wave-partitioning serializes tools
+  with conflicting declared resources.
+- Providers backed by a blocking SDK MUST wrap the call in `asyncio.to_thread`
+  inside their own `complete`. Never call blocking IO directly from a coroutine.
 
 ## Important Invariants
 
-- Treat `Message`, `ToolCall`, `ToolResult`, and `LLMResult` as cross-layer
+- Treat `Message`, `ToolCall`, `ToolResult`, `LLMResult` as cross-layer
   contracts. Change them deliberately and update affected tests.
-- Preserve `LLMResult.thinking_blocks` and their signatures. Claude's API needs
+- Preserve `LLMResult.thinking_blocks` and their signatures — Claude's API needs
   prior thinking blocks when extended thinking and tool use span turns.
-- MCP and web access are now core dependencies, imported normally. Keep other
-  optional dependencies out of the core import path unless they are small,
-  stable, and broadly useful: use extras plus lazy imports for *future*
-  heavyweight capabilities such as browser control, LSP, vector stores, and
-  remote runtimes.
-- Every tool must set the correct `ToolRisk`: `READ`, `WRITE`, or `DANGEROUS`.
-  Permission behavior depends on this.
-- Tools implement either the blocking `_invoke()` hook or an async `run()`
-  override — never both. The executor detects an overridden `run` and awaits it
-  on the loop instead of the thread-offload path.
-- Workspace-scoped tools should use `WorkspacePathMixin`; do not allow absolute
-  path or `..` escapes.
-- Tools self-register with `@builtin_tool`. Adding a built-in tool should not
-  require editing `react.py`.
+- Enabled capabilities (MCP, web) are imported normally and eagerly. Do NOT use
+  lazy imports / first-use loading for project capabilities; initialize their
+  deps at startup. The same applies to any future heavyweight capability
+  (browser control, LSP, vector stores, remote runtimes) once included.
+- Every tool MUST set the correct `ToolRisk` (`READ`/`WRITE`/`DANGEROUS`) —
+  permission behavior depends on it.
+- A tool implements EITHER `_invoke()` OR an async `run()` override — never both.
+  The executor awaits an overridden `run` on the loop instead of thread-offload.
+- Workspace-scoped tools MUST use `WorkspacePathMixin`; NEVER allow absolute-path
+  or `..` escapes.
+- Tools self-register with `@builtin_tool`; adding a built-in MUST NOT require
+  editing `react.py`.
 - Session-aware tools use `SessionAwareMixin` and are rebound by
-  `ReActAgent.__init__`. Avoid importing `ReActAgent` from tools; use the
-  session seam instead.
-- Subagents must not receive the `dispatch_agent` tool, otherwise recursion can
-  escape the intended limit.
-- `NullUI` is the default and must remain silent/non-interactive for tests and
-  library use. `ConsoleUI` is wired only for interactive CLI runs.
-- Streaming UI hooks are finalizers when deltas were already printed; do not
-  duplicate streamed content.
-- Memory is off by default. Recall happens at run start; extraction happens only
-  after natural termination and must never fail an otherwise completed run.
-- Advanced capabilities should degrade clearly when unavailable. Prefer an
-  actionable install/configuration error over import-time failure.
+  `ReActAgent.__init__`. Do NOT import `ReActAgent` from tools — use the session
+  seam.
+- Sub-agents MUST NOT receive the `dispatch_agent` tool, or recursion escapes the
+  intended limit.
+- `NullUI` is the default and MUST stay silent/non-interactive for tests and
+  library use; `ConsoleUI` is wired only for interactive CLI runs. Streaming UI
+  hooks are finalizers when deltas were already printed — do NOT duplicate
+  streamed content.
+- Memory is off by default. Recall at run start; extraction only after natural
+  termination, and it MUST NOT fail an otherwise completed run.
+- Advanced capabilities MUST degrade with an actionable install/config error
+  rather than an import-time crash.
 - `runs/` and `memory/` are runtime state and are gitignored.
 
-## Design Direction
+## Configuration
 
-When adding capabilities, aim for agent-grade behavior rather than one-off
-demos:
-
-- Tool use should be observable, permissioned, and recoverable.
-- Long tasks should preserve context without hiding important recent evidence.
-- Editing tools should be precise, reviewable, and safe under partial failure.
-- Providers should share stable interfaces even when their APIs differ.
-- UI should report progress and decisions without becoming required for library
-  use or tests.
-- Memory should help across runs while staying opt-in, inspectable, and
-  correctable.
-- External integrations should be isolated behind adapters so the core loop
-  remains testable.
-
-## Configuration Notes
-
-Scalar config precedence is:
-
-1. built-in defaults
-2. `agent.toml`
-3. environment variables
-4. CLI flags
-
-Memory, output truncation, and MCP tables are resolved separately. Live display
-knobs such as `--quiet`, `--no-stream`, and `--thinking-budget` are CLI-only.
-
-See `agent.toml.example` for supported configuration shape.
+Scalar precedence: built-in defaults → `agent.toml` → environment → CLI flags.
+Memory, output truncation, and MCP tables resolve separately; live-display knobs
+(`--quiet`, `--no-stream`, `--thinking-budget`) are CLI-only. See
+`agent.toml.example` for the supported shape.
 
 ## When Changing Code
 
 - Run focused tests for the area touched; run the full suite for shared behavior.
-- For provider changes, test streaming and non-streaming paths where applicable.
-- For tool changes, test permissions, workspace confinement, and failure output.
-- For config changes, test precedence and unknown-key behavior.
-- For memory changes, test both disabled and enabled modes.
-- For UI changes, keep non-interactive runs stable.
+- Provider changes: test streaming and non-streaming paths.
+- Tool changes: test permissions, workspace confinement, and failure output.
+- Config changes: test precedence and unknown-key behavior.
+- Memory changes: test both disabled and enabled modes.
+- UI changes: keep non-interactive runs stable.
