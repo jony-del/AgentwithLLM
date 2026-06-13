@@ -8,6 +8,7 @@ from pathlib import Path
 from agent_core.config import (
     resolve_concurrency_config,
     resolve_config,
+    resolve_context_config,
     resolve_limits_config,
     resolve_mcp_config,
     resolve_memory_config,
@@ -139,11 +140,14 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         (None if cli_steps <= 0 else int(cli_steps)) if cli_steps is not None
         else limits["max_steps"]
     )
+    context = resolve_context_config()
     config = ReActConfig(
         model=values["model"],
         permission=values["permission"],
         memory=_memory_config(args),
         output=resolve_output_config(),
+        project_instructions=bool(context["project_instructions"]),
+        claudemd_max_chars=int(context["claudemd_max_chars"]),
         thinking_budget=getattr(args, "thinking_budget", None),
         stream=not getattr(args, "no_stream", False),
         parallel_tools=bool(concurrency["parallel_tools"]),

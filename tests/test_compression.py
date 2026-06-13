@@ -41,6 +41,19 @@ def test_compact_reports_each_stage() -> None:
     assert [stage for _, _, stage in calls] == ["snip", "microcompact", "context_collapse"]
 
 
+def test_microcompact_preserves_pinned() -> None:
+    pinned = Message("system", "PINNED " * 2000, metadata={"pinned": "claudemd"})
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=60, collapsed_keep_recent=4))
+    messages = [pinned]
+    messages.extend(Message("user", str(index) + "x" * 200) for index in range(10))
+
+    compacted, _ = pipeline.compact(messages, aggressive=True)
+
+    # The pinned block survives verbatim; ordinary long messages are still compressed.
+    assert pinned in compacted
+    assert any(message.metadata.get("compressed") for message in compacted)
+
+
 def test_collapse_event_carries_detail() -> None:
     pipeline = CompressionPipeline(CompressionConfig(max_message_chars=1000, collapsed_keep_recent=4))
     messages = [Message("user", f"{index}: {'x' * 40}") for index in range(10)]

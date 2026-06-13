@@ -78,6 +78,13 @@ class CompressionPipeline:
         compacted: list[Message] = []
         count = 0
         for message in messages:
+            # Pinned blocks (e.g. injected CLAUDE.md) are kept verbatim — they are
+            # one-time context that must survive compaction. _context_collapse already
+            # preserves system messages, but microcompact truncates by length without
+            # regard to role, so it needs its own guard.
+            if message.metadata.get("pinned"):
+                compacted.append(message)
+                continue
             if len(message.content) > limit:
                 content = f"{message.content[:limit]} [microcompact: omitted {len(message.content) - limit} chars]"
                 compacted.append(Message(message.role, content, message.name, {**message.metadata, "compressed": "microcompact"}))

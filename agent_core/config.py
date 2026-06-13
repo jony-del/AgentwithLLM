@@ -230,6 +230,32 @@ def resolve_limits_config(config_file: str | Path = "agent.toml") -> dict[str, A
     return values
 
 
+def resolve_context_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
+    """Resolve one-time project-context settings from ``[context]``, then env.
+
+    Covers CLAUDE.md project-instruction injection. Precedence: defaults →
+    ``agent.toml`` → env. The toggle has a single source of truth here (the
+    ``context`` module itself stays env-free): ``AGENT_DISABLE_CLAUDE_MD`` being
+    truthy forces ``project_instructions`` off, mirroring the reference runtime's
+    ``CLAUDE_CODE_DISABLE_CLAUDE_MDS``.
+    """
+    table = load_agent_toml(config_file).get("context")
+    values: dict[str, Any] = {
+        "project_instructions": True,
+        "claudemd_max_chars": 32000,
+    }
+    if isinstance(table, dict):
+        if "project_instructions" in table:
+            values["project_instructions"] = coerce_to_type(bool, table["project_instructions"])
+        if "claudemd_max_chars" in table:
+            values["claudemd_max_chars"] = max(0, coerce_to_type(int, table["claudemd_max_chars"]))
+
+    disable = os.getenv("AGENT_DISABLE_CLAUDE_MD")
+    if disable is not None and coerce_to_type(bool, disable):
+        values["project_instructions"] = False
+    return values
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

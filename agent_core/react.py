@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_core.agents.team import TeamStore
 from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
+from agent_core.context import build_project_instructions
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolRisk
@@ -76,6 +77,11 @@ class ReActConfig:
         "their resources are independent; if an action needs the output from a previous "
         "tool call, wait until the next turn to request it."
     )
+    # Discover and inject project instructions (CLAUDE.md) as a pinned system block at
+    # run start. Off when False (or AGENT_DISABLE_CLAUDE_MD is truthy, folded in by
+    # config.resolve_context_config). The joined block is truncated to claudemd_max_chars.
+    project_instructions: bool = True
+    claudemd_max_chars: int = 32000
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
@@ -213,6 +219,7 @@ class ReActAgent:
         ]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
         await self._recall(task, messages)
+        await self._inject_project_context(messages)
 
         cancelled = should_cancel or (lambda: False)
         start = time.monotonic()
@@ -355,6 +362,28 @@ class ReActAgent:
         # extraction skips it and context_collapse keeps it pinned.
         messages.insert(1, Message("system", block, metadata={"memory": "recall"}))
         await self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
+
+    async def _inject_project_context(self, messages: list[Message]) -> None:
+        """Inject project instructions (CLAUDE.md) as a pinned system block.
+
+        Runs right after ``_recall`` so the final order is
+        ``system → CLAUDE.md → memory recall → user``: ``_recall`` already put any
+        recall block at index 1, and inserting here at index 1 lands CLAUDE.md just
+        ahead of it. Tagged ``pinned`` so compaction never collapses/truncates it.
+        Best-effort: any failure degrades to no injection and never sinks the run."""
+        if not self.config.project_instructions:
+            return
+        try:
+            text = await build_project_instructions(
+                self.session.workspace, max_chars=self.config.claudemd_max_chars
+            )
+        except Exception as exc:  # noqa: BLE001 - injection must not fail a run
+            await self.logger.write("project_instructions", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        if not text:
+            return
+        messages.insert(1, Message("system", text, metadata={"pinned": "claudemd"}))
+        await self.logger.write("project_instructions", {"chars": len(text)})
 
     async def _extract_memories(self, messages: list[Message]) -> None:
         """Extraction at natural termination — goes through ``complete`` (and thus

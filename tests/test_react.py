@@ -121,6 +121,38 @@ async def test_run_honors_cancel_pressed_during_final_answer_turn(tmp_path: Path
     assert "Final answer" not in result.answer
 
 
+async def test_run_injects_pinned_claude_md(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "CLAUDE.md").write_text("PROJECT INSTRUCTIONS HERE", encoding="utf-8")
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(run_dir=str(tmp_path), memory=MemoryConfig(enabled=False))
+    agent = ReActAgent(FakeProvider(), config, logger=logger)
+    agent.session.workspace = workspace
+
+    result = await agent.run("hello")
+
+    pinned = [m for m in result.messages if m.role == "system" and m.metadata.get("pinned") == "claudemd"]
+    assert len(pinned) == 1
+    assert "PROJECT INSTRUCTIONS HERE" in pinned[0].content
+
+
+async def test_run_skips_claude_md_when_disabled(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "CLAUDE.md").write_text("PROJECT INSTRUCTIONS HERE", encoding="utf-8")
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(
+        run_dir=str(tmp_path), memory=MemoryConfig(enabled=False), project_instructions=False
+    )
+    agent = ReActAgent(FakeProvider(), config, logger=logger)
+    agent.session.workspace = workspace
+
+    result = await agent.run("hello")
+
+    assert not any(m.metadata.get("pinned") == "claudemd" for m in result.messages)
+
+
 async def test_reactive_compact_retries_after_context_error(tmp_path: Path) -> None:
     logger = JSONLRunLogger(tmp_path)
     provider = FakeProvider(fail_once_context=True)
