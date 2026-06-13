@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from agent_core.agents.team import TeamStore
-from agent_core.compression import CompressionConfig, CompressionPipeline
+from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolRisk
@@ -248,7 +248,9 @@ class ReActAgent:
                     wrapup_sent = True
             step += 1
 
-            messages, events = self.compression.maybe_auto_compact(messages)
+            messages, events = self.compression.maybe_auto_compact(
+                messages, on_stage=self._compaction_reporter(reactive=False)
+            )
             for event in events:
                 await self.logger.write("compression", asdict(event))
 
@@ -265,7 +267,9 @@ class ReActAgent:
                     return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
                 raise
             except LLMContextTooLongError:
-                messages, events = self.compression.reactive_compact(messages)
+                messages, events = self.compression.reactive_compact(
+                    messages, on_stage=self._compaction_reporter(reactive=True)
+                )
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
                 self.ui.on_turn_start()
@@ -365,6 +369,31 @@ class ReActAgent:
             return
         if stored:
             await self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
+
+    def _compaction_reporter(self, reactive: bool) -> Callable[[int, int, CompressionEvent], None]:
+        """Build the per-stage callback that drives the UI's compaction progress bar.
+
+        Only fires when compaction actually runs (the threshold gate lives in
+        ``maybe_auto_compact``). Accumulates the overall before/after size and the
+        non-empty stage details, emitting start → progress* → end. ``NullUI`` makes
+        all three hooks no-ops, so non-interactive runs stay silent."""
+        state: dict[str, object] = {"started": False, "before": 0, "after": 0, "details": []}
+
+        def on_stage(done: int, total: int, event: CompressionEvent) -> None:
+            if not state["started"]:
+                self.ui.on_compaction_start(reactive)
+                state["started"] = True
+                state["before"] = event.before_chars
+            state["after"] = event.after_chars
+            if event.detail:
+                state["details"].append(event.detail)  # type: ignore[union-attr]
+            self.ui.on_compaction_progress(done / total, event.stage)
+            if done == total:
+                self.ui.on_compaction_end(
+                    state["before"], state["after"], ", ".join(state["details"]), reactive  # type: ignore[arg-type]
+                )
+
+        return on_stage
 
     def _provider_config(self) -> dict[str, object]:
         return {

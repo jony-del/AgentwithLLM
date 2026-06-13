@@ -1,4 +1,4 @@
-from agent_core.compression import CompressionConfig, CompressionPipeline
+from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
 from agent_core.models import Message
 
 
@@ -28,3 +28,25 @@ def test_context_collapse_preserves_system_prompt() -> None:
     assert events
     assert compacted[0] == Message("system", "keep these instructions")
     assert any(message.metadata.get("compressed") == "context_collapse" for message in compacted)
+
+
+def test_compact_reports_each_stage() -> None:
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=60, collapsed_keep_recent=4))
+    messages = [Message("user", str(index) + "x" * 100) for index in range(10)]
+    calls: list[tuple[int, int, str]] = []
+
+    pipeline.compact(messages, on_stage=lambda done, total, event: calls.append((done, total, event.stage)))
+
+    assert [(done, total) for done, total, _ in calls] == [(1, 3), (2, 3), (3, 3)]
+    assert [stage for _, _, stage in calls] == ["snip", "microcompact", "context_collapse"]
+
+
+def test_collapse_event_carries_detail() -> None:
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=1000, collapsed_keep_recent=4))
+    messages = [Message("user", f"{index}: {'x' * 40}") for index in range(10)]
+    events: list[CompressionEvent] = []
+
+    pipeline.compact(messages, on_stage=lambda done, total, event: events.append(event))
+
+    collapse = next(event for event in events if event.stage == "context_collapse")
+    assert collapse.detail == "collapsed 6 msgs"  # 10 messages, keep_recent=4

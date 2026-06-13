@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agent_core.models import Message
+
+# Called after each compaction stage so a UI can drive a progress bar:
+# (completed_stages, total_stages, event).
+StageReporter = Callable[[int, int, "CompressionEvent"], None]
 
 
 @dataclass(slots=True)
@@ -25,49 +30,62 @@ class CompressionConfig:
 class CompressionPipeline:
     config: CompressionConfig = field(default_factory=CompressionConfig)
 
-    def maybe_auto_compact(self, messages: list[Message]) -> tuple[list[Message], list[CompressionEvent]]:
+    def maybe_auto_compact(
+        self, messages: list[Message], on_stage: StageReporter | None = None
+    ) -> tuple[list[Message], list[CompressionEvent]]:
         if self._char_count(messages) < self.config.max_context_chars * self.config.auto_threshold_ratio:
             return messages, []
-        return self.compact(messages, aggressive=False)
+        return self.compact(messages, aggressive=False, on_stage=on_stage)
 
-    def reactive_compact(self, messages: list[Message]) -> tuple[list[Message], list[CompressionEvent]]:
-        return self.compact(messages, aggressive=True)
+    def reactive_compact(
+        self, messages: list[Message], on_stage: StageReporter | None = None
+    ) -> tuple[list[Message], list[CompressionEvent]]:
+        return self.compact(messages, aggressive=True, on_stage=on_stage)
 
-    def compact(self, messages: list[Message], aggressive: bool = False) -> tuple[list[Message], list[CompressionEvent]]:
+    def compact(
+        self, messages: list[Message], aggressive: bool = False, on_stage: StageReporter | None = None
+    ) -> tuple[list[Message], list[CompressionEvent]]:
+        stages = (self._snip, self._microcompact, self._context_collapse)
         events: list[CompressionEvent] = []
-        current, event = self._snip(messages, aggressive)
-        events.append(event)
-        current, event = self._microcompact(current, aggressive)
-        events.append(event)
-        current, event = self._context_collapse(current, aggressive)
-        events.append(event)
+        current = messages
+        for index, stage in enumerate(stages):
+            current, event = stage(current, aggressive)
+            events.append(event)
+            if on_stage is not None:
+                on_stage(index + 1, len(stages), event)
         return current, [event for event in events if event.before_chars != event.after_chars]
 
     def _snip(self, messages: list[Message], aggressive: bool) -> tuple[list[Message], CompressionEvent]:
         before = self._char_count(messages)
         limit = self.config.max_message_chars // (2 if aggressive else 1)
         snipped: list[Message] = []
+        count = 0
         for message in messages:
             if message.role == "tool" and len(message.content) > limit:
                 half = max(100, limit // 2)
                 content = f"{message.content[:half]}\n[snip]\n{message.content[-half:]}"
                 snipped.append(Message(message.role, content, message.name, {**message.metadata, "compressed": "snip"}))
+                count += 1
             else:
                 snipped.append(message)
-        return snipped, CompressionEvent("snip", before, self._char_count(snipped))
+        detail = f"snipped {count}" if count else ""
+        return snipped, CompressionEvent("snip", before, self._char_count(snipped), detail)
 
     def _microcompact(self, messages: list[Message], aggressive: bool) -> tuple[list[Message], CompressionEvent]:
         before = self._char_count(messages)
         budget_limit = max(40, self.config.max_context_chars // (6 if aggressive else 4))
         limit = min(self.config.max_message_chars // (3 if aggressive else 2), budget_limit)
         compacted: list[Message] = []
+        count = 0
         for message in messages:
             if len(message.content) > limit:
                 content = f"{message.content[:limit]} [microcompact: omitted {len(message.content) - limit} chars]"
                 compacted.append(Message(message.role, content, message.name, {**message.metadata, "compressed": "microcompact"}))
+                count += 1
             else:
                 compacted.append(message)
-        return compacted, CompressionEvent("microcompact", before, self._char_count(compacted))
+        detail = f"microcompacted {count}" if count else ""
+        return compacted, CompressionEvent("microcompact", before, self._char_count(compacted), detail)
 
     def _context_collapse(self, messages: list[Message], aggressive: bool) -> tuple[list[Message], CompressionEvent]:
         before = self._char_count(messages)
@@ -96,7 +114,8 @@ class CompressionPipeline:
             ),
             *recent,
         ]
-        return collapsed, CompressionEvent("context_collapse", before, self._char_count(collapsed))
+        detail = f"collapsed {len(prefix)} msgs"
+        return collapsed, CompressionEvent("context_collapse", before, self._char_count(collapsed), detail)
 
     @staticmethod
     def _char_count(messages: list[Message]) -> int:

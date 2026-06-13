@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 
+from agent_core.compression import CompressionConfig
 from agent_core.memory import MemoryConfig
 from agent_core.models import Message, ToolResult
 from agent_core.providers.fake import FakeProvider
@@ -38,6 +39,12 @@ class RecordingUI(NullUI):
     def on_final(self, answer: str) -> None:
         self.events.append(("final", answer))
 
+    def on_compaction_start(self, reactive: bool) -> None:
+        self.events.append(("compaction_start", reactive))
+
+    def on_compaction_end(self, before_chars: int, after_chars: int, detail: str, reactive: bool) -> None:
+        self.events.append(("compaction_end", reactive))
+
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict) -> str:
         return "always"
 
@@ -61,6 +68,24 @@ async def test_ui_emits_events_in_order(tmp_path: Path) -> None:
     assert kinds == ["reasoning", "tool_call", "tool_result", "final"]
     assert ui.events[1] == ("tool_call", "echo")
     assert ui.events[-1][0] == "final"
+
+
+async def test_compaction_emits_start_and_end(tmp_path: Path) -> None:
+    # A tiny context budget forces auto_compact to fire on the first loop step,
+    # so the UI must see a start/end pair (the bar's bracketing events).
+    ui = RecordingUI()
+    config = ReActConfig(
+        run_dir=str(tmp_path),
+        memory=MemoryConfig(enabled=False),
+        compression=CompressionConfig(max_context_chars=10, auto_threshold_ratio=0.1),
+    )
+    agent = ReActAgent(FakeProvider(), config, ui=ui)
+
+    await agent.run("please use tool: echo")
+
+    kinds = [kind for kind, _ in ui.events]
+    assert "compaction_start" in kinds
+    assert "compaction_end" in kinds
 
 
 async def test_always_allow_via_ui_grants_write_permission(tmp_path: Path) -> None:
@@ -153,3 +178,41 @@ def test_console_ui_finalizer_prints_full_when_not_streamed(capsys) -> None:
     ui.on_final("the answer")  # no deltas this turn -> print the whole thing
     out = capsys.readouterr().out
     assert "the answer" in out
+
+
+# --- compaction progress bar -------------------------------------------------
+
+
+def test_console_ui_compaction_bar_and_summary(capsys) -> None:
+    ui = ConsoleUI(color=False)
+    ui.on_compaction_start(reactive=False)
+    ui.on_compaction_progress(1 / 3, "snip")
+    ui.on_compaction_progress(2 / 3, "microcompact")
+    ui.on_compaction_progress(1.0, "context_collapse")
+    ui.on_compaction_end(24000, 9000, "collapsed 12 msgs", reactive=False)
+    out = capsys.readouterr().out
+    assert "100%" in out  # the bar reached full
+    assert "█" in out  # rendered with block glyphs
+    assert "compacted 24.0k→9.0k chars" in out
+    assert "collapsed 12 msgs" in out
+    # The summary text never includes the compressed content itself.
+    assert "answer" not in out
+
+
+def test_console_ui_reactive_compaction_is_louder(capsys) -> None:
+    ui = ConsoleUI(color=False)
+    ui.on_compaction_start(reactive=True)
+    ui.on_compaction_progress(1.0, "context_collapse")
+    ui.on_compaction_end(31000, 7000, "collapsed 20 msgs", reactive=True)
+    out = capsys.readouterr().out
+    assert "⚠" in out
+    assert "overflowed" in out
+
+
+def test_console_ui_compaction_summary_drops_empty_detail(capsys) -> None:
+    ui = ConsoleUI(color=False)
+    ui.on_compaction_start(reactive=False)
+    ui.on_compaction_end(500, 500, "", reactive=False)
+    out = capsys.readouterr().out
+    assert "compacted 500→500 chars" in out
+    assert " · " not in out  # no dangling separator when there's no detail

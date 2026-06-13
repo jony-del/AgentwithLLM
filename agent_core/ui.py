@@ -59,6 +59,15 @@ class AgentUI:
     def on_stopped(self, reason: str, human: str) -> None:
         """A safety-net guard (cancel / max_steps / deadline) ended the run."""
 
+    def on_compaction_start(self, reactive: bool) -> None:
+        """Context compaction began (``reactive`` = emergency after an overflow)."""
+
+    def on_compaction_progress(self, fraction: float, stage: str) -> None:
+        """A compaction stage finished; ``fraction`` advances 0.0 → 1.0."""
+
+    def on_compaction_end(self, before_chars: int, after_chars: int, detail: str, reactive: bool) -> None:
+        """Compaction finished; report the net size change (never the content)."""
+
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         """Ask the user whether to run a tool. Base/non-interactive answer: deny."""
         return "deny"
@@ -106,6 +115,7 @@ class ConsoleUI(AgentUI):
         self._streamed_text = False
         self._streamed_thinking = False
         self._open_block = False  # a streamed line is open and needs a trailing newline
+        self._compaction_reactive = False
 
     # --- styling helpers ---------------------------------------------------
 
@@ -216,6 +226,36 @@ class ConsoleUI(AgentUI):
     def on_stopped(self, reason: str, human: str) -> None:
         self._close_block()
         self._emit(self._style(f"■ stopped: {human}", _YELLOW))
+
+    # --- context compaction progress --------------------------------------
+
+    def on_compaction_start(self, reactive: bool) -> None:
+        self._close_block()
+        self._compaction_reactive = reactive
+
+    def on_compaction_progress(self, fraction: float, stage: str) -> None:
+        fraction = max(0.0, min(1.0, fraction))
+        width = 14
+        filled = round(fraction * width)
+        bar = "█" * filled + "░" * (width - filled)
+        color = _YELLOW if self._compaction_reactive else _DIM
+        line = self._style(f"⊙ compacting ▕{bar}▏ {int(fraction * 100)}%  {stage}", color)
+        # In-place update: carriage return + erase-to-end-of-line, no newline.
+        print(f"\r{line}\x1b[K", end="", flush=True)
+
+    def on_compaction_end(self, before_chars: int, after_chars: int, detail: str, reactive: bool) -> None:
+        sizes = f"{self._human_chars(before_chars)}→{self._human_chars(after_chars)} chars"
+        suffix = f" · {detail}" if detail else ""
+        if reactive:
+            summary = self._style(f"⚠ context overflowed, compacted {sizes}{suffix}", _YELLOW)
+        else:
+            summary = self._style(f"⊙ compacted {sizes}{suffix}", _DIM)
+        # Overwrite the in-place bar, then terminate the line with a newline.
+        print(f"\r\x1b[K{summary}", flush=True)
+
+    @staticmethod
+    def _human_chars(n: int) -> str:
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
     # --- interactive permission prompt ------------------------------------
 
