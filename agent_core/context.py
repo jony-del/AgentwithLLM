@@ -29,6 +29,24 @@ DEFAULT_MAX_CHARS = 32000
 # Marker appended when the joined text is truncated to ``max_chars``.
 _TRUNCATION_SUFFIX = "\n...(truncated)"
 
+# Project-root markers, in priority order. VCS markers win first (``.git`` may be a
+# directory or a file in worktrees/submodules, so probe with ``.exists()``); if none
+# of those exist anywhere up the tree, fall back to language-agnostic build/manifest
+# files. The walk stops at the nearest ancestor bearing any marker so a generic agent
+# framework never reads CLAUDE.md from directories outside the current project.
+_VCS_MARKERS = (".git", ".hg", ".svn")
+_PROJECT_ROOT_MARKERS = (
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+)
+
 
 async def build_project_instructions(
     workspace: Path,
@@ -38,10 +56,12 @@ async def build_project_instructions(
 ) -> str | None:
     """Discover and join CLAUDE.md files into one injectable block.
 
-    Walks ``workspace`` up to the filesystem root collecting a ``CLAUDE.md`` per
+    Walks ``workspace`` up to the *project root* collecting a ``CLAUDE.md`` per
     directory (root → workspace order, so the closest file wins), optionally
-    prepending the user-global ``~/.claude/CLAUDE.md``. Returns ``None`` when there is
-    nothing to inject (no files, all empty, or all unreadable). Never raises.
+    prepending the user-global ``~/.claude/CLAUDE.md``. The project root is the
+    nearest ancestor bearing a VCS or build marker (see ``_find_project_root``);
+    the walk never climbs past it. Returns ``None`` when there is nothing to inject
+    (no files, all empty, or all unreadable). Never raises.
     """
     try:
         paths = await asyncio.to_thread(_discover_claude_md_sync, workspace, include_user_home)
@@ -52,11 +72,35 @@ async def build_project_instructions(
         return None
 
 
+def _find_project_root(workspace: Path) -> Path:
+    """Return the project root for ``workspace`` (an already-resolved path).
+
+    Searches ``workspace`` and its ancestors, nearest first: the closest directory
+    holding a VCS marker wins; failing that, the closest directory holding any
+    build/manifest marker. When nothing is found the workspace is its own root, so a
+    marker-less directory never causes a climb past the workspace. The returned path
+    is always a member of ``[workspace, *workspace.parents]``. Never raises.
+    """
+    chain = [workspace, *workspace.parents]
+
+    def _has_marker(directory: Path, markers: tuple[str, ...]) -> bool:
+        try:
+            return any((directory / marker).exists() for marker in markers)
+        except OSError:
+            return False
+
+    for markers in (_VCS_MARKERS, _PROJECT_ROOT_MARKERS):
+        for directory in chain:
+            if _has_marker(directory, markers):
+                return directory
+    return workspace
+
+
 def _discover_claude_md_sync(workspace: Path, include_user_home: bool) -> list[Path]:
     """Return deduped CLAUDE.md paths in priority order (lowest → highest).
 
     Order: ``~/.claude/CLAUDE.md`` (if present and requested) first, then each
-    directory from the filesystem root down to ``workspace``. Files closer to the
+    directory from the project root down to ``workspace``. Files closer to the
     workspace come later so the model weights them higher. Dedup is by resolved path.
     """
     candidates: list[Path] = []
@@ -66,9 +110,14 @@ def _discover_claude_md_sync(workspace: Path, include_user_home: bool) -> list[P
         candidates.append(user_file)
 
     workspace = workspace.resolve()
-    # workspace itself + every parent, then reverse to get root → workspace.
-    dirs = [workspace, *workspace.parents]
-    for directory in reversed(dirs):
+    root = _find_project_root(workspace)
+    # Collect workspace → root (inclusive), then reverse to get root → workspace.
+    scoped: list[Path] = []
+    for directory in [workspace, *workspace.parents]:
+        scoped.append(directory)
+        if directory == root:
+            break
+    for directory in reversed(scoped):
         candidates.append(directory / "CLAUDE.md")
 
     discovered: list[Path] = []

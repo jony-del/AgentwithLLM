@@ -23,6 +23,8 @@ async def test_discovers_workspace_claude_md(tmp_path: Path) -> None:
 
 
 async def test_multi_level_order_root_to_workspace(tmp_path: Path) -> None:
+    # A .git marker pins tmp_path as the project root so the walk climbs into it.
+    (tmp_path / ".git").mkdir()
     (tmp_path / "CLAUDE.md").write_text("ROOT RULES", encoding="utf-8")
     sub = tmp_path / "sub"
     sub.mkdir()
@@ -34,6 +36,76 @@ async def test_multi_level_order_root_to_workspace(tmp_path: Path) -> None:
     assert "ROOT RULES" in result and "SUB RULES" in result
     # Root file is lower priority, so it appears before the workspace file.
     assert result.index("ROOT RULES") < result.index("SUB RULES")
+
+
+async def test_walk_stops_at_vcs_root(tmp_path: Path) -> None:
+    # .git pins the root at `repo`; CLAUDE.md above it must not be read.
+    (tmp_path / "CLAUDE.md").write_text("OUTSIDE RULES", encoding="utf-8")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "CLAUDE.md").write_text("REPO RULES", encoding="utf-8")
+    deep = repo / "pkg" / "mod"
+    deep.mkdir(parents=True)
+    (deep / "CLAUDE.md").write_text("DEEP RULES", encoding="utf-8")
+
+    result = await build_project_instructions(deep, include_user_home=False)
+
+    assert result is not None
+    assert "REPO RULES" in result and "DEEP RULES" in result
+    assert "OUTSIDE RULES" not in result
+    assert result.index("REPO RULES") < result.index("DEEP RULES")
+
+
+async def test_walk_stops_at_project_marker_without_vcs(tmp_path: Path) -> None:
+    # No VCS anywhere; pyproject.toml pins the root at `proj`.
+    (tmp_path / "CLAUDE.md").write_text("OUTSIDE RULES", encoding="utf-8")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (proj / "CLAUDE.md").write_text("PROJ RULES", encoding="utf-8")
+    sub = proj / "sub"
+    sub.mkdir()
+    (sub / "CLAUDE.md").write_text("SUB RULES", encoding="utf-8")
+
+    result = await build_project_instructions(sub, include_user_home=False)
+
+    assert result is not None
+    assert "PROJ RULES" in result and "SUB RULES" in result
+    assert "OUTSIDE RULES" not in result
+
+
+async def test_walk_workspace_only_without_any_marker(tmp_path: Path) -> None:
+    # No marker at all: the workspace is its own root, parents are not read.
+    (tmp_path / "CLAUDE.md").write_text("PARENT RULES", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "CLAUDE.md").write_text("ONLY RULES", encoding="utf-8")
+
+    result = await build_project_instructions(sub, include_user_home=False)
+
+    assert result is not None
+    assert "ONLY RULES" in result
+    assert "PARENT RULES" not in result
+
+
+async def test_vcs_marker_beats_project_marker(tmp_path: Path) -> None:
+    # .git at `repo` outranks pyproject.toml at the nearer `repo/pkg`.
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "CLAUDE.md").write_text("REPO RULES", encoding="utf-8")
+    pkg = repo / "pkg"
+    pkg.mkdir()
+    (pkg / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (pkg / "CLAUDE.md").write_text("PKG RULES", encoding="utf-8")
+    deep = pkg / "mod"
+    deep.mkdir()
+    (deep / "CLAUDE.md").write_text("DEEP RULES", encoding="utf-8")
+
+    result = await build_project_instructions(deep, include_user_home=False)
+
+    assert result is not None
+    # Root is the repo (VCS wins), so all three levels are read.
+    assert "REPO RULES" in result and "PKG RULES" in result and "DEEP RULES" in result
 
 
 async def test_truncates_oversized(tmp_path: Path) -> None:
