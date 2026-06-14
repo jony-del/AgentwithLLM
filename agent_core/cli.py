@@ -147,6 +147,7 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         memory=_memory_config(args),
         output=resolve_output_config(),
         project_instructions=bool(context["project_instructions"]),
+        git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),
         thinking_budget=getattr(args, "thinking_budget", None),
         stream=not getattr(args, "no_stream", False),

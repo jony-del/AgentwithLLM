@@ -8,7 +8,7 @@
 > 3. LLM 摘要式 compaction（双轨）
 >
 > 设计约束（遵循 `CLAUDE.md`）：
-> - `import agent_core` 不得依赖可选重依赖；新增能力走懒加载/降级。
+> - `import agent_core` 不得依赖可选重依赖。
 > - 公共执行 API 一律 `async def` 干净命名，阻塞 IO 只作为 `_xxx_sync` 内部实现。
 > - 跨层契约 `Message/ToolCall/ToolResult/LLMResult` 谨慎变更并更新测试。
 > - 上下文管理不得隐藏重要近期证据；compaction 失败不得让已完成的 run 崩。

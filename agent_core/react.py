@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agent_core.agents.team import TeamStore
 from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
-from agent_core.context import build_project_instructions
+from agent_core.context import build_git_status, build_project_instructions
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolRisk
@@ -82,6 +82,10 @@ class ReActConfig:
     # config.resolve_context_config). The joined block is truncated to claudemd_max_chars.
     project_instructions: bool = True
     claudemd_max_chars: int = 32000
+    # Collect a one-time git snapshot (branch/main/user/status/log) at run start and
+    # inject it as a pinned system block just after CLAUDE.md. Off when False (or
+    # AGENT_DISABLE_GIT_CONTEXT is truthy, folded in by config.resolve_context_config).
+    git_context: bool = True
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
@@ -364,13 +368,27 @@ class ReActAgent:
         await self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
 
     async def _inject_project_context(self, messages: list[Message]) -> None:
-        """Inject project instructions (CLAUDE.md) as a pinned system block.
+        """Inject CLAUDE.md and the git snapshot as pinned system blocks.
 
-        Runs right after ``_recall`` so the final order is
-        ``system → CLAUDE.md → memory recall → user``: ``_recall`` already put any
-        recall block at index 1, and inserting here at index 1 lands CLAUDE.md just
-        ahead of it. Tagged ``pinned`` so compaction never collapses/truncates it.
-        Best-effort: any failure degrades to no injection and never sinks the run."""
+        Runs right after ``_recall``, which already put any recall block at index 1, so
+        messages are ``[system, (recall), user]`` here. We insert the git block at index
+        1 *first*, then CLAUDE.md at index 1, so they stack into the final order
+        ``system → CLAUDE.md → git_status → memory recall → user``. Both blocks are
+        tagged ``pinned`` so compaction never collapses/truncates them.
+
+        Each source is independently best-effort: a failure in one (or its absence)
+        degrades to no injection for that block and never sinks the run."""
+        # git first: inserting at index 1 before CLAUDE.md lands git just after it.
+        if self.config.git_context:
+            try:
+                git_block = await build_git_status(self.session.workspace)
+            except Exception as exc:  # noqa: BLE001 - build_git_status shouldn't raise; defensive.
+                await self.logger.write("git_status", {"error": f"{type(exc).__name__}: {exc}"})
+                git_block = None
+            if git_block:
+                messages.insert(1, Message("system", git_block, metadata={"pinned": "git_status"}))
+                await self.logger.write("git_status", {"chars": len(git_block)})
+
         if not self.config.project_instructions:
             return
         try:

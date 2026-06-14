@@ -57,13 +57,17 @@ max_steps = 0                  # hard ceiling on tool turns; 0 = no cap
 # so the model can return a useful partial answer before the hard stop. >= 1 disables it.
 soft_deadline_fraction = 0.9
 
-# --- One-time project context (CLAUDE.md) -----------------------------------
+# --- One-time project context (CLAUDE.md + git) -----------------------------
 # At run start the agent discovers CLAUDE.md files (workspace up to the root, plus
 # ~/.claude/CLAUDE.md) and injects them as a pinned system block the model must
-# follow. The block survives compaction. Turn it off here or with a truthy
-# AGENT_DISABLE_CLAUDE_MD env var (mirrors Claude Code's CLAUDE_CODE_DISABLE_CLAUDE_MDS).
+# follow. It also captures a one-shot git snapshot (branch, main branch, user,
+# `git status --short`, last 5 commits) and injects it as a second pinned block,
+# wrapped as untrusted context. Both blocks survive compaction and degrade silently
+# (no CLAUDE.md / not a git repo / git missing). Toggle here or with truthy
+# AGENT_DISABLE_CLAUDE_MD / AGENT_DISABLE_GIT_CONTEXT env vars.
 [context]
-project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips all injection
+project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAUDE.md injection
+git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
 
 # --- Tool concurrency -------------------------------------------------------
