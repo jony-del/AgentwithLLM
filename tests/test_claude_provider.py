@@ -73,6 +73,31 @@ def test_claude_provider_converts_orphan_tool_messages_to_user_text() -> None:
     assert formatted == [{"role": "user", "content": [{"type": "text", "text": "orphan observation"}]}]
 
 
+def test_claude_provider_serializes_restructured_context_assembly() -> None:
+    # New context-assembly shape (Phase 1C): one base system message carrying an
+    # appended ``gitStatus:`` line, then TWO consecutive leading user messages
+    # (the <system-reminder> userContext message + the actual task). The Anthropic
+    # API accepts consecutive user messages, and the system parts join into one string.
+    provider = ClaudeProvider(api_key="test-key")
+    messages = [
+        Message("system", "base prompt\n\ngitStatus: on branch main"),
+        Message(
+            "user",
+            "<system-reminder>\n# claudeMd\nRULES\n</system-reminder>",
+            metadata={"pinned": "user_context"},
+        ),
+        Message("user", "do the task"),
+    ]
+
+    system, formatted = provider._format_messages(messages)
+
+    assert system == "base prompt\n\ngitStatus: on branch main"
+    assert formatted == [
+        {"role": "user", "content": "<system-reminder>\n# claudeMd\nRULES\n</system-reminder>"},
+        {"role": "user", "content": "do the task"},
+    ]
+
+
 # --- Extended thinking -------------------------------------------------------
 
 

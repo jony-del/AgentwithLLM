@@ -269,7 +269,9 @@ def resolve_compression_config(config_file: str | Path = "agent.toml") -> "Compr
     Covers the deterministic shrink thresholds and the Track A (LLM summary) knobs.
     Precedence: defaults → ``[compression]`` → env. ``AGENT_DISABLE_LLM_SUMMARY``
     (truthy) forces ``use_llm_summary`` off so a run is pinned to deterministic
-    Track B regardless of provider. Unknown keys in the table are ignored.
+    Track B regardless of provider. ``AGENT_AUTOCOMPACT_PCT_OVERRIDE`` (percent of the
+    effective window, 0 < p <= 100) lowers the token-based auto-compact threshold for
+    testing. Unknown keys in the table are ignored.
     """
     from agent_core.compression import CompressionConfig
 
@@ -279,6 +281,15 @@ def resolve_compression_config(config_file: str | Path = "agent.toml") -> "Compr
     disable = os.getenv("AGENT_DISABLE_LLM_SUMMARY")
     if disable is not None and coerce_to_type(bool, disable):
         config.use_llm_summary = False
+
+    pct = os.getenv("AGENT_AUTOCOMPACT_PCT_OVERRIDE")
+    if pct is not None:
+        try:
+            parsed = float(pct)
+        except ValueError:
+            parsed = 0.0
+        if 0 < parsed <= 100:
+            config.autocompact_pct_override = parsed
     return config
 
 

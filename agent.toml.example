@@ -78,14 +78,33 @@ claudemd_max_chars = 32000     # truncate the joined block to this many characte
 # deterministic string join (Track B). Any summary failure degrades to Track B, so a
 # run never breaks. AGENT_DISABLE_LLM_SUMMARY=1 pins a run to Track B.
 [compression]
-max_context_chars = 24000      # size at which proactive compaction is considered
-auto_threshold_ratio = 0.8     # compact once history crosses this fraction of the cap
 max_message_chars = 6000       # per-message size above which snip/microcompact trim
 collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
 use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
-summary_max_tokens = 2048      # output budget for the summary call
 summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
 summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
+compact_max_output_tokens = 8192 # output budget for the Track A summary call
+# summary_timeout_seconds = 30   # single (non-stacked) timeout on the summary call; None disables
+# Token-based auto-compact gate (parity with the reference). The gate compares a
+# running token estimate (last response usage, else chars/4) against
+# `effective_window - autocompact_buffer_tokens`, where the effective window reserves
+# room for the summary output. The char fields below only bound per-message snip/
+# microcompact budgets — they no longer drive the trigger.
+# max_context_chars = 24000    # per-message microcompact budget basis (NOT the trigger)
+# auto_threshold_ratio = 0.8   # retained for back-compat; the gate is token-based now
+# summary_max_tokens = 2048    # legacy; superseded by compact_max_output_tokens
+# context_window_tokens caps the model's window for local auto-compact decisions
+# (leave unset to use the model's native window: claude-* = 200k, [1m]-tagged = 1M).
+# autocompact_buffer_tokens = 13000        # headroom below the effective window before compaction fires
+# reserved_output_tokens_for_summary = 20000 # tokens held back from the window for the summary's output
+# max_consecutive_autocompact_failures = 3   # circuit breaker: stop retrying after this many failures
+# AGENT_AUTOCOMPACT_PCT_OVERRIDE=<0..100> (env only) lowers the threshold to a
+# percent of the effective window for easier testing.
+# Post-compact file re-injection: after a real fold, re-attach the most-recently-read
+# files as one untrusted <system-reminder> user message so file context isn't lost.
+# post_compact_max_files = 5                 # most-recent files re-attached (newest first)
+# post_compact_max_chars_per_file = 4000     # per-file truncation cap
+# post_compact_total_budget_chars = 16000    # total char budget across all re-attached files
 
 # --- Tool concurrency -------------------------------------------------------
 # Same-turn tool calls run concurrently when their declared resources do not

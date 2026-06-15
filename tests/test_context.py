@@ -7,7 +7,13 @@ import pytest
 
 from agent_core import context as context_module
 from agent_core.config import resolve_context_config
-from agent_core.context import build_git_status, build_project_instructions
+from agent_core.context import (
+    append_system_context,
+    build_git_status,
+    build_project_instructions,
+    current_date_line,
+    prepend_user_context,
+)
 from agent_core.memory import MemoryConfig
 from agent_core.models import Message
 from agent_core.providers.fake import FakeProvider
@@ -399,17 +405,25 @@ async def test_injection_order_without_memory(monkeypatch: pytest.MonkeyPatch, t
 
     result = await agent.run("hello")
 
-    pinned = [m for m in result.messages if m.role == "system"]
-    assert [m.content for m in pinned] == [
-        agent.config.system_prompt,
-        "CLAUDEMD BLOCK",
-        "GIT BLOCK",
-    ]
-    git_block = next(m for m in result.messages if m.content == "GIT BLOCK")
-    assert git_block.metadata["pinned"] == "git_status"
-    # Overall sequence: system → CLAUDE.md → git_status → user.
-    roles_contents = [m.content for m in result.messages]
-    assert roles_contents.index("GIT BLOCK") < roles_contents.index("hello")
+    # The git snapshot now rides inside the single base system block (systemContext),
+    # not as a standalone system message. So there is exactly one system message.
+    system_msgs = [m for m in result.messages if m.role == "system"]
+    assert len(system_msgs) == 1
+    base = system_msgs[0]
+    assert base.content.startswith(agent.config.system_prompt)
+    assert "gitStatus: GIT BLOCK" in base.content  # appended key: value line
+
+    # CLAUDE.md now lives in the pinned <system-reminder> userContext user message.
+    meta = next(m for m in result.messages if m.metadata.get("pinned") == "user_context")
+    assert meta.role == "user"
+    assert "# claudeMd\nCLAUDEMD BLOCK" in meta.content
+    assert "# currentDate\n" in meta.content
+    assert meta.content.startswith("<system-reminder>")
+
+    # Overall sequence: system(+gitStatus) → userContext user → user task.
+    order = [m for m in result.messages]
+    assert order.index(base) < order.index(meta)
+    assert order.index(meta) < next(i for i, m in enumerate(order) if m.content == "hello")
 
 
 async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -424,31 +438,68 @@ async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatc
     result = await agent.run("hello")
 
     order = [m.content for m in result.messages]
-    # Full five-part order: system → CLAUDE.md → git_status → memory recall → user.
-    assert order[:5] == [
-        agent.config.system_prompt,
-        "CLAUDEMD BLOCK",
-        "GIT BLOCK",
-        "RECALLED MEMORY BLOCK",
-        "hello",
-    ]
-    recall_block = result.messages[3]
-    assert recall_block.metadata["memory"] == "recall"
-    assert result.messages[2].metadata["pinned"] == "git_status"
+    # Order: system(+gitStatus) → memory recall (system) → userContext user → user task.
+    assert result.messages[0].role == "system"
+    assert "gitStatus: GIT BLOCK" in result.messages[0].content
+    assert result.messages[1].content == "RECALLED MEMORY BLOCK"
+    assert result.messages[1].metadata["memory"] == "recall"
+    assert result.messages[2].metadata.get("pinned") == "user_context"
+    assert "# claudeMd\nCLAUDEMD BLOCK" in result.messages[2].content
+    assert result.messages[3].content == "hello"
 
 
 async def test_git_block_survives_compaction(tmp_path: Path) -> None:
     from agent_core.compression import CompressionPipeline
 
-    git_block = Message("system", "GIT SNAPSHOT", metadata={"pinned": "git_status"})
+    # git status is now part of the base system block (messages[0]), which compaction
+    # always preserves as the base system message.
+    base = Message("system", "system prompt\n\ngitStatus: GIT SNAPSHOT")
     messages = [
-        Message("system", "system prompt"),
-        git_block,
+        base,
         *[Message("user" if i % 2 == 0 else "assistant", f"chatter {i} " * 50) for i in range(30)],
     ]
 
     compacted, _ = await CompressionPipeline().reactive_compact(messages)
 
-    survivor = [m for m in compacted if m.metadata.get("pinned") == "git_status"]
+    survivor = [m for m in compacted if m.role == "system" and "gitStatus: GIT SNAPSHOT" in m.content]
     assert len(survivor) == 1
-    assert survivor[0].content == "GIT SNAPSHOT"  # verbatim, not collapsed/truncated
+    assert survivor[0].content == "system prompt\n\ngitStatus: GIT SNAPSHOT"  # verbatim
+
+
+# --- assembly helpers -------------------------------------------------------
+
+
+def test_append_system_context_empty_is_unchanged() -> None:
+    assert append_system_context("BASE", {}) == "BASE"
+
+
+def test_append_system_context_appends_key_value_lines() -> None:
+    out = append_system_context("BASE PROMPT", {"gitStatus": "on main", "foo": "bar"})
+    assert out == "BASE PROMPT\n\ngitStatus: on main\nfoo: bar"
+
+
+def test_prepend_user_context_empty_is_none() -> None:
+    assert prepend_user_context({}) is None
+
+
+def test_prepend_user_context_exact_wrapper() -> None:
+    msg = prepend_user_context({"claudeMd": "RULES", "currentDate": "Today's date is 2026-06-15."})
+    assert msg is not None
+    assert msg.role == "user"
+    assert msg.metadata["pinned"] == "user_context"
+    content = msg.content
+    assert content.startswith(
+        "<system-reminder>\nAs you answer the user's questions, "
+        "you can use the following context:\n"
+    )
+    assert "# claudeMd\nRULES" in content
+    assert "# currentDate\nToday's date is 2026-06-15." in content
+    assert "IMPORTANT: this context may or may not be relevant to your tasks." in content
+    assert content.rstrip().endswith("</system-reminder>")
+
+
+def test_current_date_line_shape() -> None:
+    import datetime as _dt
+
+    line = current_date_line()
+    assert line == f"Today's date is {_dt.date.today().isoformat()}."

@@ -8,12 +8,24 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from agent_core.agents.team import TeamStore
-from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
+from agent_core.compression import (
+    CompressionConfig,
+    CompressionEvent,
+    CompressionPipeline,
+    parse_prompt_too_long_gap,
+    truncate_head_for_ptl_retry,
+)
 from agent_core.compression_summary import build_summarizer
-from agent_core.context import build_git_status, build_project_instructions
+from agent_core.context import (
+    append_system_context,
+    build_git_status,
+    build_project_instructions,
+    current_date_line,
+    prepend_user_context,
+)
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
-from agent_core.models import LLMContextTooLongError, Message, ToolRisk
+from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
@@ -30,6 +42,12 @@ WRAPUP_TEXT = (
     "You are almost out of time for this task. Stop calling tools now and reply with "
     "your best final answer based on what you have so far, noting anything left undone."
 )
+
+# Bound on the reactive 413 recovery loop: after summarizing once, we peel the oldest
+# whole API rounds and retry ``complete`` at most this many times. This is the guard that
+# prevents a 413 → compact → 413 → … infinite loop — once the retries are exhausted (or
+# nothing is left to drop) the overflow error propagates instead of spinning forever.
+MAX_PTL_RETRIES = 5
 
 
 @dataclass(slots=True)
@@ -78,14 +96,16 @@ class ReActConfig:
         "their resources are independent; if an action needs the output from a previous "
         "tool call, wait until the next turn to request it."
     )
-    # Discover and inject project instructions (CLAUDE.md) as a pinned system block at
-    # run start. Off when False (or AGENT_DISABLE_CLAUDE_MD is truthy, folded in by
+    # Discover project instructions (CLAUDE.md) at run start and inject them as the
+    # ``claudeMd`` entry of the pinned ``<system-reminder>`` userContext user message.
+    # Off when False (or AGENT_DISABLE_CLAUDE_MD is truthy, folded in by
     # config.resolve_context_config). The joined block is truncated to claudemd_max_chars.
     project_instructions: bool = True
     claudemd_max_chars: int = 32000
     # Collect a one-time git snapshot (branch/main/user/status/log) at run start and
-    # inject it as a pinned system block just after CLAUDE.md. Off when False (or
-    # AGENT_DISABLE_GIT_CONTEXT is truthy, folded in by config.resolve_context_config).
+    # append it as the ``gitStatus`` entry of the base system block (systemContext). Off
+    # when False (or AGENT_DISABLE_GIT_CONTEXT is truthy, folded in by
+    # config.resolve_context_config).
     git_context: bool = True
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -176,6 +196,10 @@ class ReActAgent:
         self.memory_store, self.retriever, self.extractor = self._build_memory(
             memory_store, retriever, extractor
         )
+        # Running prompt-token figure from the last response's usage (Phase 2B). The
+        # auto-compact gate thresholds against this (parity with the reference) instead
+        # of a char ratio; 0 until the first response with usage arrives.
+        self._last_usage_tokens: int = 0
 
     def _build_memory(
         self,
@@ -266,8 +290,18 @@ class ReActAgent:
                     wrapup_sent = True
             step += 1
 
+            # Build the post-compact file re-injection attachments once per turn; they
+            # are appended to the conversation tail ONLY if a real fold happens (the
+            # pipeline forwards them to build_post_compact_messages inside the collapse
+            # stage). Empty when nothing has been read yet.
+            attachments = self._build_read_attachments()
             messages, events = await self.compression.auto_compact(
-                messages, summarizer=self._summarizer, on_stage=self._compaction_reporter(reactive=False)
+                messages,
+                model=self.config.model,
+                token_estimator=self._estimate_tokens,
+                summarizer=self._summarizer,
+                on_stage=self._compaction_reporter(reactive=False),
+                attachments=attachments,
             )
             for event in events:
                 await self.logger.write("compression", asdict(event))
@@ -284,24 +318,61 @@ class ReActAgent:
                 if cancelled():
                     return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
                 raise
-            except LLMContextTooLongError:
+            except LLMContextTooLongError as exc:
+                # Reactive recovery, bounded so a 413 can never loop forever: summarize
+                # aggressively once, then retry ``complete`` up to MAX_PTL_RETRIES times,
+                # peeling the oldest whole API rounds before each retry. If a retry still
+                # 413s and nothing is left to drop (< 2 rounds), or the retries are
+                # exhausted, the overflow propagates.
+                gap = parse_prompt_too_long_gap(str(exc))
                 messages, events = await self.compression.reactive_compact(
-                    messages, summarizer=self._summarizer, on_stage=self._compaction_reporter(reactive=True)
+                    messages,
+                    model=self.config.model,
+                    token_estimator=self._estimate_tokens,
+                    summarizer=self._summarizer,
+                    on_stage=self._compaction_reporter(reactive=True),
+                    attachments=self._build_read_attachments(),
                 )
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
-                self.ui.on_turn_start()
-                try:
-                    result = await self.provider.complete(
-                        messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
-                        should_cancel=cancelled,
-                    )
-                except asyncio.CancelledError:
-                    if cancelled():
-                        return await self._stopped(
-                            messages, step, "interrupted", "being interrupted by the user (Esc)"
+                result = None
+                for _ in range(MAX_PTL_RETRIES):
+                    self.ui.on_turn_start()
+                    try:
+                        result = await self.provider.complete(
+                            messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
+                            should_cancel=cancelled,
                         )
-                    raise
+                        break
+                    except asyncio.CancelledError:
+                        if cancelled():
+                            return await self._stopped(
+                                messages, step, "interrupted", "being interrupted by the user (Esc)"
+                            )
+                        raise
+                    except LLMContextTooLongError as exc_retry:
+                        gap = parse_prompt_too_long_gap(str(exc_retry)) or gap
+                        truncated = truncate_head_for_ptl_retry(
+                            messages, token_gap=gap, token_estimator=self._estimate_tokens
+                        )
+                        if truncated is None:
+                            # Nothing safe left to drop (< 2 rounds) — give up and surface
+                            # the overflow rather than spin.
+                            raise
+                        messages = truncated
+                        await self.logger.write(
+                            "compression",
+                            {"stage": "ptl_head_truncate", "reactive": True, "kept": len(messages)},
+                        )
+                if result is None:
+                    # Exhausted MAX_PTL_RETRIES without a successful completion.
+                    raise exc
+
+            # Track the running prompt token count from the response usage, when the
+            # provider reports it, so the next turn's auto-compact gate thresholds against
+            # real usage (parity with the reference) rather than only a char estimate.
+            if result.usage is not None:
+                self._last_usage_tokens = result.usage.context_tokens
 
             # Re-poll after the turn completes: an Esc pressed *during* the model
             # call (including a single-turn final answer that requests no tools, and
@@ -354,6 +425,10 @@ class ReActAgent:
                         metadata={**tool_result.metadata, "ok": tool_result.ok, "tool_call_id": tool_call.id},
                     )
                 )
+                # Record read-file state HERE (not in the read tool — its mixin shape
+                # conflicts with SessionAwareMixin) so it can be re-injected after a
+                # post-compaction fold. Defensive: odd/missing args just skip.
+                self._record_read_result(tool_call, tool_result)
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
         answer = f"Stopped after {human} without a final answer."
@@ -375,17 +450,31 @@ class ReActAgent:
         await self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
 
     async def _inject_project_context(self, messages: list[Message]) -> None:
-        """Inject CLAUDE.md and the git snapshot as pinned system blocks.
+        """Assemble run-start context the reference Open-ClaudeCode way.
 
         Runs right after ``_recall``, which already put any recall block at index 1, so
-        messages are ``[system, (recall), user]`` here. We insert the git block at index
-        1 *first*, then CLAUDE.md at index 1, so they stack into the final order
-        ``system → CLAUDE.md → git_status → memory recall → user``. Both blocks are
-        tagged ``pinned`` so compaction never collapses/truncates them.
+        messages are ``[system, (recall), user]`` here. We build two seams:
+
+        - ``system_context`` ``{"gitStatus": <git block>}`` — appended to the *base*
+          system message (``messages[0]``) as ``key: value`` lines via
+          ``append_system_context``. Git thus rides inside the single system block
+          (always preserved by compaction), not as a standalone system message.
+        - ``user_context`` ``{"claudeMd": <CLAUDE.md>, "currentDate": <today>}`` —
+          rendered as ONE pinned ``<system-reminder>`` user message via
+          ``prepend_user_context`` and inserted immediately before the user task.
+
+        Final order becomes ``system(+gitStatus) → (memory recall system) →
+        userContext <system-reminder> user (pinned) → user task``.
 
         Each source is independently best-effort: a failure in one (or its absence)
-        degrades to no injection for that block and never sinks the run."""
-        # git first: inserting at index 1 before CLAUDE.md lands git just after it.
+        degrades to no injection for that part and never sinks the run. Log event
+        names/sizes are unchanged (``git_status`` / ``project_instructions``).
+
+        NOTE for Phase 2B: the userContext message is a *pinned user* message.
+        Compaction must preserve pinned messages regardless of role (``_context_collapse``
+        will enforce this); the ``pinned`` tag is the seam for that.
+        """
+        system_context: dict[str, str] = {}
         if self.config.git_context:
             try:
                 git_block = await build_git_status(self.session.workspace)
@@ -393,22 +482,39 @@ class ReActAgent:
                 await self.logger.write("git_status", {"error": f"{type(exc).__name__}: {exc}"})
                 git_block = None
             if git_block:
-                messages.insert(1, Message("system", git_block, metadata={"pinned": "git_status"}))
+                system_context["gitStatus"] = git_block
                 await self.logger.write("git_status", {"chars": len(git_block)})
 
-        if not self.config.project_instructions:
-            return
-        try:
-            text = await build_project_instructions(
-                self.session.workspace, max_chars=self.config.claudemd_max_chars
+        if system_context:
+            base = messages[0]
+            messages[0] = Message(
+                "system",
+                append_system_context(base.content, system_context),
+                metadata=base.metadata,
             )
-        except Exception as exc:  # noqa: BLE001 - injection must not fail a run
-            await self.logger.write("project_instructions", {"error": f"{type(exc).__name__}: {exc}"})
-            return
-        if not text:
-            return
-        messages.insert(1, Message("system", text, metadata={"pinned": "claudemd"}))
-        await self.logger.write("project_instructions", {"chars": len(text)})
+
+        user_context: dict[str, str] = {}
+        if self.config.project_instructions:
+            try:
+                text = await build_project_instructions(
+                    self.session.workspace, max_chars=self.config.claudemd_max_chars
+                )
+            except Exception as exc:  # noqa: BLE001 - injection must not fail a run
+                await self.logger.write("project_instructions", {"error": f"{type(exc).__name__}: {exc}"})
+                text = None
+            if text:
+                user_context["claudeMd"] = text
+                await self.logger.write("project_instructions", {"chars": len(text)})
+
+        # currentDate always rides in userContext (cheap, stdlib-only).
+        user_context["currentDate"] = current_date_line()
+
+        meta = prepend_user_context(user_context)
+        if meta is not None:
+            # Insert immediately before the user task message (the last message at this
+            # point). Memory recall, if any, stays its own pinned system message ahead
+            # of this one.
+            messages.insert(len(messages) - 1, meta)
 
     async def _extract_memories(self, messages: list[Message]) -> None:
         """Extraction at natural termination — goes through ``complete`` (and thus
@@ -448,6 +554,97 @@ class ReActAgent:
                 )
 
         return on_stage
+
+    def _record_read_result(self, tool_call: ToolCall, tool_result: ToolResult) -> None:
+        """Record a successful ``read_text_file`` result into the session read-state.
+
+        The key is the workspace-resolved path string (stable across relative spellings);
+        the value is the file content snapshot. Re-injection (after a fold) reads this back.
+        Fully defensive — any odd/missing argument or resolve failure just skips, never
+        raises, so a malformed call can't break the loop. (Deferred-tool delta
+        re-announcements are intentionally NOT done here: this framework re-sends every
+        tool schema each turn via ``registry.schemas_for_llm()``, so tools are never lost
+        after compaction.)
+        """
+        if tool_call.name != "read_text_file" or not tool_result.ok:
+            return
+        try:
+            raw_path = tool_call.arguments.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                return
+            key = str((self.session.workspace / raw_path).resolve())
+            self.session.record_read(key, tool_result.content)
+        except Exception:  # noqa: BLE001 - read-state recording is best-effort, never fatal
+            return
+
+    def _build_read_attachments(self) -> list[Message]:
+        """Build the post-compact file re-injection message from session read-state.
+
+        Takes the most-recently-read files (newest first) up to
+        ``post_compact_max_files``, each truncated to ``post_compact_max_chars_per_file``,
+        within a total ``post_compact_total_budget_chars`` budget. Returns ``[]`` when
+        nothing has been read. Emits ONE combined ``user`` message framed as untrusted
+        situational context (avoids role-alternation worries and is cheaper than many
+        messages), tagged ``metadata={"post_compact_attachment": True}`` so it is foldable
+        conversation in the tail — NOT pinned (pinning would break the preserved-front
+        invariant in ``_context_collapse``).
+        """
+        state = self.session.read_file_state
+        if not state:
+            return []
+        config = self.config.compression
+        max_files = config.post_compact_max_files
+        per_file = config.post_compact_max_chars_per_file
+        total_budget = config.post_compact_total_budget_chars
+        if max_files <= 0 or per_file <= 0 or total_budget <= 0:
+            return []
+
+        sections: list[str] = []
+        spent = 0
+        # Newest-last dict → reverse for newest-first.
+        for key, content in reversed(list(state.items())):
+            if len(sections) >= max_files:
+                break
+            rel = self._relativize(key)
+            body = content[:per_file]
+            if len(content) > per_file:
+                body = f"{body}\n[truncated {len(content) - per_file} chars]"
+            remaining = total_budget - spent
+            if remaining <= 0:
+                break
+            if len(body) > remaining:
+                body = f"{body[:remaining]}\n[truncated to fit budget]"
+            sections.append(f"## {rel}\n{body}")
+            spent += len(body)
+        if not sections:
+            return []
+        joined = "\n\n".join(sections)
+        text = (
+            "<system-reminder>\n"
+            "Files you read earlier, re-attached after the conversation was compacted. "
+            "This is a snapshot — the file may have changed since; re-read it if you need "
+            "the current contents.\n"
+            f"{joined}\n"
+            "</system-reminder>"
+        )
+        return [Message("user", text, metadata={"post_compact_attachment": True})]
+
+    def _relativize(self, key: str) -> str:
+        """Workspace-relative path for the attachment heading; fall back to the raw key."""
+        try:
+            return str(Path(key).relative_to(self.session.workspace))
+        except Exception:  # noqa: BLE001 - outside the workspace or unrelativizable
+            return key
+
+    def _estimate_tokens(self, messages: list[Message]) -> int:
+        """Estimate the prompt token footprint for the auto-compact gate.
+
+        Uses the larger of the last response's reported context tokens and a cheap
+        char/4 estimate of the current history — so the gate reflects real usage once a
+        response arrives, but still rises with the not-yet-sent delta and works offline
+        (FakeProvider reports usage too, but char/4 keeps the gate honest mid-turn).
+        """
+        return max(self._last_usage_tokens, sum(len(m.content) for m in messages) // 4)
 
     def _provider_config(self) -> dict[str, object]:
         return {

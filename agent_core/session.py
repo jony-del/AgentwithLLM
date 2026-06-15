@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Cap on the recently-read file snapshots kept on a session (Phase 3E). Only the most
+# recent handful are ever re-injected after compaction, so a small bound is plenty and
+# keeps a many-file run from growing the dict unboundedly.
+_MAX_READ_FILE_STATE = 20
+
 # Allowed to-do states, mirroring Claude Code's TodoWrite.
 VALID_TODO_STATUS = frozenset({"pending", "in_progress", "completed"})
 _TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
@@ -91,10 +96,29 @@ class SessionContext:
     ui_notify: Callable[[list[Todo]], None] | None = None
     depth: int = 0
     max_depth: int = 1
+    # Recently-read file snapshots, keyed by workspace-resolved path string and
+    # recorded by the react loop (NOT the read tool — see Phase 3E). Insertion-ordered
+    # newest-last so post-compaction re-injection can take the most-recent few. Capped
+    # so a long run that reads many files can't grow this unbounded.
+    read_file_state: dict[str, str] = field(default_factory=dict)
 
     def notify_todos(self) -> None:
         if self.ui_notify is not None:
             self.ui_notify(self.todos.items())
+
+    def record_read(self, path: str, content: str) -> None:
+        """Record the latest snapshot of a read file, newest-last by recency.
+
+        Re-reading a file moves it to the end (most recent). The dict is capped at
+        ``_MAX_READ_FILE_STATE`` entries; the oldest entries are evicted first.
+        """
+        if path in self.read_file_state:
+            # Drop then re-insert so the key lands at the end (most recent).
+            del self.read_file_state[path]
+        self.read_file_state[path] = content
+        while len(self.read_file_state) > _MAX_READ_FILE_STATE:
+            oldest = next(iter(self.read_file_state))
+            del self.read_file_state[oldest]
 
 
 class SessionAwareMixin:

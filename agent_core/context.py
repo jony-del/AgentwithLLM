@@ -1,9 +1,16 @@
 """One-time project context discovered at run start.
 
-Two independent sources, each injected as a pinned system block by ``ReActAgent``:
+Two independent sources, discovered by ``ReActAgent`` and assembled into the
+reference Open-ClaudeCode shape (one system block + ``systemContext`` appended as
+``key: value`` lines + ``userContext`` as a single ``<system-reminder>`` user
+message):
 
-- ``build_project_instructions`` — CLAUDE.md project instructions (disk IO).
+- ``build_project_instructions`` — CLAUDE.md project instructions (disk IO). Feeds
+  the ``userContext`` ``claudeMd`` entry (the ``<system-reminder>`` user message).
 - ``build_git_status`` — a one-shot git snapshot (branch/main/user/status/log).
+  Feeds the ``systemContext`` ``gitStatus`` entry (appended to the base system block).
+- ``append_system_context`` / ``prepend_user_context`` — the two assembly helpers
+  that mirror the reference ``appendSystemContext`` / ``prependUserContext``.
 
 Pure standard library: ``import agent_core`` must not pull in heavy deps, and this
 module is on that path. Disk IO runs in ``_xxx_sync`` helpers offloaded via
@@ -21,7 +28,10 @@ never sink a run.
 from __future__ import annotations
 
 import asyncio
+import datetime
 from pathlib import Path
+
+from agent_core.models import Message
 
 # Mirrors Claude Code's MEMORY_INSTRUCTION_PROMPT so the model treats the block the
 # same way it does in the reference runtime.
@@ -319,3 +329,67 @@ def _format_git_status(
         return None
     body = "\n".join(lines)
     return f"{GIT_STATUS_PREAMBLE}\n\n<git_status>\n{body}\n</git_status>"
+
+
+# --- run-start assembly helpers ---------------------------------------------
+#
+# Mirror the reference Open-ClaudeCode pipeline: run-start context is split into
+# two dicts. ``systemContext`` (e.g. ``{"gitStatus": ...}``) is appended to the
+# single base system block as ``key: value`` lines; ``userContext`` (e.g.
+# ``{"claudeMd": ..., "currentDate": ...}``) is rendered as ONE ``<system-reminder>``
+# meta user message prepended to the conversation. Keeping CLAUDE.md/git inside
+# these seams (rather than as standalone system messages) matches the reference's
+# prompt-cache and ordering behavior.
+
+# Exact reference wrapper for the userContext meta user message. Each entry renders
+# as ``# {key}\n{value}``; entries are joined by ``\n``. The preamble/trailer text is
+# copied verbatim from ``prependUserContext`` so the model treats the block the same
+# way it does in the reference runtime.
+_USER_CONTEXT_PREAMBLE = (
+    "<system-reminder>\n"
+    "As you answer the user's questions, you can use the following context:\n"
+)
+_USER_CONTEXT_TRAILER = (
+    "\n\n      IMPORTANT: this context may or may not be relevant to your tasks. "
+    "You should not respond to this context unless it is highly relevant to your "
+    "task.\n</system-reminder>\n"
+)
+
+
+def append_system_context(system_text: str, system_context: dict[str, str]) -> str:
+    """Append ``key: value`` lines from ``system_context`` to one base system string.
+
+    Mirrors the reference ``appendSystemContext``: the joined
+    ``f"{k}: {v}"`` lines are appended to the base system text (separated from it by a
+    blank line). Returns ``system_text`` unchanged when the dict is empty. We keep a
+    single base system string here rather than a parts list — the provider already
+    joins all system messages into one system block.
+    """
+    if not system_context:
+        return system_text
+    appended = "\n".join(f"{key}: {value}" for key, value in system_context.items())
+    if not system_text:
+        return appended
+    return f"{system_text}\n\n{appended}"
+
+
+def prepend_user_context(user_context: dict[str, str]) -> Message | None:
+    """Build the single ``<system-reminder>`` meta user message for ``userContext``.
+
+    Mirrors the reference ``prependUserContext``: each entry renders as
+    ``# {key}\\n{value}`` (entries joined by ``\\n``), wrapped in the exact
+    preamble/trailer above. Returns ``None`` when the dict is empty so the caller can
+    skip injection. The message is tagged ``metadata={"pinned": "user_context"}`` so
+    compaction never folds it (it is a pinned *user* message — Phase 2B must preserve
+    pinned messages regardless of role).
+    """
+    if not user_context:
+        return None
+    body = "\n".join(f"# {key}\n{value}" for key, value in user_context.items())
+    content = f"{_USER_CONTEXT_PREAMBLE}{body}{_USER_CONTEXT_TRAILER}"
+    return Message("user", content, metadata={"pinned": "user_context"})
+
+
+def current_date_line() -> str:
+    """Return a one-line ``currentDate`` value, e.g. ``"Today's date is 2026-06-15."``."""
+    return f"Today's date is {datetime.date.today().isoformat()}."

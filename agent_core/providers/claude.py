@@ -17,6 +17,7 @@ from agent_core.models import (
     LLMResult,
     LLMTransientError,
     Message,
+    TokenUsage,
     ToolCall,
 )
 from agent_core.providers.base import LLMProvider, StreamHandler
@@ -41,6 +42,9 @@ class _StreamAccumulator:
         self.tool_calls: list[ToolCall] = []
         self.stop_reason: str | None = None
         self.blocks: dict[int, dict[str, Any]] = {}
+        # Token accounting: input/cache counts arrive in ``message_start``, the
+        # running output total in each ``message_delta``.
+        self.usage: TokenUsage = TokenUsage()
 
     def result(self) -> LLMResult:
         return LLMResult(
@@ -50,6 +54,7 @@ class _StreamAccumulator:
             raw={},
             thinking="\n".join(part for part in self.thinking_parts if part),
             thinking_blocks=self.thinking_blocks,
+            usage=self.usage,
         )
 
 
@@ -415,6 +420,19 @@ class ClaudeProvider(LLMProvider):
             raw=payload,
             thinking="\n".join(part for part in thinking_parts if part),
             thinking_blocks=thinking_blocks,
+            usage=self._parse_usage(payload.get("usage")),
+        )
+
+    @staticmethod
+    def _parse_usage(usage: Any) -> TokenUsage | None:
+        """Map an Anthropic ``usage`` object onto ``TokenUsage`` (cache_* default 0)."""
+        if not isinstance(usage, dict):
+            return None
+        return TokenUsage(
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
+            cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
+            cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
         )
 
     # --- streaming (Server-Sent Events) -----------------------------------
@@ -447,7 +465,16 @@ class ClaudeProvider(LLMProvider):
     def _handle_sse_event(self, event: dict[str, Any], acc: "_StreamAccumulator", stream: StreamHandler) -> None:
         """Dispatch one parsed SSE event into the accumulator (shared sync + async)."""
         etype = event.get("type")
-        if etype == "content_block_start":
+        if etype == "message_start":
+            # Input + cache token counts are reported once, up front. Output is still
+            # zero here; the running output total accrues in message_delta below.
+            message = event.get("message", {})
+            usage = self._parse_usage(message.get("usage")) if isinstance(message, dict) else None
+            if usage is not None:
+                # Preserve any output already accumulated (defensive — normally none yet).
+                usage.output_tokens = acc.usage.output_tokens or usage.output_tokens
+                acc.usage = usage
+        elif etype == "content_block_start":
             acc.blocks[event.get("index")] = self._start_block(event.get("content_block", {}))
         elif etype == "content_block_delta":
             self._apply_delta(acc.blocks.get(event.get("index")), event.get("delta", {}), stream)
@@ -461,6 +488,10 @@ class ClaudeProvider(LLMProvider):
             )
         elif etype == "message_delta":
             acc.stop_reason = event.get("delta", {}).get("stop_reason") or acc.stop_reason
+            # message_delta carries the running output token total at top level.
+            delta_usage = event.get("usage")
+            if isinstance(delta_usage, dict) and "output_tokens" in delta_usage:
+                acc.usage.output_tokens = int(delta_usage.get("output_tokens") or 0)
         elif etype == "error":
             err = event.get("error", {})
             raise LLMTransientError(

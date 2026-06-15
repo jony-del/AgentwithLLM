@@ -72,7 +72,17 @@ Core loop & contracts:
 - `agent_core/interrupt.py`: `KeyInterrupt` — background Esc watcher exposing a
   cooperative cancellation flag the loop polls at safe points (no-op on
   non-TTY/CI).
-- `agent_core/compression.py`: proactive and reactive context compaction.
+- `agent_core/compression.py`: proactive and reactive context compaction, aligned
+  with Open-ClaudeCode (token-gated; folds the prefix into a USER summary message;
+  round-boundary grouping; 413 head-truncation + circuit breaker). See
+  `docs/compaction-openclaudecode-alignment.md`.
+- `agent_core/compression_summary.py`: Track A summarizer seam (full 9-section
+  summary prompt; bounded, no-tools call; single non-stacked timeout).
+- `agent_core/tokens.py`: pure-stdlib model context-window + auto-compact threshold math.
+- `agent_core/context.py`: run-start assembly — base system prompt + `systemContext`
+  (git folded in as `key: value`) + a pinned `<system-reminder>` `userContext` USER
+  message (CLAUDE.md + date), mirroring the reference's `appendSystemContext`/
+  `prependUserContext`.
 
 Providers:
 - `agent_core/providers/`: `FakeProvider` (deterministic, for tests/demos) and
@@ -109,7 +119,9 @@ Cross-cutting:
 
 `async ReActAgent.run()` is the central loop:
 
-1. Auto-compact history if needed.
+1. Auto-compact history if the running token estimate crosses the model's
+   threshold (token-gated, not char-gated; reactive compaction additionally
+   recovers from a context-overflow 413).
 2. Call the configured `LLMProvider`.
 3. If the result has no tool calls, return the final answer.
 4. Execute tool calls through `ToolExecutor`.

@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCall
+from agent_core.models import LLMContextTooLongError, LLMResult, Message, TokenUsage, ToolCall
 from agent_core.providers.base import LLMProvider, StreamHandler
 
 
@@ -32,11 +32,20 @@ class FakeProvider(LLMProvider):
             raise LLMContextTooLongError("simulated context-too-long")
 
         result = self._compute(messages)
+        # Deterministic token accounting so offline/test compaction thresholds are
+        # meaningful and stable: char/4 estimate of the sent input + a fixed output.
+        result.usage = self._estimate_usage(messages)
         # Stream the answer text in whitespace chunks so the live UI can render it
         # token-by-token, mirroring a real SSE stream — without needing an API key.
         if stream is not None and result.content and not result.tool_calls:
             await self._stream_text(result.content, stream, should_cancel)
         return result
+
+    @staticmethod
+    def _estimate_usage(messages: list[Message]) -> TokenUsage:
+        """Char/4 input estimate plus a small fixed output, deterministic by design."""
+        input_tokens = sum(len(m.content) for m in messages) // 4
+        return TokenUsage(input_tokens=input_tokens, output_tokens=8)
 
     def _compute(self, messages: list[Message]) -> LLMResult:
         memory_response = self._maybe_memory_response(messages)

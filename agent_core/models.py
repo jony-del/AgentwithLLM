@@ -48,6 +48,26 @@ class ToolResult:
 
 
 @dataclass(slots=True)
+class TokenUsage:
+    """Per-response token accounting reported by a provider.
+
+    Mirrors the Anthropic ``usage`` object. ``context_tokens`` is the total token
+    footprint of the *request that was sent* (the non-cached prompt plus whatever was
+    read from / written to the prompt cache) — that running figure is what context
+    compaction thresholds against, not the freshly generated output.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+    @property
+    def context_tokens(self) -> int:
+        return self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+
+
+@dataclass(slots=True)
 class LLMResult:
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -59,6 +79,10 @@ class LLMResult:
     # they can be replayed verbatim on later turns — the Anthropic API requires the
     # prior turn's thinking block when thinking and tool use span multiple turns.
     thinking_blocks: list[dict[str, Any]] = field(default_factory=list)
+    # Token accounting for this response, when the provider reports it. Appended last
+    # so existing positional ``LLMResult(...)`` construction stays valid. Compaction
+    # reads ``usage.context_tokens`` as the running prompt size.
+    usage: "TokenUsage | None" = None
 
 
 class LLMContextTooLongError(RuntimeError):

@@ -122,7 +122,9 @@ class MemoryExtractor:
     @staticmethod
     def _transcript(messages: list[Message]) -> str:
         # Only user/assistant turns carry rememberable signal; skip system prompts,
-        # tool observations, and anything compression already rewrote.
+        # tool observations, anything compression already rewrote, and injected meta
+        # context (the pinned <system-reminder> userContext message is a *user* message
+        # but carries no conversational signal — exclude it like the system prompt).
         lines = [
             f"{message.role}: {message.content}"
             for message in messages
@@ -130,5 +132,6 @@ class MemoryExtractor:
             and message.content.strip()
             and message.metadata.get("compressed") is None
             and message.metadata.get("memory") is None
+            and message.metadata.get("pinned") is None
         ]
         return "\n".join(lines)
