@@ -93,13 +93,39 @@ user( task )
   tool schemas every turn, so tools are never lost after compaction.
 
 ## Verification
-- `pytest` — **349 passed**. Focused: `tests/test_tokens.py`, `test_compression.py`,
+- `pytest` — **358 passed** (349 alignment + 9 hardening). Focused: `tests/test_tokens.py`, `test_compression.py`,
   `test_context.py`, `test_react.py`, `test_session.py`, `test_postcompact.py`,
   `test_claude_provider.py`.
 - Manual acceptance (offline `--provider fake`, forced fold): the produced messages are
   `system(+gitStatus)` → pinned `<system-reminder>` userContext → summary **USER**
   message with the continuation wrapper → recent rounds intact on round boundaries →
   `post_compact_attachment` USER message at the tail.
+
+## Post-alignment hardening (critical-review follow-up)
+
+A critical review against the reference source surfaced robustness/parity gaps that
+this pass closed (full suite **358 passed**):
+
+- **Single oversized round/message converges** (`shrink_oversize_messages`): when whole-
+  round head-truncation can't help (one round, or one message, alone exceeds the window),
+  the 413 loop falls back to head/tail-truncating the largest **non-preserved** messages
+  (omission marker, `min_keep_chars` each end) until the gap is shed. Guarantees the retry
+  loop always makes progress instead of re-raising / spinning. Logged as `ptl_shrink`.
+- **`PTL_RETRY_MARKER`**: after a head-truncation, if the first non-system message would be
+  an assistant/tool turn (possible when the pinned `userContext` is absent — no git AND no
+  CLAUDE.md), a synthetic user turn is prepended so the Anthropic messages array still
+  begins with a user message. Mirrors the reference marker.
+- **Bounded summary timeout by default**: `summary_timeout_seconds` now defaults to `60`
+  (was `None`/unbounded) so a wedged Track A call can't hang a run; set to `None` to rely
+  only on the run-level deadline.
+- **Post-compact re-injection budgets are token-based** (`post_compact_max_tokens_per_file`
+  = 5000, `post_compact_total_budget_tokens` = 20000), matching the gate's unit and
+  restoring meaningfully more file context than the old ~4k-char total. **CLAUDE.md is
+  excluded** from re-injection (already pinned as `userContext`).
+- **Dead config removed**: `auto_threshold_ratio`, `summary_max_tokens` (both unused since
+  the token gate / `compact_max_output_tokens` landed). `max_context_chars` is retained —
+  it still bounds the microcompact budget. `compact_max_output_tokens` stays 8192 (safe
+  across models; raise per-config for high-output models).
 
 ## Deliberately out of scope
 - `cache_edits` / time-based microcompaction (needs server-side prompt-cache editing

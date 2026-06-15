@@ -36,6 +36,21 @@ def test_record_read_result_skips_non_read_and_failed(tmp_path: Path) -> None:
     assert agent.session.read_file_state == {}
 
 
+def test_record_read_result_excludes_claude_md(tmp_path: Path) -> None:
+    # CLAUDE.md is already pinned as the userContext reminder, so re-attaching it after a
+    # fold is pure duplication — it must never enter the read-state.
+    agent = _agent(tmp_path)
+    agent._record_read_result(
+        ToolCall("read_text_file", {"path": "CLAUDE.md"}, id="t1"),
+        ToolResult(name="read_text_file", content="# project rules", ok=True),
+    )
+    agent._record_read_result(
+        ToolCall("read_text_file", {"path": "sub/CLAUDE.md"}, id="t2"),
+        ToolResult(name="read_text_file", content="# nested rules", ok=True),
+    )
+    assert agent.session.read_file_state == {}
+
+
 def test_build_read_attachments_empty_when_nothing_read(tmp_path: Path) -> None:
     agent = _agent(tmp_path)
     assert agent._build_read_attachments() == []
@@ -65,19 +80,21 @@ def test_build_read_attachments_recency_cap_newest_first(tmp_path: Path) -> None
 
 
 def test_build_read_attachments_per_file_truncation(tmp_path: Path) -> None:
-    agent = _agent(tmp_path, post_compact_max_chars_per_file=10)
+    # Token-based: per-file cap of 10 tokens → 40-char ceiling.
+    agent = _agent(tmp_path, post_compact_max_tokens_per_file=10)
     agent.session.record_read(str((tmp_path / "big.txt").resolve()), "x" * 100)
     [msg] = agent._build_read_attachments()
-    assert "xxxxxxxxxx" in msg.content  # first 10 kept
-    assert "[truncated 90 chars]" in msg.content
+    assert "x" * 40 in msg.content  # first 40 (10 tokens) kept
+    assert "[truncated 60 chars]" in msg.content
 
 
 def test_build_read_attachments_total_budget(tmp_path: Path) -> None:
+    # Token-based: 7-token total budget → 28-char ceiling, smaller than one file.
     agent = _agent(
         tmp_path,
         post_compact_max_files=5,
-        post_compact_max_chars_per_file=1000,
-        post_compact_total_budget_chars=30,
+        post_compact_max_tokens_per_file=250,
+        post_compact_total_budget_tokens=7,
     )
     for name in ("a", "b", "c"):
         agent.session.record_read(str((tmp_path / f"{name}.txt").resolve()), name * 1000)

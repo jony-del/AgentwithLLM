@@ -83,16 +83,15 @@ collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
 use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
 summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
 summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
-compact_max_output_tokens = 8192 # output budget for the Track A summary call
-# summary_timeout_seconds = 30   # single (non-stacked) timeout on the summary call; None disables
+compact_max_output_tokens = 8192 # output budget for the Track A summary call (safe across
+                                 # models; e.g. Haiku caps output at 8192 — raise for high-output models)
+summary_timeout_seconds = 60     # single (non-stacked) timeout (s) on the summary call; omit/None disables
 # Token-based auto-compact gate (parity with the reference). The gate compares a
 # running token estimate (last response usage, else chars/4) against
 # `effective_window - autocompact_buffer_tokens`, where the effective window reserves
 # room for the summary output. The char fields below only bound per-message snip/
 # microcompact budgets — they no longer drive the trigger.
 # max_context_chars = 24000    # per-message microcompact budget basis (NOT the trigger)
-# auto_threshold_ratio = 0.8   # retained for back-compat; the gate is token-based now
-# summary_max_tokens = 2048    # legacy; superseded by compact_max_output_tokens
 # context_window_tokens caps the model's window for local auto-compact decisions
 # (leave unset to use the model's native window: claude-* = 200k, [1m]-tagged = 1M).
 # autocompact_buffer_tokens = 13000        # headroom below the effective window before compaction fires
@@ -103,8 +102,9 @@ compact_max_output_tokens = 8192 # output budget for the Track A summary call
 # Post-compact file re-injection: after a real fold, re-attach the most-recently-read
 # files as one untrusted <system-reminder> user message so file context isn't lost.
 # post_compact_max_files = 5                 # most-recent files re-attached (newest first)
-# post_compact_max_chars_per_file = 4000     # per-file truncation cap
-# post_compact_total_budget_chars = 16000    # total char budget across all re-attached files
+# post_compact_max_tokens_per_file = 5000    # per-file truncation cap (token-based, char/4)
+# post_compact_total_budget_tokens = 20000   # total token budget across all re-attached files
+# (CLAUDE.md is never re-attached here — it is already pinned as the userContext reminder.)
 
 # --- Tool concurrency -------------------------------------------------------
 # Same-turn tool calls run concurrently when their declared resources do not

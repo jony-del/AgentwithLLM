@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 from agent_core.compression import (
+    PTL_RETRY_MARKER,
     CompressionConfig,
     CompressionEvent,
     CompressionPipeline,
@@ -10,6 +11,7 @@ from agent_core.compression import (
     group_into_rounds,
     is_preserved,
     parse_prompt_too_long_gap,
+    shrink_oversize_messages,
     split_on_round_boundary,
     truncate_head_for_ptl_retry,
 )
@@ -766,3 +768,96 @@ def test_truncate_head_preserves_round_integrity_under_gap_drop() -> None:
         assert group[0].role == "assistant"
         assert all(m.role == "tool" for m in group[1:])
     _assert_no_orphan_tool_results(out)
+
+
+def test_truncate_head_does_not_insert_marker_when_userContext_present() -> None:
+    # The preserved front ends with the pinned userContext USER message, so the first
+    # non-system message is already a user turn → no synthetic marker is prepended.
+    out = truncate_head_for_ptl_retry(_ptl_history(4), token_gap=None)
+    assert out is not None
+    assert not any(m.metadata.get("ptl_retry_marker") for m in out)
+
+
+def test_truncate_head_inserts_user_marker_when_no_pinned_userContext() -> None:
+    # No pinned userContext (preserved front is system-only). After dropping the oldest
+    # round, the first conversation message would be an assistant → a PTL_RETRY_MARKER
+    # user turn is prepended so the messages array still begins with a user turn.
+    messages = [Message("system", "base system")]
+    for index in range(3):
+        call_id = f"toolu_{index}"
+        messages.append(_assistant_with_calls(f"call {index}", [call_id]))
+        messages.append(_tool_result(f"result {index}", call_id))
+    out = truncate_head_for_ptl_retry(messages, token_gap=None)
+    assert out is not None
+    # First non-system message is the synthetic user marker.
+    first_non_system = next(m for m in out if m.role != "system")
+    assert first_non_system.role == "user"
+    assert first_non_system.metadata.get("ptl_retry_marker")
+    assert first_non_system.content == PTL_RETRY_MARKER
+    _assert_no_orphan_tool_results(out)
+
+
+def test_shrink_oversize_messages_shrinks_largest_and_converges() -> None:
+    # A single oversized non-preserved message: whole-round truncation can't help, so
+    # shrink head/tail-truncates it with an omission marker until the gap is shed.
+    messages = [
+        Message("system", "base"),
+        _pinned("user", "ctx"),
+        Message("user", "x" * 8000),
+    ]
+    out = shrink_oversize_messages(messages, tokens_to_drop=500, min_keep_chars=200)
+    assert out is not None
+    # Preserved front untouched (identity preserved).
+    assert out[0] is messages[0] and out[1] is messages[1]
+    shrunk = out[2]
+    assert shrunk.metadata.get("compressed") == "ptl_shrink"
+    assert len(shrunk.content) < 8000
+    assert "[truncated" in shrunk.content
+    # Head and tail are both retained.
+    assert shrunk.content.startswith("x" * 200)
+    assert shrunk.content.endswith("x" * 200)
+
+
+def test_shrink_oversize_messages_returns_none_when_nothing_to_shrink() -> None:
+    # All messages already at/under the floor → nothing can be shed → None (caller gives up).
+    messages = [Message("system", "base"), _pinned("user", "ctx"), Message("user", "tiny")]
+    assert shrink_oversize_messages(messages, tokens_to_drop=500) is None
+    # Non-positive request → None.
+    assert shrink_oversize_messages([Message("user", "x" * 8000)], tokens_to_drop=0) is None
+
+
+def test_shrink_oversize_messages_never_touches_preserved() -> None:
+    # Even a huge preserved (pinned) message is left intact; only conversation shrinks.
+    messages = [
+        Message("system", "base"),
+        _pinned("user", "P" * 8000),
+        Message("assistant", "A" * 8000),
+    ]
+    out = shrink_oversize_messages(messages, tokens_to_drop=100, min_keep_chars=200)
+    assert out is not None
+    assert out[1].content == "P" * 8000  # pinned untouched
+    assert len(out[2].content) < 8000  # conversation shrunk
+
+
+async def test_context_collapse_then_truncate_keeps_rounds_intact() -> None:
+    # Adversarial: run a real fold, THEN head-truncate the folded result. Round integrity
+    # and the preserved front must survive both stages in sequence.
+    pipeline = CompressionPipeline(CompressionConfig(summary_keep_recent=4, use_llm_summary=False))
+    messages = _ptl_history(8)  # system + pinned userContext + 8 tool rounds
+    folded, event = await pipeline._context_collapse(messages, aggressive=False, summarizer=None)
+    # A summary USER message replaced the old prefix; preserved front still leads.
+    assert folded[0].role == "system"
+    assert folded[1].metadata.get("pinned")
+    _assert_no_orphan_tool_results(folded)
+    # Now truncate the folded history.
+    truncated = truncate_head_for_ptl_retry(folded, token_gap=None)
+    assert truncated is not None
+    assert truncated[0].role == "system"
+    assert truncated[1].metadata.get("pinned")
+    _assert_no_orphan_tool_results(truncated)
+
+
+def test_summary_timeout_default_is_bounded() -> None:
+    # Regression: the Track A summary call must be time-bounded by default so a wedged
+    # provider can't hang a run (was previously None / unbounded).
+    assert CompressionConfig().summary_timeout_seconds == 60.0

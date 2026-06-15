@@ -267,8 +267,9 @@ class _Always413Provider:
 
 
 async def test_reactive_recovery_propagates_when_history_cannot_shrink(tmp_path: Path) -> None:
-    # The very first model call 413s with a history that has < 2 droppable rounds, so
-    # truncate_head_for_ptl_retry returns None and the error propagates — bounded, no loop.
+    # The very first model call 413s with a history that has < 2 droppable rounds AND no
+    # message large enough to shrink, so truncate_head returns None, shrink returns None,
+    # and the error propagates — bounded, no loop.
     provider = _Always413Provider()
     logger = JSONLRunLogger(tmp_path)
     config = ReActConfig(run_dir=str(tmp_path), permission="auto", memory=MemoryConfig(enabled=False))
@@ -278,3 +279,53 @@ async def test_reactive_recovery_propagates_when_history_cannot_shrink(tmp_path:
         await agent.run("hello")
     # Bounded: it gave up well before MAX_PTL_RETRIES could spin (no droppable rounds).
     assert provider.calls <= 2
+
+
+class _GiantRoundUntilFitsProvider:
+    """Seeds one giant assistant round, then 413s while any non-system message is still
+    large, then returns a final answer. Exercises the single-oversized-round shrink path:
+    whole-round head-truncation can't help (one big round), so the loop falls back to
+    ``shrink_oversize_messages`` until the giant message is small enough to fit. The 413
+    decision keys off the largest *conversation* message (not the preserved system block),
+    so the test is independent of the system-prompt size.
+    """
+
+    def __init__(self, big_threshold: int = 1000) -> None:
+        self.calls = 0
+        self.big_threshold = big_threshold
+        self.last_messages: list[Message] = []
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.calls += 1
+        self.last_messages = list(messages)
+        if self.calls == 1:
+            return LLMResult(
+                "G" * 8000,
+                tool_calls=[ToolCall("echo", {"text": "x"}, id="toolu_1")],
+                stop_reason="tool_use",
+            )
+        # Only react to non-preserved conversation messages — the preserved system block
+        # and the pinned userContext (which may carry a large CLAUDE.md) can't be shrunk.
+        biggest = max(
+            (len(m.content) for m in messages if m.role != "system" and not m.metadata.get("pinned")),
+            default=0,
+        )
+        if biggest > self.big_threshold:
+            total = sum(len(m.content) for m in messages)
+            # Gap large enough to force shrinking the giant message.
+            raise LLMContextTooLongError(f"prompt is too long: {total} tokens > {total - 2000}")
+        return LLMResult("done", stop_reason="end")
+
+
+async def test_reactive_recovery_shrinks_single_oversized_round(tmp_path: Path) -> None:
+    provider = _GiantRoundUntilFitsProvider(big_threshold=1000)
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(run_dir=str(tmp_path), permission="auto", memory=MemoryConfig(enabled=False))
+    agent = ReActAgent(provider, config, logger=logger)
+
+    result = await agent.run("kick off the work")
+
+    # The run converges via the shrink fallback rather than spinning or propagating.
+    assert result.answer == "done"
+    # The giant assistant message was head/tail-truncated (carries the shrink marker).
+    assert any(m.metadata.get("compressed") == "ptl_shrink" for m in provider.last_messages)

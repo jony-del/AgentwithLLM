@@ -13,6 +13,7 @@ from agent_core.compression import (
     CompressionEvent,
     CompressionPipeline,
     parse_prompt_too_long_gap,
+    shrink_oversize_messages,
     truncate_head_for_ptl_retry,
 )
 from agent_core.compression_summary import build_summarizer
@@ -355,14 +356,29 @@ class ReActAgent:
                         truncated = truncate_head_for_ptl_retry(
                             messages, token_gap=gap, token_estimator=self._estimate_tokens
                         )
-                        if truncated is None:
-                            # Nothing safe left to drop (< 2 rounds) — give up and surface
-                            # the overflow rather than spin.
+                        if truncated is not None:
+                            messages = truncated
+                            await self.logger.write(
+                                "compression",
+                                {"stage": "ptl_head_truncate", "reactive": True, "kept": len(messages)},
+                            )
+                            continue
+                        # No whole round is safe to drop (< 2 rounds) — a single oversized
+                        # round/message is the whole overflow. Last resort: head/tail-truncate
+                        # the largest non-preserved messages so the prompt finally fits. We
+                        # must shed at least the known gap (else a fraction of the estimate).
+                        need = gap or max(1, self._estimate_tokens(messages) // 5)
+                        shrunk = shrink_oversize_messages(
+                            messages, tokens_to_drop=need, token_estimator=self._estimate_tokens
+                        )
+                        if shrunk is None:
+                            # Even the largest messages are already at their floor — nothing
+                            # left to shrink. Surface the overflow rather than spin.
                             raise
-                        messages = truncated
+                        messages = shrunk
                         await self.logger.write(
                             "compression",
-                            {"stage": "ptl_head_truncate", "reactive": True, "kept": len(messages)},
+                            {"stage": "ptl_shrink", "reactive": True, "kept": len(messages)},
                         )
                 if result is None:
                     # Exhausted MAX_PTL_RETRIES without a successful completion.
@@ -572,6 +588,11 @@ class ReActAgent:
             raw_path = tool_call.arguments.get("path")
             if not isinstance(raw_path, str) or not raw_path:
                 return
+            # Skip CLAUDE.md — it is already injected (and pinned) as the userContext
+            # system-reminder, so re-attaching it after a fold is pure duplication that
+            # wastes the re-injection budget. Mirrors the reference's CLAUDE.md exclusion.
+            if Path(raw_path).name == "CLAUDE.md":
+                return
             key = str((self.session.workspace / raw_path).resolve())
             self.session.record_read(key, tool_result.content)
         except Exception:  # noqa: BLE001 - read-state recording is best-effort, never fatal
@@ -594,8 +615,10 @@ class ReActAgent:
             return []
         config = self.config.compression
         max_files = config.post_compact_max_files
-        per_file = config.post_compact_max_chars_per_file
-        total_budget = config.post_compact_total_budget_chars
+        # Budgets are token-based (char/4, matching the auto-compact gate); convert to a
+        # char ceiling for the actual truncation, which operates on the raw string.
+        per_file = config.post_compact_max_tokens_per_file * 4
+        total_budget = config.post_compact_total_budget_tokens * 4
         if max_files <= 0 or per_file <= 0 or total_budget <= 0:
             return []
 

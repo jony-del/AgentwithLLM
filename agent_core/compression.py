@@ -203,6 +203,31 @@ def parse_prompt_too_long_gap(text: str) -> int | None:
     return gap if gap > 0 else None
 
 
+# Synthetic user turn prepended after a head-truncation when the first non-system
+# message would otherwise be an assistant/tool turn — the Anthropic Messages API
+# requires the messages array (system is a separate param) to begin with a user turn.
+# Our preserved front usually begins with the pinned ``userContext`` USER message, but
+# that message is optional (no git AND no CLAUDE.md), so this is the safety net. Mirrors
+# the reference ``PTL_RETRY_MARKER`` + ``ensureToolResultPairing`` re-prepend.
+PTL_RETRY_MARKER = "[earlier conversation truncated to fit the context window]"
+
+
+def _ensure_user_first(messages: list[Message]) -> list[Message]:
+    """Insert the PTL marker before the first non-system message if it isn't a user turn.
+
+    Leaves ``messages`` untouched when the first non-system message is already a user
+    turn (the common case: a pinned ``userContext`` USER message leads the conversation).
+    """
+    for index, message in enumerate(messages):
+        if message.role == "system":
+            continue
+        if message.role == "user":
+            return messages
+        marker = Message("user", PTL_RETRY_MARKER, metadata={"ptl_retry_marker": True})
+        return [*messages[:index], marker, *messages[index:]]
+    return messages
+
+
 def truncate_head_for_ptl_retry(
     messages: list[Message],
     *,
@@ -251,7 +276,58 @@ def truncate_head_for_ptl_retry(
     if drop < 1:
         return None
     kept_conversation = [m for group in rounds[drop:] for m in group]
-    return [*preserved, *kept_conversation]
+    return _ensure_user_first([*preserved, *kept_conversation])
+
+
+def shrink_oversize_messages(
+    messages: list[Message],
+    *,
+    tokens_to_drop: int,
+    token_estimator: Callable[[list[Message]], int] | None = None,
+    min_keep_chars: int = 200,
+) -> list[Message] | None:
+    """Last-resort fold when whole-round head-truncation can't help (a single oversized
+    round or one giant message that alone exceeds the window).
+
+    Head/tail-truncates the largest NON-preserved messages (each with an omission marker,
+    keeping ``min_keep_chars`` from each end) until at least ``tokens_to_drop`` tokens
+    (estimated, default ``char_count // 4``) have been shed. Returns a NEW list, or
+    ``None`` when nothing further can be shrunk (so the caller can finally give up rather
+    than spin). Preserved system/pinned messages are never touched. This guarantees the
+    413 retry loop always makes progress and converges.
+    """
+    if tokens_to_drop <= 0:
+        return None
+    estimator = token_estimator or (lambda msgs: sum(len(m.content) for m in msgs) // 4)
+    # Largest non-preserved messages first — shrink where it frees the most.
+    order = sorted(
+        (i for i, m in enumerate(messages) if not is_preserved(m)),
+        key=lambda i: len(messages[i].content),
+        reverse=True,
+    )
+    floor_len = 2 * min_keep_chars + len("\n[truncated NNNN chars]")
+    result = list(messages)
+    dropped = 0
+    changed = False
+    for i in order:
+        message = result[i]
+        if len(message.content) <= floor_len:
+            continue
+        head = message.content[:min_keep_chars]
+        tail = message.content[-min_keep_chars:]
+        omitted = len(message.content) - 2 * min_keep_chars
+        content = f"{head}\n[truncated {omitted} chars]\n{tail}"
+        saved_chars = len(message.content) - len(content)
+        result[i] = Message(
+            message.role, content, message.name, {**message.metadata, "compressed": "ptl_shrink"}
+        )
+        changed = True
+        dropped += max(0, saved_chars) // 4
+        if dropped >= tokens_to_drop:
+            break
+    if not changed:
+        return None
+    return result
 
 
 @dataclass(slots=True)
@@ -265,7 +341,6 @@ class CompressionEvent:
 @dataclass(slots=True)
 class CompressionConfig:
     max_context_chars: int = 24000
-    auto_threshold_ratio: float = 0.8
     max_message_chars: int = 6000
     collapsed_keep_recent: int = 8
     # Track A (LLM summary) knobs. When a real summarizer is injected and
@@ -273,17 +348,19 @@ class CompressionConfig:
     # summary instead of the deterministic Track B join; any failure degrades to
     # Track B. With no summarizer (FakeProvider / no key) these are inert.
     use_llm_summary: bool = True
-    summary_max_tokens: int = 2048
     summary_keep_recent: int = 8
     summary_input_max_chars: int = 16000
     # Summary OUTPUT budget for the Track A call (parity with the reference's larger
-    # reservation). Replaces the old hard-coded 2048 max_tokens on the summary path;
-    # ``summary_max_tokens`` is retained only for back-compat with callers that set it.
+    # reservation). Replaces the old hard-coded 2048 max_tokens on the summary path. Kept
+    # at 8192 — a safe ceiling across models (e.g. Haiku caps output at 8192); raise it in
+    # ``agent.toml`` for high-output models. If a model rejects the request the Track A
+    # call simply degrades to Track B.
     compact_max_output_tokens: int = 8192
     # Single, non-stacked timeout (seconds) wrapped around the Track A summarizer call.
-    # None disables it (no asyncio.wait_for). On TimeoutError the prefix degrades to the
-    # deterministic Track B fold — this is the ONLY asyncio-level timeout on the path.
-    summary_timeout_seconds: float | None = None
+    # Defaults to 60s so a wedged summary call can't hang a run indefinitely; set to None
+    # to disable (then only the run-level deadline bounds it). On timeout the prefix
+    # degrades to the deterministic Track B fold — the ONLY asyncio-level timeout here.
+    summary_timeout_seconds: float | None = 60.0
     # Token-based threshold knobs (Phase 1A). The char-based fields above still govern
     # per-message snip/microcompact budgets; the gate itself is token-based (Phase 2B).
     # ``context_window_tokens`` optionally caps the model's window; the buffer / reserved
@@ -298,12 +375,15 @@ class CompressionConfig:
     autocompact_pct_override: float | None = None
     # Post-compact file re-injection (Phase 3E). After a real fold the react loop re-attaches
     # the most-recently-read files (newest first) as one untrusted ``<system-reminder>`` user
-    # message, so the model doesn't lose file context the summary may have dropped. The caps
-    # bound how much is re-attached: at most ``post_compact_max_files`` files, each truncated
-    # to ``post_compact_max_chars_per_file``, within a total ``post_compact_total_budget_chars``.
+    # message, so the model doesn't lose file context the summary may have dropped. Budgets
+    # are TOKEN-based (parity with the reference; same char/4 estimate as the auto-compact
+    # gate, so the units match): at most ``post_compact_max_files`` files, each truncated to
+    # ``post_compact_max_tokens_per_file``, within a total ``post_compact_total_budget_tokens``.
+    # These are larger than the old char caps (~4k tokens total) so folded file context is
+    # actually restored, while staying well under the window on a 200k model.
     post_compact_max_files: int = 5
-    post_compact_max_chars_per_file: int = 4000
-    post_compact_total_budget_chars: int = 16000
+    post_compact_max_tokens_per_file: int = 5000
+    post_compact_total_budget_tokens: int = 20000
 
 
 @dataclass
