@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_core.agents.team import TeamStore
 from agent_core.compression import CompressionConfig, CompressionEvent, CompressionPipeline
+from agent_core.compression_summary import build_summarizer
 from agent_core.context import build_git_status, build_project_instructions
 from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
@@ -130,6 +131,12 @@ class ReActAgent:
         self.registry = tools or self.default_registry()
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         self.compression = CompressionPipeline(self.config.compression)
+        # Track A summarizer (or None → deterministic Track B). Built from the gated
+        # provider so summary calls share the fan-out's API budget; None for
+        # FakeProvider / no key / disabled, keeping offline runs byte-stable.
+        self._summarizer = build_summarizer(
+            self.provider, self._provider_config(), self.config.compression
+        )
         self.ui = ui or NullUI()
         self.team_store = team_store or TeamStore(Path(self.config.run_dir) / "teams")
         # Per-run shared state for session-aware tools (planning, sub-agents). The
@@ -259,8 +266,8 @@ class ReActAgent:
                     wrapup_sent = True
             step += 1
 
-            messages, events = self.compression.maybe_auto_compact(
-                messages, on_stage=self._compaction_reporter(reactive=False)
+            messages, events = await self.compression.auto_compact(
+                messages, summarizer=self._summarizer, on_stage=self._compaction_reporter(reactive=False)
             )
             for event in events:
                 await self.logger.write("compression", asdict(event))
@@ -278,8 +285,8 @@ class ReActAgent:
                     return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
                 raise
             except LLMContextTooLongError:
-                messages, events = self.compression.reactive_compact(
-                    messages, on_stage=self._compaction_reporter(reactive=True)
+                messages, events = await self.compression.reactive_compact(
+                    messages, summarizer=self._summarizer, on_stage=self._compaction_reporter(reactive=True)
                 )
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
@@ -421,7 +428,7 @@ class ReActAgent:
         """Build the per-stage callback that drives the UI's compaction progress bar.
 
         Only fires when compaction actually runs (the threshold gate lives in
-        ``maybe_auto_compact``). Accumulates the overall before/after size and the
+        ``auto_compact``). Accumulates the overall before/after size and the
         non-empty stage details, emitting start → progress* → end. ``NullUI`` makes
         all three hooks no-ops, so non-interactive runs stay silent."""
         state: dict[str, object] = {"started": False, "before": 0, "after": 0, "details": []}

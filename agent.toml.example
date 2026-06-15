@@ -70,6 +70,23 @@ project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAU
 git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
 
+# --- Context compaction -----------------------------------------------------
+# How the history is shrunk when it grows large. Cheap deterministic stages (snip,
+# microcompact) run every turn; the prefix-collapse stage folds old turns into one
+# summary block. With a real provider and use_llm_summary on, that fold is an LLM
+# summary (Track A); with no API key / --provider fake / disabled, it is a
+# deterministic string join (Track B). Any summary failure degrades to Track B, so a
+# run never breaks. AGENT_DISABLE_LLM_SUMMARY=1 pins a run to Track B.
+[compression]
+max_context_chars = 24000      # size at which proactive compaction is considered
+auto_threshold_ratio = 0.8     # compact once history crosses this fraction of the cap
+max_message_chars = 6000       # per-message size above which snip/microcompact trim
+collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
+use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
+summary_max_tokens = 2048      # output budget for the summary call
+summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
+summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
+
 # --- Tool concurrency -------------------------------------------------------
 # Same-turn tool calls run concurrently when their declared resources do not
 # conflict. Disable this to force the old strictly serial execution path.

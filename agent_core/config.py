@@ -263,6 +263,25 @@ def resolve_context_config(config_file: str | Path = "agent.toml") -> dict[str, 
     return values
 
 
+def resolve_compression_config(config_file: str | Path = "agent.toml") -> "CompressionConfig":
+    """Resolve context-compaction settings from the ``[compression]`` toml table, env.
+
+    Covers the deterministic shrink thresholds and the Track A (LLM summary) knobs.
+    Precedence: defaults → ``[compression]`` → env. ``AGENT_DISABLE_LLM_SUMMARY``
+    (truthy) forces ``use_llm_summary`` off so a run is pinned to deterministic
+    Track B regardless of provider. Unknown keys in the table are ignored.
+    """
+    from agent_core.compression import CompressionConfig
+
+    table = load_agent_toml(config_file).get("compression")
+    config = overlay_dataclass(CompressionConfig(), table if isinstance(table, dict) else None)
+
+    disable = os.getenv("AGENT_DISABLE_LLM_SUMMARY")
+    if disable is not None and coerce_to_type(bool, disable):
+        config.use_llm_summary = False
+    return config
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

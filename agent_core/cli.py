@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from agent_core.config import (
+    resolve_compression_config,
     resolve_concurrency_config,
     resolve_config,
     resolve_context_config,
@@ -146,6 +147,7 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         permission=values["permission"],
         memory=_memory_config(args),
         output=resolve_output_config(),
+        compression=resolve_compression_config(),
         project_instructions=bool(context["project_instructions"]),
         git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),

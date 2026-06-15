@@ -447,7 +447,7 @@ async def test_git_block_survives_compaction(tmp_path: Path) -> None:
         *[Message("user" if i % 2 == 0 else "assistant", f"chatter {i} " * 50) for i in range(30)],
     ]
 
-    compacted, _ = CompressionPipeline().compact(messages, aggressive=True)
+    compacted, _ = await CompressionPipeline().reactive_compact(messages)
 
     survivor = [m for m in compacted if m.metadata.get("pinned") == "git_status"]
     assert len(survivor) == 1
