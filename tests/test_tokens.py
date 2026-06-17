@@ -37,34 +37,50 @@ def test_context_window_default_for_plain_claude_model() -> None:
     assert tokens.context_window_for_model("claude-haiku-4-5-20251001") == 200_000
 
 
-def test_context_window_1m_only_for_explicit_tag() -> None:
-    # 1M is opt-in via an explicit [1m] tag; a plain model id stays at the 200k default
-    # so auto-compaction still fires on common 200k deployments.
-    assert tokens.context_window_for_model("claude-sonnet-4-6[1m]") == 1_000_000
-    assert tokens.context_window_for_model("claude-sonnet-4-6") == 200_000
+def test_context_window_native_1m_family() -> None:
+    # The known 1M family (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5) reports 1M natively.
+    assert tokens.context_window_for_model("claude-opus-4-8") == 1_000_000
+    assert tokens.context_window_for_model("claude-sonnet-4-6") == 1_000_000
+    assert tokens.context_window_for_model("claude-fable-5") == 1_000_000
 
 
-def test_context_window_default_for_unknown_model() -> None:
+def test_context_window_1m_tag_forces_1m_for_any_id() -> None:
+    assert tokens.context_window_for_model("some-model[1m]") == 1_000_000
+
+
+def test_context_window_default_for_200k_and_unknown_models() -> None:
+    # Haiku 4.5 (genuine 200k) and unrecognised ids stay at the conservative default.
+    assert tokens.context_window_for_model("claude-haiku-4-5") == 200_000
     assert tokens.context_window_for_model("some-other-model") == 200_000
+
+
+def test_model_output_tokens_default_and_upper() -> None:
+    assert tokens.model_output_tokens("claude-opus-4-8") == (64_000, 128_000)
+    assert tokens.model_output_tokens("claude-haiku-4-5") == (32_000, 64_000)
+    # Unknown ids fall back to the conservative flat default for both.
+    assert tokens.model_output_tokens("some-other-model") == (8_192, 8_192)
+    # max_output_tokens_for_model returns just the steady-state default.
+    assert tokens.max_output_tokens_for_model("claude-opus-4-8") == 64_000
 
 
 # --- effective_context_window ------------------------------------------------
 
 
 def test_effective_context_window_reserves_output() -> None:
-    # 200k window minus min(max_output=8192, reserved=20000) = 200000 - 8192.
-    assert tokens.effective_context_window("claude-haiku-4-5") == 200_000 - 8_192
+    # 200k window minus min(haiku max_output=32000, reserved=20000) = 200000 - 20000.
+    assert tokens.effective_context_window("claude-haiku-4-5") == 200_000 - 20_000
 
 
 def test_effective_context_window_respects_override() -> None:
+    # Sonnet 4.6's native window (1M) is capped down to the override; reserve = min(32000, 20000).
     eff = tokens.effective_context_window("claude-sonnet-4-6", context_window_override=50_000)
-    assert eff == 50_000 - 8_192
+    assert eff == 50_000 - 20_000
 
 
 def test_effective_context_window_override_only_caps_down() -> None:
     # An override larger than the native window does not raise it.
     eff = tokens.effective_context_window("claude-haiku-4-5", context_window_override=999_999)
-    assert eff == 200_000 - 8_192
+    assert eff == 200_000 - 20_000
 
 
 # --- auto_compact_threshold --------------------------------------------------

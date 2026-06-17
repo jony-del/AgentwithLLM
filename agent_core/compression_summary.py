@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from agent_core import tokens
 from agent_core.compression import CompressionConfig, Summarizer
 from agent_core.models import Message
 from agent_core.providers.base import GatedProvider, LLMProvider
@@ -182,6 +183,35 @@ def _unwrap(provider: LLMProvider) -> LLMProvider:
     return provider.inner if isinstance(provider, GatedProvider) else provider
 
 
+class _NullStreamHandler:
+    """No-op ``StreamHandler``: the summary call STREAMS (so large output budgets don't
+    trip the SDK's non-streaming timeout) but its tokens are rendered nowhere. Kept local
+    so this seam stays free of any ``ui`` import."""
+
+    def on_text_delta(self, text: str) -> None: ...
+
+    def on_thinking_delta(self, text: str) -> None: ...
+
+    def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None: ...
+
+
+def _budget_ladder(config: CompressionConfig, ceiling: int) -> list[int]:
+    """Build the ascending output-token escalation ladder, clamped to the model ceiling.
+
+    Tiers: steady-state start -> compaction cap -> model hard ceiling. Deduped, clamped
+    to ``ceiling``, sorted ascending, then truncated to ``1 + compact_max_output_retries``
+    attempts (first attempt plus the allowed escalations).
+    """
+    tiers = (config.compact_summary_start_tokens, config.compact_max_output_tokens, ceiling)
+    ladder: list[int] = []
+    for tier in tiers:
+        value = min(int(tier), int(ceiling))
+        if value > 0 and value not in ladder:
+            ladder.append(value)
+    ladder.sort()
+    return ladder[: 1 + max(0, config.compact_max_output_retries)]
+
+
 def build_summarizer(
     provider: LLMProvider,
     provider_config: dict[str, Any],
@@ -191,8 +221,9 @@ def build_summarizer(
 
     Returns ``None`` when LLM summary is disabled or the provider is the deterministic
     :class:`FakeProvider` (no real key), so offline/test runs stay byte-stable on
-    Track B. The returned callback issues a no-tools, non-streaming completion through
-    the *gated* provider so it shares the fan-out's API budget.
+    Track B. The returned callback issues a no-tools, STREAMED completion through the
+    *gated* provider (so it shares the fan-out's API budget), escalating the output
+    budget on truncation.
     """
     if not config.use_llm_summary:
         return None
@@ -202,15 +233,27 @@ def build_summarizer(
     async def summarize(prefix: list[Message]) -> str:
         convo = render_prefix(prefix, config.summary_input_max_chars)
         messages = [Message("system", SUMMARY_SYSTEM), Message("user", convo)]
-        # Override the live-run knobs: a bounded summary, no streaming, no thinking,
-        # and (via the empty tools list at the call site) no tool use.
-        summary_config = {
-            **provider_config,
-            "max_tokens": config.compact_max_output_tokens,
-            "stream": False,
-            "thinking_budget": None,
-        }
-        result = await provider.complete(messages, [], summary_config)
-        return extract_summary(result.content)
+        model = str(provider_config.get("model", ""))
+        ceiling = tokens.model_output_tokens(model)[1]
+        ladder = _budget_ladder(config, ceiling)
+        sink = _NullStreamHandler()
+        # Escalation ladder: try the steady-state budget first; only when the model
+        # actually truncated (stop_reason "max_tokens") retry at the next, larger tier.
+        # All attempts run inside the single asyncio.wait_for the caller wraps us in, so
+        # the whole ladder shares one (non-stacked) timeout. Each attempt overrides the
+        # live-run knobs: bounded output, streamed, no thinking, no tools (empty list).
+        result_content = ""
+        for budget in ladder:
+            summary_config = {
+                **provider_config,
+                "max_tokens": budget,
+                "stream": True,
+                "thinking_budget": None,
+            }
+            result = await provider.complete(messages, [], summary_config, stream=sink)
+            result_content = result.content
+            if result.stop_reason != "max_tokens":
+                break
+        return extract_summary(result_content)
 
     return summarize

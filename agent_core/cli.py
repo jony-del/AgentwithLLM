@@ -30,6 +30,7 @@ def _resolve(args: argparse.Namespace) -> dict:
             "model": args.model,
             "permission": args.permission,
             "provider": args.provider,
+            "effort": getattr(args, "effort", None),
         }
     )
 
@@ -152,6 +153,7 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),
         thinking_budget=getattr(args, "thinking_budget", None),
+        effort=values["effort"],
         stream=not getattr(args, "no_stream", False),
         parallel_tools=bool(concurrency["parallel_tools"]),
         max_tool_workers=int(concurrency["max_tool_workers"]),
@@ -439,6 +441,13 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             metavar="TOKENS",
             help="Enable Claude extended thinking with this token budget (claude provider).",
+        )
+        subparser.add_argument(
+            "--effort",
+            choices=["low", "medium", "high", "xhigh", "max"],
+            default=None,
+            help="output_config.effort depth/cost level (effort-capable models only; "
+            "dropped for models that don't support the level).",
         )
         subparser.add_argument(
             "--max-api-concurrency",

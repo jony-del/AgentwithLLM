@@ -109,14 +109,16 @@ def resolve_config(
     load_dotenv(env_file)
     file_values = load_agent_toml(config_file)
     defaults = {
-        "model": "claude-sonnet-4-6",
+        "model": "claude-opus-4-8",
         "permission": "default",
         "provider": "claude",
+        "effort": "high",
     }
     env_values = {
         "model": os.getenv("AGENT_MODEL"),
         "permission": os.getenv("AGENT_PERMISSION"),
         "provider": os.getenv("AGENT_PROVIDER"),
+        "effort": os.getenv("AGENT_EFFORT"),
     }
     # Only scalar settings are merged here; the ``[memory]`` table is resolved
     # separately (see resolve_memory_config) so its nested fields don't collide

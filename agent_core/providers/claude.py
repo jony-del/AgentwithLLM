@@ -31,6 +31,53 @@ _RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 # buggy header can't wedge the agent for minutes.
 _MAX_RETRY_AFTER = 60.0
 
+# Model families that REMOVED the sampling params (``temperature``/``top_p``/``top_k``)
+# and dropped manual extended thinking — on these, sending ``temperature`` or
+# ``thinking:{type:"enabled", budget_tokens}`` is a 400. Thinking is adaptive-only
+# (``thinking:{type:"adaptive"}``). Opus 4.7+ and the Fable/Mythos line share this
+# request shape; everything older (Haiku 4.5, Sonnet, Opus <= 4.6) keeps the legacy
+# shape below. Matched as substrings so suffixes / ``[1m]`` tags don't defeat it.
+_ADAPTIVE_THINKING_MARKERS = ("opus-4-7", "opus-4-8", "fable-5", "mythos-5", "mythos-preview")
+
+
+def _is_adaptive_thinking_model(model: str) -> bool:
+    """True for models that reject sampling params and use adaptive-only thinking."""
+    name = (model or "").lower()
+    return any(marker in name for marker in _ADAPTIVE_THINKING_MARKERS)
+
+
+# ``output_config.effort`` support (mirrors Open-ClaudeCode ``modelSupportsEffort`` /
+# ``modelSupportsMaxEffort``). ``low``/``medium``/``high`` are the base levels every
+# effort-capable model accepts; ``xhigh`` (Opus 4.7+/Fable) and ``max`` (Opus 4.6+/
+# Sonnet 4.6/Fable) are narrower. Sending an unsupported level/model is a 400, so the
+# provider drops effort it can't honor (keeps Haiku debug runs working).
+_EFFORT_MARKERS = ("opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5", "mythos-5", "mythos-preview")
+_XHIGH_MARKERS = ("opus-4-7", "opus-4-8", "fable-5", "mythos-5", "mythos-preview")
+_MAX_EFFORT_MARKERS = ("opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5", "mythos-5", "mythos-preview")
+_BASE_EFFORT_LEVELS = ("low", "medium", "high")
+
+
+def _effort_for_model(model: str, level: Any) -> str | None:
+    """Resolve the ``effort`` level to send for ``model``, or ``None`` to omit it.
+
+    Returns ``None`` when no level is requested, the model doesn't support effort, or
+    the requested level isn't allowed on that model (``xhigh``/``max`` gating) — so the
+    caller never sends a value that would 400.
+    """
+    if not isinstance(level, str) or not level:
+        return None
+    name = (model or "").lower()
+    if not any(marker in name for marker in _EFFORT_MARKERS):
+        return None
+    level = level.lower()
+    if level in _BASE_EFFORT_LEVELS:
+        return level
+    if level == "xhigh" and any(marker in name for marker in _XHIGH_MARKERS):
+        return level
+    if level == "max" and any(marker in name for marker in _MAX_EFFORT_MARKERS):
+        return level
+    return None
+
 
 class _StreamAccumulator:
     """Mutable assembly state for one streamed response, shared by sync + async consumers."""
@@ -200,13 +247,22 @@ class ClaudeProvider(LLMProvider):
     ) -> dict[str, Any]:
         """Build the Anthropic Messages request body (pure; shared by sync + async)."""
         system, anthropic_messages = self._format_messages(messages)
+        model = config.get("model", "claude-opus-4-8")
         body: dict[str, Any] = {
-            "model": config.get("model", "claude-sonnet-4-6"),
+            "model": model,
             "max_tokens": config.get("max_tokens", 1024),
-            "temperature": config.get("temperature", 0.2),
             "messages": anthropic_messages,
         }
-        self._apply_thinking(body, config.get("thinking_budget"))
+        if _is_adaptive_thinking_model(model):
+            # Opus 4.7+/Fable/Mythos: NO sampling params (they 400), adaptive-only thinking.
+            self._apply_adaptive_thinking(body, config.get("thinking_budget"))
+        else:
+            # Legacy shape (Haiku 4.5, Sonnet, Opus <= 4.6): temperature + manual thinking.
+            body["temperature"] = config.get("temperature", 0.2)
+            self._apply_thinking(body, config.get("thinking_budget"))
+        effort = _effort_for_model(model, config.get("effort"))
+        if effort is not None:
+            body["output_config"] = {"effort": effort}
         if streaming:
             body["stream"] = True
         if system:
@@ -235,6 +291,21 @@ class ClaudeProvider(LLMProvider):
         body["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
         body["temperature"] = 1
         body["max_tokens"] = max(body.get("max_tokens", 0), thinking_budget + 1024)
+
+    @staticmethod
+    def _apply_adaptive_thinking(body: dict[str, Any], thinking_budget: Any) -> None:
+        """Enable adaptive thinking in-place for Opus 4.7+/Fable/Mythos models.
+
+        These models reject ``temperature`` and the manual ``budget_tokens`` shape, so
+        a positive ``thinking_budget`` only toggles adaptive thinking ON — the model
+        decides depth, and the numeric value is advisory (ignored here). ``display`` is
+        set to ``summarized`` so the live trace can render reasoning (the API default is
+        ``omitted``, i.e. empty thinking text). No sampling params are ever set; with no
+        budget requested we leave ``thinking`` unset (request runs without thinking).
+        """
+        if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool) or thinking_budget <= 0:
+            return
+        body["thinking"] = {"type": "adaptive", "display": "summarized"}
 
     def _http_error(self, code: int, text: str) -> Exception:
         lowered = text.lower()

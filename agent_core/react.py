@@ -53,9 +53,16 @@ MAX_PTL_RETRIES = 5
 
 @dataclass(slots=True)
 class ReActConfig:
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-opus-4-8"
+    # NOTE: temperature applies only to legacy models (Haiku 4.5, Sonnet, Opus <= 4.6).
+    # Opus 4.7+/Fable/Mythos reject sampling params, so the Claude provider drops it for
+    # them (see providers/claude.py _is_adaptive_thinking_model). Left for debug runs
+    # that override --model to a legacy id.
     temperature: float = 0.2
-    max_tokens: int = 2048
+    # Answer-token cap. 16k is non-truncating headroom for Opus 4.8 (you're billed for
+    # tokens actually produced, not the cap) and stays under the SDK's ~16k non-streaming
+    # timeout guard while leaving room for streaming runs.
+    max_tokens: int = 16000
     # No fixed step cap by default: like Claude Code, the loop runs until the model
     # stops requesting tools. Set an int only if you want a hard ceiling on tool turns.
     max_steps: int | None = None
@@ -71,6 +78,11 @@ class ReActConfig:
     # Extended-thinking token budget for the Claude provider. None disables thinking
     # (default); a positive int enables it and is passed through _provider_config().
     thinking_budget: int | None = 4096
+    # output_config.effort depth/cost control for effort-capable models (Opus 4.5+,
+    # Sonnet 4.6, Fable/Mythos). "high" is the safe agentic default ("xhigh" is Opus
+    # 4.8-best but errors on Sonnet 4.6/Opus<=4.6). The provider drops it for models
+    # that don't support the level (see providers/claude.py _effort_for_model). None omits it.
+    effort: str | None = "high"
     # Stream tokens to a live UI as they arrive. Only takes effect when the UI is
     # live (ConsoleUI); NullUI never streams. CLI exposes this via --no-stream.
     stream: bool = True
@@ -675,6 +687,7 @@ class ReActAgent:
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
             "thinking_budget": self.config.thinking_budget,
+            "effort": self.config.effort,
             "stream": self.config.stream,
         }
 

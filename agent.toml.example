@@ -5,9 +5,14 @@
 # AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
 
 # --- Top-level scalars -------------------------------------------------------
-model = "claude-haiku-4-5-20251001"
+model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask
 provider = "claude"           # claude | fake
+# output_config.effort depth/cost control. low | medium | high | xhigh | max.
+# "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
+# Sonnet 4.6 / Opus <= 4.6 (the provider drops a level the model can't honor). Overridable
+# by AGENT_EFFORT or --effort. Only effort-capable models (Opus 4.5+, Sonnet 4.6, Fable) use it.
+effort = "high"
 
 # --- Live display (CLI-only, NOT configured here) ----------------------------
 # The terminal trace, token streaming, and extended thinking are controlled by
@@ -83,17 +88,26 @@ collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
 use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
 summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
 summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
-compact_max_output_tokens = 8192 # output budget for the Track A summary call (safe across
-                                 # models; e.g. Haiku caps output at 8192 — raise for high-output models)
-summary_timeout_seconds = 60     # single (non-stacked) timeout (s) on the summary call; omit/None disables
+# Track A summary OUTPUT budget — a streamed escalation ladder (parity with the reference's
+# streamed compact). Attempt 1 uses compact_summary_start_tokens; on a max_tokens truncation
+# it escalates to compact_max_output_tokens, then to the model's hard ceiling
+# (tokens.model_output_tokens(model)[1]: 128k for Opus 4.8). Streaming means the high tiers
+# don't trip the SDK's non-streaming timeout. Any failure still degrades to Track B.
+compact_summary_start_tokens = 8000  # first attempt (steady-state, ~ the reference's 8k slot cap)
+compact_max_output_tokens = 20000    # middle tier (the reference's COMPACT_MAX_OUTPUT_TOKENS)
+compact_max_output_retries = 2       # escalations allowed after the first attempt
+summary_timeout_seconds = 120    # single (non-stacked) timeout (s) bounding the WHOLE ladder; omit/None disables
 # Token-based auto-compact gate (parity with the reference). The gate compares a
 # running token estimate (last response usage, else chars/4) against
 # `effective_window - autocompact_buffer_tokens`, where the effective window reserves
 # room for the summary output. The char fields below only bound per-message snip/
 # microcompact budgets — they no longer drive the trigger.
 # max_context_chars = 24000    # per-message microcompact budget basis (NOT the trigger)
-# context_window_tokens caps the model's window for local auto-compact decisions
-# (leave unset to use the model's native window: claude-* = 200k, [1m]-tagged = 1M).
+# context_window_tokens caps the model's window for local auto-compact decisions.
+# tokens.py now recognises the native 1M family (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5)
+# and Haiku 4.5's 200k automatically, so this is only needed to MODEL A SMALLER deployment
+# (e.g. a capped window) — leave unset otherwise.
+# context_window_tokens = 200000
 # autocompact_buffer_tokens = 13000        # headroom below the effective window before compaction fires
 # reserved_output_tokens_for_summary = 20000 # tokens held back from the window for the summary's output
 # max_consecutive_autocompact_failures = 3   # circuit breaker: stop retrying after this many failures

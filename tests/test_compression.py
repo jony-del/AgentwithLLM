@@ -45,15 +45,30 @@ def _tool_result(content: str, call_id: str) -> Message:
 
 
 class _RecordingProvider(LLMProvider):
-    """Non-fake provider that records each ``complete`` call and returns a canned reply."""
+    """Non-fake provider that records each ``complete`` call and returns a canned reply.
 
-    def __init__(self, content: str = "<analysis>scratch</analysis><summary>DONE</summary>") -> None:
+    ``stop_reasons`` optionally drives the per-call ``stop_reason`` (e.g.
+    ``["max_tokens", "end_turn"]`` to truncate the first attempt then succeed); once
+    exhausted the last value repeats. ``None`` returns ``stop_reason=None`` every call.
+    """
+
+    def __init__(
+        self,
+        content: str = "<analysis>scratch</analysis><summary>DONE</summary>",
+        stop_reasons: list[str] | None = None,
+    ) -> None:
         self.content = content
         self.calls: list[tuple[list[Message], list[dict[str, Any]], dict[str, Any]]] = []
+        self.streams: list[Any] = []
+        self._stop_reasons = list(stop_reasons) if stop_reasons else None
 
     async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
         self.calls.append((messages, tools, config))
-        return LLMResult(content=self.content)
+        self.streams.append(stream)
+        stop = None
+        if self._stop_reasons:
+            stop = self._stop_reasons[min(len(self.calls) - 1, len(self._stop_reasons) - 1)]
+        return LLMResult(content=self.content, stop_reason=stop)
 
 
 def _long_history(count: int, *, prefix: str = "m") -> list[Message]:
@@ -326,22 +341,66 @@ def test_build_summarizer_is_none_when_disabled() -> None:
     assert build_summarizer(_RecordingProvider(), {}, CompressionConfig(use_llm_summary=False)) is None
 
 
-async def test_build_summarizer_issues_no_tools_bounded_call() -> None:
+async def test_build_summarizer_issues_no_tools_streamed_bounded_call() -> None:
     provider = _RecordingProvider()
     summarizer = build_summarizer(
-        provider, {"model": "m", "max_tokens": 2048, "stream": True, "thinking_budget": 4096},
-        CompressionConfig(compact_max_output_tokens=99),
+        provider,
+        {"model": "claude-opus-4-8", "max_tokens": 2048, "stream": False, "thinking_budget": 4096},
+        CompressionConfig(compact_summary_start_tokens=8000, compact_max_output_tokens=20000),
     )
     assert summarizer is not None
 
     out = await summarizer([Message("user", "hello"), Message("assistant", "hi")])
 
     assert out == "DONE"  # <summary> extracted, <analysis> stripped
+    # stop_reason is None (success) → no escalation, a single attempt.
     (_messages, tools, config), = provider.calls
     assert tools == []  # no tool use during summary
-    assert config["max_tokens"] == 99  # uses compact_max_output_tokens, not summary_max_tokens
-    assert config["stream"] is False
+    assert config["max_tokens"] == 8000  # first ladder tier = compact_summary_start_tokens
+    assert config["stream"] is True  # summary call streams (dodges non-streaming timeout)
     assert config["thinking_budget"] is None
+    assert provider.streams[0] is not None  # a (no-op) StreamHandler sink is passed
+
+
+async def test_build_summarizer_escalates_budget_on_max_tokens() -> None:
+    # Truncate the first two attempts, succeed on the third: 8k → 20k → model ceiling (128k).
+    provider = _RecordingProvider(stop_reasons=["max_tokens", "max_tokens", "end_turn"])
+    summarizer = build_summarizer(
+        provider,
+        {"model": "claude-opus-4-8"},
+        CompressionConfig(
+            compact_summary_start_tokens=8000,
+            compact_max_output_tokens=20000,
+            compact_max_output_retries=2,
+        ),
+    )
+    assert summarizer is not None
+
+    out = await summarizer([Message("user", "x" * 200)])
+
+    assert out == "DONE"
+    budgets = [config["max_tokens"] for (_m, _t, config) in provider.calls]
+    assert budgets == [8000, 20000, 128_000]  # Opus hard ceiling from tokens.model_output_tokens
+
+
+async def test_build_summarizer_stops_escalating_after_retry_budget() -> None:
+    # Every attempt truncates; retries=1 caps the ladder at 2 attempts (no third tier).
+    provider = _RecordingProvider(stop_reasons=["max_tokens"])
+    summarizer = build_summarizer(
+        provider,
+        {"model": "claude-opus-4-8"},
+        CompressionConfig(
+            compact_summary_start_tokens=8000,
+            compact_max_output_tokens=20000,
+            compact_max_output_retries=1,
+        ),
+    )
+    assert summarizer is not None
+
+    await summarizer([Message("user", "x" * 200)])
+
+    budgets = [config["max_tokens"] for (_m, _t, config) in provider.calls]
+    assert budgets == [8000, 20000]  # 1 attempt + 1 escalation, ceiling tier not reached
 
 
 def test_extract_summary_parses_and_falls_back() -> None:
@@ -859,5 +918,6 @@ async def test_context_collapse_then_truncate_keeps_rounds_intact() -> None:
 
 def test_summary_timeout_default_is_bounded() -> None:
     # Regression: the Track A summary call must be time-bounded by default so a wedged
-    # provider can't hang a run (was previously None / unbounded).
-    assert CompressionConfig().summary_timeout_seconds == 60.0
+    # provider can't hang a run (was previously None / unbounded). 120s bounds the WHOLE
+    # streamed escalation ladder under one (non-stacked) timeout.
+    assert CompressionConfig().summary_timeout_seconds == 120.0

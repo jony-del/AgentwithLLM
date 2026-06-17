@@ -105,22 +105,80 @@ def _request_body(provider: ClaudeProvider, config: dict) -> dict:
     return provider._build_body([Message("user", "hi")], [], config)
 
 
-def test_thinking_budget_enables_thinking_and_adjusts_limits() -> None:
+# Legacy models (Haiku 4.5, Sonnet, Opus <= 4.6) keep the temperature + manual
+# budget_tokens shape.
+def test_legacy_thinking_budget_enables_thinking_and_adjusts_limits() -> None:
     provider = ClaudeProvider(api_key="test-key")
-    body = _request_body(provider, {"max_tokens": 512, "temperature": 0.2, "thinking_budget": 2048})
+    body = _request_body(
+        provider, {"model": "claude-haiku-4-5", "max_tokens": 512, "temperature": 0.2, "thinking_budget": 2048}
+    )
 
     assert body["thinking"] == {"type": "enabled", "budget_tokens": 2048}
     assert body["temperature"] == 1  # forced on while thinking is enabled
     assert body["max_tokens"] > 2048  # API requires max_tokens > budget_tokens
 
 
-def test_no_thinking_budget_leaves_request_unchanged() -> None:
+def test_legacy_no_thinking_budget_leaves_request_unchanged() -> None:
     provider = ClaudeProvider(api_key="test-key")
-    body = _request_body(provider, {"max_tokens": 512, "temperature": 0.2, "thinking_budget": None})
+    body = _request_body(
+        provider, {"model": "claude-haiku-4-5", "max_tokens": 512, "temperature": 0.2, "thinking_budget": None}
+    )
 
     assert "thinking" not in body
     assert body["temperature"] == 0.2
     assert body["max_tokens"] == 512
+
+
+# Opus 4.7+/Fable/Mythos reject sampling params and use adaptive-only thinking.
+def test_adaptive_model_thinking_budget_enables_adaptive_and_drops_sampling() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    body = _request_body(
+        provider, {"model": "claude-opus-4-8", "max_tokens": 512, "temperature": 0.2, "thinking_budget": 2048}
+    )
+
+    assert body["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert "temperature" not in body  # sampling params 400 on Opus 4.7+ — never sent
+    assert body["max_tokens"] == 512  # adaptive has no budget_tokens floor to satisfy
+
+
+def test_adaptive_model_without_budget_has_no_thinking_or_temperature() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    body = _request_body(
+        provider, {"model": "claude-fable-5", "max_tokens": 512, "temperature": 0.2, "thinking_budget": None}
+    )
+
+    assert "thinking" not in body
+    assert "temperature" not in body
+    assert body["max_tokens"] == 512
+
+
+# --- output_config.effort ----------------------------------------------------
+
+
+def test_effort_sent_for_effort_capable_model() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    body = _request_body(provider, {"model": "claude-opus-4-8", "effort": "high"})
+    assert body["output_config"] == {"effort": "high"}
+
+
+def test_effort_dropped_for_unsupported_model() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    body = _request_body(provider, {"model": "claude-haiku-4-5", "effort": "high"})
+    assert "output_config" not in body  # Haiku 4.5 doesn't support effort — dropped, not 400
+
+
+def test_xhigh_allowed_on_opus_but_dropped_on_sonnet() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    opus = _request_body(provider, {"model": "claude-opus-4-8", "effort": "xhigh"})
+    sonnet = _request_body(provider, {"model": "claude-sonnet-4-6", "effort": "xhigh"})
+    assert opus["output_config"] == {"effort": "xhigh"}
+    assert "output_config" not in sonnet  # xhigh not allowed on Sonnet 4.6 → dropped
+
+
+def test_no_effort_means_no_output_config() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    body = _request_body(provider, {"model": "claude-opus-4-8"})
+    assert "output_config" not in body
 
 
 def test_parse_response_collects_thinking_blocks() -> None:

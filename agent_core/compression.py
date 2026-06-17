@@ -350,17 +350,23 @@ class CompressionConfig:
     use_llm_summary: bool = True
     summary_keep_recent: int = 8
     summary_input_max_chars: int = 16000
-    # Summary OUTPUT budget for the Track A call (parity with the reference's larger
-    # reservation). Replaces the old hard-coded 2048 max_tokens on the summary path. Kept
-    # at 8192 — a safe ceiling across models (e.g. Haiku caps output at 8192); raise it in
-    # ``agent.toml`` for high-output models. If a model rejects the request the Track A
-    # call simply degrades to Track B.
-    compact_max_output_tokens: int = 8192
-    # Single, non-stacked timeout (seconds) wrapped around the Track A summarizer call.
-    # Defaults to 60s so a wedged summary call can't hang a run indefinitely; set to None
-    # to disable (then only the run-level deadline bounds it). On timeout the prefix
-    # degrades to the deterministic Track B fold — the ONLY asyncio-level timeout here.
-    summary_timeout_seconds: float | None = 60.0
+    # Track A summary OUTPUT budget, as a 3-tier escalation ladder (mirrors the
+    # reference's streamed compact: steady-state -> compaction cap -> model ceiling). The
+    # call STREAMS (compression_summary.py) so the high tiers don't trip the SDK's
+    # non-streaming timeout. ``compact_summary_start_tokens`` is the first attempt
+    # (steady-state, ~the reference's 8k slot-cap); on a ``max_tokens`` truncation it
+    # escalates to ``compact_max_output_tokens`` (the compaction cap, the reference's 20k),
+    # then to the model's hard ceiling (``tokens.model_output_tokens(model)[1]`` — 128k for
+    # Opus). ``compact_max_output_retries`` caps the escalations after the first attempt.
+    compact_summary_start_tokens: int = 8000
+    compact_max_output_tokens: int = 20000
+    compact_max_output_retries: int = 2
+    # Single, non-stacked timeout (seconds) wrapped around the Track A summarizer call —
+    # it bounds the WHOLE escalation ladder, not each attempt (the ONLY asyncio-level
+    # timeout here). Defaults to 120s so a wedged call can't hang a run yet the ladder has
+    # room to escalate; set to None to disable (then only the run-level deadline bounds it).
+    # On timeout the prefix degrades to the deterministic Track B fold.
+    summary_timeout_seconds: float | None = 120.0
     # Token-based threshold knobs (Phase 1A). The char-based fields above still govern
     # per-message snip/microcompact budgets; the gate itself is token-based (Phase 2B).
     # ``context_window_tokens`` optionally caps the model's window; the buffer / reserved
