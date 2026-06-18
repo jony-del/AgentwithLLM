@@ -63,6 +63,26 @@ def test_model_output_tokens_default_and_upper() -> None:
     assert tokens.max_output_tokens_for_model("claude-opus-4-8") == 64_000
 
 
+def test_is_supported_model_recognises_known_families() -> None:
+    # Each known family (with realistic suffixes / tags) is accepted.
+    for model in (
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-6",
+        "claude-opus-4-8",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-4-8[1m]",
+    ):
+        assert tokens.is_supported_model(model)
+
+
+def test_is_supported_model_rejects_unknown_and_empty() -> None:
+    assert not tokens.is_supported_model("gpt-4")
+    assert not tokens.is_supported_model("some-other-model")
+    assert not tokens.is_supported_model("")
+    assert not tokens.is_supported_model(None)  # type: ignore[arg-type]
+
+
 # --- effective_context_window ------------------------------------------------
 
 

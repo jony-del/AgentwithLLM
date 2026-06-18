@@ -39,6 +39,15 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
                 "enum": ["read_only", "full"],
                 "description": "Capability level for the child (default read_only).",
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for the child (e.g. claude-haiku-4-5-..., "
+                    "claude-sonnet-4-6, claude-opus-4-8). Omit to inherit the parent's "
+                    "model. Each dispatch chooses independently, so cheaper sub-tasks can "
+                    "run a smaller model."
+                ),
+            },
         },
         "required": ["task"],
     }
@@ -59,6 +68,7 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
+        model = str(arguments.get("model", "")).strip() or None
 
         factory = self.session.subagent_factory
         if factory is None:
@@ -69,7 +79,7 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
                 metadata={"error_type": "Unavailable"},
             )
         try:
-            answer = await factory(task, preset)
+            answer = await factory(task, preset, model)
         except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
             return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
-        return ToolResult(self.name, answer, metadata={"preset": preset})
+        return ToolResult(self.name, answer, metadata={"preset": preset, "model": model})

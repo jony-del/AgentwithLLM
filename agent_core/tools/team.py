@@ -153,6 +153,14 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
                 "enum": ["read_only", "full"],
                 "description": "read_only gives read/search plus team tools; full also allows file writes.",
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for the teammate (e.g. claude-haiku-4-5-..., "
+                    "claude-sonnet-4-6, claude-opus-4-8). Omit to inherit the parent's "
+                    "model, so a team can mix models by role."
+                ),
+            },
         },
         "required": ["team_id", "name", "role"],
     }
@@ -191,14 +199,21 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
+        model = str(arguments.get("model", "")).strip() or None
         try:
-            answer = await factory(team_id, name, role, task_id, preset)
+            answer = await factory(team_id, name, role, task_id, preset, model)
         except Exception as exc:  # noqa: BLE001
             return _team_error(self.name, exc)
         return ToolResult(
             self.name,
             answer,
-            metadata={"team_id": team_id, "teammate": name, "task_id": task_id, "preset": preset},
+            metadata={
+                "team_id": team_id,
+                "teammate": name,
+                "task_id": task_id,
+                "preset": preset,
+                "model": model,
+            },
         )
 
 

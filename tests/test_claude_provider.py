@@ -152,6 +152,20 @@ def test_adaptive_model_without_budget_has_no_thinking_or_temperature() -> None:
     assert body["max_tokens"] == 512
 
 
+# One shared provider instance picks the request shape per-call from config["model"],
+# never from construction — so a heterogeneous fan-out (Opus leader, Haiku/Sonnet
+# children) is safe to run over a single shared (gated) provider.
+def test_shared_provider_picks_shape_per_call_model() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+
+    haiku = _request_body(provider, {"model": "claude-haiku-4-5", "thinking_budget": 2048})
+    opus = _request_body(provider, {"model": "claude-opus-4-8", "thinking_budget": 2048})
+
+    # Same instance, different per-call model → different (correct) body shapes.
+    assert "temperature" in haiku and haiku["thinking"]["type"] == "enabled"
+    assert "temperature" not in opus and opus["thinking"]["type"] == "adaptive"
+
+
 # --- output_config.effort ----------------------------------------------------
 
 

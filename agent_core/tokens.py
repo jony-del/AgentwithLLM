@@ -99,6 +99,23 @@ def model_output_tokens(model: str) -> tuple[int, int]:
     return MAX_OUTPUT_TOKENS_DEFAULT, MAX_OUTPUT_TOKENS_DEFAULT
 
 
+def is_supported_model(model: str) -> bool:
+    """True when ``model`` belongs to a known model family.
+
+    The known families are exactly the markers in :data:`MODEL_OUTPUT_TOKENS` (Opus
+    4.6/4.7/4.8, Fable/Mythos 5, Sonnet 4.6, Haiku 4.5), matched as substrings so
+    suffixes / ``[1m]`` tags don't defeat the check — same semantics as
+    :func:`context_window_for_model` and :func:`model_output_tokens`.
+
+    Used to validate a caller-supplied (LLM-driven) model id before spawning a
+    sub-agent/teammate with it: an unrecognised id would silently fall back to the
+    conservative 200k window here AND be sent verbatim to the provider (a likely API
+    404), so it's rejected up front instead.
+    """
+    name = (model or "").lower()
+    return any(marker in name for marker, _default, _upper in MODEL_OUTPUT_TOKENS)
+
+
 def max_output_tokens_for_model(model: str) -> int:
     """Return the assumed steady-state per-request output ceiling for a model.
 

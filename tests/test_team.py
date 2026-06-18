@@ -11,6 +11,7 @@ import pytest
 from agent_core.agents.team import FileLock, TeamPermissionError, TeamStore
 from agent_core.models import LLMResult, ToolCall, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
+from agent_core.providers import FakeProvider
 from agent_core.providers.base import LLMProvider, StreamHandler
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.session import SessionContext
@@ -137,10 +138,12 @@ async def test_team_tools_create_tasks_assign_and_message(tmp_path: Path) -> Non
 
 
 async def test_teammate_spawn_tool_uses_session_factory() -> None:
-    calls: list[tuple[str, str, str, str | None, str]] = []
+    calls: list[tuple[str, str, str, str | None, str, str | None]] = []
 
-    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
-        calls.append((team_id, name, role, task_id, preset))
+    async def factory(
+        team_id: str, name: str, role: str, task_id: str | None, preset: str, model: str | None = None
+    ) -> str:
+        calls.append((team_id, name, role, task_id, preset, model))
         return "spawned"
 
     session = SessionContext(teammate_factory=factory)
@@ -149,11 +152,30 @@ async def test_teammate_spawn_tool_uses_session_factory() -> None:
     )
     assert result.ok
     assert result.content == "spawned"
-    assert calls == [("team_abc", "worker", "researcher", "task_1", "full")]
+    # No model given → None forwarded (inherit the parent's model).
+    assert calls == [("team_abc", "worker", "researcher", "task_1", "full", None)]
+
+
+async def test_teammate_spawn_forwards_model_override() -> None:
+    seen: list = []
+
+    async def factory(
+        team_id: str, name: str, role: str, task_id: str | None, preset: str, model: str | None = None
+    ) -> str:
+        seen.append(model)
+        return "spawned"
+
+    result = await TeammateSpawnTool(SessionContext(teammate_factory=factory)).run(
+        {"team_id": "t", "name": "w", "role": "r", "model": "claude-sonnet-4-6"}
+    )
+    assert result.metadata["model"] == "claude-sonnet-4-6"
+    assert seen == ["claude-sonnet-4-6"]
 
 
 async def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Path) -> None:
-    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+    async def factory(
+        team_id: str, name: str, role: str, task_id: str | None, preset: str, model: str | None = None
+    ) -> str:
         await asyncio.sleep(0.15)
         return f"{name}:{task_id}"
 
@@ -175,7 +197,9 @@ async def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Pat
 
 
 async def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
-    async def factory(team_id: str, name: str, role: str, task_id: str | None, preset: str) -> str:
+    async def factory(
+        team_id: str, name: str, role: str, task_id: str | None, preset: str, model: str | None = None
+    ) -> str:
         await asyncio.sleep(0.15)
         return f"{name}:{task_id}"
 
@@ -269,3 +293,52 @@ async def test_react_spawn_teammate_can_update_task_and_message_leader(tmp_path:
     leader_messages = await store.read_inbox(team_id, "leader")
     assert leader_messages[-1]["kind"] == "completion"
     assert leader_messages[-1]["content"] == "done"
+
+
+# --- per-teammate model override (heterogeneous team) ------------------------
+
+
+async def test_teammate_child_uses_model_override(tmp_path: Path) -> None:
+    store = TeamStore(tmp_path / "teams")
+    team = await store.create_team("alpha", "coordinate")
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), permission="auto", model="claude-opus-4-8"),
+        team_store=store,
+    )
+
+    built = await agent._make_teammate_child(
+        team["id"], "worker", "researcher", None, "read_only", "claude-haiku-4-5-20251001"
+    )
+    assert not isinstance(built, str)
+    child, _prompt = built
+    assert child.config.model == "claude-haiku-4-5-20251001"  # teammate override
+    assert agent.config.model == "claude-opus-4-8"  # leader unchanged
+
+
+async def test_teammate_child_inherits_parent_model_by_default(tmp_path: Path) -> None:
+    store = TeamStore(tmp_path / "teams")
+    team = await store.create_team("alpha", "coordinate")
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), permission="auto", model="claude-opus-4-8"),
+        team_store=store,
+    )
+
+    built = await agent._make_teammate_child(team["id"], "worker", "researcher", None, "read_only")
+    assert not isinstance(built, str)
+    child, _prompt = built
+    assert child.config.model == "claude-opus-4-8"  # back-compat: no override
+
+
+async def test_teammate_unknown_model_refused(tmp_path: Path) -> None:
+    store = TeamStore(tmp_path / "teams")
+    team = await store.create_team("alpha", "coordinate")
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), permission="auto"),
+        team_store=store,
+    )
+
+    answer = await agent._spawn_teammate(team["id"], "worker", "researcher", None, "read_only", "gpt-4")
+    assert "unsupported model" in answer

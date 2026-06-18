@@ -21,8 +21,8 @@ from agent_core.tools.subagent import DispatchAgentTool
 async def test_dispatch_passes_task_and_preset_to_factory() -> None:
     calls: list = []
 
-    async def factory(task: str, preset: str) -> str:
-        calls.append((task, preset))
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
+        calls.append((task, preset, model))
         return f"done: {task}"
 
     tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
@@ -30,13 +30,39 @@ async def test_dispatch_passes_task_and_preset_to_factory() -> None:
     assert result.ok
     assert result.content == "done: research X"
     assert result.metadata["preset"] == "full"
-    assert calls == [("research X", "full")]
+    # No model given → None forwarded (inherit the parent's model).
+    assert calls == [("research X", "full", None)]
+
+
+async def test_dispatch_forwards_model_override() -> None:
+    seen: list = []
+
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
+        seen.append(model)
+        return "ok"
+
+    tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
+    result = await tool.run({"task": "t", "model": "claude-haiku-4-5-20251001"})
+    assert result.metadata["model"] == "claude-haiku-4-5-20251001"
+    assert seen == ["claude-haiku-4-5-20251001"]
+
+
+async def test_dispatch_blank_model_is_none() -> None:
+    seen: list = []
+
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
+        seen.append(model)
+        return "ok"
+
+    tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
+    await tool.run({"task": "t", "model": "   "})
+    assert seen == [None]
 
 
 async def test_dispatch_defaults_to_read_only() -> None:
     seen: list = []
 
-    async def factory(task: str, preset: str) -> str:
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
         seen.append(preset)
         return "ok"
 
@@ -46,7 +72,7 @@ async def test_dispatch_defaults_to_read_only() -> None:
 
 
 async def test_dispatch_rejects_empty_task() -> None:
-    async def factory(task: str, preset: str) -> str:
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
         return "x"
 
     tool = DispatchAgentTool(SessionContext(subagent_factory=factory))
@@ -62,7 +88,7 @@ async def test_dispatch_unavailable_without_factory() -> None:
 
 
 async def test_dispatch_captures_child_error() -> None:
-    async def boom(task: str, preset: str) -> str:
+    async def boom(task: str, preset: str, model: str | None = None) -> str:
         raise RuntimeError("kaboom")
 
     result = await DispatchAgentTool(SessionContext(subagent_factory=boom)).run({"task": "t"})
@@ -89,7 +115,7 @@ class WorkspaceWriteSleepTool(WorkspacePathMixin, Tool):
 
 
 async def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
-    async def factory(task: str, preset: str) -> str:
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
         await asyncio.sleep(0.15)
         return f"{preset}:{task}"
 
@@ -111,7 +137,7 @@ async def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
 
 
 async def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
-    async def factory(task: str, preset: str) -> str:
+    async def factory(task: str, preset: str, model: str | None = None) -> str:
         await asyncio.sleep(0.15)
         return f"{preset}:{task}"
 
@@ -222,6 +248,67 @@ async def test_dispatch_depth_ceiling_refuses() -> None:
     agent.session.depth = agent.session.max_depth  # already at the limit
     answer = await agent._spawn_subagent("go deeper", "read_only")
     assert "max sub-agent depth" in answer
+
+
+# --- per-child model override (heterogeneous fan-out) ------------------------
+
+
+def test_subagent_child_inherits_parent_model_by_default(tmp_path) -> None:
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path), model="claude-opus-4-8"),
+    )
+    child = agent._make_subagent_child("read_only")
+    assert not isinstance(child, str)
+    assert child.config.model == "claude-opus-4-8"  # back-compat: no override
+
+
+def test_subagent_child_uses_model_override(tmp_path) -> None:
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path), model="claude-opus-4-8"),
+    )
+    child = agent._make_subagent_child("read_only", "claude-haiku-4-5-20251001")
+    assert not isinstance(child, str)
+    assert child.config.model == "claude-haiku-4-5-20251001"
+
+
+def test_subagent_heterogeneous_compaction_threshold(tmp_path) -> None:
+    """A Haiku child gets Haiku's 200k window; the Opus leader keeps its 1M window."""
+    from agent_core import tokens
+
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path), model="claude-opus-4-8"),
+    )
+    child = agent._make_subagent_child("read_only", "claude-haiku-4-5-20251001")
+    assert not isinstance(child, str)
+
+    leader_threshold = tokens.auto_compact_threshold(agent.config.model)
+    child_threshold = tokens.auto_compact_threshold(child.config.model)
+    # The Haiku child compacts far earlier than the 1M-window Opus leader.
+    assert child_threshold < leader_threshold
+    assert child_threshold < tokens.MODEL_CONTEXT_WINDOW_DEFAULT
+
+
+def test_subagent_multiple_heterogeneous_children(tmp_path) -> None:
+    """One Opus leader fans out children on different models, independently."""
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path), model="claude-opus-4-8"),
+    )
+    models = ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"]
+    children = [agent._make_subagent_child("read_only", m) for m in models]
+    assert [c.config.model for c in children] == models
+    assert agent.config.model == "claude-opus-4-8"  # leader unchanged
+
+
+async def test_subagent_unknown_model_refused(tmp_path) -> None:
+    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(run_dir=str(tmp_path)))
+    answer = await agent._spawn_subagent("t", "read_only", "gpt-4")
+    assert "unsupported model" in answer
+    # Refusal is a string, not a constructed child.
+    assert isinstance(agent._make_subagent_child("read_only", "gpt-4"), str)
 
 
 # --- MultiAgentCoordinator ---------------------------------------------------

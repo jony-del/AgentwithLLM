@@ -84,9 +84,12 @@ class SessionContext:
     workspace: Path = field(default_factory=lambda: Path.cwd().resolve())
     todos: TodoStore = field(default_factory=TodoStore)
     # Async factories: children are awaited on the shared event loop so several
-    # children's API calls overlap (bounded by the shared provider gate).
-    subagent_factory: Callable[[str, str], Awaitable[str]] | None = None
-    teammate_factory: Callable[[str, str, str, str | None, str], Awaitable[str]] | None = None
+    # children's API calls overlap (bounded by the shared provider gate). The trailing
+    # ``str | None`` is an optional per-spawn model override (None → inherit the parent's
+    # model); each spawn call chooses independently, so one leader can fan out a mix of
+    # Haiku/Sonnet/Opus children.
+    subagent_factory: Callable[[str, str, str | None], Awaitable[str]] | None = None
+    teammate_factory: Callable[[str, str, str, str | None, str, str | None], Awaitable[str]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None

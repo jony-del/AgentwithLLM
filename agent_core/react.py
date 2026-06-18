@@ -31,6 +31,7 @@ from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
+from agent_core.tokens import is_supported_model
 from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
@@ -49,6 +50,20 @@ WRAPUP_TEXT = (
 # prevents a 413 → compact → 413 → … infinite loop — once the retries are exhausted (or
 # nothing is left to drop) the overflow error propagates instead of spinning forever.
 MAX_PTL_RETRIES = 5
+
+
+def _unsupported_model_refusal(tool: str, model: str) -> str:
+    """Actionable refusal when a spawn names a model from no known family.
+
+    An unrecognised id would silently fall back to the conservative 200k window in
+    ``tokens`` and be sent verbatim to the provider (a likely API 404), so spawns name
+    a known family or omit ``model`` to inherit the parent's.
+    """
+    return (
+        f"[{tool}] unsupported model {model!r}; refusing to spawn. Name a known family "
+        "(e.g. claude-haiku-4-5-*, claude-sonnet-4-6, claude-opus-4-8, claude-fable-5) "
+        "or omit model to inherit the parent's."
+    )
 
 
 @dataclass(slots=True)
@@ -703,7 +718,7 @@ class ReActAgent:
             "parent_run_id": self.session.parent_run_id,
         }
 
-    def _make_subagent_child(self, preset: str) -> "ReActAgent | str":
+    def _make_subagent_child(self, preset: str, model: str | None = None) -> "ReActAgent | str":
         """Build the ``dispatch_agent`` child (or a refusal string at the depth ceiling).
 
         The child reuses this agent's gated provider and scalar config but gets a
@@ -711,9 +726,17 @@ class ReActAgent:
         crucially — **never** the ``dispatch_agent`` tool itself, so sub-agents can't
         recurse. A depth ceiling is a second guard. The child runs silently (``NullUI``)
         and writes its own run log, tagged with this agent's run id as parent.
+
+        An optional ``model`` overrides the child's model independently of this agent's
+        (None → inherit). Compaction and the provider request shape adapt per-model
+        automatically (each child builds its own summarizer / compaction threshold from
+        its own config, and the shared provider picks the body shape per call), so a
+        single leader can fan out a mix of Haiku/Sonnet/Opus children.
         """
         if self.session.depth >= self.session.max_depth:
             return "[dispatch_agent] max sub-agent depth reached; refusing to spawn deeper."
+        if model and not is_supported_model(model):
+            return _unsupported_model_refusal("dispatch_agent", model)
         sub_registry = ToolRegistry()
         excluded = {
             "dispatch_agent",
@@ -735,6 +758,8 @@ class ReActAgent:
             sub_registry.register(tool)
         # Disable memory in the child so a sub-task doesn't recall/extract on its own.
         child_config = replace(self.config, memory=replace(self.config.memory, enabled=False))
+        if model:
+            child_config = replace(child_config, model=model)
         child = ReActAgent(
             provider=self.provider,
             config=child_config,
@@ -747,9 +772,11 @@ class ReActAgent:
         child.session.parent_run_id = self.logger.run_id
         return child
 
-    async def _spawn_subagent(self, task: str, preset: str = "read_only") -> str:
+    async def _spawn_subagent(
+        self, task: str, preset: str = "read_only", model: str | None = None
+    ) -> str:
         """``dispatch_agent`` factory — awaits the child on the shared event loop."""
-        child = self._make_subagent_child(preset)
+        child = self._make_subagent_child(preset, model)
         if isinstance(child, str):
             return child
         return (await child.run(task, deadline=self._active_deadline)).answer
@@ -761,10 +788,18 @@ class ReActAgent:
         role: str,
         task_id: str | None,
         preset: str,
+        model: str | None = None,
     ) -> "tuple[ReActAgent, str] | str":
-        """Build a teammate child and its prompt (or a refusal string at the ceiling)."""
+        """Build a teammate child and its prompt (or a refusal string at the ceiling).
+
+        An optional ``model`` overrides the teammate's model independently (None →
+        inherit), so one team can mix Haiku/Sonnet/Opus teammates; compaction and the
+        provider shape adapt per-model automatically.
+        """
         if self.session.depth >= self.session.max_depth:
             return "[teammate_spawn] max sub-agent depth reached; refusing to spawn deeper."
+        if model and not is_supported_model(model):
+            return _unsupported_model_refusal("teammate_spawn", model)
 
         store = self.team_store
         await store.add_member(team_id, name, role)
@@ -798,6 +833,8 @@ class ReActAgent:
             permission="auto",
             memory=replace(self.config.memory, enabled=False),
         )
+        if model:
+            child_config = replace(child_config, model=model)
         child = ReActAgent(
             provider=self.provider,
             config=child_config,
@@ -820,9 +857,10 @@ class ReActAgent:
         role: str,
         task_id: str | None = None,
         preset: str = "read_only",
+        model: str | None = None,
     ) -> str:
         """Teammate factory — awaits the teammate turn on the shared event loop."""
-        built = await self._make_teammate_child(team_id, name, role, task_id, preset)
+        built = await self._make_teammate_child(team_id, name, role, task_id, preset, model)
         if isinstance(built, str):
             return built
         child, prompt = built

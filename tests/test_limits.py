@@ -109,7 +109,7 @@ async def test_subagent_inherits_parent_deadline(tmp_path: Path) -> None:
             recorded["deadline"] = deadline
             return AgentRunResult("child done", [], 0, "run-x")
 
-    agent._make_subagent_child = lambda preset: StubChild()  # type: ignore[assignment]
+    agent._make_subagent_child = lambda preset, model=None: StubChild()  # type: ignore[assignment]
     out = await agent._spawn_subagent("subtask", "read_only")
     assert out == "child done"
     assert recorded["deadline"] == sentinel
