@@ -285,3 +285,30 @@ async def test_file_tools_reject_paths_outside_workspace(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="escapes workspace"):
         await writer.run({"path": "../outside.txt", "content": "nope"})
+
+
+async def test_spilled_output_is_retrievable_with_read_text_file_paging(tmp_path: Path) -> None:
+    # End-to-end §6.4 retrieval loop: a huge tool result is spilled to runs/outputs and
+    # replaced by a pointer; the model pages the full text back via read_text_file, and a
+    # bounded page does NOT re-trip the output hook (no retrieve→re-spill loop).
+    from agent_core.hooks import MaxOutputPostHook
+
+    spill_dir = tmp_path / "runs" / "outputs"
+    hook = MaxOutputPostHook(spill_dir=spill_dir, max_lines=10, preview_chars=200)
+    content = "\n".join(f"line {i}" for i in range(1000))
+    pointer = hook.after_tool(ToolCall(name="bash"), ToolResult(name="bash", content=content))
+
+    ref = Path(pointer.metadata["tool_result_ref"])
+    rel = ref.relative_to(tmp_path)  # workspace-relative spelling the model would use
+
+    reader = ReadTextFileTool(tmp_path)
+    page = await reader.run({"path": str(rel), "offset": 1, "limit": 5})
+    assert page.content == "\n".join(f"line {i}" for i in range(5))  # first page, verbatim
+
+    tail = await reader.run({"path": str(rel), "offset": 996, "limit": 5})
+    assert tail.content == "\n".join(f"line {i}" for i in range(995, 1000))  # tail reachable
+
+    # A bounded page stays under the hook's budget → returned untouched, no second spill.
+    rechecked = hook.after_tool(ToolCall(name="read_text_file"), page)
+    assert rechecked is page
+    assert len(list(spill_dir.iterdir())) == 1

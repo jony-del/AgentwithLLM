@@ -190,6 +190,43 @@ async def test_microcompact_preserves_pinned() -> None:
     assert any(message.metadata.get("compressed") for message in compacted)
 
 
+async def test_pointer_tool_message_survives_snip_and_microcompact(tmp_path) -> None:
+    # A §6.4 preview pointer (~preview_chars) is already small, so the snip/microcompact
+    # stages must pass it through untouched — re-truncating it would corrupt the pointer.
+    from agent_core.hooks import MaxOutputPostHook
+    from agent_core.models import ToolCall, ToolResult
+
+    hook = MaxOutputPostHook(spill_dir=tmp_path / "outputs", max_lines=10, preview_chars=2000)
+    huge = "\n".join(f"line {i}" for i in range(5000))
+    spilled = hook.after_tool(ToolCall(name="bash"), ToolResult(name="bash", content=huge))
+    pointer = Message(
+        "tool", spilled.content, name="bash",
+        metadata={**spilled.metadata, "ok": True, "tool_call_id": "c1"},
+    )
+    assert pointer.metadata["spilled"] is True
+
+    # Default budgets: snip fires above max_message_chars(6000); the ~2KB pointer is well under.
+    pipeline = CompressionPipeline(CompressionConfig())
+    snipped, _ = pipeline._snip([pointer], aggressive=False)
+    assert snipped[0].content == pointer.content
+    assert "compressed" not in snipped[0].metadata
+    compacted, _ = pipeline._microcompact([pointer], aggressive=False)
+    assert compacted[0].content == pointer.content
+    assert "compressed" not in compacted[0].metadata
+
+
+def test_pointer_tool_message_stays_paired_with_its_tool_call() -> None:
+    # The pointer is an ordinary tool message (carries tool_call_id), so round grouping
+    # keeps it glued to its assistant tool_call — collapse can't orphan it.
+    assistant = _assistant_with_calls("running it", ["c1"])
+    pointer = Message(
+        "tool", "<tool_output_ref>…</tool_output_ref>", name="bash",
+        metadata={"tool_call_id": "c1", "ok": True, "spilled": True},
+    )
+    rounds = group_into_rounds([assistant, pointer])
+    assert rounds == [[assistant, pointer]]
+
+
 async def test_collapse_event_carries_detail() -> None:
     pipeline = CompressionPipeline(CompressionConfig(max_message_chars=1000, collapsed_keep_recent=4))
     messages = [Message("user", f"{index}: {'x' * 40}") for index in range(10)]

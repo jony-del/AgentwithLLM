@@ -216,6 +216,10 @@ risk = "read"
 [output]
 max_lines = 100               # truncate when output has more lines than this
 max_chars = 8000              # fallback cap for pathological single-line output
-head_lines = 20               # lines kept from the start
-tail_lines = 20               # lines kept from the end
+head_lines = 20               # lines kept from the start (legacy mode, pointer=false)
+tail_lines = 20               # lines kept from the end (legacy mode, pointer=false)
 spill = true                  # write the full output to disk (false = drop it)
+pointer = true                # replace oversized output with a <tool_output_ref> preview
+                              #   pointer (head + on-disk path the model pages back via
+                              #   read_text_file); false = legacy head+tail truncation
+preview_chars = 2000          # head kept inline in the pointer (pointer mode only)
