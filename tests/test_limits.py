@@ -162,6 +162,12 @@ def _cli_args(**overrides) -> argparse.Namespace:
         max_api_concurrency=None,
         max_wall_seconds=None,
         max_steps=None,
+        no_session_persistence=True,
+        session_dir=None,
+        resume=None,
+        continue_=False,
+        fork_session=False,
+        session_id=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -169,7 +175,8 @@ def _cli_args(**overrides) -> argparse.Namespace:
 
 def test_build_agent_cli_limits_win(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)  # no agent.toml here -> defaults, then CLI override
-    agent, _ui, mcp = build_agent(_cli_args(max_wall_seconds=42.0, max_steps=7))
+    built = build_agent(_cli_args(max_wall_seconds=42.0, max_steps=7))
+    agent, mcp = built.agent, built.mcp
     try:
         assert agent.config.max_wall_seconds == 42.0
         assert agent.config.max_steps == 7
@@ -180,7 +187,8 @@ def test_build_agent_cli_limits_win(tmp_path: Path, monkeypatch) -> None:
 
 def test_build_agent_cli_zero_disables(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    agent, _ui, mcp = build_agent(_cli_args(max_wall_seconds=0, max_steps=0))
+    built = build_agent(_cli_args(max_wall_seconds=0, max_steps=0))
+    agent, mcp = built.agent, built.mcp
     try:
         assert agent.config.max_wall_seconds is None
         assert agent.config.max_steps is None

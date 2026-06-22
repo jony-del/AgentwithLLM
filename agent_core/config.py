@@ -232,6 +232,23 @@ def resolve_limits_config(config_file: str | Path = "agent.toml") -> dict[str, A
     return values
 
 
+def resolve_session_dir(config_file: str | Path = "agent.toml") -> str:
+    """Resolve the resumable-transcript root: defaults → ``[session] dir`` → env.
+
+    Precedence ends here; a ``--session-dir`` CLI flag is layered on by the caller.
+    ``~`` is left unexpanded (the transcript layer expands it). An empty string
+    disables session persistence — useful for tests and ``--no-session-persistence``.
+    """
+    value = "~/.polaris/projects"
+    table = load_agent_toml(config_file).get("session")
+    if isinstance(table, dict) and "dir" in table:
+        value = str(table["dir"])
+    env = os.getenv("AGENT_SESSION_DIR")
+    if env is not None:
+        value = env
+    return value
+
+
 def resolve_context_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
     """Resolve one-time project-context settings from ``[context]``, then env.
 

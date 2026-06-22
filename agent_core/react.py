@@ -32,6 +32,7 @@ from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
 from agent_core.tokens import is_supported_model
+from agent_core.transcript import TranscriptStore, new_session_id
 from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
@@ -112,6 +113,11 @@ class ReActConfig:
     api_rate_limit_per_min: int = 0
     permission: PermissionMode | str = PermissionMode.DEFAULT
     run_dir: str = "runs"
+    # Root for resumable session transcripts (distinct from the ``run_dir`` event log).
+    # Mirrors the reference's ``~/.claude/projects`` so sessions are scoped per project
+    # (a sanitized cwd subdir) and listable/resumable across projects. ``~`` is expanded.
+    # Empty string disables transcript persistence entirely.
+    session_dir: str = "~/.polaris/projects"
     system_prompt: str = (
         "You are a ReAct agent. Reason briefly, call tools when useful, "
         "and return a final answer when the task is complete. "
@@ -161,6 +167,8 @@ class ReActAgent:
         extractor: MemoryExtractor | None = None,
         team_store: TeamStore | None = None,
         ui: AgentUI | None = None,
+        session_id: str | None = None,
+        transcript: "TranscriptStore | None" = None,
     ) -> None:
         self.config = config or ReActConfig()
         # Effective monotonic deadline of the in-flight run(), shared with children
@@ -178,6 +186,20 @@ class ReActAgent:
         )
         self.registry = tools or self.default_registry()
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
+        # Resumable session transcript (distinct from the event logger above). An injected
+        # store wins; otherwise build one from config unless ``session_dir`` is disabled
+        # (empty). ``parent_uuid`` chaining is tracked across appends by ``_emit``.
+        self.session_id = session_id or new_session_id()
+        if transcript is not None:
+            self.transcript: TranscriptStore | None = transcript
+        elif self.config.session_dir:
+            workspace = Path.cwd().resolve()
+            self.transcript = TranscriptStore(self.config.session_dir, workspace, self.session_id)
+        else:
+            self.transcript = None
+        # uuid of the last message appended to the transcript, so each new message links
+        # back to its predecessor. Reset at the top of every run().
+        self._last_message_uuid: str | None = None
         self.compression = CompressionPipeline(self.config.compression)
         # Track A summarizer (or None → deterministic Track B). Built from the gated
         # provider so summary calls share the fan-out's API budget; None for
@@ -192,6 +214,7 @@ class ReActAgent:
         # rebind every session-aware tool to *this* session below.
         self.session = SessionContext(
             workspace=Path.cwd().resolve(),
+            session_id=self.session_id,
             subagent_factory=self._spawn_subagent,
             teammate_factory=self._spawn_teammate,
             team_store=self.team_store,
@@ -264,6 +287,7 @@ class ReActAgent:
         task: str,
         should_cancel: Callable[[], bool] | None = None,
         deadline: float | None = None,
+        history: list[Message] | None = None,
     ) -> AgentRunResult:
         """Drive the ReAct loop to completion and return the final answer.
 
@@ -275,14 +299,39 @@ class ReActAgent:
         bounded by one wall-clock budget instead of each child getting a fresh one.
         When ``None``, the deadline is derived from ``config.max_wall_seconds`` (and
         is itself ``None`` when that is unset, disabling the wall cap).
+
+        ``history`` seeds the loop with a prior conversation — the mechanism behind both
+        ``chat`` cross-turn memory and ``--resume``/``--continue``. The system prompt and
+        project context are rebuilt fresh each call (so any system messages carried in
+        ``history`` are dropped), and the history is assumed already persisted, so it is
+        only re-linked into the message chain, not re-written to the transcript.
         """
-        messages = [
-            Message("system", self.config.system_prompt),
-            Message("user", task),
-        ]
+        self._last_message_uuid = None
+        user_message = Message("user", task)
+        messages: list[Message] = [Message("system", self.config.system_prompt), user_message]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
+        # ``_recall``/``_inject_project_context`` position the recall and pinned
+        # userContext blocks relative to the trailing user task, so the task must already
+        # be in place. Final front order: system(+gitStatus) → (recall) → userContext → task.
         await self._recall(task, messages)
         await self._inject_project_context(messages)
+        # Splice prior conversation in just before the new task (after the pinned context),
+        # so the order is [system, (recall), userContext, ...history..., task]. System and
+        # pinned context are rebuilt fresh above, so any carried in ``history`` are dropped
+        # to avoid stacking a new copy on every turn.
+        if history:
+            insert_at = messages.index(user_message)
+            for past in history:
+                if past.role == "system" or past.metadata.get("pinned") == "user_context":
+                    continue
+                messages.insert(insert_at, past)
+                insert_at += 1
+                self._last_message_uuid = past.uuid
+        # Chain + persist the new task (parent = last history message, or None).
+        user_message.parent_uuid = self._last_message_uuid
+        if self.transcript is not None:
+            await self.transcript.append_message(user_message)
+        self._last_message_uuid = user_message.uuid
 
         cancelled = should_cancel or (lambda: False)
         start = time.monotonic()
@@ -443,7 +492,7 @@ class ReActAgent:
             # next turn (required by the API when thinking and tool use span turns).
             if result.thinking_blocks:
                 assistant_metadata["thinking_blocks"] = result.thinking_blocks
-            messages.append(Message("assistant", result.content, metadata=assistant_metadata))
+            await self._emit(messages, Message("assistant", result.content, metadata=assistant_metadata))
 
             # Natural termination: the model stopped requesting tools, so this is the answer.
             if not result.tool_calls:
@@ -460,18 +509,34 @@ class ReActAgent:
             tool_results = await self.executor.execute_many(result.tool_calls, should_cancel=cancelled)
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
-                messages.append(
+                await self._emit(
+                    messages,
                     Message(
                         "tool",
                         observation,
                         name=tool_result.name,
                         metadata={**tool_result.metadata, "ok": tool_result.ok, "tool_call_id": tool_call.id},
-                    )
+                    ),
                 )
                 # Record read-file state HERE (not in the read tool — its mixin shape
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
                 # post-compaction fold. Defensive: odd/missing args just skip.
                 self._record_read_result(tool_call, tool_result)
+
+    async def _emit(self, messages: list[Message], message: Message) -> None:
+        """Append a real conversation turn: link it into the chain and persist it.
+
+        The transcript is the faithful, append-only record of the conversation; ``uuid``/
+        ``parent_uuid`` chain each turn to its predecessor. Compaction is a separate,
+        in-memory-only optimization — its summary messages never come through here, so the
+        transcript always reflects the true history and a resume reconstructs it intact
+        (the live loop re-compacts as needed). Persistence is best-effort and never raises.
+        """
+        message.parent_uuid = self._last_message_uuid
+        messages.append(message)
+        if self.transcript is not None:
+            await self.transcript.append_message(message)
+        self._last_message_uuid = message.uuid
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
         answer = f"Stopped after {human} without a final answer."
@@ -760,17 +825,33 @@ class ReActAgent:
         child_config = replace(self.config, memory=replace(self.config.memory, enabled=False))
         if model:
             child_config = replace(child_config, model=model)
+        agent_id = new_session_id()
         child = ReActAgent(
             provider=self.provider,
             config=child_config,
             tools=sub_registry,
             team_store=self.team_store,
             ui=NullUI(),
+            session_id=self.session_id,
+            transcript=self._child_transcript(agent_id),
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
         child.session.parent_run_id = self.logger.run_id
         return child
+
+    def _child_transcript(self, agent_id: str) -> "TranscriptStore | None":
+        """A sidechain transcript for a spawned child, nested under this session.
+
+        Children write to ``{session_id}/subagents/agent-{id}.jsonl`` so their turns are
+        preserved but never surface as standalone resumable sessions (``list_sessions``
+        only globs top-level ``*.jsonl``). ``None`` when persistence is disabled.
+        """
+        if self.transcript is None:
+            return None
+        return TranscriptStore(
+            self.config.session_dir, self.session.workspace, self.session_id, agent_id=agent_id
+        )
 
     async def _spawn_subagent(
         self, task: str, preset: str = "read_only", model: str | None = None
@@ -841,6 +922,8 @@ class ReActAgent:
             tools=sub_registry,
             team_store=store,
             ui=NullUI(),
+            session_id=self.session_id,
+            transcript=self._child_transcript(new_session_id()),
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth

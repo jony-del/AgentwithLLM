@@ -82,6 +82,9 @@ class SessionContext:
     """
 
     workspace: Path = field(default_factory=lambda: Path.cwd().resolve())
+    # Identifier of the resumable session transcript this run writes to. Threaded through
+    # to sub-agents so their sidechain transcripts nest under the parent session dir.
+    session_id: str = ""
     todos: TodoStore = field(default_factory=TodoStore)
     # Async factories: children are awaited on the shared event loop so several
     # children's API calls overlap (bounded by the shared provider gate). The trailing

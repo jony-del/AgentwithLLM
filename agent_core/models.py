@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid as _uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -20,16 +21,45 @@ class Message:
     content: str
     name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Identity for transcript persistence / resume: each message carries a stable
+    # ``uuid`` and points at its predecessor via ``parent_uuid``, forming the message
+    # tree the reference project stores per session. Appended last with defaults so all
+    # existing positional ``Message(role, content, ...)`` construction stays valid, and
+    # providers (which only read role/content/metadata/name) are unaffected.
+    # ``compare=False`` keeps equality based on role/content/name/metadata as before, so
+    # two messages with the same content but distinct ids still compare equal.
+    uuid: str = field(default_factory=lambda: _uuid.uuid4().hex, compare=False)
+    parent_uuid: str | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "role": self.role,
             "content": self.content,
             "metadata": self.metadata,
+            "uuid": self.uuid,
+            "parent_uuid": self.parent_uuid,
         }
         if self.name:
             data["name"] = self.name
         return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Message":
+        """Rebuild a ``Message`` from its ``to_dict`` form (transcript load path).
+
+        ``metadata`` round-trips verbatim — that is what preserves ``thinking_blocks``
+        (Claude's thinking invariant) and ``tool_calls`` / ``tool_call_id`` (tool-result
+        correlation) across a resume. ``uuid`` is regenerated only when absent so older
+        records without identity still load.
+        """
+        return cls(
+            role=data["role"],
+            content=data.get("content", ""),
+            name=data.get("name"),
+            metadata=dict(data.get("metadata") or {}),
+            uuid=data.get("uuid") or _uuid.uuid4().hex,
+            parent_uuid=data.get("parent_uuid"),
+        )
 
 
 @dataclass(slots=True)

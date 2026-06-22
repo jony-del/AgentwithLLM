@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent_core.config import (
@@ -14,13 +15,24 @@ from agent_core.config import (
     resolve_mcp_config,
     resolve_memory_config,
     resolve_output_config,
+    resolve_session_dir,
 )
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
-from agent_core.models import LLMTransientError
+from agent_core.models import LLMTransientError, Message
 from agent_core.providers import ClaudeProvider, FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.tools.registry import ToolRegistry
+from agent_core.transcript import (
+    build_chain,
+    find_session,
+    fork_chain,
+    latest_session,
+    list_sessions,
+    load_transcript,
+    new_session_id,
+    project_dir,
+)
 from agent_core.ui import AgentUI, ConsoleUI, NullUI
 
 
@@ -119,7 +131,7 @@ def _start_mcp(registry: ToolRegistry):
     return manager
 
 
-def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object | None]:
+def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     values = _resolve(args)
     provider = _make_provider(values)
     ui = _make_ui(args)
@@ -162,11 +174,77 @@ def build_agent(args: argparse.Namespace) -> tuple[ReActAgent, AgentUI, object |
         max_wall_seconds=max_wall_seconds,
         max_steps=max_steps,
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
+        session_dir=_session_dir(args),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
-    agent = ReActAgent(provider=provider, config=config, tools=registry, ui=ui)
-    return agent, ui, manager
+    # Resolve which session this run writes to (new / resumed / continued / forked) and
+    # load any prior conversation to seed it. ``seed`` is the fork's cloned chain that
+    # must be written into the fresh transcript before the run; for plain resume it is
+    # empty because the history already lives on disk.
+    session_id, history, seed = _resolve_session(args, config.session_dir)
+    agent = ReActAgent(
+        provider=provider, config=config, tools=registry, ui=ui, session_id=session_id
+    )
+    return BuiltAgent(agent, ui, manager, history, seed)
+
+
+@dataclass(slots=True)
+class BuiltAgent:
+    agent: ReActAgent
+    ui: AgentUI
+    mcp: object | None
+    history: list[Message]
+    seed: list[Message]
+
+
+def _session_dir(args: argparse.Namespace) -> str:
+    """Transcript root: config/env resolution, then ``--session-dir`` /
+    ``--no-session-persistence`` CLI overrides."""
+    if getattr(args, "no_session_persistence", False):
+        return ""
+    cli = getattr(args, "session_dir", None)
+    return cli if cli else resolve_session_dir()
+
+
+def _resolve_session(
+    args: argparse.Namespace, session_dir: str
+) -> tuple[str, list[Message], list[Message]]:
+    """Pick the session id and seed history from ``--resume``/``--continue``/``--fork-session``.
+
+    Returns ``(session_id, history, seed)``: ``history`` is fed to ``run(history=...)``;
+    ``seed`` is the (cloned) chain that still needs writing to a fresh transcript (fork),
+    empty when the history already exists on disk.
+    """
+    fork = getattr(args, "fork_session", False)
+    explicit = getattr(args, "session_id", None)
+    resume_id = getattr(args, "resume", None)
+    cont = getattr(args, "continue_", False)
+    cwd = Path.cwd().resolve()
+
+    path = None
+    if resume_id:
+        if not session_dir:
+            raise RuntimeError("--resume needs session persistence (it is disabled)")
+        path = find_session(session_dir, cwd, resume_id)
+        if path is None:
+            raise RuntimeError(f"no session found with id {resume_id!r}")
+    elif cont:
+        if not session_dir:
+            raise RuntimeError("--continue needs session persistence (it is disabled)")
+        info = latest_session(project_dir(session_dir, cwd))
+        if info is None:
+            raise RuntimeError("no prior session to continue in this project")
+        path = info.path
+
+    if path is None:
+        return explicit or new_session_id(), [], []
+
+    loaded = load_transcript(path)
+    if fork:
+        new_id, cloned = fork_chain(loaded)
+        return explicit or new_id, cloned, list(cloned)
+    return loaded.session_id, build_chain(loaded), []
 
 
 async def _async_input(prompt: str) -> str | None:
@@ -196,17 +274,28 @@ async def _async_input(prompt: str) -> str | None:
     return await future
 
 
+async def _seed_transcript(built: "BuiltAgent") -> None:
+    """Write a fork's cloned chain into its fresh transcript before the first turn."""
+    if built.seed and built.agent.transcript is not None:
+        for message in built.seed:
+            await built.agent.transcript.append_message(message)
+
+
 def run_command(args: argparse.Namespace) -> int:
     try:
-        agent, ui, mcp = build_agent(args)
+        built = build_agent(args)
     except RuntimeError as exc:
-        # E.g. an MCP server failed to connect.
+        # E.g. an MCP server failed to connect, or a bad --resume id.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
+    agent, ui, mcp = built.agent, built.ui, built.mcp
 
     async def run_once():
+        await _seed_transcript(built)
         with KeyInterrupt(confirm=True) as interrupt:
-            return await agent.run(args.task, should_cancel=interrupt.is_set)
+            return await agent.run(
+                args.task, should_cancel=interrupt.is_set, history=built.history or None
+            )
 
     try:
         result = asyncio.run(run_once())
@@ -222,20 +311,29 @@ def run_command(args: argparse.Namespace) -> int:
     if not ui.is_live:
         print(result.answer)
     print(f"\nRun log: runs/{result.run_id}.jsonl")
+    if agent.transcript is not None:
+        print(f"Session: {agent.session_id}  (resume with --resume {agent.session_id})")
     return 0
 
 
 def chat_command(args: argparse.Namespace) -> int:
     try:
-        agent, ui, mcp = build_agent(args)
+        built = build_agent(args)
     except RuntimeError as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
+    agent, ui, mcp = built.agent, built.ui, built.mcp
     print("Agent chat. Type /exit to quit. Press Esc, then y, during a turn to interrupt.")
+    if agent.transcript is not None:
+        print(f"Session {agent.session_id} (resume later with --resume {agent.session_id})")
 
     async def session() -> None:
         # One event loop for the whole chat: every turn shares the same provider
         # gate, httpx pool, and asyncio primitives instead of rebinding per turn.
+        # ``history`` carries the conversation across turns (and seeds from --resume),
+        # so the agent finally has cross-turn memory within a session.
+        await _seed_transcript(built)
+        history: list[Message] = list(built.history)
         while True:
             task = await _async_input("> ")
             if task is None:  # EOF
@@ -247,7 +345,10 @@ def chat_command(args: argparse.Namespace) -> int:
                 continue
             try:
                 with KeyInterrupt(confirm=True) as interrupt:
-                    result = await agent.run(task, should_cancel=interrupt.is_set)
+                    result = await agent.run(
+                        task, should_cancel=interrupt.is_set, history=history or None
+                    )
+                history = result.messages
             except LLMTransientError as exc:
                 # A network hiccup must not tear down the whole session: report it and
                 # keep the loop (and the accumulated context) alive for a retry.
@@ -265,6 +366,30 @@ def chat_command(args: argparse.Namespace) -> int:
     finally:
         if mcp is not None:
             mcp.close()
+    return 0
+
+
+def sessions_command(args: argparse.Namespace) -> int:
+    """List resumable sessions saved for the current project, newest first."""
+    root = getattr(args, "session_dir", None) or resolve_session_dir()
+    if not root:
+        print("Session persistence is disabled (empty session dir).")
+        return 0
+    cwd = Path.cwd().resolve()
+    infos = list_sessions(project_dir(root, cwd))
+    if not infos:
+        print(f"No saved sessions for {cwd}")
+        return 0
+    import datetime as _dt
+
+    print(f"Sessions for {cwd}:\n")
+    for info in infos:
+        when = _dt.datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
+        label = info.title or info.first_prompt or "(empty)"
+        branch = f" [{info.git_branch}]" if info.git_branch else ""
+        print(f"  {info.session_id}  {when}  ({info.message_count} msgs){branch}")
+        print(f"      {label}")
+    print(f"\nResume with: polaris run <task> --resume <id>   (or --continue for the newest)")
     return 0
 
 
@@ -471,14 +596,62 @@ def main(argv: list[str] | None = None) -> int:
             help="Hard ceiling on tool turns; 0 (or omitted) means no cap.",
         )
 
+    def add_session_flags(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--resume",
+            metavar="SESSION_ID",
+            default=None,
+            help="Resume a saved session by id (searches this project, then all projects).",
+        )
+        subparser.add_argument(
+            "-c",
+            "--continue",
+            dest="continue_",
+            action="store_true",
+            help="Resume the most recent session in the current project.",
+        )
+        subparser.add_argument(
+            "--fork-session",
+            action="store_true",
+            help="With --resume/--continue: branch into a NEW session, leaving the source intact.",
+        )
+        subparser.add_argument(
+            "--session-id",
+            metavar="UUID",
+            default=None,
+            help="Use this id for the (new or forked) session instead of a generated one.",
+        )
+        subparser.add_argument(
+            "--session-dir",
+            metavar="PATH",
+            default=None,
+            help="Root for resumable transcripts (overrides config/env; ~ is expanded).",
+        )
+        subparser.add_argument(
+            "--no-session-persistence",
+            action="store_true",
+            help="Do not write a resumable transcript for this run.",
+        )
+
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("task")
     add_common(run_parser)
+    add_session_flags(run_parser)
     run_parser.set_defaults(func=run_command)
 
     chat_parser = subparsers.add_parser("chat")
     add_common(chat_parser)
+    add_session_flags(chat_parser)
     chat_parser.set_defaults(func=chat_command)
+
+    sessions_parser = subparsers.add_parser(
+        "sessions", help="List resumable sessions saved for the current project."
+    )
+    sessions_parser.add_argument(
+        "action", nargs="?", choices=["list"], default="list", help="list: show saved sessions."
+    )
+    sessions_parser.add_argument("--session-dir", metavar="PATH", default=None)
+    sessions_parser.set_defaults(func=sessions_command)
 
     dream_parser = subparsers.add_parser("dream", help="Consolidate memory (decay, merge, insights).")
     add_common(dream_parser)
