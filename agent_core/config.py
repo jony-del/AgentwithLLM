@@ -157,6 +157,16 @@ def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimi
     return OutputLimitConfig.from_dict(table if isinstance(table, dict) else None)
 
 
+def resolve_tool_use_summary_config(
+    config_file: str | Path = "agent.toml",
+) -> "ToolUseSummaryConfig":
+    """Resolve the tool-use progress-label settings from the ``[tool_use_summary]`` toml table."""
+    from agent_core.tool_use_summary import ToolUseSummaryConfig
+
+    table = load_agent_toml(config_file).get("tool_use_summary")
+    return ToolUseSummaryConfig.from_dict(table if isinstance(table, dict) else None)
+
+
 def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
     """Resolve concurrency settings from ``[concurrency]``, then env, then CLI.
 

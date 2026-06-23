@@ -33,6 +33,11 @@ from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.storage import JSONLRunLogger
 from agent_core.tokens import is_supported_model
+from agent_core.tool_use_summary import (
+    ToolUseSummaryConfig,
+    ToolUseSummarizer,
+    build_tool_use_summarizer,
+)
 from agent_core.transcript import TranscriptStore, new_session_id
 from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
@@ -151,6 +156,7 @@ class ReActConfig:
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
+    tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
 
 
 @dataclass(slots=True)
@@ -214,6 +220,18 @@ class ReActAgent:
         self._summarizer = build_summarizer(
             self.provider, self._provider_config(), self.config.compression
         )
+        # Async tool-use progress label (UI-only, ephemeral). None when disabled or for
+        # FakeProvider (offline byte-stable). The live-UI / leader-only gates are applied
+        # at fire time (``_fire_tool_use_summary``) since ``self.ui`` is set just below.
+        self._tool_use_summarizer: ToolUseSummarizer | None = build_tool_use_summarizer(
+            self.provider, self._provider_config(), self.config.tool_use_summary
+        )
+        # The in-flight (or just-finished) label task; fired after a tool batch, awaited and
+        # emitted on the next turn so the Haiku call overlaps the main model call. Reset per run.
+        # ``_pending_tool_use_names`` carries that batch's tool names for the UI emit (the task
+        # itself only returns the label string).
+        self._pending_tool_use_summary: "asyncio.Task[str | None] | None" = None
+        self._pending_tool_use_names: list[str] = []
         self.ui = ui or NullUI()
         self.team_store = team_store or TeamStore(Path(self.config.run_dir) / "teams")
         # Per-run shared state for session-aware tools (planning, sub-agents). The
@@ -314,6 +332,7 @@ class ReActAgent:
         only re-linked into the message chain, not re-written to the transcript.
         """
         self._last_message_uuid = None
+        self._pending_tool_use_summary = None
         user_message = Message("user", task)
         messages: list[Message] = [Message("system", self.config.system_prompt), user_message]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
@@ -484,6 +503,12 @@ class ReActAgent:
             if cancelled():
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
 
+            # Emit the previous tool batch's progress label here — the model call just
+            # finished, so the background Haiku task fired last turn has had that whole
+            # call to resolve (near-zero added latency). This runs before both the final-
+            # answer return and the next tool execution, so neither path drops a label.
+            await self._flush_pending_tool_use_summary()
+
             await self.logger.write(
                 "llm",
                 {
@@ -533,6 +558,12 @@ class ReActAgent:
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
                 # post-compaction fold. Defensive: odd/missing args just skip.
                 self._record_read_result(tool_call, tool_result)
+
+            # Fire (fire-and-forget) the tool-use progress label for this batch. It runs in
+            # the background during next turn's model call and is awaited/emitted there.
+            self._fire_tool_use_summary(
+                list(zip(result.tool_calls, tool_results, strict=True)), result.content
+            )
 
     async def _emit(self, messages: list[Message], message: Message) -> None:
         """Append a real conversation turn: link it into the chain and persist it.
@@ -606,10 +637,67 @@ class ReActAgent:
         self._last_message_uuid = running
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
+        # We're aborting (cancel / deadline / max_steps) — don't wait on an in-flight label;
+        # cancel and reap the task so it never leaks past the run.
+        await self._cancel_pending_tool_use_summary()
         answer = f"Stopped after {human} without a final answer."
         self.ui.on_stopped(reason, human)
         await self.logger.write("final", {"answer": answer, "stopped": reason})
         return AgentRunResult(answer, messages, step, self.logger.run_id)
+
+    def _fire_tool_use_summary(
+        self, batch: list[tuple[ToolCall, ToolResult]], last_assistant_text: str
+    ) -> None:
+        """Kick off (fire-and-forget) the async progress label for a finished tool batch.
+
+        No-op unless a summarizer exists (feature on + real provider), the UI is live (no
+        one to show a label to otherwise — don't waste an API call), and this is the leader
+        (or sub-agent labels are explicitly enabled). The created task is awaited and emitted
+        next turn by ``_flush_pending_tool_use_summary``.
+        """
+        if self._tool_use_summarizer is None or not self.ui.is_live or not batch:
+            return
+        if self.session.depth != 0 and not self.config.tool_use_summary.include_subagents:
+            return
+        self._pending_tool_use_names = [call.name for call, _ in batch]
+        self._pending_tool_use_summary = asyncio.create_task(
+            self._tool_use_summarizer(batch, last_assistant_text)
+        )
+
+    async def _flush_pending_tool_use_summary(self) -> None:
+        """Await the pending label task and emit it to the UI + event log (never the API).
+
+        Best-effort: any failure (including the task having degraded to ``None``) just drops
+        the label — it must never sink a run. The label is observability only; it is written
+        to ``runs/*.jsonl`` but never to the transcript or the API ``messages``.
+        """
+        task = self._pending_tool_use_summary
+        if task is None:
+            return
+        names = self._pending_tool_use_names
+        self._pending_tool_use_summary = None
+        self._pending_tool_use_names = []
+        try:
+            label = await task
+        except Exception:  # noqa: BLE001 - a missing label is non-fatal.
+            return
+        if not label:
+            return
+        self.ui.on_tool_use_summary(label, names)
+        await self.logger.write("tool_use_summary", {"label": label, "tools": names})
+
+    async def _cancel_pending_tool_use_summary(self) -> None:
+        """Cancel and reap the in-flight label task without emitting it (used on abort)."""
+        task = self._pending_tool_use_summary
+        if task is None:
+            return
+        self._pending_tool_use_summary = None
+        self._pending_tool_use_names = []
+        task.cancel()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 - reap quietly (incl. CancelledError).
+            pass
 
     async def _recall(self, task: str, messages: list[Message]) -> None:
         """Inject relevant past memories as a pinned system block before the task."""

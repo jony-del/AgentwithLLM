@@ -17,6 +17,7 @@ from agent_core.config import (
     resolve_output_config,
     resolve_persist_compaction_boundary,
     resolve_session_dir,
+    resolve_tool_use_summary_config,
 )
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
@@ -162,6 +163,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         memory=_memory_config(args),
         output=resolve_output_config(),
         compression=resolve_compression_config(),
+        tool_use_summary=resolve_tool_use_summary_config(),
         project_instructions=bool(context["project_instructions"]),
         git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),

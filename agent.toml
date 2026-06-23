@@ -238,3 +238,17 @@ pointer = true                # replace oversized output with a <tool_output_ref
                               #   pointer (head + on-disk path the model pages back via
                               #   read_text_file); false = legacy head+tail truncation
 preview_chars = 2000          # head kept inline in the pointer (pointer mode only)
+
+# Tool-use progress labels: after each tool batch, a cheap model (Haiku) is asked
+# asynchronously for a one-line, git-subject-style label ("Searched auth/, fixed NPE")
+# shown in the live UI as a progress indicator. It is UI-only and ephemeral: never sent
+# to the model's context and never written to the resumable transcript (only the live UI
+# and the runs/*.jsonl event log see it). Off by default — it costs one extra (small) API
+# call per tool batch and only helps when a live terminal UI is attached.
+[tool_use_summary]
+enabled = false                       # opt-in; also requires a live UI + a real provider
+model = "claude-haiku-4-5-20251001"   # the cheap model used to write the label
+max_tokens = 64                       # labels are short — keep the budget tiny
+max_input_chars_per_tool = 300        # head-truncate each tool's input/output before labeling
+timeout_seconds = 8.0                 # single bound on the label call; on timeout, no label
+include_subagents = false             # default: only the leader narrates (not sub-agents)

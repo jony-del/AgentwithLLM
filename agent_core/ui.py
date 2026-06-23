@@ -56,6 +56,13 @@ class AgentUI:
     def on_todos(self, todos: list[Any]) -> None:
         """The task-planning tool (``update_todos``) rewrote the to-do list."""
 
+    def on_tool_use_summary(self, label: str, tool_names: list[str]) -> None:
+        """A one-line progress label for the tool batch that just ran (UI-only).
+
+        Generated asynchronously by a cheap model; never sent to the API or stored in the
+        transcript. The base sink ignores it — only a live UI renders it.
+        """
+
     def on_stopped(self, reason: str, human: str) -> None:
         """A safety-net guard (cancel / max_steps / deadline) ended the run."""
 
@@ -222,6 +229,10 @@ class ConsoleUI(AgentUI):
             status = getattr(todo, "status", "pending")
             content = getattr(todo, "content", str(todo))
             self._emit(self._style(f"  {marks.get(status, '○')} {content}", colors.get(status, _DIM)))
+
+    def on_tool_use_summary(self, label: str, tool_names: list[str]) -> None:
+        self._close_block()
+        self._emit(self._style(f"⊙ {label}", _DIM))
 
     def on_stopped(self, reason: str, human: str) -> None:
         self._close_block()

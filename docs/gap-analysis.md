@@ -76,9 +76,15 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 
 ### 3.2 缺失的部分 ❌（按缺口大小）
 
-1. **LLM 驱动的 compaction**：参考用 forked agent 调模型生成 `<analysis>+<summary>`
+1. ~~**LLM 驱动的 compaction**：参考用 forked agent 调模型生成 `<analysis>+<summary>`
    摘要；本项目是纯字符串截断（snip/omit）。**这是上下文质量的最大差距**——长任务里
-   截断会丢语义，摘要不会。
+   截断会丢语义，摘要不会。~~ **✅ 已实现**：`compression_summary.py` 实现了完整的
+   Track A LLM 摘要器——9 节 prompt（移植自参考 `BASE_COMPACT_PROMPT`）、`<analysis>+<summary>`
+   解析、无工具强制前导（`_NO_TOOLS_PREAMBLE`/`_NO_TOOLS_TRAILER`）、不可信 transcript
+   定界符（`<transcript>`）、升档 `_budget_ladder`（steady-state → compact_max → 模型硬限），
+   全部共享 `GatedProvider` 预算。`react.py:214` 在初始化时构建 `self._summarizer`；
+   proactive 与 reactive 两路压缩均传入该 summarizer；`FakeProvider` / 无 key / `use_llm_summary=False`
+   时自动降级到 Track B 字符串截断，保持离线/测试环境 byte-stable。
 2. ~~**会话持久化 / resume**：参考有 session 文件 + `/resume` + 历史。本项目只有
    `runs/*.jsonl` 单向日志，不能续接会话。~~ **✅ 已实现**：新增 `transcript.py`——
    按 `session_id` 命名的追加式 Message round-trip JSONL（`uuid`/`parent_uuid` 消息树，
@@ -87,8 +93,13 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
    compact-boundary**：一次 fold 把边界 + 摘要写盘，`--resume` 直接加载压缩后状态（含
    `>5MB` fd 级字节截断 + 边界前元数据抢救扫描）；可经 `persist_compaction_boundary`
    开关回退到忠实全量历史。`runs/*.jsonl` 事件日志保持不变、各司其职。
-3. **项目指令注入（CLAUDE.md）**：参考把 CLAUDE.md / memory files 作为 `userContext`
-   每轮注入。本项目有 memory 系统但**不读取/注入项目级 CLAUDE.md**。
+3. ~~**项目指令注入（CLAUDE.md）**：参考把 CLAUDE.md / memory files 作为 `userContext`
+   每轮注入。本项目有 memory 系统但**不读取/注入项目级 CLAUDE.md**。~~ **✅ 已实现**：
+   `context.py:build_project_instructions()` 从 workspace 向上发现并合并所有 CLAUDE.md（VCS
+   根 → workspace 优先级顺序 + 可选 `~/.claude/CLAUDE.md`），注入为 pinned `<system-reminder>`
+   userContext 中的 `claudeMd` 条目（`react.py:672-682`），截断至 `claudemd_max_chars`（默认
+   32000）。`build_git_status()` 同步实现 git 快照注入（`systemContext.gitStatus`），带单次
+   `asyncio.wait_for` 超时 + subprocess kill-await，对标参考 §3.5-P0-1/2。
 4. **规则驱动权限 + bash 分类器**：参考能对单条命令做细粒度 allow/deny/ask（按命令
    前缀、路径、危险模式）。本项目粒度到"工具级"，无法表达"允许 `git status` 但 ask
    `git push`"。
@@ -101,7 +112,20 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
    reactive_compact 一次；参考有 collapse-drain → reactive → 升档重试 → 多轮 recovery
    的完整链。
 9. **fallback 模型切换**与 tombstone 清理。
-10. **tool result 预算裁剪 + tool-use summary**（Haiku 异步摘要降低上下文占用）。
+10. ~~**tool result 预算裁剪 + tool-use summary**（Haiku 异步摘要降低上下文占用）。~~
+    **✅ 已实现**。**订正**：参考的两件事职责不同 ——
+    (a) **预算裁剪**（`applyToolResultBudget`）才是真正「降低上下文占用」的部分，本项目早已由
+    `hooks.py:MaxOutputPostHook` 的 pointer 模式（`<tool_output_ref>` 结构化预览指针，对标参考
+    `toolResultStorage`）完成；
+    (b) **tool-use summary**（`toolUseSummaryGenerator.ts` / `query.ts:1410-1482`）其实**不缩
+    上下文** —— 它是每个工具批次后由 Haiku 异步生成的一句 ~30 字进度标签，**只发 SDK/UI**，
+    `normalizeMessagesForAPI` 从不含它（不进 API、不进 transcript）。原条目括号「降低上下文占用」
+    系对 (b) 的误标。
+    现新增 `tool_use_summary.py`（镜像 `compression_summary.py` 的注入闭包 seam）忠实复刻 (b)：
+    fire-and-forget 异步 Haiku 标签、下一轮 model 调用期间并发跑完、`ui.on_tool_use_summary` +
+    `runs/*.jsonl` 观测日志、**绝不进 API messages / transcript**；`[tool_use_summary]` 配置
+    （默认关、可选模型、单次非堆叠超时、leader-only）、live-UI + 非 Fake 闸、离线 byte-stable。
+    共 15 个新测试（`tests/test_tool_use_summary.py`），全套 423 绿。
 
 ### 3.3 设计不同但可以保留 🔵
 
@@ -142,21 +166,22 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 
 **P0（高收益 / 低风险，先做）**
 
-1. **CLAUDE.md 注入**：在 `react.py` 组装初始 messages 时，读取 workspace 的
+1. ~~**CLAUDE.md 注入**：在 `react.py` 组装初始 messages 时，读取 workspace 的
    `CLAUDE.md` 注入为 system/pinned 块（仿 `context.ts:getUserContext`）。改动局部、
-   收益立竿见影。
-2. **git status 上下文块**：仿 `context.ts:getGitStatus`，run 开始时注入一次性 git
-   快照。小、独立。
-3. **LLM 摘要式 compaction（双轨）**：默认走模型摘要、降级到现有字符串截断。这是缩小
-   与参考差距的**最高杠杆**项。
+   收益立竿见影。~~ **✅ 已完成**（见 §3.2-3）。
+2. ~~**git status 上下文块**：仿 `context.ts:getGitStatus`，run 开始时注入一次性 git
+   快照。小、独立。~~ **✅ 已完成**（见 §3.2-3）。
+3. ~~**LLM 摘要式 compaction（双轨）**：默认走模型摘要、降级到现有字符串截断。这是缩小
+   与参考差距的**最高杠杆**项。~~ **✅ 已完成**（见 §3.2-1）。
 
 **P1（中收益，中风险）**
 
 4. **stop hook**（可阻断/可续跑）——让"任务未完成时强制继续/收尾"成为可能。
 5. **413 / max_output_tokens 分级恢复**——在现有 `reactive_compact` 上补
    max_output_tokens 续跑。
-6. **tool result 预算裁剪**——超大工具输出按 per-message 预算截断（已有
-   MaxOutputPostHook，可扩展）。
+6. ~~**tool result 预算裁剪**——超大工具输出按 per-message 预算截断（已有
+   MaxOutputPostHook，可扩展）。~~ **✅ 已完成**：预算裁剪由 `MaxOutputPostHook` pointer 模式
+   承担；参考的 tool-use summary（UI 进度标签，非上下文缩减）也已忠实复刻（见 §3.2-10）。
 
 **P2（架构投入，按需）**
 
@@ -175,8 +200,18 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 （LLM 摘要 compaction、CLAUDE.md/git 注入）和**会话连续性**（resume）。建议从 P0 三项
 入手：改动小、风险低、最快拉近与参考项目的体感差距，且都不触碰高风险的契约变更。
 
-> **进展更新（2026-06）**：**会话连续性（resume）已完成**——包括 `transcript.py`
-> 持久化、`--resume`/`--continue`/`--fork-session`/`sessions list`、`chat` 跨轮记忆，
-> 以及对标参考的 **transcript 内建 compact-boundary**（fold 写边界 + 摘要、`>5MB` 字节
-> 截断、`persist_compaction_boundary` 开关回退）。详见 §2 表「session / transcript」行、
-> §3.2-2、§3.4-3、§3.5-7。其余 §3.2/§3.5 各项状态未在本次更新范围内，仍按原文。
+> **进展更新（2026-06）**：
+> - **P0 三项全部完成**：LLM 双轨 compaction（§3.2-1）、CLAUDE.md 注入（§3.2-3）、
+>   git status 注入（§3.5-P0-2）均已实现，`compression_summary.py` + `context.py` 是
+>   主要新文件。
+> - **会话连续性（resume）已完成**（§3.2-2 / §3.4-3）——包括 `transcript.py` 持久化、
+>   `--resume`/`--continue`/`--fork-session`/`sessions list`、`chat` 跨轮记忆，以及
+>   transcript 内建 compact-boundary（fold 写边界 + 摘要、`>5MB` 截断、`persist_compaction_boundary`
+>   开关）。
+> - **tool result 预算裁剪 + tool-use summary**（§3.2-10）**已完成**：预算裁剪由
+>   `MaxOutputPostHook` pointer 模式承担；参考的 tool-use summary（异步 Haiku **UI 进度标签**，
+>   非上下文缩减）由新增 `tool_use_summary.py` 忠实复刻（只进 UI + `runs/*.jsonl`，不进
+>   API/transcript）。同时订正了原条目「降低上下文占用」对 tool-use summary 的误标。
+> - **仍未实现**：stop/postSampling hook（§3.2-5）、skill/slash command（§3.2-6）、
+>   流式工具执行（§3.2-7）、413 分级恢复完整链（§3.2-8）、fallback 模型切换（§3.2-9）、
+>   规则驱动权限（§3.2-4）。
