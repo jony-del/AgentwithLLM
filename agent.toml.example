@@ -71,6 +71,11 @@ soft_deadline_fraction = 0.9
 # Also settable via the AGENT_SESSION_DIR env var.
 [session]
 dir = "~/.polaris/projects"
+# When true (default), a context-compaction fold writes a compact boundary + summary into
+# the transcript, so resuming loads the *compacted* state (only turns after the last
+# boundary) — like the reference. Set false to keep transcripts a faithful full record and
+# have resume reload everything (the loop re-compacts). Env: AGENT_PERSIST_COMPACT_BOUNDARY.
+persist_compaction_boundary = true
 
 # --- One-time project context (CLAUDE.md + git) -----------------------------
 # At run start the agent discovers CLAUDE.md files (workspace up to the root, plus

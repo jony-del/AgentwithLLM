@@ -12,6 +12,7 @@ from agent_core.compression import (
     CompressionConfig,
     CompressionEvent,
     CompressionPipeline,
+    is_summary_message,
     parse_prompt_too_long_gap,
     shrink_oversize_messages,
     truncate_head_for_ptl_retry,
@@ -118,6 +119,12 @@ class ReActConfig:
     # (a sanitized cwd subdir) and listable/resumable across projects. ``~`` is expanded.
     # Empty string disables transcript persistence entirely.
     session_dir: str = "~/.polaris/projects"
+    # When True (reference behavior), a context-collapse fold writes a compact boundary +
+    # summary into the transcript, so a resume loads the *compacted* state (only messages
+    # after the last boundary) instead of replaying the full pre-fold history. When False,
+    # the transcript stays a faithful full record and a resume reloads everything, letting
+    # the live loop re-compact (cheaper/simpler; the original decoupled behavior).
+    persist_compaction_boundary: bool = True
     system_prompt: str = (
         "You are a ReAct agent. Reason briefly, call tools when useful, "
         "and return a final answer when the task is complete. "
@@ -372,6 +379,7 @@ class ReActAgent:
             # pipeline forwards them to build_post_compact_messages inside the collapse
             # stage). Empty when nothing has been read yet.
             attachments = self._build_read_attachments()
+            before_compaction = list(messages)
             messages, events = await self.compression.auto_compact(
                 messages,
                 model=self.config.model,
@@ -382,6 +390,7 @@ class ReActAgent:
             )
             for event in events:
                 await self.logger.write("compression", asdict(event))
+            await self._commit_compaction_boundary(before_compaction, messages)
 
             # Stream tokens to the UI only when it is live and streaming is enabled.
             sink = self.ui if (self.ui.is_live and self.config.stream) else None
@@ -402,6 +411,7 @@ class ReActAgent:
                 # 413s and nothing is left to drop (< 2 rounds), or the retries are
                 # exhausted, the overflow propagates.
                 gap = parse_prompt_too_long_gap(str(exc))
+                before_compaction = list(messages)
                 messages, events = await self.compression.reactive_compact(
                     messages,
                     model=self.config.model,
@@ -412,6 +422,7 @@ class ReActAgent:
                 )
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
+                await self._commit_compaction_boundary(before_compaction, messages)
                 result = None
                 for _ in range(MAX_PTL_RETRIES):
                     self.ui.on_turn_start()
@@ -537,6 +548,62 @@ class ReActAgent:
         if self.transcript is not None:
             await self.transcript.append_message(message)
         self._last_message_uuid = message.uuid
+
+    async def _commit_compaction_boundary(
+        self, before: list[Message], after: list[Message]
+    ) -> None:
+        """Persist a compaction boundary when a context-collapse fold actually happened.
+
+        Mirrors the reference: the new summary becomes a transcript root
+        (``parent_uuid=None`` + ``compact_boundary`` tag), the kept tail's first message is
+        relinked onto it, and post-compact file attachments are chained on — so a
+        ``--resume`` loads only the *compacted* state (turns after the last boundary), not
+        the full pre-fold history. The fold is detected by diffing message uuids, so
+        snip/microcompact (which truncate content in place, same uuids) are correctly
+        ignored. No-op when persistence or the boundary feature is off; best-effort and
+        decoupled from the loop's correctness, exactly like ``_emit``.
+        """
+        if self.transcript is None or not self.config.persist_compaction_boundary:
+            return
+        before_uuids = {m.uuid for m in before}
+        new_msgs = [m for m in after if m.uuid not in before_uuids]
+        if not new_msgs:
+            return  # snip/microcompact only, or nothing changed — no boundary to write.
+        summary = next((m for m in new_msgs if is_summary_message(m)), None)
+        if summary is None:
+            # A drop with no summary (e.g. emergency PTL head-truncation): don't write a
+            # boundary — let a resume reload the full history and re-compact.
+            return
+
+        # The summary becomes a new root; record the real predecessor for forensics.
+        if self._last_message_uuid is not None:
+            summary.metadata["logical_parent_uuid"] = self._last_message_uuid
+        summary.metadata["compact_boundary"] = True
+        summary.parent_uuid = None
+        await self.transcript.append_message(summary)
+
+        # Everything after the summary in the folded list is either kept tail (already on
+        # disk, uuid in ``before``) or new attachments. Preserved front matter sits before
+        # the summary, so it is excluded here.
+        tail = after[after.index(summary) + 1 :]
+        recent = [m for m in tail if m.uuid in before_uuids]
+        attachments = [m for m in tail if m.uuid not in before_uuids]
+
+        if recent:
+            # Re-point the kept tail's head onto the summary via an append-only relink
+            # (the original line can't be mutated); keep the in-memory chain in sync.
+            recent[0].parent_uuid = summary.uuid
+            await self.transcript.append_relink(recent[0].uuid, summary.uuid)
+            running = recent[-1].uuid
+        else:
+            running = summary.uuid
+
+        for attachment in attachments:
+            attachment.parent_uuid = running
+            await self.transcript.append_message(attachment)
+            running = attachment.uuid
+
+        self._last_message_uuid = running
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
         answer = f"Stopped after {human} without a final answer."

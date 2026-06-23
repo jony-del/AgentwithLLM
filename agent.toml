@@ -5,9 +5,14 @@
 # AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
 
 # --- Top-level scalars -------------------------------------------------------
-model = "claude-haiku-4-5-20251001"
+model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask
 provider = "claude"           # claude | fake
+# output_config.effort depth/cost control. low | medium | high | xhigh | max.
+# "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
+# Sonnet 4.6 / Opus <= 4.6 (the provider drops a level the model can't honor). Overridable
+# by AGENT_EFFORT or --effort. Only effort-capable models (Opus 4.5+, Sonnet 4.6, Fable) use it.
+effort = "high"
 
 # --- Live display (CLI-only, NOT configured here) ----------------------------
 # The terminal trace, token streaming, and extended thinking are controlled by
@@ -44,10 +49,108 @@ importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
 
+# --- Run-level safety limits ------------------------------------------------
+# Bound a whole `run()`. The wall-clock budget is SHARED across the sub-agent
+# fan-out (leader + children), not refreshed per child. Cooperative cancel (Esc)
+# is the primary interactive control; these are the runaway/stuck safety net.
+# Overridable by env (AGENT_MAX_WALL_SECONDS, AGENT_MAX_STEPS) and CLI flags
+# (--max-wall-seconds, --max-steps). For both caps, 0 means "disabled".
+[limits]
+max_wall_seconds = 1800        # whole-run wall-clock budget in seconds; 0 = no limit
+max_steps = 0                  # hard ceiling on tool turns; 0 = no cap
+# Fraction of the wall budget after which a one-time "wrap up now" nudge is injected
+# so the model can return a useful partial answer before the hard stop. >= 1 disables it.
+soft_deadline_fraction = 0.9
+
+# --- Resumable session transcripts ------------------------------------------
+# Each run/chat records its conversation as an append-only transcript so it can be
+# resumed later (`--resume <id>` / `--continue`, or `polaris sessions` to list).
+# Transcripts are scoped per project under this root (a sanitized-cwd subdir), so a
+# session resumes only where it was created (plus a cross-project id lookup as a
+# fallback). `~` is expanded. Set to "" (or pass --no-session-persistence) to disable.
+# Also settable via the AGENT_SESSION_DIR env var.
+[session]
+dir = "~/.polaris/projects"
+# When true (default), a context-compaction fold writes a compact boundary + summary into
+# the transcript, so resuming loads the *compacted* state (only turns after the last
+# boundary) — like the reference. Set false to keep transcripts a faithful full record and
+# have resume reload everything (the loop re-compacts). Env: AGENT_PERSIST_COMPACT_BOUNDARY.
+persist_compaction_boundary = true
+
+# --- One-time project context (CLAUDE.md + git) -----------------------------
+# At run start the agent discovers CLAUDE.md files (workspace up to the root, plus
+# ~/.claude/CLAUDE.md) and injects them as a pinned system block the model must
+# follow. It also captures a one-shot git snapshot (branch, main branch, user,
+# `git status --short`, last 5 commits) and injects it as a second pinned block,
+# wrapped as untrusted context. Both blocks survive compaction and degrade silently
+# (no CLAUDE.md / not a git repo / git missing). Toggle here or with truthy
+# AGENT_DISABLE_CLAUDE_MD / AGENT_DISABLE_GIT_CONTEXT env vars.
+[context]
+project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAUDE.md injection
+git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
+claudemd_max_chars = 32000     # truncate the joined block to this many characters
+
+# --- Context compaction -----------------------------------------------------
+# How the history is shrunk when it grows large. Cheap deterministic stages (snip,
+# microcompact) run every turn; the prefix-collapse stage folds old turns into one
+# summary block. With a real provider and use_llm_summary on, that fold is an LLM
+# summary (Track A); with no API key / --provider fake / disabled, it is a
+# deterministic string join (Track B). Any summary failure degrades to Track B, so a
+# run never breaks. AGENT_DISABLE_LLM_SUMMARY=1 pins a run to Track B.
+[compression]
+max_message_chars = 6000       # per-message size above which snip/microcompact trim
+collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
+use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
+summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
+summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
+# Track A summary OUTPUT budget — a streamed escalation ladder (parity with the reference's
+# streamed compact). Attempt 1 uses compact_summary_start_tokens; on a max_tokens truncation
+# it escalates to compact_max_output_tokens, then to the model's hard ceiling
+# (tokens.model_output_tokens(model)[1]: 128k for Opus 4.8). Streaming means the high tiers
+# don't trip the SDK's non-streaming timeout. Any failure still degrades to Track B.
+compact_summary_start_tokens = 8000  # first attempt (steady-state, ~ the reference's 8k slot cap)
+compact_max_output_tokens = 20000    # middle tier (the reference's COMPACT_MAX_OUTPUT_TOKENS)
+compact_max_output_retries = 2       # escalations allowed after the first attempt
+summary_timeout_seconds = 120    # single (non-stacked) timeout (s) bounding the WHOLE ladder; omit/None disables
+# Token-based auto-compact gate (parity with the reference). The gate compares a
+# running token estimate (last response usage, else chars/4) against
+# `effective_window - autocompact_buffer_tokens`, where the effective window reserves
+# room for the summary output. The char fields below only bound per-message snip/
+# microcompact budgets — they no longer drive the trigger.
+# max_context_chars = 24000    # per-message microcompact budget basis (NOT the trigger)
+# context_window_tokens caps the model's window for local auto-compact decisions.
+# tokens.py now recognises the native 1M family (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5)
+# and Haiku 4.5's 200k automatically, so this is only needed to MODEL A SMALLER deployment
+# (e.g. a capped window) — leave unset otherwise.
+# context_window_tokens = 200000
+# autocompact_buffer_tokens = 13000        # headroom below the effective window before compaction fires
+# reserved_output_tokens_for_summary = 20000 # tokens held back from the window for the summary's output
+# max_consecutive_autocompact_failures = 3   # circuit breaker: stop retrying after this many failures
+# AGENT_AUTOCOMPACT_PCT_OVERRIDE=<0..100> (env only) lowers the threshold to a
+# percent of the effective window for easier testing.
+# Post-compact file re-injection: after a real fold, re-attach the most-recently-read
+# files as one untrusted <system-reminder> user message so file context isn't lost.
+# post_compact_max_files = 5                 # most-recent files re-attached (newest first)
+# post_compact_max_tokens_per_file = 5000    # per-file truncation cap (token-based, char/4)
+# post_compact_total_budget_tokens = 20000   # total token budget across all re-attached files
+# (CLAUDE.md is never re-attached here — it is already pinned as the userContext reminder.)
+
+# --- Tool concurrency -------------------------------------------------------
+# Same-turn tool calls run concurrently when their declared resources do not
+# conflict. Disable this to force the old strictly serial execution path.
+[concurrency]
+parallel_tools = true          # false = execute tool calls one at a time
+max_tool_workers = 10          # worker threads for one independent wave
+# When several sub-agents/teammates run at once, their LLM API calls now overlap.
+# These bound the shared budget across the whole fan-out (env: AGENT_MAX_API_CONCURRENCY,
+# AGENT_API_RATE_LIMIT; CLI: --max-api-concurrency).
+max_api_concurrency = 8        # max simultaneous in-flight LLM API calls
+api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
+
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
-# to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK is a core dep,
-# available by default.
+# to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official
+# git/fetch/time reference servers are core deps, available by default.
 # Every tool defaults to risk = "dangerous" (so it's denied in auto/dontask and
 # confirmed in default); set risk per server to "read" or "write" to relax that.
 # Inspect what a server exposes with:  python -m agent_core mcp list
@@ -67,6 +170,40 @@ synthesize_insights = true    # let the LLM infer higher-level "insight" memorie
 # url = "http://localhost:8000/mcp"
 # headers = { Authorization = "Bearer TOKEN" }
 # risk = "write"
+#
+# --- Popular community servers (uncomment + install to enable) ---------------
+# These are Node-based; they run via `npx -y <pkg>` (needs Node/npm on PATH) and
+# are NOT in the `mcp-servers` extra (that extra only carries the pip git/fetch/time
+# servers). Each needs its own setup (tokens, paths) — see the package's README.
+#
+# # GitHub: repos, issues, PRs, code search. Needs a personal access token.
+# [mcp.servers.github]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-github"]
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..." }
+# risk = "write"
+#
+# # Playwright: drive a real browser (navigate, click, screenshot, scrape).
+# [mcp.servers.playwright]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@playwright/mcp@latest"]
+# risk = "dangerous"
+#
+# # SQLite: query/inspect a local database file.
+# [mcp.servers.sqlite]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "mcp-server-sqlite-npx", "./app.db"]
+# risk = "write"
+#
+# # Sequential-thinking: a structured step-by-step reasoning scratchpad.
+# [mcp.servers.sequential-thinking]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+# risk = "read"
 
 [mcp.servers.git]
 transport = "stdio"
@@ -94,6 +231,10 @@ risk = "read"
 [output]
 max_lines = 100               # truncate when output has more lines than this
 max_chars = 8000              # fallback cap for pathological single-line output
-head_lines = 20               # lines kept from the start
-tail_lines = 20               # lines kept from the end
+head_lines = 20               # lines kept from the start (legacy mode, pointer=false)
+tail_lines = 20               # lines kept from the end (legacy mode, pointer=false)
 spill = true                  # write the full output to disk (false = drop it)
+pointer = true                # replace oversized output with a <tool_output_ref> preview
+                              #   pointer (head + on-disk path the model pages back via
+                              #   read_text_file); false = legacy head+tail truncation
+preview_chars = 2000          # head kept inline in the pointer (pointer mode only)

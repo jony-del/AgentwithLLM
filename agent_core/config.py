@@ -249,6 +249,23 @@ def resolve_session_dir(config_file: str | Path = "agent.toml") -> str:
     return value
 
 
+def resolve_persist_compaction_boundary(config_file: str | Path = "agent.toml") -> bool:
+    """Whether a compaction fold writes a compact boundary into the transcript.
+
+    Precedence: default ``True`` → ``[session] persist_compaction_boundary`` →
+    ``AGENT_PERSIST_COMPACT_BOUNDARY`` env. ``False`` keeps the transcript a faithful
+    full record (resume reloads everything; the loop re-compacts).
+    """
+    value = True
+    table = load_agent_toml(config_file).get("session")
+    if isinstance(table, dict) and "persist_compaction_boundary" in table:
+        value = coerce_to_type(bool, table["persist_compaction_boundary"])
+    env = os.getenv("AGENT_PERSIST_COMPACT_BOUNDARY")
+    if env is not None:
+        value = env.strip().lower() in {"1", "true", "yes", "on"}
+    return value
+
+
 def resolve_context_config(config_file: str | Path = "agent.toml") -> dict[str, Any]:
     """Resolve one-time project-context settings from ``[context]``, then env.
 

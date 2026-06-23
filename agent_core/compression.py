@@ -178,6 +178,15 @@ def is_preserved(message: Message) -> bool:
     return message.role == "system" and message.metadata.get("compressed") not in _COLLAPSE_MARKERS
 
 
+def is_summary_message(message: Message) -> bool:
+    """True for a folded-summary block produced by ``build_summary_user_message`` (either
+    track). The single source of truth for "is this the message a context_collapse fold
+    just produced" — used by the transcript layer to find the new summary at a compaction
+    boundary without duplicating the marker set.
+    """
+    return message.metadata.get("compressed") in _COLLAPSE_MARKERS
+
+
 # Regex for the Anthropic "prompt is too long" 413/400 error body (case-insensitive,
 # lenient about SDK/JSON wrapping): ``prompt is too long: 219763 tokens > 200000``.
 # Captures (actual, limit). Mirrors the reference ``parsePromptTooLongTokenCounts``.

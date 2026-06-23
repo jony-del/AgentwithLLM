@@ -15,6 +15,7 @@ from agent_core.config import (
     resolve_mcp_config,
     resolve_memory_config,
     resolve_output_config,
+    resolve_persist_compaction_boundary,
     resolve_session_dir,
 )
 from agent_core.interrupt import KeyInterrupt
@@ -175,6 +176,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         max_steps=max_steps,
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
         session_dir=_session_dir(args),
+        persist_compaction_boundary=resolve_persist_compaction_boundary(),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)

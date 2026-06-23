@@ -41,6 +41,17 @@ from .models import Message
 # Entry "type" values that are NOT conversation messages.
 _TITLE = "custom-title"
 _TAG = "tag"
+_RELINK = "relink"
+
+# Above this file size, the resume load skips everything before the last compaction
+# boundary (reading only post-boundary bytes + a cheap pre-boundary metadata rescue),
+# mirroring the reference's SKIP_PRECOMPACT_THRESHOLD. Small files are read whole.
+SKIP_PRECOMPACT_THRESHOLD = 5 * 1024 * 1024
+
+# Byte signature of a compact-boundary message line (we control the serialization, so the
+# ``json.dumps`` default ``": "`` separator is stable). Used to locate the last boundary
+# without JSON-parsing every line.
+_BOUNDARY_MARKER = b'"compact_boundary": true'
 
 
 def sanitize_project(cwd: str | Path) -> str:
@@ -122,6 +133,15 @@ class TranscriptStore:
         record = {"type": kind, "session_id": self.session_id, "ts": time.time(), **payload}
         await asyncio.to_thread(self._write_sync, record)
 
+    async def append_relink(self, uuid: str, parent_uuid: str | None) -> None:
+        """Record that ``uuid``'s parent should be re-pointed to ``parent_uuid`` on load.
+
+        Written at a compaction boundary to re-attach the kept tail's first message to the
+        summary (the append-only file can't mutate the original line). ``load_transcript``
+        applies these last-wins after parsing all messages.
+        """
+        await self.append_meta(_RELINK, {"uuid": uuid, "parent_uuid": parent_uuid})
+
     def _write_sync(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
@@ -178,48 +198,143 @@ class LoadedTranscript:
         return self.order[-1]
 
 
-def load_transcript(path: str | Path) -> LoadedTranscript:
-    """Parse a session file into messages + metadata. Malformed lines are skipped."""
+class _Accumulator:
+    """Folds transcript entry lines into the maps a ``LoadedTranscript`` needs.
+
+    Shared by the whole-file and the boundary-truncated read paths so both interpret
+    entries identically. ``relinks`` are applied last (last-wins) to re-point parents.
+    """
+
+    __slots__ = ("session_id", "messages", "order", "relinks", "title", "tag", "branch")
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.messages: dict[str, Message] = {}
+        self.order: list[str] = []
+        self.relinks: dict[str, str | None] = {}
+        self.title: str | None = None
+        self.tag: str | None = None
+        self.branch: str | None = None
+
+    def feed(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        etype = entry.get("type")
+        if etype == "message":
+            msg = Message.from_dict(entry)
+            self.session_id = entry.get("session_id", self.session_id)
+            self.branch = entry.get("git_branch") or self.branch
+            if msg.uuid not in self.messages:
+                self.order.append(msg.uuid)
+            self.messages[msg.uuid] = msg
+        elif etype == _RELINK:
+            self.relinks[entry["uuid"]] = entry.get("parent_uuid")
+        elif etype == _TITLE:
+            self.title = entry.get("title", self.title)
+        elif etype == _TAG:
+            self.tag = entry.get("tag", self.tag)
+        # Unknown entry types are ignored, keeping the format forward-compatible.
+
+    def finish(self, path: Path) -> "LoadedTranscript":
+        # Apply relinks: a compaction boundary re-points the kept tail's head at the
+        # summary so the parent-walk stops at the boundary (pre-boundary turns drop out).
+        for uuid, parent in self.relinks.items():
+            msg = self.messages.get(uuid)
+            if msg is not None:
+                msg.parent_uuid = parent
+        return LoadedTranscript(
+            path=path,
+            session_id=self.session_id,
+            messages=self.messages,
+            order=self.order,
+            title=self.title,
+            tag=self.tag,
+            git_branch=self.branch,
+        )
+
+
+def load_transcript(path: str | Path, *, skip_precompact: bool = True) -> LoadedTranscript:
+    """Parse a session file into messages + metadata. Malformed lines are skipped.
+
+    For files larger than ``SKIP_PRECOMPACT_THRESHOLD`` (and ``skip_precompact``), only
+    the bytes from the last compaction boundary onward are parsed — the resume chain lives
+    entirely after that boundary — plus a cheap scan of the pre-boundary region to rescue
+    session metadata (title/tag) that would otherwise be skipped. Smaller files (and the
+    no-boundary case) are read whole.
+    """
     path = Path(path)
-    messages: dict[str, Message] = {}
-    order: list[str] = []
-    title: str | None = None
-    tag: str | None = None
-    branch: str | None = None
-    session_id = path.stem
+    acc = _Accumulator(session_id=path.stem)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
 
-    with path.open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            etype = entry.get("type")
-            if etype == "message":
-                msg = Message.from_dict(entry)
-                session_id = entry.get("session_id", session_id)
-                branch = entry.get("git_branch") or branch
-                if msg.uuid not in messages:
-                    order.append(msg.uuid)
-                messages[msg.uuid] = msg
-            elif etype == _TITLE:
-                title = entry.get("title", title)
-            elif etype == _TAG:
-                tag = entry.get("tag", tag)
-            # Unknown entry types are ignored, keeping the format forward-compatible.
+    boundary_offset = 0
+    if skip_precompact and size > SKIP_PRECOMPACT_THRESHOLD:
+        boundary_offset = _last_boundary_offset(path)
 
-    return LoadedTranscript(
-        path=path,
-        session_id=session_id,
-        messages=messages,
-        order=order,
-        title=title,
-        tag=tag,
-        git_branch=branch,
-    )
+    if boundary_offset > 0:
+        for line in _scan_pre_boundary_metadata(path, boundary_offset):
+            acc.feed(line)
+        with path.open("rb") as file:
+            file.seek(boundary_offset)
+            for raw in file:
+                acc.feed(raw.decode("utf-8", "ignore"))
+    else:
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                acc.feed(line)
+
+    return acc.finish(path)
+
+
+def _last_boundary_offset(path: Path) -> int:
+    """Byte offset of the start of the last compact-boundary line, or 0 if none.
+
+    Scans forward in binary, summing line byte-lengths, so the returned offset is exactly
+    where a ``file.seek`` lands to read the boundary line and everything after it.
+    """
+    offset = 0
+    last = 0
+    found = False
+    try:
+        with path.open("rb") as file:
+            for raw in file:
+                if _BOUNDARY_MARKER in raw:
+                    last = offset
+                    found = True
+                offset += len(raw)
+    except OSError:
+        return 0
+    return last if found else 0
+
+
+def _scan_pre_boundary_metadata(path: Path, end_offset: int) -> list[str]:
+    """Rescue session-metadata lines (title/tag) from ``[0, end_offset)``.
+
+    Truncating at the boundary would otherwise drop these, since they may have been
+    written before the last fold. Cheap substring filter — only candidate lines are kept
+    for the accumulator to JSON-parse.
+    """
+    markers = (b'"type": "%s"' % _TITLE.encode(), b'"type": "%s"' % _TAG.encode())
+    out: list[str] = []
+    consumed = 0
+    try:
+        with path.open("rb") as file:
+            for raw in file:
+                if consumed >= end_offset:
+                    break
+                if any(m in raw for m in markers):
+                    out.append(raw.decode("utf-8", "ignore"))
+                consumed += len(raw)
+    except OSError:
+        return out
+    return out
 
 
 def build_chain(loaded: LoadedTranscript, leaf: str | None = None) -> list[Message]:
@@ -258,6 +373,64 @@ class SessionInfo:
     git_branch: str | None = None
 
 
+def read_lite(path: str | Path) -> SessionInfo | None:
+    """Cheap metadata read for listing — never JSON-parses the whole file.
+
+    One binary pass: the *original* first user prompt (near the head, so it survives
+    boundary truncation), a message-line count, and the newest title/tag. Avoids the full
+    ``load_transcript`` (and its tree reconstruction) when all we need is a list row.
+    Returns ``None`` for an empty/unreadable file.
+    """
+    path = Path(path)
+    first_prompt = ""
+    count = 0
+    title: str | None = None
+    tag: str | None = None
+    branch: str | None = None
+    session_id = path.stem
+    msg_marker = b'"type": "message"'
+    title_marker = b'"type": "%s"' % _TITLE.encode()
+    tag_marker = b'"type": "%s"' % _TAG.encode()
+    try:
+        with path.open("rb") as file:
+            for raw in file:
+                if msg_marker in raw:
+                    count += 1
+                    if not first_prompt:
+                        try:
+                            entry = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        session_id = entry.get("session_id", session_id)
+                        branch = entry.get("git_branch") or branch
+                        if entry.get("role") == "user" and str(entry.get("content", "")).strip():
+                            first_prompt = " ".join(str(entry["content"]).split())[:200]
+                elif title_marker in raw:
+                    try:
+                        title = json.loads(raw).get("title", title)
+                    except json.JSONDecodeError:
+                        pass
+                elif tag_marker in raw:
+                    try:
+                        tag = json.loads(raw).get("tag", tag)
+                    except json.JSONDecodeError:
+                        pass
+    except OSError:
+        return None
+    if count == 0:
+        return None
+    return SessionInfo(
+        session_id=session_id,
+        path=path,
+        modified=path.stat().st_mtime,
+        first_prompt=first_prompt,
+        message_count=count,
+        title=title,
+        tag=tag,
+        git_branch=branch,
+    )
+
+
 def list_sessions(proj_dir: str | Path) -> list[SessionInfo]:
     """List sessions in one project dir, newest first. Sidechains are excluded.
 
@@ -269,24 +442,9 @@ def list_sessions(proj_dir: str | Path) -> list[SessionInfo]:
         return []
     infos: list[SessionInfo] = []
     for file in proj.glob("*.jsonl"):
-        try:
-            loaded = load_transcript(file)
-        except OSError:
-            continue
-        if loaded.message_count == 0:
-            continue
-        infos.append(
-            SessionInfo(
-                session_id=loaded.session_id,
-                path=file,
-                modified=file.stat().st_mtime,
-                first_prompt=loaded.first_prompt,
-                message_count=loaded.message_count,
-                title=loaded.title,
-                tag=loaded.tag,
-                git_branch=loaded.git_branch,
-            )
-        )
+        info = read_lite(file)
+        if info is not None:
+            infos.append(info)
     infos.sort(key=lambda i: i.modified, reverse=True)
     return infos
 
