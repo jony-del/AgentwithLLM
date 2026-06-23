@@ -178,7 +178,9 @@ class ToolExecutor:
             )
             return await self._finish(rewritten_call, result, "unknown tool")
 
-        self.ui.on_tool_call(tool.name, tool.risk.value, rewritten_call.arguments)
+        self.ui.on_tool_call(
+            tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
+        )
         decision = self.permissions.decide(tool)
         # The confirm step may block on an interactive prompt (input()); run it on a
         # worker thread so a question to the user doesn't freeze other in-flight work.
@@ -201,13 +203,34 @@ class ToolExecutor:
 
     async def _post_and_finish(self, prepared: _PreparedCall, result: ToolResult) -> ToolResult:
         result = self.hooks.run_post(prepared.tool_call, result)
-        return await self._finish(prepared.tool_call, result, prepared.reason)
+        return await self._finish(prepared.tool_call, result, prepared.reason, tool=prepared.tool)
 
-    async def _finish(self, tool_call: ToolCall, result: ToolResult, reason: str | None) -> ToolResult:
+    async def _finish(
+        self, tool_call: ToolCall, result: ToolResult, reason: str | None, tool: Tool | None = None
+    ) -> ToolResult:
         """Log, surface the observation to the UI, and return one exit for every path."""
         await self._log_result(tool_call, result, reason)
-        self.ui.on_tool_result(result)
+        diff = self._render_result(tool, tool_call, result) if tool is not None else None
+        self.ui.on_tool_result(result, diff=diff)
         return result
+
+    @staticmethod
+    def _render_args(tool: Tool, tool_call: ToolCall) -> str | None:
+        """A tool's optional compact argument label; never let display crash a run."""
+        try:
+            return tool.render_args(tool_call.arguments)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _render_result(tool: Tool, tool_call: ToolCall, result: ToolResult) -> str | None:
+        """A tool's optional unified-diff for the result branch; failures are swallowed."""
+        if not result.ok:
+            return None
+        try:
+            return tool.render_result(tool_call.arguments, result)
+        except Exception:
+            return None
 
     async def _log_result(self, tool_call: ToolCall, result: ToolResult, reason: str | None) -> None:
         if self.logger:

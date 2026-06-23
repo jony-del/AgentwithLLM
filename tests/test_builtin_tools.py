@@ -10,10 +10,13 @@ from agent_core.tools.builtin import (
     EditFileTool,
     GitDiffTool,
     ListDirTool,
+    ReadTextFileTool,
     RunCommandTool,
     RunTestsTool,
     SearchTextTool,
+    _DEFAULT_READ_LINES,
     _run_subprocess,
+    _shell_invocation,
 )
 
 
@@ -140,6 +143,62 @@ async def test_run_command_shell_echo(tmp_path: Path) -> None:
 
 def test_run_command_is_dangerous() -> None:
     assert RunCommandTool().risk is ToolRisk.DANGEROUS
+
+
+def test_shell_invocation_per_platform() -> None:
+    spec, shell = _shell_invocation("Get-Content x")
+    if sys.platform.startswith("win"):
+        assert shell is False
+        assert spec[0] == "powershell" and spec[-1].endswith("Get-Content x")
+    else:
+        assert shell is True
+        assert spec == "Get-Content x"
+
+
+async def test_run_command_child_python_emits_utf8(tmp_path: Path) -> None:
+    # The GBK regression: a child printing non-ASCII must not crash and must
+    # round-trip as UTF-8 (PYTHONUTF8/PYTHONIOENCODING are forced for the child).
+    code = "print('\\u2705 完成')"
+    result = await RunCommandTool(tmp_path).run({"command": f'{sys.executable} -c "{code}"'})
+    assert result.ok
+    assert "完成" in result.content
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="PowerShell cmdlet test is Windows-only")
+async def test_run_command_powershell_cmdlet_reads_utf8(tmp_path: Path) -> None:
+    # Get-Content (a PowerShell cmdlet, absent in cmd.exe) must resolve AND read a
+    # UTF-8 file's CJK correctly under Windows PowerShell 5.1.
+    (tmp_path / "u.txt").write_text("你好世界\n", encoding="utf-8")
+    result = await RunCommandTool(tmp_path).run({"command": "Get-Content u.txt"})
+    assert result.ok
+    assert "你好世界" in result.content
+
+
+# --- read_text_file ----------------------------------------------------------
+
+
+async def test_read_text_file_returns_small_file_whole(tmp_path: Path) -> None:
+    (tmp_path / "s.txt").write_text("a\nb\nc\n", encoding="utf-8")
+    result = await ReadTextFileTool(tmp_path).run({"path": "s.txt"})
+    assert result.content == "a\nb\nc\n"  # returned verbatim, including trailing newline
+    assert "file truncated" not in result.content
+
+
+async def test_read_text_file_caps_large_file_with_note(tmp_path: Path) -> None:
+    total = _DEFAULT_READ_LINES + 500
+    (tmp_path / "big.txt").write_text("\n".join(str(i) for i in range(total)), encoding="utf-8")
+    result = await ReadTextFileTool(tmp_path).run({"path": "big.txt"})
+    body, _, note = result.content.rpartition("\n")
+    assert len(body.splitlines()) == _DEFAULT_READ_LINES
+    assert f"of {total} lines" in note
+    assert f"offset={_DEFAULT_READ_LINES + 1}" in note
+    assert result.metadata["total_lines"] == total
+
+
+async def test_read_text_file_explicit_paging_is_exact(tmp_path: Path) -> None:
+    (tmp_path / "p.txt").write_text("\n".join(f"L{i}" for i in range(100)), encoding="utf-8")
+    result = await ReadTextFileTool(tmp_path).run({"path": "p.txt", "offset": 10, "limit": 3})
+    assert result.content == "L9\nL10\nL11"  # offset is 1-based
 
 
 # --- run_tests ---------------------------------------------------------------

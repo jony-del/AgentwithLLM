@@ -13,8 +13,11 @@ from agent_core.models import ToolCall, ToolResult
 class OutputLimitConfig:
     """Limits for :class:`MaxOutputPostHook`, configurable via the ``[output]`` toml table."""
 
-    max_lines: int = 100
-    max_chars: int = 8000
+    # Coding-agent sized: ordinary source/doc files (up to ~2000 lines, like Claude
+    # Code's Read) return in full; only genuinely huge output spills to disk. Set
+    # too low and the model loses the file content it just read.
+    max_lines: int = 2000
+    max_chars: int = 50000
     head_lines: int = 20
     tail_lines: int = 20
     spill: bool = True
@@ -22,7 +25,7 @@ class OutputLimitConfig:
     # a structured preview pointer (head ``preview_chars`` + an on-disk path the model can
     # page back with ``read_text_file``) instead of the legacy head+tail truncation.
     # Set ``pointer=False`` to keep the byte-for-byte legacy behavior.
-    preview_chars: int = 2000
+    preview_chars: int = 4000
     pointer: bool = True
 
     @classmethod
@@ -104,16 +107,22 @@ class MaxOutputPostHook:
     explicit against accidental double-invocation.
     """
 
+    #: Tools whose output is never spilled/pointer-ised. ``read_text_file`` is the
+    #: designated pager, so truncating its result into a pointer that points back at
+    #: itself would be circular — exempt it so paging always returns real content.
+    DEFAULT_EXEMPT_TOOLS = frozenset({"read_text_file"})
+
     def __init__(
         self,
-        max_lines: int = 100,
-        max_chars: int = 8000,
+        max_lines: int = 2000,
+        max_chars: int = 50000,
         head_lines: int | None = None,
         tail_lines: int | None = None,
         spill_dir: str | Path = "runs/outputs",
         spill: bool = True,
-        preview_chars: int = 2000,
+        preview_chars: int = 4000,
         pointer: bool = True,
+        exempt_tools: frozenset[str] | None = None,
     ) -> None:
         self.max_lines = max_lines
         self.max_chars = max_chars
@@ -125,6 +134,7 @@ class MaxOutputPostHook:
         self.spill = spill
         self.preview_chars = preview_chars
         self.pointer = pointer
+        self.exempt_tools = self.DEFAULT_EXEMPT_TOOLS if exempt_tools is None else exempt_tools
 
     @classmethod
     def from_config(cls, config: OutputLimitConfig, spill_dir: str | Path) -> "MaxOutputPostHook":
@@ -143,6 +153,10 @@ class MaxOutputPostHook:
         # Freeze guard: an already-spilled result is never reprocessed (idempotent),
         # so re-invocation can't churn a frozen message and break the cache prefix.
         if result.metadata.get("spilled"):
+            return result
+        # The dedicated pager self-limits and supports offset/limit; never spill it,
+        # or paging a large file would just hand back another pointer (circular).
+        if tool_call.name in self.exempt_tools:
             return result
 
         content = result.content

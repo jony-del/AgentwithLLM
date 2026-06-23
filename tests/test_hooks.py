@@ -21,6 +21,29 @@ def test_small_output_is_unchanged(tmp_path: Path) -> None:
     assert not (tmp_path / "outputs").exists()  # nothing spilled
 
 
+def test_read_text_file_is_exempt_from_spill(tmp_path: Path) -> None:
+    # read_text_file is the designated pager; spilling its output would point a
+    # pointer back at itself. The same oversized output from another tool DOES spill.
+    hook = _hook(tmp_path, max_lines=100)
+    content = "\n".join(f"line {i}" for i in range(5000))
+
+    read = hook.after_tool(ToolCall(name="read_text_file"), _result(content))
+    assert read.content == content              # returned verbatim
+    assert not read.metadata.get("spilled")
+    assert not (tmp_path / "outputs").exists()  # nothing written for the exempt tool
+
+    other = hook.after_tool(ToolCall(name="run_command"), _result(content))
+    assert other.metadata.get("spilled") is True  # non-exempt tool still spills
+
+
+def test_default_thresholds_are_coding_agent_sized() -> None:
+    # Guard the raised defaults so an ordinary file (a few hundred lines) is never
+    # truncated back to a tiny preview again.
+    cfg = OutputLimitConfig()
+    assert cfg.max_lines >= 2000
+    assert cfg.max_chars >= 50000
+
+
 def test_line_truncation_keeps_head_tail_and_counts_omitted(tmp_path: Path) -> None:
     # Legacy head/tail mode (pointer=False) — byte-for-byte regression guard.
     hook = _hook(tmp_path, max_lines=100, head_lines=20, tail_lines=20, pointer=False)

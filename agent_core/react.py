@@ -333,6 +333,11 @@ class ReActAgent:
         """
         self._last_message_uuid = None
         self._pending_tool_use_summary = None
+        self._run_start_time = time.monotonic()
+        # A live UI's interactive permission prompt runs on a worker thread; give it
+        # the running loop so it can bridge the prompt back onto the main thread.
+        if self.ui.is_live:
+            self.ui.bind_event_loop(asyncio.get_running_loop())
         user_message = Message("user", task)
         messages: list[Message] = [Message("system", self.config.system_prompt), user_message]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
@@ -533,6 +538,7 @@ class ReActAgent:
             # Natural termination: the model stopped requesting tools, so this is the answer.
             if not result.tool_calls:
                 self.ui.on_final(result.content)
+                self._emit_recap(messages, step, "completed")
                 await self.logger.write("final", {"answer": result.content})
                 await self._extract_memories(messages)
                 return AgentRunResult(result.content, messages, step, self.logger.run_id)
@@ -564,6 +570,20 @@ class ReActAgent:
             self._fire_tool_use_summary(
                 list(zip(result.tool_calls, tool_results, strict=True)), result.content
             )
+
+    def _emit_recap(self, messages: list[Message], step: int, reason: str) -> None:
+        duration = time.monotonic() - getattr(self, "_run_start_time", time.monotonic())
+        tool_counts = {}
+        for msg in messages:
+            if msg.role == "tool" and msg.name:
+                tool_counts[msg.name] = tool_counts.get(msg.name, 0) + 1
+        stats = {
+            "duration": duration,
+            "steps": step,
+            "reason": reason,
+            "tool_counts": tool_counts
+        }
+        self.ui.on_run_completed(stats)
 
     async def _emit(self, messages: list[Message], message: Message) -> None:
         """Append a real conversation turn: link it into the chain and persist it.
@@ -637,8 +657,8 @@ class ReActAgent:
         self._last_message_uuid = running
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
-        # We're aborting (cancel / deadline / max_steps) — don't wait on an in-flight label;
-        # cancel and reap the task so it never leaks past the run.
+        """Shared exit path for run interruption (cancel / max_steps / deadline)."""
+        self._emit_recap(messages, step, reason)
         await self._cancel_pending_tool_use_summary()
         answer = f"Stopped after {human} without a final answer."
         self.ui.on_stopped(reason, human)

@@ -20,6 +20,7 @@ from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
     _IGNORED_DIRS,
+    unified_diff,
 )
 from agent_core.tools.catalog import builtin_tool
 
@@ -120,7 +121,8 @@ class MultiEditTool(WorkspacePathMixin, Tool):
         if not path.exists():
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
 
-        text = path.read_text(encoding="utf-8")
+        original = path.read_text(encoding="utf-8")
+        text = original
         total = 0
         for index, edit in enumerate(edits):
             if not isinstance(edit, dict):
@@ -142,7 +144,20 @@ class MultiEditTool(WorkspacePathMixin, Tool):
                 )
             total += replaced
         path.write_text(text, encoding="utf-8")
-        return ToolResult(self.name, f"Applied {len(edits)} edit(s) ({total} replacement(s)) to {path}")
+        rel = str(arguments.get("path", ""))
+        return ToolResult(
+            self.name,
+            f"Applied {len(edits)} edit(s) ({total} replacement(s)) to {path}",
+            metadata={"diff": unified_diff(original, text, rel)},
+        )
+
+    def render_args(self, arguments: dict[str, object]) -> str | None:
+        edits = arguments.get("edits")
+        count = len(edits) if isinstance(edits, list) else 0
+        return f"{arguments.get('path', '')}, {count} edits"
+
+    def render_result(self, arguments: dict[str, object], result: ToolResult) -> str | None:
+        return result.metadata.get("diff") or None
 
 
 @builtin_tool
@@ -212,6 +227,18 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
             path.write_text(new_text, encoding="utf-8")
         summary = ", ".join(p.relative_to(self.workspace).as_posix() for p, _, _ in planned)
         return ToolResult(self.name, f"Patched {len(planned)} file(s): {summary}")
+
+    def render_args(self, arguments: dict[str, object]) -> str | None:
+        try:
+            files = _parse_unified_diff(str(arguments.get("patch", "")))
+        except _PatchError:
+            return None
+        names = ", ".join(target for target, _, _ in files)
+        return names or None
+
+    def render_result(self, arguments: dict[str, object], result: ToolResult) -> str | None:
+        # The patch argument already *is* a unified diff — show it verbatim.
+        return str(arguments.get("patch", "")) or None
 
 
 # --- unified-diff parsing/application (stdlib only) ------------------------------

@@ -72,7 +72,7 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
         interactive = bool(sys.stdin) and sys.stdin.isatty() and bool(sys.stdout) and sys.stdout.isatty()
     except (ValueError, OSError):
         interactive = False
-    return ConsoleUI() if interactive else NullUI()
+    return ConsoleUI(verbose=getattr(args, "verbose", False)) if interactive else NullUI()
 
 
 def _describe_mcp_error(exc: BaseException) -> str:
@@ -251,13 +251,42 @@ def _resolve_session(
     return loaded.session_id, build_chain(loaded), []
 
 
-async def _async_input(prompt: str) -> str | None:
-    """Read one stdin line without blocking the event loop; ``None`` on EOF.
+async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
+    """Read one chat message without blocking the loop; ``None`` on EOF (exit).
 
-    A plain ``asyncio.to_thread(input, ...)`` would leave a non-daemon worker
-    thread stuck in ``input()`` if the user hits Ctrl-C at the prompt, and the
-    loop shutdown would then join (hang on) it. A daemon thread resolving a
-    future via ``call_soon_threadsafe`` keeps Ctrl-C an immediate exit.
+    On a real terminal this is a multi-line ``prompt_toolkit`` session (Enter
+    sends, Alt+Enter/Ctrl+J inserts a newline, Ctrl+O toggles verbose, Ctrl-C
+    clears the line). When stdin is not a TTY (piped/CI) ``prompt_toolkit`` can't
+    drive the terminal, so we fall back to a daemon-thread ``input()`` whose
+    Ctrl-C stays an immediate exit.
+    """
+    if not (sys.stdin and sys.stdin.isatty()):
+        return await _threaded_input(prompt)
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+    from agent_core.terminal.keybindings import create_keybindings
+
+    session = getattr(_async_input, "_session", None)
+    if session is None:
+        toggle = getattr(ui, "toggle_verbose", None)
+        session = PromptSession(key_bindings=create_keybindings(toggle), multiline=True)
+        _async_input._session = session
+
+    try:
+        line = await session.prompt_async(HTML("<ansicyan>›</ansicyan> "))
+        return line
+    except EOFError:
+        return None  # Ctrl-D / closed stdin → leave the chat loop
+    except KeyboardInterrupt:
+        return ""  # Ctrl-C clears the current line and re-prompts
+
+
+async def _threaded_input(prompt: str) -> str | None:
+    """Non-TTY fallback: read one stdin line on a daemon thread; ``None`` on EOF.
+
+    A daemon thread resolving the future via ``call_soon_threadsafe`` keeps Ctrl-C
+    an immediate exit instead of leaving a worker stuck in ``input()``.
     """
     import threading
 
@@ -327,7 +356,6 @@ def chat_command(args: argparse.Namespace) -> int:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
     agent, ui, mcp = built.agent, built.ui, built.mcp
-    print("Agent chat. Type /exit to quit. Press Esc, then y, during a turn to interrupt.")
     if agent.transcript is not None:
         print(f"Session {agent.session_id} (resume later with --resume {agent.session_id})")
 
@@ -339,7 +367,7 @@ def chat_command(args: argparse.Namespace) -> int:
         await _seed_transcript(built)
         history: list[Message] = list(built.history)
         while True:
-            task = await _async_input("> ")
+            task = await _async_input("> ", ui)
             if task is None:  # EOF
                 break
             task = task.strip()
@@ -563,6 +591,11 @@ def main(argv: list[str] | None = None) -> int:
             "--no-stream",
             action="store_true",
             help="Disable token-by-token streaming; render each turn after it completes.",
+        )
+        subparser.add_argument(
+            "--verbose",
+            action="store_true",
+            help="Show every read/search tool call instead of folding bursts into one line.",
         )
         subparser.add_argument(
             "--thinking-budget",

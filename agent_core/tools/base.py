@@ -8,6 +8,23 @@ from typing import Any, Literal
 
 from agent_core.models import ToolRisk, ToolResult
 
+class ToolDisplayProvider:
+    """Optional UI-rendering hints a tool may supply for a nicer live trace.
+
+    Both hooks return plain strings (or ``None`` to decline) so tools stay free
+    of any UI/Rich dependency — the renderer owns presentation. ``ConsoleUI``
+    consults these via ``ToolExecutor``; a ``None`` lets the renderer fall back
+    to its generic formatting.
+    """
+
+    def render_args(self, arguments: dict[str, Any]) -> str | None:
+        """A compact one-line argument summary for the ``● tool(...)`` header."""
+        return None
+
+    def render_result(self, arguments: dict[str, Any], result: ToolResult) -> str | None:
+        """A unified-diff string to show under the result branch (e.g. edits)."""
+        return None
+
 LockMode = Literal["read", "write"]
 
 
@@ -56,7 +73,7 @@ class WorkspacePathMixin:
         return ResourceLock("fs", str(self.resolve_workspace_path(raw_path)), mode, subtree=subtree)
 
 
-class Tool(ABC):
+class Tool(ABC, ToolDisplayProvider):
     name: str
     description: str
     input_schema: dict[str, Any]

@@ -16,6 +16,8 @@ dependencies = [
     "mcp-server-git",
     "mcp-server-fetch",
     "mcp-server-time",
+    "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]

@@ -225,19 +225,20 @@ args = ["-m", "mcp_server_time", "--local-timezone=Asia/Shanghai"]
 risk = "read"
 
 # --- Single tool-output truncation ------------------------------------------
-# When one tool call's output exceeds these limits, only head+tail (with a
-# "[... omitted N lines ...]" notice) enters the context; the full, untouched
-# output is written to runs/<run>/outputs/ for later retrieval.
+# When one tool call's output exceeds these limits, only a head preview (with the
+# full output spilled to runs/<run>/outputs/) enters the context. Sized for a
+# coding agent (Claude-Code-like): ordinary files come back whole, only huge output
+# spills. read_text_file is always exempt — it self-pages via offset/limit.
 [output]
-max_lines = 100               # truncate when output has more lines than this
-max_chars = 8000              # fallback cap for pathological single-line output
+max_lines = 2000              # truncate when output has more lines than this
+max_chars = 50000             # fallback cap for pathological single-line output
 head_lines = 20               # lines kept from the start (legacy mode, pointer=false)
 tail_lines = 20               # lines kept from the end (legacy mode, pointer=false)
 spill = true                  # write the full output to disk (false = drop it)
 pointer = true                # replace oversized output with a <tool_output_ref> preview
                               #   pointer (head + on-disk path the model pages back via
                               #   read_text_file); false = legacy head+tail truncation
-preview_chars = 2000          # head kept inline in the pointer (pointer mode only)
+preview_chars = 4000          # head kept inline in the pointer (pointer mode only)
 
 # Tool-use progress labels: after each tool batch, a cheap model (Haiku) is asked
 # asynchronously for a one-line, git-subject-style label ("Searched auth/, fixed NPE")

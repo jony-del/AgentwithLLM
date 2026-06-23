@@ -30,10 +30,10 @@ class RecordingUI(NullUI):
     def on_reasoning(self, text: str) -> None:
         self.events.append(("reasoning", text))
 
-    def on_tool_call(self, tool_name: str, risk: str, arguments: dict) -> None:
+    def on_tool_call(self, tool_name: str, risk: str, arguments: dict, label: str | None = None) -> None:
         self.events.append(("tool_call", tool_name))
 
-    def on_tool_result(self, result: ToolResult) -> None:
+    def on_tool_result(self, result: ToolResult, diff: str | None = None) -> None:
         self.events.append(("tool_result", result.name))
 
     def on_final(self, answer: str) -> None:
@@ -105,42 +105,9 @@ async def test_always_allow_via_ui_grants_write_permission(tmp_path: Path) -> No
     assert "observation" in result.answer.lower()
 
 
-# --- permission prompt parsing -----------------------------------------------
-
-
-def _confirm_with_inputs(monkeypatch, answers: list[str]) -> str:
-    """Drive ConsoleUI.confirm_tool, feeding `answers` to successive input() calls."""
-    pending = iter(answers)
-
-    def fake_input(prompt: str = "") -> str:
-        try:
-            return next(pending)
-        except StopIteration:  # ran out of scripted answers → simulate closed stdin
-            raise EOFError
-
-    monkeypatch.setattr("builtins.input", fake_input)
-    return ConsoleUI(color=False).confirm_tool("echo", "write", {"text": "hi"})
-
-
-def test_confirm_tool_reprompts_on_unrecognised_key(monkeypatch) -> None:
-    # A fat-fingered "x" is not silently denied: it re-asks, and the next valid
-    # answer ("y") is honoured.
-    assert _confirm_with_inputs(monkeypatch, ["x", "y"]) == "once"
-
-
-def test_confirm_tool_empty_line_reprompts(monkeypatch) -> None:
-    # A bare Enter is not a decision: it re-asks rather than silently denying.
-    # Here the empty line re-prompts and the explicit "n" that follows denies.
-    assert _confirm_with_inputs(monkeypatch, ["", "n"]) == "deny"
-
-
-def test_confirm_tool_eof_denies_without_looping(monkeypatch) -> None:
-    # Closed/piped stdin denies immediately instead of hanging in the re-prompt loop.
-    assert _confirm_with_inputs(monkeypatch, []) == "deny"
-
-
-def test_confirm_tool_recognises_always(monkeypatch) -> None:
-    assert _confirm_with_inputs(monkeypatch, ["a"]) == "always"
+# --- permission prompt: see tests/test_terminal_permission.py ----------------
+# confirm_tool now bridges to TerminalRenderer.ask_permission_async (prompt_toolkit),
+# so the interactive prompt is covered there with a headless pipe input.
 
 
 # --- streaming ---------------------------------------------------------------

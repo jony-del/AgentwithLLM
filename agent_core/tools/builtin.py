@@ -8,7 +8,9 @@ Everything here is stdlib only — no LSP/MCP or other external integrations.
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
+import os
 import re
 import subprocess
 import sys
@@ -17,6 +19,24 @@ from pathlib import Path
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.catalog import builtin_tool
+
+
+def unified_diff(before: str, after: str, path: str) -> str:
+    """A unified diff (stdlib only) for a file edit, or ``""`` when nothing changed.
+
+    Used by write/edit tools to hand the UI a ready-to-highlight diff via
+    ``Tool.render_result`` — the diff is kept in result metadata so it doesn't
+    enter the model's transcript.
+    """
+    if before == after:
+        return ""
+    diff = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    )
+    return "".join(diff)
 
 # Directories that are noise for search/listing and almost never what a user wants
 # to grep through. Skipped when walking the tree.
@@ -45,6 +65,8 @@ _IGNORED_DIRS = frozenset(
 # Search guards so one giant or binary file can't wedge a scan.
 _MAX_SEARCH_FILE_BYTES = 2_000_000
 _MAX_COMMAND_TIMEOUT = 600  # hard cap (seconds) regardless of requested timeout
+# Default line window for an unguided read_text_file (mirrors Claude Code's Read).
+_DEFAULT_READ_LINES = 2000
 
 
 def _is_probably_binary(sample: bytes) -> bool:
@@ -150,7 +172,18 @@ class EditFileTool(WorkspacePathMixin, Tool):
         except ExactEditError as exc:
             return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": exc.error_type, **exc.metadata})
         path.write_text(updated, encoding="utf-8")
-        return ToolResult(self.name, f"Replaced {replaced} occurrence(s) in {path}")
+        rel = str(arguments.get("path", ""))
+        return ToolResult(
+            self.name,
+            f"Replaced {replaced} occurrence(s) in {path}",
+            metadata={"diff": unified_diff(text, updated, rel)},
+        )
+
+    def render_args(self, arguments: dict[str, object]) -> str | None:
+        return str(arguments.get("path", "")) or None
+
+    def render_result(self, arguments: dict[str, object], result: ToolResult) -> str | None:
+        return result.metadata.get("diff") or None
 
 
 @builtin_tool
@@ -258,7 +291,8 @@ class RunCommandTool(WorkspacePathMixin, Tool):
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         command = str(arguments["command"])
         timeout = min(int(arguments.get("timeout", 30)), _MAX_COMMAND_TIMEOUT)
-        return _run_subprocess(self.name, command, cwd=self.workspace, timeout=timeout, shell=True)
+        spec, shell = _shell_invocation(command)
+        return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
 
 
 @builtin_tool
@@ -317,11 +351,41 @@ class RunTestsTool(WorkspacePathMixin, Tool):
         return _run_subprocess(self.name, cmd, cwd=self.workspace, timeout=timeout, shell=False)
 
 
+def _shell_invocation(command: str):
+    """Pick how to run a free-form shell command line per platform.
+
+    On Windows the default ``shell=True`` runs ``cmd.exe``, which lacks ``cat`` and
+    every PowerShell cmdlet (``Get-Content`` etc.) the model naturally reaches for —
+    so run PowerShell explicitly and force its output stream to UTF-8. On POSIX,
+    ``shell=True`` (``/bin/sh``) is what's expected. Returns ``(spec, shell)``.
+    """
+    if os.name == "nt":
+        # Force UTF-8 both ways: the output stream, and cmdlet file reads/writes
+        # (Windows PowerShell 5.1 otherwise reads files in the ANSI codepage — GBK
+        # on zh-CN — and garbles UTF-8 content like CJK).
+        prelude = (
+            "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+            "$PSDefaultParameterValues['*:Encoding']='utf8'; "
+        )
+        return (["powershell", "-NoProfile", "-NonInteractive", "-Command", prelude + command], False)
+    return (command, True)
+
+
+def _utf8_child_env() -> dict[str, str]:
+    """Environment that makes child processes emit UTF-8 (kills GBK encode errors)."""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _run_subprocess(tool_name: str, command, *, cwd: Path, timeout: int, shell: bool) -> ToolResult:
     """Run a subprocess, capturing combined output and exit code into a ToolResult.
 
     A non-zero exit code is reported as ``ok=False`` but is not an error in itself —
     the output (e.g. failing tests, a diff) is still returned for the agent to read.
+    Output is decoded as UTF-8 with ``errors="replace"`` so a narrow OS locale (e.g.
+    GBK on zh-CN Windows) can't raise mid-decode.
     """
     try:
         completed = subprocess.run(
@@ -329,7 +393,9 @@ def _run_subprocess(tool_name: str, command, *, cwd: Path, timeout: int, shell: 
             cwd=str(cwd),
             shell=shell,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_utf8_child_env(),
             timeout=timeout,
         )
     except FileNotFoundError as exc:
@@ -387,9 +453,24 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
         text = path.read_text(encoding="utf-8")
         offset = arguments.get("offset")
         limit = arguments.get("limit")
-        # No paging requested: return the whole file verbatim (original behavior).
+        # No paging requested: return up to DEFAULT_READ_LINES (like Claude Code's
+        # Read), with a note to page on if the file is longer. This keeps an
+        # unguided read predictable and bounded instead of dumping a huge file.
         if offset is None and limit is None:
-            return ToolResult(name=self.name, content=text)
+            lines = text.splitlines()
+            if len(lines) <= _DEFAULT_READ_LINES:
+                return ToolResult(name=self.name, content=text)
+            shown = "\n".join(lines[:_DEFAULT_READ_LINES])
+            note = (
+                f"\n[file truncated: showing 1-{_DEFAULT_READ_LINES} of {len(lines)} lines; "
+                f"pass offset={_DEFAULT_READ_LINES + 1} to continue]"
+            )
+            return ToolResult(
+                name=self.name,
+                content=shown + note,
+                metadata={"total_lines": len(lines), "shown_lines": _DEFAULT_READ_LINES},
+            )
+        # Explicit paging: honor offset/limit verbatim.
         lines = text.splitlines()
         start = max(int(offset) - 1, 0) if offset is not None else 0
         end = start + int(limit) if limit is not None else len(lines)
@@ -415,6 +496,20 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
+        before = path.read_text(encoding="utf-8") if path.exists() else ""
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(arguments.get("content", "")), encoding="utf-8")
-        return ToolResult(name=self.name, content=f"Wrote {path}")
+        content = str(arguments.get("content", ""))
+        path.write_text(content, encoding="utf-8")
+        rel = str(arguments.get("path", ""))
+        verb = "Created" if before == "" else "Wrote"
+        return ToolResult(
+            name=self.name,
+            content=f"{verb} {path}",
+            metadata={"diff": unified_diff(before, content, rel)},
+        )
+
+    def render_args(self, arguments: dict[str, object]) -> str | None:
+        return str(arguments.get("path", "")) or None
+
+    def render_result(self, arguments: dict[str, object], result: ToolResult) -> str | None:
+        return result.metadata.get("diff") or None
