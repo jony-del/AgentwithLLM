@@ -32,5 +32,5 @@ class JSONLRunLogger:
     def _write_sync(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as file:
+            with self.path.open("a", encoding="utf-8", errors="replace") as file:
                 file.write(line)

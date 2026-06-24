@@ -256,7 +256,9 @@ async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
 
     On a real terminal this is a multi-line ``prompt_toolkit`` session (Enter
     sends, Shift+Enter/Alt+Enter/Ctrl+J inserts a newline, Ctrl+O toggles
-    verbose, Ctrl-C clears the line). When stdin is not a TTY (piped/CI)
+    verbose, Ctrl-C clears the current input in place via our keybinding). The
+    ``KeyboardInterrupt`` branch below is a fallback for the rare terminal/race
+    where the default abort still fires. When stdin is not a TTY (piped/CI)
     ``prompt_toolkit`` can't drive the terminal, so we fall back to a
     daemon-thread ``input()`` whose Ctrl-C stays an immediate exit.
     """
@@ -282,6 +284,17 @@ async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
         return ""  # Ctrl-C clears the current line and re-prompts
 
 
+def _clean_surrogates(text: str) -> str:
+    """Collapse lone surrogateescape code points (U+DC80..U+DCFF) to valid text.
+
+    Non-TTY stdin (a Windows pipe) decodes undecodable bytes into lone
+    surrogates; those cannot be re-encoded to UTF-8 downstream (JSONL log,
+    transcript, API request). Map them back to bytes and re-decode UTF-8 with
+    replacement so only clean text ever enters the conversation.
+    """
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 async def _threaded_input(prompt: str) -> str | None:
     """Non-TTY fallback: read one stdin line on a daemon thread; ``None`` on EOF.
 
@@ -295,7 +308,7 @@ async def _threaded_input(prompt: str) -> str | None:
 
     def read() -> None:
         try:
-            line: str | None = input(prompt)
+            line: str | None = _clean_surrogates(input(prompt))
         except EOFError:
             line = None
         try:

@@ -1,6 +1,8 @@
+import json
 import sys
 
-from agent_core.cli import _force_utf8_output
+from agent_core.cli import _clean_surrogates, _force_utf8_output
+from agent_core.storage import JSONLRunLogger
 
 
 class _RecordingStream:
@@ -35,3 +37,23 @@ def test_force_utf8_output_ignores_streams_without_reconfigure(monkeypatch) -> N
     monkeypatch.setattr(sys, "stderr", _PlainStream())
 
     _force_utf8_output()  # should be a no-op, not an AttributeError
+
+
+def test_clean_surrogates_strips_lone_surrogates() -> None:
+    # A lone surrogate (born from non-TTY stdin's surrogateescape decode) must be
+    # collapsed so the result re-encodes to UTF-8 without raising.
+    cleaned = _clean_surrogates("hello\udcbfworld")
+    assert all(not (0xDC80 <= ord(c) <= 0xDCFF) for c in cleaned)
+    cleaned.encode("utf-8")  # would raise on a surviving surrogate
+    assert _clean_surrogates("plain ascii") == "plain ascii"
+
+
+def test_run_logger_write_survives_surrogates(tmp_path) -> None:
+    # A surrogate-laden payload must never crash the JSONL append, and the file
+    # must stay valid (each line parseable as JSON).
+    logger = JSONLRunLogger(run_dir=tmp_path, run_id="surrogate")
+    logger._write_sync({"event": "user", "content": "bad\udcbfbyte"})
+
+    lines = logger.path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["event"] == "user"

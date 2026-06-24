@@ -3,6 +3,10 @@
 - ``Enter``                      submit the message.
 - ``Shift+Enter``                insert a newline (modern terminals only — see below).
 - ``Alt+Enter`` / ``Ctrl+J``     insert a newline (compose a multi-line message).
+- ``Ctrl+C``                     clear the current input in place; press again within
+                                  a short window (on an empty buffer) to exit the chat.
+- ``Ctrl+D``                     exit the chat on an empty buffer (EOF); on a non-empty
+                                  buffer it deletes the character under the cursor.
 - ``Ctrl+O``                     toggle verbose detail for subsequent turns.
 
 ``Shift+Enter`` requires a terminal that emits a distinct escape sequence for the
@@ -19,10 +23,14 @@ reliable cross-terminal alternatives.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+
+# A second Ctrl+C within this window (on an already-empty buffer) exits the chat.
+_DOUBLE_CTRL_C_SECONDS: float = 1.0
 
 # ---------------------------------------------------------------------------
 # Teach prompt_toolkit to recognise Shift+Enter.
@@ -69,6 +77,37 @@ def create_keybindings(on_toggle_verbose: Callable[[], None] | None = None) -> K
     @kb.add("c-j")                   # Ctrl+J — reliable across all terminals
     def _(event) -> None:
         event.current_buffer.insert_text("\n")
+
+    last_ctrl_c = {"at": 0.0}  # monotonic timestamp of the previous Ctrl+C, for double-press exit
+
+    @kb.add("c-c")
+    def _(event) -> None:
+        # First Ctrl+C clears the current input in place; a second Ctrl+C within
+        # _DOUBLE_CTRL_C_SECONDS on an already-empty buffer exits the chat (raises
+        # EOFError in prompt_async, mirroring Ctrl-D). Typing refills the buffer, so
+        # the next Ctrl+C clears again instead of exiting. Overriding c-c suppresses
+        # prompt_toolkit's default abort (grey-out + new line + KeyboardInterrupt).
+        buffer = event.current_buffer
+        now = time.monotonic()
+        if not buffer.text and (now - last_ctrl_c["at"]) <= _DOUBLE_CTRL_C_SECONDS:
+            event.app.exit(exception=EOFError)
+            return
+        buffer.reset()
+        last_ctrl_c["at"] = now
+
+    @kb.add("c-d")
+    def _(event) -> None:
+        # On an empty buffer Ctrl+D exits the chat (EOFError in prompt_async,
+        # mirroring Ctrl-D's POSIX EOF semantics and our double-Ctrl+C exit).
+        # On a non-empty buffer it falls back to the default delete-forward-char
+        # so editing still works. We bind it explicitly because our custom
+        # KeyBindings + multiline mode + Windows terminals make prompt_toolkit's
+        # default c-d handling unreliable (it often never fires the exit).
+        buffer = event.current_buffer
+        if not buffer.text:
+            event.app.exit(exception=EOFError)
+            return
+        buffer.delete()
 
     @kb.add("c-o")
     def _(event) -> None:

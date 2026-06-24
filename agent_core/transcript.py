@@ -81,12 +81,15 @@ def _git_branch(cwd: str | Path) -> str | None:
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=str(cwd),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    branch = out.stdout.strip()
+    if out.returncode != 0:
+        return None
+    branch = (out.stdout or "").strip()
     return branch or None
 
 
@@ -147,7 +150,7 @@ class TranscriptStore:
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as file:
+                with self.path.open("a", encoding="utf-8", errors="replace") as file:
                     file.write(line)
         except OSError as exc:
             # Persistence is best-effort: a transcript write must never crash an
