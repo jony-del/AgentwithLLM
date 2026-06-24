@@ -255,10 +255,10 @@ async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
     """Read one chat message without blocking the loop; ``None`` on EOF (exit).
 
     On a real terminal this is a multi-line ``prompt_toolkit`` session (Enter
-    sends, Alt+Enter/Ctrl+J inserts a newline, Ctrl+O toggles verbose, Ctrl-C
-    clears the line). When stdin is not a TTY (piped/CI) ``prompt_toolkit`` can't
-    drive the terminal, so we fall back to a daemon-thread ``input()`` whose
-    Ctrl-C stays an immediate exit.
+    sends, Shift+Enter/Alt+Enter/Ctrl+J inserts a newline, Ctrl+O toggles
+    verbose, Ctrl-C clears the line). When stdin is not a TTY (piped/CI)
+    ``prompt_toolkit`` can't drive the terminal, so we fall back to a
+    daemon-thread ``input()`` whose Ctrl-C stays an immediate exit.
     """
     if not (sys.stdin and sys.stdin.isatty()):
         return await _threaded_input(prompt)
