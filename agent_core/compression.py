@@ -412,6 +412,35 @@ class CompressionPipeline:
         # After config.max_consecutive_autocompact_failures, auto_compact short-circuits.
         self._consecutive_autocompact_failures = 0
 
+    def should_compact(
+        self,
+        messages: list[Message],
+        *,
+        model: str = "",
+        token_estimator: TokenEstimator | None = None,
+    ) -> bool:
+        """Read-only predicate: would ``auto_compact`` run the shrink stages now?
+
+        Mirrors the gate at the top of ``auto_compact`` (token estimate vs. threshold,
+        plus the circuit breaker) without any side effects, so the loop can fire a
+        ``PreCompact`` hook *before* compaction only when a fold is actually imminent —
+        instead of firing it every turn. ``auto_compact`` still re-checks the gate
+        itself, so this is purely advisory.
+        """
+        estimate = self._estimate(messages, token_estimator)
+        threshold = tokens.auto_compact_threshold(
+            model,
+            context_window_override=self.config.context_window_tokens,
+            buffer_tokens=self.config.autocompact_buffer_tokens,
+            reserved_output_tokens=self.config.reserved_output_tokens_for_summary,
+            pct_override=self.config.autocompact_pct_override,
+        )
+        if estimate < threshold:
+            return False
+        if self._consecutive_autocompact_failures >= self.config.max_consecutive_autocompact_failures:
+            return False
+        return True
+
     async def auto_compact(
         self,
         messages: list[Message],

@@ -108,7 +108,12 @@ Multi-agent:
 Cross-cutting:
 - `agent_core/cli.py`: argparse CLI (real entry for `polaris` / `__main__`).
 - `agent_core/permissions.py`: permission modes and risk decisions.
-- `agent_core/hooks.py`: pre/post tool execution hooks.
+- `agent_core/hooks.py`: hook surface. Sync pre/post *tool* hooks run inside the
+  executor; async *lifecycle* hooks (`UserPromptSubmit`, `PostSampling`,
+  `PreCompact`, `PostCompact`, blockable `Stop`) fire at `react.py` loop
+  boundaries via `HookPipeline.run_*`. All are programmatic (constructor-injected);
+  a `HookOutcome.block` is event-specific (abort prompt / skip compaction / keep
+  running). Stop-blocking is bounded by `config.max_stop_blocks`.
 - `agent_core/config.py`: config resolution (defaults → `agent.toml` → env → CLI).
 - `agent_core/memory/`: optional cross-conversation memory.
 - `agent_core/mcp/`: MCP client, config, tool adapter.
@@ -117,14 +122,23 @@ Cross-cutting:
 
 ## Agent Loop
 
-`async ReActAgent.run()` is the central loop:
+`async ReActAgent.run()` is the central loop. Lifecycle hooks fire at fixed
+boundaries (shown as `[Hook]`), so hook ordering is part of the loop contract:
 
-1. Auto-compact history if the running token estimate crosses the model's
-   threshold (token-gated, not char-gated; reactive compaction additionally
-   recovers from a context-overflow 413).
-2. Call the configured `LLMProvider`.
-3. If the result has no tool calls, return the final answer.
-4. Execute tool calls through `ToolExecutor`.
+0. `[UserPromptSubmit]` once the task is in place, before the first model call —
+   may abort the run or inject grounding context.
+1. `[PreCompact]` (only when the gate would fold) → auto-compact history if the
+   running token estimate crosses the model's threshold (token-gated, not
+   char-gated; reactive compaction additionally recovers from a 413) →
+   `[PostCompact]` when a fold actually happened. `PreCompact.block` skips the
+   proactive fold; it is ignored on the forced reactive path.
+2. Call the configured `LLMProvider`, then `[PostSampling]` (fire-and-forget) once
+   the assistant turn is recorded.
+3. If the result has no tool calls, fire `[Stop]`: a hook may *block* the stop and
+   force the loop to keep running (bounded by `max_stop_blocks`); otherwise return
+   the final answer.
+4. Execute tool calls through `ToolExecutor` (which runs the sync pre/post *tool*
+   hooks around each call).
 5. Append tool observations as `tool` messages and continue.
 
 Do NOT design around a small fixed step cap — a capable coding agent often needs

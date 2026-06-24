@@ -3,10 +3,11 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from agent_core.models import ToolCall, ToolResult
+from agent_core.models import Message, ToolCall, ToolResult
 
 
 @dataclass(slots=True)
@@ -53,14 +54,128 @@ class PostToolHook(Protocol):
         ...
 
 
+# --- Lifecycle (non-tool) hooks ------------------------------------------------
+#
+# The two Protocols above gate a single tool call inside the executor and run
+# *synchronously* there (the executor offloads blocking tool work to threads, so
+# the hooks stay sync). The lifecycle hooks below fire at loop-level boundaries in
+# ``ReActAgent.run`` and are therefore ``async`` — they may do real work (call a
+# model, run a verifier) without blocking the loop's thread. This mirrors the
+# reference's richer hook surface (UserPromptSubmit / PostSampling / PreCompact /
+# PostCompact / Stop) while staying programmatic (constructor-injected callables)
+# rather than the reference's settings.json external-process machinery.
+
+
+class HookEvent(str, Enum):
+    USER_PROMPT_SUBMIT = "UserPromptSubmit"
+    PRE_TOOL_USE = "PreToolUse"
+    POST_TOOL_USE = "PostToolUse"
+    POST_SAMPLING = "PostSampling"
+    PRE_COMPACT = "PreCompact"
+    POST_COMPACT = "PostCompact"
+    STOP = "Stop"
+
+
+@dataclass(slots=True)
+class HookContext:
+    """Input handed to a lifecycle hook.
+
+    One context shape with optional, event-specific fields (mirroring the
+    reference's per-event input objects without a class explosion). ``messages`` is
+    the live conversation at the firing point; hooks must treat it as read-only —
+    the loop owns mutation. Event-specific payload:
+
+    - ``prompt`` — UserPromptSubmit: the submitted task text.
+    - ``trigger`` — Pre/PostCompact: ``"auto"`` (proactive gate) or ``"reactive"``
+      (post-overflow 413 recovery).
+    - ``summary`` — PostCompact: the new summary text, when a prefix fold produced one.
+    - ``last_assistant_message`` — PostSampling / Stop: the latest assistant text.
+    - ``stop_hook_active`` — Stop: True once a stop hook has already blocked the stop
+      at least once this run, so a hook can avoid blocking forever (parity with the
+      reference's ``stop_hook_active``).
+    """
+
+    event: HookEvent
+    messages: list[Message]
+    session_id: str | None = None
+    prompt: str | None = None
+    trigger: str | None = None
+    summary: str | None = None
+    last_assistant_message: str | None = None
+    stop_hook_active: bool = False
+
+
+@dataclass(slots=True)
+class HookOutcome:
+    """Result of a lifecycle hook.
+
+    ``block`` is the single decision flag; its meaning is event-specific (parity with
+    the reference, where ``decision: 'block'`` / ``continue: false`` mean different
+    things per event):
+
+    - UserPromptSubmit: block the prompt — abort the run before the first model call.
+    - PreCompact: block compaction — skip the fold this turn (ignored on the forced
+      ``reactive`` recovery path, where compaction is mandatory).
+    - Stop: block the *stop* — force the loop to keep running instead of returning the
+      final answer (the "可阻断/可续跑" continuation behavior). Bounded by
+      ``config.max_stop_blocks`` so it can't loop forever.
+
+    ``additional_context`` is text injected into the conversation (as a framed
+    ``<system-reminder>``) so a hook can steer the next turn — the continuation
+    directive for a blocked Stop, or extra grounding for a submitted prompt. ``reason``
+    is the human-readable explanation surfaced in logs and the injected message.
+    """
+
+    block: bool = False
+    additional_context: str | None = None
+    reason: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+class UserPromptSubmitHook(Protocol):
+    async def on_user_prompt(self, ctx: HookContext) -> HookOutcome:
+        ...
+
+
+class PostSamplingHook(Protocol):
+    async def after_sampling(self, ctx: HookContext) -> None:
+        ...
+
+
+class PreCompactHook(Protocol):
+    async def before_compact(self, ctx: HookContext) -> HookOutcome:
+        ...
+
+
+class PostCompactHook(Protocol):
+    async def after_compact(self, ctx: HookContext) -> HookOutcome:
+        ...
+
+
+class StopHook(Protocol):
+    async def on_stop(self, ctx: HookContext) -> HookOutcome:
+        ...
+
+
 class HookPipeline:
     def __init__(
         self,
         pre_hooks: list[PreToolHook] | None = None,
         post_hooks: list[PostToolHook] | None = None,
+        *,
+        user_prompt_hooks: list[UserPromptSubmitHook] | None = None,
+        post_sampling_hooks: list[PostSamplingHook] | None = None,
+        pre_compact_hooks: list[PreCompactHook] | None = None,
+        post_compact_hooks: list[PostCompactHook] | None = None,
+        stop_hooks: list[StopHook] | None = None,
     ) -> None:
         self.pre_hooks = pre_hooks or []
         self.post_hooks = post_hooks or []
+        self.user_prompt_hooks = user_prompt_hooks or []
+        self.post_sampling_hooks = post_sampling_hooks or []
+        self.pre_compact_hooks = pre_compact_hooks or []
+        self.post_compact_hooks = post_compact_hooks or []
+        self.stop_hooks = stop_hooks or []
 
     def run_pre(self, tool_call: ToolCall) -> tuple[ToolCall, list[HookResult]]:
         current = tool_call
@@ -79,6 +194,72 @@ class HookPipeline:
         for hook in self.post_hooks:
             current = hook.after_tool(tool_call, current)
         return current
+
+    # --- Lifecycle runners -----------------------------------------------------
+    #
+    # Each "decision" runner (user-prompt, compact, stop) folds the hooks in order:
+    # it accumulates every hook's ``additional_context`` and short-circuits on the
+    # first ``block=True`` (returning that hook's reason plus the context gathered so
+    # far). The post-sampling runner is fire-each, return-nothing (observational).
+
+    @staticmethod
+    def _fold(outcomes: list[HookOutcome], blocked: HookOutcome | None) -> HookOutcome:
+        contexts = [o.additional_context for o in outcomes if o.additional_context]
+        joined = "\n".join(contexts) if contexts else None
+        if blocked is not None:
+            return HookOutcome(
+                block=True,
+                additional_context=blocked.additional_context or joined,
+                reason=blocked.reason,
+                metadata=blocked.metadata,
+            )
+        return HookOutcome(block=False, additional_context=joined)
+
+    async def run_user_prompt(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.user_prompt_hooks:
+            outcome = await hook.on_user_prompt(ctx)
+            if outcome is None:
+                continue
+            seen.append(outcome)
+            if outcome.block:
+                return self._fold(seen, outcome)
+        return self._fold(seen, None)
+
+    async def run_pre_compact(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.pre_compact_hooks:
+            outcome = await hook.before_compact(ctx)
+            if outcome is None:
+                continue
+            seen.append(outcome)
+            if outcome.block:
+                return self._fold(seen, outcome)
+        return self._fold(seen, None)
+
+    async def run_post_compact(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.post_compact_hooks:
+            outcome = await hook.after_compact(ctx)
+            if outcome is None:
+                continue
+            seen.append(outcome)
+        return self._fold(seen, None)
+
+    async def run_stop(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.stop_hooks:
+            outcome = await hook.on_stop(ctx)
+            if outcome is None:
+                continue
+            seen.append(outcome)
+            if outcome.block:
+                return self._fold(seen, outcome)
+        return self._fold(seen, None)
+
+    async def run_post_sampling(self, ctx: HookContext) -> None:
+        for hook in self.post_sampling_hooks:
+            await hook.after_sampling(ctx)
 
 
 class MaxOutputPostHook:

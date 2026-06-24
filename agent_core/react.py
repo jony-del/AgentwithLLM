@@ -25,7 +25,14 @@ from agent_core.context import (
     current_date_line,
     prepend_user_context,
 )
-from agent_core.hooks import HookPipeline, MaxOutputPostHook, OutputLimitConfig
+from agent_core.hooks import (
+    HookContext,
+    HookEvent,
+    HookOutcome,
+    HookPipeline,
+    MaxOutputPostHook,
+    OutputLimitConfig,
+)
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
@@ -88,6 +95,12 @@ class ReActConfig:
     # No fixed step cap by default: like Claude Code, the loop runs until the model
     # stops requesting tools. Set an int only if you want a hard ceiling on tool turns.
     max_steps: int | None = None
+    # Upper bound on how many times a Stop hook may block the agent's natural
+    # termination and force it to keep running ("可阻断/可续跑"). Once this many
+    # consecutive blocks have happened, the loop stops regardless, so a misbehaving
+    # stop hook can't pin the agent in an infinite continue loop. 0 disables stop-hook
+    # blocking entirely (a stop hook can still observe/inject context but never continue).
+    max_stop_blocks: int = 3
     # Wall-clock safety net so a runaway/stuck loop can't hang forever. Configurable
     # via the [limits] toml table, AGENT_MAX_WALL_SECONDS, or --max-wall-seconds.
     # None disables the wall cap entirely (cooperative Esc-cancel still applies);
@@ -254,21 +267,27 @@ class ReActAgent:
             self.config.permission,
             prompter=self.ui.confirm_tool if self.ui.is_live else None,
         )
+        # One pipeline shared by the executor (pre/post tool hooks) and the run loop
+        # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop).
+        self.hooks = hooks or HookPipeline(
+            post_hooks=[
+                MaxOutputPostHook.from_config(
+                    self.config.output, spill_dir=str(Path(self.config.run_dir) / "outputs")
+                )
+            ]
+        )
         self.executor = ToolExecutor(
             self.registry,
             permissions,
-            hooks or HookPipeline(
-                post_hooks=[
-                    MaxOutputPostHook.from_config(
-                        self.config.output, spill_dir=str(Path(self.config.run_dir) / "outputs")
-                    )
-                ]
-            ),
+            self.hooks,
             self.logger,
             self.ui,
             parallel_tools=self.config.parallel_tools,
             max_workers=self.config.max_tool_workers,
         )
+        # Strong refs to in-flight fire-and-forget PostSampling hook tasks, so they
+        # aren't garbage-collected mid-run; reaped best-effort at terminal returns.
+        self._background_hook_tasks: set[asyncio.Task[None]] = set()
         self.memory_store, self.retriever, self.extractor = self._build_memory(
             memory_store, retriever, extractor
         )
@@ -333,6 +352,7 @@ class ReActAgent:
         """
         self._last_message_uuid = None
         self._pending_tool_use_summary = None
+        self._background_hook_tasks = set()
         self._run_start_time = time.monotonic()
         # A live UI's interactive permission prompt runs on a worker thread; give it
         # the running loop so it can bridge the prompt back onto the main thread.
@@ -364,6 +384,13 @@ class ReActAgent:
             await self.transcript.append_message(user_message)
         self._last_message_uuid = user_message.uuid
 
+        # UserPromptSubmit fires once the task is in place but before the first model
+        # call, so a hook can either abort the run (block) or inject extra grounding
+        # (additional_context) that the model sees this turn.
+        blocked = await self._run_user_prompt_hooks(messages, task)
+        if blocked is not None:
+            return blocked
+
         cancelled = should_cancel or (lambda: False)
         start = time.monotonic()
         if deadline is None and self.config.max_wall_seconds is not None:
@@ -376,6 +403,9 @@ class ReActAgent:
         if deadline is not None and self.config.soft_deadline_fraction < 1.0:
             soft_threshold = start + (deadline - start) * self.config.soft_deadline_fraction
         wrapup_sent = False
+        # How many times a Stop hook has blocked termination so far this run; bounds
+        # the "可阻断/可续跑" continuation so a stop hook can't pin the loop forever.
+        stop_blocks = 0
         step = 0
         while True:
             # The natural exit below — the model returning no tool calls — is the primary
@@ -403,18 +433,30 @@ class ReActAgent:
             # pipeline forwards them to build_post_compact_messages inside the collapse
             # stage). Empty when nothing has been read yet.
             attachments = self._build_read_attachments()
-            before_compaction = list(messages)
-            messages, events = await self.compression.auto_compact(
-                messages,
-                model=self.config.model,
-                token_estimator=self._estimate_tokens,
-                summarizer=self._summarizer,
-                on_stage=self._compaction_reporter(reactive=False),
-                attachments=attachments,
-            )
-            for event in events:
-                await self.logger.write("compression", asdict(event))
-            await self._commit_compaction_boundary(before_compaction, messages)
+            # PreCompact fires only when a proactive fold is actually imminent (the gate
+            # predicate mirrors auto_compact's own check). A hook may block the fold this
+            # turn or inject grounding; PostCompact fires afterwards with the new summary.
+            skip_compaction = False
+            if self.compression.should_compact(
+                messages, model=self.config.model, token_estimator=self._estimate_tokens
+            ):
+                pre = await self._run_pre_compact_hooks(messages, "auto")
+                skip_compaction = pre.block
+            if not skip_compaction:
+                before_compaction = list(messages)
+                messages, events = await self.compression.auto_compact(
+                    messages,
+                    model=self.config.model,
+                    token_estimator=self._estimate_tokens,
+                    summarizer=self._summarizer,
+                    on_stage=self._compaction_reporter(reactive=False),
+                    attachments=attachments,
+                )
+                for event in events:
+                    await self.logger.write("compression", asdict(event))
+                await self._commit_compaction_boundary(before_compaction, messages)
+                if events:
+                    await self._run_post_compact_hooks(messages, before_compaction, "auto")
 
             # Stream tokens to the UI only when it is live and streaming is enabled.
             sink = self.ui if (self.ui.is_live and self.config.stream) else None
@@ -436,6 +478,9 @@ class ReActAgent:
                 # exhausted, the overflow propagates.
                 gap = parse_prompt_too_long_gap(str(exc))
                 before_compaction = list(messages)
+                # PreCompact fires for observability/grounding; its block flag is IGNORED
+                # here — reactive compaction recovers from an actual overflow and must run.
+                await self._run_pre_compact_hooks(messages, "reactive")
                 messages, events = await self.compression.reactive_compact(
                     messages,
                     model=self.config.model,
@@ -447,6 +492,8 @@ class ReActAgent:
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
                 await self._commit_compaction_boundary(before_compaction, messages)
+                if events:
+                    await self._run_post_compact_hooks(messages, before_compaction, "reactive")
                 result = None
                 for _ in range(MAX_PTL_RETRIES):
                     self.ui.on_turn_start()
@@ -535,8 +582,40 @@ class ReActAgent:
                 assistant_metadata["thinking_blocks"] = result.thinking_blocks
             await self._emit(messages, Message("assistant", result.content, metadata=assistant_metadata))
 
+            # PostSampling: fire-and-forget after the assistant turn is in the history, so
+            # an observational hook (e.g. background extraction) overlaps the next model
+            # call instead of blocking the loop. Awaited only at terminal returns.
+            self._fire_post_sampling(messages, result.content)
+
             # Natural termination: the model stopped requesting tools, so this is the answer.
             if not result.tool_calls:
+                # Stop hook: a hook may BLOCK this stop and force the loop to keep running
+                # ("可阻断/可续跑"), bounded by config.max_stop_blocks so it can't loop
+                # forever. A block injects the continuation directive and re-enters the loop.
+                stop = await self._run_stop_hooks(messages, result.content, stop_blocks)
+                if stop.block and stop_blocks < self.config.max_stop_blocks:
+                    stop_blocks += 1
+                    directive = (
+                        stop.additional_context
+                        or stop.reason
+                        or "A stop hook requested that you keep working instead of stopping."
+                    )
+                    await self._emit(
+                        messages,
+                        Message(
+                            "user",
+                            f"<system-reminder>\n{directive}\n</system-reminder>",
+                            metadata={"stop_hook": "continue"},
+                        ),
+                    )
+                    await self.logger.write(
+                        "hook",
+                        {"event": "Stop", "decision": "continue", "block_count": stop_blocks,
+                         "reason": stop.reason},
+                    )
+                    self.ui.on_reasoning(result.content)
+                    continue
+                await self._reap_background_hooks()
                 self.ui.on_final(result.content)
                 self._emit_recap(messages, step, "completed")
                 await self.logger.write("final", {"answer": result.content})
@@ -660,6 +739,7 @@ class ReActAgent:
         """Shared exit path for run interruption (cancel / max_steps / deadline)."""
         self._emit_recap(messages, step, reason)
         await self._cancel_pending_tool_use_summary()
+        await self._reap_background_hooks()
         answer = f"Stopped after {human} without a final answer."
         self.ui.on_stopped(reason, human)
         await self.logger.write("final", {"answer": answer, "stopped": reason})
@@ -718,6 +798,150 @@ class ReActAgent:
             await task
         except BaseException:  # noqa: BLE001 - reap quietly (incl. CancelledError).
             pass
+
+    # --- Lifecycle hook seams --------------------------------------------------
+    #
+    # Each fires a class of programmatic hook at a specific loop boundary. All are
+    # best-effort observability/steering seams: a missing hook list makes them cheap
+    # no-ops, and (except for an explicit block decision) they never alter control
+    # flow. ``self.hooks`` is the same pipeline the executor uses for tool hooks.
+
+    async def _run_user_prompt_hooks(
+        self, messages: list[Message], task: str
+    ) -> "AgentRunResult | None":
+        """Fire UserPromptSubmit. Returns a terminal result if a hook blocked the run,
+        else ``None`` (after injecting any additional_context for the model to see)."""
+        if not self.hooks.user_prompt_hooks:
+            return None
+        ctx = HookContext(
+            event=HookEvent.USER_PROMPT_SUBMIT,
+            messages=messages,
+            session_id=self.session_id,
+            prompt=task,
+        )
+        outcome = await self.hooks.run_user_prompt(ctx)
+        await self.logger.write(
+            "hook",
+            {"event": "UserPromptSubmit", "blocked": outcome.block, "reason": outcome.reason},
+        )
+        if outcome.block:
+            answer = outcome.reason or "Request blocked by a UserPromptSubmit hook."
+            self._emit_recap(messages, 0, "blocked")
+            self.ui.on_stopped("blocked", answer)
+            await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
+            return AgentRunResult(answer, messages, 0, self.logger.run_id)
+        if outcome.additional_context:
+            await self._emit(
+                messages,
+                Message(
+                    "user",
+                    f"<system-reminder>\n{outcome.additional_context}\n</system-reminder>",
+                    metadata={"hook": "user_prompt_context"},
+                ),
+            )
+        return None
+
+    async def _run_pre_compact_hooks(self, messages: list[Message], trigger: str) -> HookOutcome:
+        """Fire PreCompact. The caller honors ``block`` only on the proactive (``auto``)
+        path; on the forced ``reactive`` path the block is ignored (compaction is mandatory)."""
+        if not self.hooks.pre_compact_hooks:
+            return HookOutcome()
+        ctx = HookContext(
+            event=HookEvent.PRE_COMPACT,
+            messages=messages,
+            session_id=self.session_id,
+            trigger=trigger,
+        )
+        outcome = await self.hooks.run_pre_compact(ctx)
+        await self.logger.write(
+            "hook",
+            {"event": "PreCompact", "trigger": trigger, "blocked": outcome.block,
+             "reason": outcome.reason},
+        )
+        return outcome
+
+    async def _run_post_compact_hooks(
+        self, messages: list[Message], before: list[Message], trigger: str
+    ) -> None:
+        """Fire PostCompact with the new summary (when a prefix fold produced one) and
+        inject any returned additional_context to ground the next turn."""
+        if not self.hooks.post_compact_hooks:
+            return
+        before_uuids = {m.uuid for m in before}
+        new_msgs = [m for m in messages if m.uuid not in before_uuids]
+        summary = next((m.content for m in new_msgs if is_summary_message(m)), None)
+        ctx = HookContext(
+            event=HookEvent.POST_COMPACT,
+            messages=messages,
+            session_id=self.session_id,
+            trigger=trigger,
+            summary=summary,
+        )
+        outcome = await self.hooks.run_post_compact(ctx)
+        await self.logger.write(
+            "hook",
+            {"event": "PostCompact", "trigger": trigger, "has_summary": summary is not None},
+        )
+        if outcome.additional_context:
+            await self._emit(
+                messages,
+                Message(
+                    "user",
+                    f"<system-reminder>\n{outcome.additional_context}\n</system-reminder>",
+                    metadata={"hook": "post_compact_context"},
+                ),
+            )
+
+    async def _run_stop_hooks(
+        self, messages: list[Message], last_assistant_text: str, stop_blocks: int
+    ) -> HookOutcome:
+        """Fire Stop at natural termination. A returned ``block`` asks the loop to keep
+        running; ``stop_hook_active`` tells the hook it has already blocked at least once."""
+        if not self.hooks.stop_hooks:
+            return HookOutcome()
+        ctx = HookContext(
+            event=HookEvent.STOP,
+            messages=messages,
+            session_id=self.session_id,
+            last_assistant_message=last_assistant_text,
+            stop_hook_active=stop_blocks > 0,
+        )
+        outcome = await self.hooks.run_stop(ctx)
+        await self.logger.write(
+            "hook",
+            {"event": "Stop", "blocked": outcome.block, "stop_hook_active": stop_blocks > 0,
+             "reason": outcome.reason},
+        )
+        return outcome
+
+    def _fire_post_sampling(self, messages: list[Message], last_assistant_text: str) -> None:
+        """Schedule PostSampling fire-and-forget on a snapshot of the history."""
+        if not self.hooks.post_sampling_hooks:
+            return
+        ctx = HookContext(
+            event=HookEvent.POST_SAMPLING,
+            messages=list(messages),
+            session_id=self.session_id,
+            last_assistant_message=last_assistant_text,
+        )
+        task = asyncio.create_task(self._post_sampling_runner(ctx))
+        self._background_hook_tasks.add(task)
+        task.add_done_callback(self._background_hook_tasks.discard)
+
+    async def _post_sampling_runner(self, ctx: HookContext) -> None:
+        try:
+            await self.hooks.run_post_sampling(ctx)
+        except Exception as exc:  # noqa: BLE001 - observational; must never sink a run
+            await self.logger.write(
+                "hook", {"event": "PostSampling", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    async def _reap_background_hooks(self) -> None:
+        """Await any in-flight PostSampling tasks at a terminal return (best-effort)."""
+        tasks = list(self._background_hook_tasks)
+        self._background_hook_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _recall(self, task: str, messages: list[Message]) -> None:
         """Inject relevant past memories as a pinned system block before the task."""

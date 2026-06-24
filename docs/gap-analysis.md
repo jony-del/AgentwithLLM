@@ -52,7 +52,7 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 | **tool registry / execution** | `Tool.ts`（统一 contract：`isEnabled`、`validateInput`、`checkPermissions`、`call` async gen、`mapToolResultToToolResultBlockParam`、`backfillObservableInput`）；`StreamingToolExecutor` + `runTools` | `tools/`（`@builtin_tool` 自注册、`registry`、`executor` 带 wave 分区并发、`_invoke`/async `run`）、`ToolRisk` | **设计对齐良好** |
 | **permission / approval** | **规则驱动**：`alwaysAllow/Deny/AskRules` + `bashClassifier`、`pathValidation`、`dangerousPatterns`、`yoloClassifier`、shadowed-rule 检测；PermissionMode 是其中一维 | **模式驱动**：`PermissionPolicy` 按 `PermissionMode` + `ToolRisk` 决策，session allowlist | **设计哲学不同**（见 §3） |
 | **config / memory / 项目指令** | `utils/settings/`、`utils/config.js`、CLAUDE.md 发现（`claudemd.ts`）、`memdir/`（auto memory） | `config.py`（defaults→toml→env→flag 四级）、`memory/`（store/retrieval/extraction/dreaming，opt-in）、**无 CLAUDE.md 注入** | config 对齐；memory 本项目更完整；**缺项目指令注入** |
-| **扩展层** | subagent（`AgentTool`）、skill（`skills/bundled/` 17 个 + `loadSkillsDir` 用户技能）、hook（pre/post tool、stop、postSampling、userPromptSubmit）、MCP（完整 client+transport+oauth）、plugin marketplace、Task/swarm 多 agent | subagent（`dispatch_agent`）、team（多 agent 协作）、hook（pre/post tool）、MCP（client/adapter/config） | subagent/MCP/hook 对齐；**无 skill 系统、无 plugin、无 slash command、stop/postSampling hook 缺失** |
+| **扩展层** | subagent（`AgentTool`）、skill（`skills/bundled/` 17 个 + `loadSkillsDir` 用户技能）、hook（pre/post tool、stop、postSampling、userPromptSubmit，**settings.json 外部进程加载**）、MCP（完整 client+transport+oauth）、plugin marketplace、Task/swarm 多 agent | subagent（`dispatch_agent`）、team（多 agent 协作）、hook（pre/post tool **+ 生命周期：Stop/PostSampling/UserPromptSubmit/Pre·PostCompact，编程式注入**）、MCP（client/adapter/config） | subagent/MCP 对齐；**hook 事件面已补齐但仍是编程式（无外部配置加载器，见 §4）**；无 skill 系统、无 plugin、无 slash command |
 
 ---
 
@@ -103,8 +103,13 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 4. **规则驱动权限 + bash 分类器**：参考能对单条命令做细粒度 allow/deny/ask（按命令
    前缀、路径、危险模式）。本项目粒度到"工具级"，无法表达"允许 `git status` 但 ask
    `git push`"。
-5. **更丰富的 hook 类型**：参考有 stop hook（可阻断/续跑）、postSampling hook、
-   userPromptSubmit hook、preCompact hook。本项目只有 pre/post tool。
+5. ~~**更丰富的 hook 类型**：参考有 stop hook（可阻断/续跑）、postSampling hook、
+   userPromptSubmit hook、preCompact hook。本项目只有 pre/post tool。~~ **✅ 已实现
+   （编程式生命周期钩子）**：新增 `UserPromptSubmit`/`PostSampling`/`PreCompact`/
+   `PostCompact`/可阻断的 `Stop` 五类钩子，在 `react.py` 循环边界按固定顺序触发，
+   `hooks.py:HookPipeline.run_*` 折叠执行；Stop 续跑由 `config.max_stop_blocks` 封顶。
+   **保持编程式（构造期注入），尚未实现参考的 settings.json 外部进程加载器**——两者的
+   实现细节、差别与演进指引见 **§4**。
 6. **skill / slash command 系统**：参考有 bundled skills + 用户技能目录 + slash
    command。本项目无。
 7. **流式工具执行**：参考边流边跑工具；本项目是整轮 LLM 结果出齐后再 `execute_many`。
@@ -176,9 +181,13 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 
 **P1（中收益，中风险）**
 
-4. **stop hook**（可阻断/可续跑）——让"任务未完成时强制继续/收尾"成为可能。
-5. **413 / max_output_tokens 分级恢复**——在现有 `reactive_compact` 上补
-   max_output_tokens 续跑。
+4. ~~**stop hook**（可阻断/可续跑）——让"任务未完成时强制继续/收尾"成为可能。~~
+   **✅ 已完成**（连同 UserPromptSubmit/PostSampling/Pre·PostCompact 一并补齐，见 §3.2-5、§4）。
+5. ~~**413 分级恢复**——在现有 `reactive_compact` 上补多轮 prompt-too-long 恢复。~~
+   **✅ 已完成**：`react.py` 在 `LLMContextTooLongError` 后先 `reactive_compact`，
+   再用 `truncate_head_for_ptl_retry` / `shrink_oversize_messages` 做有界多轮重试
+   （见 `tests/test_react.py` Phase 3D）。**max_output_tokens 续跑**仍未完成：主循环尚未对
+   `LLMResult.stop_reason == "max_tokens"` 做续跑；目前只在 compaction summarizer 内有输出预算升档。
 6. ~~**tool result 预算裁剪**——超大工具输出按 per-message 预算截断（已有
    MaxOutputPostHook，可扩展）。~~ **✅ 已完成**：预算裁剪由 `MaxOutputPostHook` pointer 模式
    承担；参考的 tool-use summary（UI 进度标签，非上下文缩减）也已忠实复刻（见 §3.2-10）。
@@ -190,6 +199,127 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 8. skill / slash command 系统。
 9. 流式工具执行（收益/复杂度比对中型 agent 偏低）。
 10. 规则驱动权限（从命令前缀规则起步）。
+
+---
+
+## 4. 钩子机制：当前实现 + 配置驱动加载器演进指引
+
+> 本节记录本项目当前（编程式）钩子的完整实现，并对照参考项目的「settings.json 外部配置
+> 钩子」，作为后续设计「配置驱动的 command/http 钩子加载器」的指导文档。
+
+### 4.1 当前实现（编程式生命周期钩子）
+
+本项目原先只有 pre/post **工具**钩子（`HookPipeline` 的 `PreToolHook`/`PostToolHook`）。
+现已补齐一组**生命周期钩子**，与参考的事件面对齐，但保持**编程式**（构造期注入），不引入
+参考的 settings.json 外部进程机制。落点：`agent_core/hooks.py` + `agent_core/react.py` +
+`agent_core/compression.py`。
+
+**两类钩子的分工**：
+
+| 类别 | 事件 | 同步/异步 | 触发处 |
+|---|---|---|---|
+| 工具钩子（原有） | PreToolUse / PostToolUse | 同步 | `ToolExecutor`（每个工具调用前后） |
+| 生命周期钩子（新增） | UserPromptSubmit / PostSampling / PreCompact / PostCompact / Stop | 异步 | `ReActAgent.run()` 循环边界 |
+
+工具钩子在 executor 内**同步**运行（执行器把阻塞工具卸载到线程，故钩子保持同步）；生命周期
+钩子在 async 主循环里直接 `await`，可做真正的工作（调模型、跑 verifier）而不阻塞循环线程。
+
+**核心数据结构**（`hooks.py`）：
+
+- `HookEvent`：事件枚举。
+- `HookContext`：单一上下文形状 + 事件相关可选字段（`prompt` / `trigger` / `summary` /
+  `last_assistant_message` / `stop_hook_active`），镜像参考的 per-event 输入但不做类爆炸。
+- `HookOutcome`：单一 `block` 决策位（**语义按事件而定**）+ `additional_context`（注入文本）
+  + `reason`。
+- `HookPipeline.run_*`：按序折叠钩子，遇首个 `block` 短路；`run_post_sampling` 为 fire-each、
+  无返回（观测性）。
+- `compression.should_compact()`：无副作用谓词，镜像 `auto_compact` 自身闸门，让 `PreCompact`
+  只在 fold 真正迫近时触发。
+
+**钩子在循环中的逻辑顺序**（已写入 `CLAUDE.md` 的「Agent Loop」契约）：
+
+0. **UserPromptSubmit** —— 任务就位、首次 model 调用之前。可中止整个 run（`block`），或注入
+   `additional_context`（作为 `<system-reminder>` 让模型本轮看到）。
+1. **PreCompact** —— 仅当 proactive fold 真正迫近时（`should_compact()`）→ 压缩 →
+   **PostCompact**（仅当真的发生 fold、带新 summary）。`PreCompact.block` 跳过 proactive
+   fold；在被迫的 **reactive（413 恢复）路径上 block 被忽略**（压缩是强制的）。
+2. 调 model → **PostSampling**（fire-and-forget；assistant 轮落历史后触发，与下一次 model
+   调用并发；在终止返回处 reap）。
+3. 无 tool_use 时 → **Stop**：钩子可 **block 本次停止**强制续跑（"可阻断/可续跑"），由
+   `config.max_stop_blocks`（默认 3）封顶，注入续跑指令后重入循环；超过上限则照常停止。
+4. 经 `ToolExecutor` 执行工具（其内部对每个调用跑同步 pre/post 工具钩子）。
+5. 工具观察追加为 `tool` 消息，continue。
+
+**安全性 / 兜底**：
+
+- 默认无生命周期钩子时，所有 seam 都是廉价 no-op，行为与改动前**完全一致**。
+- Stop 续跑有硬上限（`max_stop_blocks`），且 `stop_hook_active` 在首次 block 后置 True ——
+  比参考多一道防失控护栏（参考只有 `preventContinuation`，无次数上限）。
+- PostSampling 是观测性 fire-and-forget，异常只记日志，绝不 sink run。
+- 测试：`tests/test_lifecycle_hooks.py` 11 个用例（管线折叠/短路、UserPromptSubmit 阻断+注入、
+  PostSampling 触发、Stop 阻断续跑+封顶+零上限禁用、Pre·PostCompact fold 触发+block 跳过），
+  全套 467 绿。
+
+### 4.2 与参考项目「settings.json 外部配置钩子」的差别
+
+参考项目的钩子是**配置驱动的外部进程调用**：在 `settings.json` 按事件 + matcher 声明，每个
+钩子是 `command`（子进程，stdin/stdout JSON，退出码 2 = block）/ `http`（POST 端点）/
+`prompt`（再发一次 LLM）/ `agent`（跑 verifier agent）之一。两者本质是**「钩子怎么被定义和
+加载」**的两条路线：进程内代码注入 vs 配置驱动的外部进程调用。
+
+| 维度 | 编程式钩子（本项目） | settings.json 外部钩子（参考） |
+|---|---|---|
+| 定义位置 | Python 代码，构造 `HookPipeline` 时注入 | `settings.json`，事件 + matcher |
+| 谁能改 | 开发者（改代码、重部署） | 终端用户/运维（改配置即可，无需改源码） |
+| 运行形态 | 同进程、同 Python 运行时 | 子进程 / HTTP / 再一次 LLM / verifier agent |
+| 语言 | 必须 Python | 任意（bash / Node / curl / …） |
+| 数据传递 | 直接传**活对象**（`HookContext`/`ToolCall`/`Message`） | 序列化 **JSON 快照**（stdin/stdout 或 HTTP body） |
+| 阻断协议 | 返回 `HookOutcome.block` | 退出码 2 / JSON `{continue:false}` |
+| 状态共享 | 能读写进程内对象/闭包/共享 store | 无共享内存，只有 JSON 快照 |
+| 延迟/开销 | 进程内 await，近零 | spawn / 网络 / LLM，量级更高 |
+| 安全面 | 由代码作者控制 | "配置即可执行任意命令/HTTP"，需信任边界/超时/沙箱 |
+
+**取舍小结**：
+
+- **外部钩子优势**：免改代码即可配置、语言无关、进程隔离、可分发可审计、天然支持
+  `prompt`/`agent` 这类"重"钩子。
+- **外部钩子劣势**：延迟大（高频的 PreToolUse/PostToolUse 尤甚）、只能传 JSON 快照（改不了
+  进程内状态）、安全面大、失败模式多（超时/僵尸进程/网络/退出码解析）、实现量大。
+- **编程式钩子优势**：零开销、能传/改富对象、类型安全、`try/except` 兜底、实现极简、契合
+  现有 async 模型。
+- **编程式钩子劣势**：改钩子 = 改代码 = 重部署、只能 Python、终端用户无法在不动源码下自定义。
+
+> 当前阶段编程式钩子更合适：本项目定位是 Python agent 框架，钩子的主要消费者是**开发者**；
+> 且 PreToolUse 改写参数、PostToolUse 改写结果、Stop 注入续跑这些场景**依赖进程内活对象**，
+> JSON 边界反而会限制能力。配置驱动加载器是面向**终端用户免改源码扩展**时才值得加的独立特性。
+
+### 4.3 配置驱动加载器的演进指引（不互斥，叠加为适配器层）
+
+**关键判断**：外部加载器应作为**编程式钩子之上的一个适配器实现**，而非替换。本次的
+`HookPipeline` 接口正是那一层的落点 —— 把每个外部钩子适配成实现对应 Protocol 的回调对象，
+与编程式钩子在同一管线里并存、同序折叠。
+
+建议落地步骤：
+
+1. **配置解析**：在 `config.py` 增加 `[[hooks]]` 表解析（事件名 + matcher + type + 具体
+   字段），遵循现有 defaults→toml→env→flag 层级；事件名复用 `HookEvent`。
+2. **适配器**：为每种 type 写一个适配器类，实现对应 Protocol（如 `StopHook.on_stop`）：
+   - `command`：`asyncio.create_subprocess_exec`，stdin 喂 `HookContext` 的 JSON 投影，
+     stdout 解析 JSON / 退出码 2→block；**必须**有单次非堆叠超时 + kill-await（对齐
+     `plan-review-standards` 与 `compression_summary` 的超时纪律）。
+   - `http`：异步 POST `HookContext` JSON，解析响应为 `HookOutcome`。
+   - `prompt` / `agent`：经 `GatedProvider` / `dispatch_agent` seam 复用现有并发预算。
+3. **上下文投影**：定义 `HookContext` → JSON 的稳定投影（`messages` 可能要裁剪/摘要，避免把
+   整段历史塞进每个外部钩子）。这是 JSON 边界的主要设计点，也是和进程内"活对象"路线最大的
+   能力分界。
+4. **装配**：构造期把解析出的适配器 `append` 进 `HookPipeline` 的对应钩子列表 —— 编程式钩子
+   与外部钩子在同一管线里并存、同序折叠，循环侧（`react.py`）无需任何改动。
+5. **安全**：外部 `command`/`http` 钩子是强力能力，需信任边界（仅项目内 `agent.toml`、不读
+   不可信远程配置）、超时、并发上限，并把失败降级为"放行 + 记日志"而非 sink run。
+
+> 即：当前已有编程式 `HookPipeline` + 生命周期 seam（已完成），配置驱动加载器只需再写
+> 「解析 + 适配器 + 投影」三块，把外部进程包装成同一接口的回调。**契约不变，循环不动，
+> 风险可控。**
 
 ---
 
@@ -212,6 +342,10 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 >   `MaxOutputPostHook` pointer 模式承担；参考的 tool-use summary（异步 Haiku **UI 进度标签**，
 >   非上下文缩减）由新增 `tool_use_summary.py` 忠实复刻（只进 UI + `runs/*.jsonl`，不进
 >   API/transcript）。同时订正了原条目「降低上下文占用」对 tool-use summary 的误标。
-> - **仍未实现**：stop/postSampling hook（§3.2-5）、skill/slash command（§3.2-6）、
->   流式工具执行（§3.2-7）、413 分级恢复完整链（§3.2-8）、fallback 模型切换（§3.2-9）、
->   规则驱动权限（§3.2-4）。
+> - **更丰富的 hook 类型（§3.2-5）已完成**：补齐 UserPromptSubmit/PostSampling/
+>   Pre·PostCompact/可阻断 Stop 五类**编程式**生命周期钩子（`hooks.py` + `react.py`，
+>   `tests/test_lifecycle_hooks.py` 11 例，全套 467 绿）。**剩余**：参考的 settings.json
+>   **外部配置钩子加载器**（command/http/prompt/agent）尚未实现——其差别与演进指引见 **§4**。
+> - **仍未实现**：skill/slash command（§3.2-6）、流式工具执行（§3.2-7）、413 分级恢复
+>   完整链（§3.2-8）、fallback 模型切换（§3.2-9）、规则驱动权限（§3.2-4）、配置驱动外部
+>   钩子加载器（§4.3）。
