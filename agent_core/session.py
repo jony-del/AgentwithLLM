@@ -100,6 +100,14 @@ class SessionContext:
     # fan-out from the per-run JSONL logs. ``None`` for the top-level agent.
     parent_run_id: str | None = None
     ui_notify: Callable[[list[Todo]], None] | None = None
+    # Per-run skill registry (loaded at agent startup), read by the ``skill`` tool to
+    # resolve a model-invoked skill by name. ``None``/empty when skills are disabled or
+    # none were found; ``Any`` to avoid importing the skills package into this seam.
+    skills: Any | None = None
+    # Run-log location for the active run, so a programmatic skill (e.g. ``debug``) can
+    # read this run's JSONL events. ``run_id`` is the JSONLRunLogger's id.
+    run_dir: str = "runs"
+    run_id: str = ""
     depth: int = 0
     max_depth: int = 1
     # Recently-read file snapshots, keyed by workspace-resolved path string and

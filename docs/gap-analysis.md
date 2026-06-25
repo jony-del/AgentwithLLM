@@ -110,8 +110,28 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
    `hooks.py:HookPipeline.run_*` 折叠执行；Stop 续跑由 `config.max_stop_blocks` 封顶。
    **保持编程式（构造期注入），尚未实现参考的 settings.json 外部进程加载器**——两者的
    实现细节、差别与演进指引见 **§4**。
-6. **skill / slash command 系统**：参考有 bundled skills + 用户技能目录 + slash
-   command。本项目无。
+6. ~~**skill / slash command 系统**：参考有 bundled skills + 用户技能目录 + slash
+   command。本项目无。~~ **✅ 已实现**：新增 `agent_core/skills/`（纯 stdlib）——
+   Markdown `SKILL.md` + frontmatter 加载器（`loader.py`，bundled→用户 `~/.polaris/skills`
+   →项目 `./.polaris/skills`→额外目录的优先级覆盖、realpath 去重、`disabled` 过滤）、
+   `SkillRegistry`、slash 解析/渲染（`dispatch.py`）、自写极简 frontmatter 解析器
+   （不引 PyYAML）、`bundled/*.md` 内置技能（`commit`/`review`）。**人类**经 chat 的
+   `/command` 触发（`cli.py` 派发 + `/help`/`/skills`）；**模型**经新增 `tools/skill.py`
+   的 `skill` 工具自主调用（`schema_for_llm` 动态列出可调用技能，无可调用技能时从 registry
+   隐藏）。支持 `inline`（注入指令）与 `fork`（复用 depth-limited `subagent_factory` 的隔离
+   子 agent）两种执行上下文；frontmatter 的 `user-invocable`/`disable-model-invocation`
+   分别控制人/模型可见性。子 agent 排除 `skill` 工具防递归。`[skills]` 配置 + `AGENT_SKILLS`
+   开关，加载失败降级为空 registry 不崩 run。
+   **Phase 2（与参考务实对齐）**：frontmatter 解析切换到 **PyYAML**（接口不变、坏 YAML 降级）；
+   bundled 静态技能扩到 8 个（commit/review/verify/simplify/remember/init/pr-review/security-review，
+   含把参考 prompt-type 命令 `/init`·`/review`·`/security-review` 实现为技能）；新增
+   **programmatic（Python 可调用）技能接缝**（`skills/programmatic.py` 的 `@programmatic_skill`
+   自注册 + `SkillPromptContext` + `build_skill_prompt`，对标参考 `getPromptForCommand`），
+   移植切题的动态技能 `lorem-ipsum`/`skillify`/`debug`；新增 `agent_core/chat_commands.py`
+   提供约 11 个**接本项目真实子系统**的内置 chat 命令（`/help`·`/skills`·`/clear`·`/status`·
+   `/context`·`/cost`·`/compact`·`/model`·`/mcp`·`/memory`·`/resume`，`ChatTurn` 返回支持
+   有状态命令；参考的 TUI/账号/云端命令无对应物故不做）。支撑改动：`ReActAgent.compact_now()`
+   强制压缩、会话累计用量计数。全套 **550 绿**。
 7. **流式工具执行**：参考边流边跑工具；本项目是整轮 LLM 结果出齐后再 `execute_many`。
 8. **413 / max_output_tokens 的分级恢复**：本项目有 `LLMContextTooLongError` →
    reactive_compact 一次；参考有 collapse-drain → reactive → 升档重试 → 多轮 recovery
@@ -196,7 +216,7 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 
 7. ~~会话持久化 / resume（需契约扩展，谨慎）。~~ **✅ 已完成**（含 transcript 内建
    compact-boundary，见 §3.2-2、§3.4-3）。
-8. skill / slash command 系统。
+8. ~~skill / slash command 系统。~~ **✅ 已完成**（见 §3.2-6）。
 9. 流式工具执行（收益/复杂度比对中型 agent 偏低）。
 10. 规则驱动权限（从命令前缀规则起步）。
 
@@ -346,6 +366,8 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 >   Pre·PostCompact/可阻断 Stop 五类**编程式**生命周期钩子（`hooks.py` + `react.py`，
 >   `tests/test_lifecycle_hooks.py` 11 例，全套 467 绿）。**剩余**：参考的 settings.json
 >   **外部配置钩子加载器**（command/http/prompt/agent）尚未实现——其差别与演进指引见 **§4**。
-> - **仍未实现**：skill/slash command（§3.2-6）、流式工具执行（§3.2-7）、413 分级恢复
->   完整链（§3.2-8）、fallback 模型切换（§3.2-9）、规则驱动权限（§3.2-4）、配置驱动外部
->   钩子加载器（§4.3）。
+> - **skill / slash command 系统（§3.2-6）已完成**：新增 `agent_core/skills/`（Markdown
+>   `SKILL.md` 加载器 + bundled 内置技能 + 用户/项目技能目录）、chat 的 `/command` 派发、
+>   可被模型调用的 `skill` 工具（inline/fork 两种上下文），57 个新测试，全套 523 绿。
+> - **仍未实现**：流式工具执行（§3.2-7）、413 分级恢复完整链（§3.2-8）、fallback 模型
+>   切换（§3.2-9）、规则驱动权限（§3.2-4）、配置驱动外部钩子加载器（§4.3）。

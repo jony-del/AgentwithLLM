@@ -339,6 +339,25 @@ def resolve_compression_config(config_file: str | Path = "agent.toml") -> "Compr
     return config
 
 
+def resolve_skills_config(config_file: str | Path = "agent.toml") -> "SkillsConfig":
+    """Resolve the skill subsystem settings from the ``[skills]`` toml table, then env.
+
+    Precedence: defaults → ``[skills]`` → ``AGENT_SKILLS`` env (only toggles ``enabled``).
+    Skills are an *enabled capability* (default on), discovered and loaded eagerly at
+    agent startup. ``AGENT_SKILLS`` truthy/falsey lets a run force them on/off without
+    editing toml. Unknown keys in the table are ignored.
+    """
+    from agent_core.skills import SkillsConfig
+
+    table = load_agent_toml(config_file).get("skills")
+    config = SkillsConfig.from_dict(table if isinstance(table, dict) else None)
+
+    env = os.getenv("AGENT_SKILLS")
+    if env is not None:
+        config.enabled = env.strip().lower() in {"1", "true", "yes", "on"}
+    return config
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

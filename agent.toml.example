@@ -90,6 +90,20 @@ project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAU
 git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
 
+# --- Skills / slash commands ------------------------------------------------
+# A skill is a Markdown file (SKILL.md + frontmatter) holding a reusable prompt.
+# Skills load eagerly at startup from (low->high precedence): bundled (shipped) ->
+# user_dir -> project_dir -> skills_dirs. A human triggers one with `/name args` in
+# chat; the model can invoke one via the `skill` tool (hidden when nothing is
+# model-invocable). Each skill's frontmatter sets context (inline|fork),
+# user-invocable, and disable-model-invocation. AGENT_SKILLS=0 disables the system.
+[skills]
+enabled = true                 # false (or AGENT_SKILLS=0) turns the subsystem off
+user_dir = "~/.polaris/skills"     # per-user skills (<name>/SKILL.md or <name>.md)
+project_dir = ".polaris/skills"    # per-project skills, resolved against the workspace
+skills_dirs = []               # extra highest-precedence directories to scan
+disabled = []                  # skill names to suppress (e.g. ["commit"])
+
 # --- Context compaction -----------------------------------------------------
 # How the history is shrunk when it grows large. Cheap deterministic stages (snip,
 # microcompact) run every turn; the prefix-collapse stage folds old turns into one

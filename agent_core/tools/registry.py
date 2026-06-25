@@ -17,6 +17,10 @@ class ToolRegistry:
         for tool in adapter.list_tools():
             self.register(tool)
 
+    def unregister(self, name: str) -> None:
+        """Drop a tool if present (idempotent). Used to hide conditionally-disabled tools."""
+        self._tools.pop(name, None)
+
     def get(self, name: str) -> Tool:
         try:
             return self._tools[name]

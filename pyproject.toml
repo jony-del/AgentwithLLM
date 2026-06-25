@@ -18,6 +18,7 @@ dependencies = [
     "mcp-server-time",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
+    "pyyaml>=6.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
@@ -31,6 +32,12 @@ polaris = "agent_core.cli:main"
 # subpackage (tools, providers, memory, mcp, ...) while excluding those output dirs.
 [tool.setuptools.packages.find]
 include = ["agent_core*"]
+
+# Bundled skills are Markdown data files (not a Python package), so they must be
+# declared explicitly to ride along in a built wheel; the editable/dev install reads
+# them straight from the source tree.
+[tool.setuptools.package-data]
+"agent_core.skills" = ["bundled/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

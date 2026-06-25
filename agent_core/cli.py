@@ -17,12 +17,14 @@ from agent_core.config import (
     resolve_output_config,
     resolve_persist_compaction_boundary,
     resolve_session_dir,
+    resolve_skills_config,
     resolve_tool_use_summary_config,
 )
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
 from agent_core.models import LLMTransientError, Message
 from agent_core.providers import ClaudeProvider, FakeProvider
+from agent_core.chat_commands import dispatch as dispatch_chat_command
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.tools.registry import ToolRegistry
 from agent_core.transcript import (
@@ -179,6 +181,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
         session_dir=_session_dir(args),
         persist_compaction_boundary=resolve_persist_compaction_boundary(),
+        skills=resolve_skills_config(),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
@@ -384,14 +387,22 @@ def chat_command(args: argparse.Namespace) -> int:
             if task is None:  # EOF
                 break
             task = task.strip()
-            if task in {"/exit", "/quit"}:
-                break
             if not task:
+                continue
+            # Resolve /commands and skills. A fully-handled command (/help, /clear, a
+            # fork skill, …) yields no prompt; a plain message or inline skill yields the
+            # prompt to run; /clear and /resume replace the loop's history; /exit quits.
+            turn = await dispatch_chat_command(task, agent, ui, history)
+            if turn.quit:
+                break
+            if turn.history is not None:
+                history = turn.history
+            if turn.prompt is None:
                 continue
             try:
                 with KeyInterrupt(confirm=True) as interrupt:
                     result = await agent.run(
-                        task, should_cancel=interrupt.is_set, history=history or None
+                        turn.prompt, should_cancel=interrupt.is_set, history=history or None
                     )
                 history = result.messages
             except LLMTransientError as exc:

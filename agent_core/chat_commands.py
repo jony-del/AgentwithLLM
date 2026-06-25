@@ -1,0 +1,303 @@
+"""Built-in chat slash-commands for the interactive ``polaris chat`` loop.
+
+A typed ``/command`` is resolved here into a :class:`ChatTurn` telling the loop what to
+do next: run a prompt through the agent, replace the conversation history (``/clear``,
+``/resume``), or quit. Skills (markdown + programmatic) are dispatched here too — an
+inline skill becomes a prompt, a fork skill runs in a sub-agent and prints its result.
+
+Built-in commands map onto subsystems this project actually has (compaction, token
+math, sessions, MCP, memory, model config); the reference's TUI/account/cloud commands
+have no analogue in this CLI and are intentionally omitted. Handlers print their own
+output and are unit-testable via captured stdout. This module imports only lower-level
+pieces (never ``cli``) so there is no import cycle.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from agent_core import tokens
+from agent_core.config import resolve_mcp_config
+from agent_core.models import Message
+from agent_core.skills import (
+    SkillContext,
+    SkillPromptContext,
+    build_skill_prompt,
+    fork_preset,
+    looks_like_command,
+    parse_slash_command,
+)
+from agent_core.transcript import (
+    TranscriptStore,
+    build_chain,
+    find_session,
+    list_sessions,
+    load_transcript,
+    project_dir,
+)
+from agent_core.ui import AgentUI
+
+if TYPE_CHECKING:
+    from agent_core.react import ReActAgent
+
+
+@dataclass(slots=True)
+class ChatTurn:
+    """What the chat loop should do after a line is handled.
+
+    ``prompt`` non-None → run it through ``agent.run`` (a plain message or an inline
+    skill). ``history`` non-None → replace the loop's conversation history. ``quit`` →
+    leave the chat. A fully-handled command (``/help``, a fork skill, …) returns the
+    default: nothing to run, history unchanged, keep going.
+    """
+
+    prompt: str | None = None
+    history: list[Message] | None = None
+    quit: bool = False
+
+
+Handler = Callable[["ReActAgent", AgentUI, str, "list[Message]"], "Awaitable[ChatTurn]"]
+
+
+def _estimate_tokens(agent: "ReActAgent", history: list[Message]) -> int:
+    """Best current prompt-size estimate: the last real usage, or a char/4 fallback."""
+    chars = sum(len(m.content) for m in history)
+    return max(getattr(agent, "_last_usage_tokens", 0), chars // 4)
+
+
+# --- handlers ----------------------------------------------------------------
+
+
+async def _cmd_help(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    print("Commands:")
+    for name, (_, summary) in sorted(_COMMAND_HELP.items()):
+        print(f"  /{name:<10} {summary}")
+    print("  /<skill> [args]  Run a skill (see /skills).")
+    print("  /exit, /quit     Leave the chat.")
+    print("Anything else is sent to the agent as a normal message.")
+    return ChatTurn()
+
+
+async def _cmd_skills(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    skills = sorted(agent.skills.user_invocable(), key=lambda skill: skill.name)
+    if not skills:
+        print("No skills available. Drop a SKILL.md under ./.polaris/skills or ~/.polaris/skills.")
+        return ChatTurn()
+    print("Available skills:")
+    for skill in skills:
+        tag = " [fork]" if skill.context is SkillContext.FORK else ""
+        print(f"  /{skill.name}{tag} — {skill.description or '(no description)'}")
+    return ChatTurn()
+
+
+async def _cmd_clear(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    print("Conversation history cleared.")
+    return ChatTurn(history=[])
+
+
+async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    mcp_servers = [s for s in resolve_mcp_config().servers if s.enabled]
+    print("Status:")
+    print(f"  model       {agent.config.model}")
+    print(f"  permission  {agent.config.permission}")
+    print(f"  session     {agent.session_id}")
+    print(f"  workspace   {agent.session.workspace}")
+    print(f"  skills      {len(agent.skills)}  ({len(agent.skills.model_invocable())} model-invocable)")
+    print(f"  tools       {len(agent.registry.list())}")
+    print(f"  mcp servers {len(mcp_servers)}")
+    return ChatTurn()
+
+
+async def _cmd_context(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    model = agent.config.model
+    est = _estimate_tokens(agent, history)
+    window = tokens.context_window_for_model(model)
+    threshold = tokens.auto_compact_threshold(model)
+    pct_window = (est / window * 100) if window else 0.0
+    pct_compact = (est / threshold * 100) if threshold else 0.0
+    print(f"Context (model {model}):")
+    print(f"  estimated prompt tokens  {est:,}")
+    print(f"  context window           {window:,}  ({pct_window:.1f}% used)")
+    print(f"  auto-compact threshold   {threshold:,}  ({pct_compact:.1f}% of the way there)")
+    return ChatTurn()
+
+
+async def _cmd_cost(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    started = getattr(agent, "_session_started", None)
+    elapsed = (time.monotonic() - started) if started else 0.0
+    inp = getattr(agent, "_session_input_tokens", 0)
+    out = getattr(agent, "_session_output_tokens", 0)
+    print("Session usage:")
+    print(f"  input tokens   {inp:,}")
+    print(f"  output tokens  {out:,}")
+    print(f"  total tokens   {inp + out:,}")
+    print(f"  duration       {elapsed:.0f}s")
+    print("  (token usage, not billed cost — no pricing table is configured)")
+    return ChatTurn()
+
+
+async def _cmd_compact(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    if not history:
+        print("Nothing to compact yet.")
+        return ChatTurn()
+    compacted, saved = await agent.compact_now(history)
+    if saved <= 0:
+        print("Nothing to compact (history already compact).")
+        return ChatTurn()
+    print(f"Compacted: {len(history)} → {len(compacted)} messages, ~{saved:,} chars saved.")
+    return ChatTurn(history=compacted)
+
+
+async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    target = args.strip()
+    if not target:
+        print(f"Current model: {agent.config.model}")
+        print("Known families: claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5-*, claude-fable-5")
+        print("Switch with: /model <name>")
+        return ChatTurn()
+    if not tokens.is_supported_model(target):
+        print(f"Unsupported model {target!r}. Name a known family (e.g. claude-sonnet-4-6).")
+        return ChatTurn()
+    agent.config.model = target
+    print(f"Model switched to {target} (takes effect on your next message).")
+    return ChatTurn()
+
+
+async def _cmd_mcp(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    servers = resolve_mcp_config().servers
+    if not servers:
+        print("No MCP servers configured (see [mcp.servers.*] in agent.toml).")
+        return ChatTurn()
+    print("MCP servers:")
+    for server in servers:
+        state = "enabled" if server.enabled else "disabled"
+        where = server.command or server.url or "?"
+        print(f"  {server.name}  [{state}]  {server.transport}: {where}")
+    return ChatTurn()
+
+
+async def _cmd_memory(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    store = getattr(agent, "memory_store", None)
+    if store is None:
+        print("Memory is disabled (enable it in [memory] or with --memory).")
+        return ChatTurn()
+    records = store.all()
+    if not records:
+        print("No memories stored yet.")
+        return ChatTurn()
+    print(f"Stored memories ({len(records)}):")
+    for record in records[-10:]:
+        summary = record.content.strip().splitlines()[0] if record.content.strip() else "(empty)"
+        print(f"  [{record.kind}] {summary[:100]}")
+    return ChatTurn()
+
+
+async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    session_dir = agent.config.session_dir
+    if not session_dir:
+        print("Session persistence is disabled; cannot resume.")
+        return ChatTurn()
+    workspace = agent.session.workspace
+    target = args.strip()
+    if not target:
+        infos = list_sessions(project_dir(session_dir, workspace))
+        if not infos:
+            print(f"No saved sessions for {workspace}.")
+            return ChatTurn()
+        print("Resumable sessions (newest first):")
+        for info in infos[:10]:
+            print(f"  {info.session_id}")
+        print("Resume with: /resume <id>")
+        return ChatTurn()
+
+    path = find_session(session_dir, workspace, target)
+    if path is None:
+        print(f"No session found with id {target!r}.")
+        return ChatTurn()
+    loaded = load_transcript(path)
+    resumed = build_chain(loaded)
+    # Repoint the agent so subsequent turns persist to the resumed session.
+    agent.session_id = loaded.session_id
+    agent.session.session_id = loaded.session_id
+    agent.transcript = TranscriptStore(session_dir, workspace, loaded.session_id)
+    print(f"Resumed session {loaded.session_id} ({len(resumed)} messages).")
+    return ChatTurn(history=resumed)
+
+
+# (handler, one-line summary) — drives both dispatch and /help. Aliases share a handler.
+_COMMANDS: dict[str, Handler] = {
+    "help": _cmd_help,
+    "skills": _cmd_skills,
+    "clear": _cmd_clear,
+    "reset": _cmd_clear,
+    "new": _cmd_clear,
+    "status": _cmd_status,
+    "context": _cmd_context,
+    "cost": _cmd_cost,
+    "compact": _cmd_compact,
+    "model": _cmd_model,
+    "mcp": _cmd_mcp,
+    "memory": _cmd_memory,
+    "resume": _cmd_resume,
+    "continue": _cmd_resume,
+}
+
+# Canonical commands shown by /help (aliases collapsed).
+_COMMAND_HELP: dict[str, tuple[Handler, str]] = {
+    "help": (_cmd_help, "Show this help."),
+    "skills": (_cmd_skills, "List available skills."),
+    "clear": (_cmd_clear, "Clear conversation history (aliases /reset /new)."),
+    "status": (_cmd_status, "Show model, session, skill/tool counts."),
+    "context": (_cmd_context, "Show context-window usage."),
+    "cost": (_cmd_cost, "Show session token usage and duration."),
+    "compact": (_cmd_compact, "Compact the conversation now."),
+    "model": (_cmd_model, "Show or switch the model."),
+    "mcp": (_cmd_mcp, "List configured MCP servers."),
+    "memory": (_cmd_memory, "List stored memories."),
+    "resume": (_cmd_resume, "List or resume a saved session (alias /continue)."),
+}
+
+
+async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Message]) -> ChatTurn:
+    """Resolve a chat line into a :class:`ChatTurn`.
+
+    Order: explicit ``/exit``·``/quit`` → not-a-command (verbatim) → built-in command →
+    skill (inline returns a prompt; fork runs in a sub-agent) → unknown command.
+    """
+    if task in {"/exit", "/quit"}:
+        return ChatTurn(quit=True)
+
+    parsed = parse_slash_command(task)
+    if parsed is None or not looks_like_command(parsed.name):
+        return ChatTurn(prompt=task)  # plain message → send verbatim
+
+    handler = _COMMANDS.get(parsed.name.lower())
+    if handler is not None:
+        return await handler(agent, ui, parsed.args, history)
+
+    skill = agent.skills.get(parsed.name)
+    if skill is None or not skill.user_invocable:
+        print(f"Unknown command: /{parsed.name}. Try /skills to list skills or /help.")
+        return ChatTurn()
+
+    ctx = SkillPromptContext.from_session(agent.session, transcript=agent.transcript)
+    prompt = await build_skill_prompt(skill, parsed.args, ctx)
+    if skill.context is not SkillContext.FORK:
+        return ChatTurn(prompt=prompt)  # inline → run through agent.run (enters history)
+
+    factory = agent.session.subagent_factory
+    if factory is None:
+        print("[error] fork skills need sub-agents, which are unavailable here.")
+        return ChatTurn()
+    try:
+        answer = await factory(prompt, fork_preset(skill.allowed_tools), skill.model)
+    except Exception as exc:  # noqa: BLE001 - a skill failure must not tear down the chat
+        print(f"[error] skill /{skill.name} failed: {type(exc).__name__}: {exc}")
+        return ChatTurn()
+    if not ui.is_live:
+        print(answer)
+    return ChatTurn()

@@ -99,6 +99,20 @@ Tools:
 - `agent_core/tools/builtin.py`, `editing.py`, `web.py`, `planning.py`: built-in,
   file-editing, web, and planning tools.
 - `agent_core/tools/subagent.py`, `team.py`: sub-agent dispatch and team tools.
+- `agent_core/tools/skill.py`: the model-facing `skill` tool (invoke a loaded skill
+  by name; inline returns the rendered prompt, fork runs a sub-agent).
+
+Skills / slash commands:
+- `agent_core/skills/`: the skill subsystem. `models.py` (`Skill`, `SkillContext`),
+  `frontmatter.py` (PyYAML-backed frontmatter parser; owns fence detection + key
+  normalisation, degrades to no-metadata on bad YAML), `loader.py`
+  (`discover_skill_dirs`/`load_skills`, dedupe by realpath, precedence
+  bundled→user→project→extra), `registry.py` (`SkillRegistry`), `dispatch.py`
+  (`parse_slash_command`/`looks_like_command`/`render_skill_prompt`/`build_skill_prompt`/
+  `fork_preset`), `programmatic.py` + `builtin_programmatic.py` (`@programmatic_skill`
+  self-registered Python skills whose prompt is computed at call time, mirroring the
+  reference's `getPromptForCommand`), `config.py` (`SkillsConfig`), `bundled/*.md`
+  (shipped markdown skills loaded like any other).
 
 Multi-agent:
 - `agent_core/agents/multi.py`: `MultiAgentCoordinator`/`SubAgent` parallel
@@ -107,6 +121,8 @@ Multi-agent:
 
 Cross-cutting:
 - `agent_core/cli.py`: argparse CLI (real entry for `polaris` / `__main__`).
+- `agent_core/chat_commands.py`: built-in interactive-chat `/commands` (`dispatch` →
+  `ChatTurn`); also routes `/skill` invocations. CLI-only, imports no `cli`.
 - `agent_core/permissions.py`: permission modes and risk decisions.
 - `agent_core/hooks.py`: hook surface. Sync pre/post *tool* hooks run inside the
   executor; async *lifecycle* hooks (`UserPromptSubmit`, `PostSampling`,
@@ -189,8 +205,19 @@ Blocking work is an internal detail, never public API:
 - Session-aware tools use `SessionAwareMixin` and are rebound by
   `ReActAgent.__init__`. Do NOT import `ReActAgent` from tools — use the session
   seam.
-- Sub-agents MUST NOT receive the `dispatch_agent` tool, or recursion escapes the
-  intended limit.
+- Sub-agents MUST NOT receive the `dispatch_agent` or `skill` tool, or recursion
+  escapes the intended limit.
+- Skills load eagerly at agent startup (per the eager-loading invariant) into a
+  per-run `SkillRegistry` on the session; a malformed skill file MUST degrade to
+  fewer/zero skills, never crash construction. The model-facing `skill` tool is
+  dropped from the registry when no skill is model-invocable. Skills come from two
+  sources merged into one registry: markdown files (`bundled/` + user/project dirs)
+  and `@programmatic_skill` self-registered Python skills; a programmatic skill's
+  `prompt_fn` MUST degrade to text on error, never raise into the run.
+- Built-in chat `/commands` live in `chat_commands.py` (CLI-only; `dispatch` returns
+  a `ChatTurn`). They wire to real subsystems (compaction/tokens/sessions/mcp/memory)
+  and do NOT exist for the reference's TUI/account/cloud commands. `/model` only
+  mutates `config.model` (read per-turn), never rebuilds the agent.
 - `NullUI` is the default and MUST stay silent/non-interactive for tests and
   library use; `ConsoleUI` is wired only for interactive CLI runs. Streaming UI
   hooks are finalizers when deltas were already printed — do NOT duplicate
@@ -199,13 +226,14 @@ Blocking work is an internal detail, never public API:
   termination, and it MUST NOT fail an otherwise completed run.
 - Advanced capabilities MUST degrade with an actionable install/config error
   rather than an import-time crash.
-- `runs/` and `memory/` are runtime state and are gitignored.
+- `runs/` and `memory/` are runtime state and are gitignored. User/project skills
+  live under `.polaris/skills/`; only `agent_core/skills/bundled/*.md` is in-repo.
 
 ## Configuration
 
 Scalar precedence: built-in defaults → `agent.toml` → environment → CLI flags.
-Memory, output truncation, and MCP tables resolve separately; live-display knobs
-(`--quiet`, `--no-stream`, `--thinking-budget`) are CLI-only. See
+Memory, output truncation, skills (`[skills]`), and MCP tables resolve separately;
+live-display knobs (`--quiet`, `--no-stream`, `--thinking-budget`) are CLI-only. See
 `agent.toml.example` for the supported shape.
 
 ## When Changing Code

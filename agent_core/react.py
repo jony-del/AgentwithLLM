@@ -38,6 +38,13 @@ from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolRes
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, gated_provider
 from agent_core.session import SessionAwareMixin, SessionContext
+from agent_core.skills import (
+    SkillRegistry,
+    SkillsConfig,
+    builtin_programmatic_skills,
+    discover_skill_dirs,
+    load_skills,
+)
 from agent_core.storage import JSONLRunLogger
 from agent_core.tokens import is_supported_model
 from agent_core.tool_use_summary import (
@@ -170,6 +177,8 @@ class ReActConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
     tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
+    # Skill / slash-command subsystem (loaded eagerly at startup when enabled).
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
 
 
 @dataclass(slots=True)
@@ -247,6 +256,10 @@ class ReActAgent:
         self._pending_tool_use_names: list[str] = []
         self.ui = ui or NullUI()
         self.team_store = team_store or TeamStore(Path(self.config.run_dir) / "teams")
+        # Skill / slash-command registry, loaded eagerly from disk (bundled + user +
+        # project) per the eager-loading invariant. Failures degrade to an empty registry
+        # so a bad skill file can never sink agent construction.
+        self.skills = self._load_skills()
         # Per-run shared state for session-aware tools (planning, sub-agents). The
         # registry may have been built before this agent existed (the CLI path), so we
         # rebind every session-aware tool to *this* session below.
@@ -257,10 +270,18 @@ class ReActAgent:
             teammate_factory=self._spawn_teammate,
             team_store=self.team_store,
             ui_notify=self.ui.on_todos,
+            skills=self.skills,
+            run_dir=self.config.run_dir,
+            run_id=self.logger.run_id,
         )
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(self.session)
+        # The model-facing ``skill`` tool is dead weight when no skill is model-invocable,
+        # so drop it from the advertised tool set in that case (saves tokens, avoids
+        # offering the model a tool it can't use).
+        if not self.skills.model_invocable():
+            self.registry.unregister("skill")
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
         permissions = PermissionPolicy(
@@ -295,6 +316,13 @@ class ReActAgent:
         # auto-compact gate thresholds against this (parity with the reference) instead
         # of a char ratio; 0 until the first response with usage arrives.
         self._last_usage_tokens: int = 0
+        # Session-cumulative token totals, surfaced by the chat ``/cost``/``/status``
+        # commands. Summed across every run() on this agent (a chat session reuses one).
+        self._session_input_tokens: int = 0
+        self._session_output_tokens: int = 0
+        # When this agent was created — a chat session builds one agent, so this doubles
+        # as the session start for ``/cost`` duration.
+        self._session_started: float = time.monotonic()
 
     def _build_memory(
         self,
@@ -316,6 +344,49 @@ class ReActAgent:
             self.provider, store, self.config.memory, self._provider_config()
         )
         return store, retriever, extractor
+
+    def _load_skills(self) -> SkillRegistry:
+        """Discover and load skills at startup, or return an empty registry.
+
+        Best-effort and eager (per the eager-loading invariant): a malformed skill file
+        or a missing directory degrades to fewer/zero skills, never an exception that
+        sinks construction. Returns an empty registry when skills are disabled.
+        """
+        if not self.config.skills.enabled:
+            return SkillRegistry()
+        try:
+            workspace = Path.cwd().resolve()
+            dirs = discover_skill_dirs(workspace, self.config.skills)
+            markdown = load_skills(dirs, disabled=self.config.skills.disabled)
+            # Programmatic (Python) skills register themselves via @programmatic_skill and
+            # are merged in alongside markdown ones (same name → markdown wins, since it's
+            # added last and the registry's last-add wins). Honour the disabled list too.
+            blocked = {name.strip().lower() for name in self.config.skills.disabled}
+            programmatic = [s for s in builtin_programmatic_skills() if s.name.lower() not in blocked]
+            return SkillRegistry(programmatic + markdown)
+        except Exception:  # noqa: BLE001 - skill loading must never crash agent construction
+            return SkillRegistry()
+
+    async def compact_now(self, messages: list[Message]) -> tuple[list[Message], int]:
+        """Force a compaction fold of ``messages`` now, ignoring the token gate.
+
+        Reuses the reactive (always-compacts) path and the agent's own summarizer, so a
+        chat ``/compact`` produces the same kind of fold the loop would. Returns the
+        compacted history and the number of characters saved (0 when nothing folded).
+        Best-effort: any failure returns the input unchanged with 0 saved.
+        """
+        before = sum(len(m.content) for m in messages)
+        try:
+            compacted, _events = await self.compression.reactive_compact(
+                messages,
+                model=self.config.model,
+                token_estimator=self._estimate_tokens,
+                summarizer=self._summarizer,
+            )
+        except Exception:  # noqa: BLE001 - a manual compact must never crash the chat session
+            return messages, 0
+        after = sum(len(m.content) for m in compacted)
+        return compacted, max(0, before - after)
 
     @staticmethod
     def default_registry() -> ToolRegistry:
@@ -545,8 +616,12 @@ class ReActAgent:
             # Track the running prompt token count from the response usage, when the
             # provider reports it, so the next turn's auto-compact gate thresholds against
             # real usage (parity with the reference) rather than only a char estimate.
+            # Also accumulate session-wide input/output totals for the chat ``/cost`` and
+            # ``/status`` commands (cheap counters; not part of any contract).
             if result.usage is not None:
                 self._last_usage_tokens = result.usage.context_tokens
+                self._session_input_tokens += result.usage.input_tokens
+                self._session_output_tokens += result.usage.output_tokens
 
             # Re-poll after the turn completes: an Esc pressed *during* the model
             # call (including a single-turn final answer that requests no tools, and
@@ -1204,6 +1279,7 @@ class ReActAgent:
         sub_registry = ToolRegistry()
         excluded = {
             "dispatch_agent",
+            "skill",
             "team_create",
             "task_create",
             "teammate_spawn",
@@ -1220,8 +1296,13 @@ class ReActAgent:
             if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
                 continue  # never hand a child arbitrary command execution implicitly
             sub_registry.register(tool)
-        # Disable memory in the child so a sub-task doesn't recall/extract on its own.
-        child_config = replace(self.config, memory=replace(self.config.memory, enabled=False))
+        # Disable memory (no independent recall/extract) and skills (the child never gets
+        # the ``skill`` tool, so there's nothing to load) in the child.
+        child_config = replace(
+            self.config,
+            memory=replace(self.config.memory, enabled=False),
+            skills=replace(self.config.skills, enabled=False),
+        )
         if model:
             child_config = replace(child_config, model=model)
         agent_id = new_session_id()
@@ -1292,7 +1373,7 @@ class ReActAgent:
         focus_task = await store.get_task(team_id, task_id) if task_id else None
 
         sub_registry = ToolRegistry()
-        excluded = {"dispatch_agent", "team_create", "task_create", "teammate_spawn", "team_status"}
+        excluded = {"dispatch_agent", "skill", "team_create", "task_create", "teammate_spawn", "team_status"}
         for tool in default_tools(workspace=self.session.workspace):
             tool_name = getattr(tool, "name", "")
             if tool_name in excluded:
@@ -1312,6 +1393,7 @@ class ReActAgent:
             self.config,
             permission="auto",
             memory=replace(self.config.memory, enabled=False),
+            skills=replace(self.config.skills, enabled=False),
         )
         if model:
             child_config = replace(child_config, model=model)
