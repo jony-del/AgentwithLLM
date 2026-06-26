@@ -96,6 +96,17 @@ class AgentUI:
         """Ask the user whether to run a tool. Base/non-interactive answer: deny."""
         return "deny"
 
+    async def pick_model(
+        self, current_model: str, current_effort: str | None
+    ) -> tuple[str, str | None] | None:
+        """Interactively choose a model + reasoning effort.
+
+        Returns ``(model_id, effort | None)`` on confirm, or ``None`` to leave the
+        current selection unchanged. The base/silent sink is non-interactive → ``None``,
+        so ``/model`` falls back to its text listing outside a live terminal.
+        """
+        return None
+
 
 class NullUI(AgentUI):
     """The default: a silent sink. Present so the loop can always emit events."""
@@ -172,6 +183,15 @@ class ConsoleUI(AgentUI):
 
     def on_compaction_end(self, before_chars: int, after_chars: int, detail: str, reactive: bool) -> None:
         self._renderer.end_compaction(before_chars, after_chars, detail, reactive)
+
+    async def pick_model(
+        self, current_model: str, current_effort: str | None
+    ) -> tuple[str, str | None] | None:
+        # Runs on the main event loop (called directly from the chat dispatch), so no
+        # thread bridging is needed. Non-TTY is handled inside run_model_picker → None.
+        from agent_core.terminal.model_picker import run_model_picker
+
+        return await run_model_picker(current_model, current_effort)
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission

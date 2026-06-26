@@ -70,7 +70,48 @@ def create_keybindings(on_toggle_verbose: Callable[[], None] | None = None) -> K
 
     @kb.add("enter")
     def _(event) -> None:
-        event.current_buffer.validate_and_handle()
+        # When the completion dropdown is open with an item highlighted (↑/↓), Enter
+        # accepts that completion AND submits in one keypress — pick a command and run
+        # it without a second Enter. With nothing highlighted it just submits the typed
+        # line, so bare `/resume` (no selection) still runs as typed.
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state is not None and state.current_completion is not None:
+            buffer.apply_completion(state.current_completion)
+        buffer.validate_and_handle()
+
+    @kb.add("tab")
+    def _(event) -> None:
+        # Tab accepts the highlighted completion WITHOUT running it (keep editing); with
+        # nothing highlighted it opens the menu / selects the first match.
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state is not None and state.current_completion is not None:
+            buffer.apply_completion(state.current_completion)
+        else:
+            buffer.start_completion(select_first=True)
+
+    @kb.add("right")
+    def _(event) -> None:
+        # Right-arrow accepts a highlighted completion inline (no run); otherwise it is
+        # an ordinary cursor move.
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state is not None and state.current_completion is not None:
+            buffer.apply_completion(state.current_completion)
+        else:
+            buffer.cursor_right()
+
+    @kb.add("backspace")
+    def _(event) -> None:
+        # Delete one char, then re-open completion while still in a single-line slash
+        # context so the menu re-filters as the user erases letters (complete_while_typing
+        # only auto-triggers on insertion, not deletion). Non-slash prose is untouched.
+        buffer = event.current_buffer
+        buffer.delete_before_cursor(1)
+        text = buffer.document.text_before_cursor
+        if "\n" not in text and text.startswith("/"):
+            buffer.start_completion(select_first=False)
 
     @kb.add(_SHIFT_ENTER_KEY)       # Shift+Enter — modern terminals (via patched VT100 table)
     @kb.add("escape", "enter")      # Alt/Meta+Enter

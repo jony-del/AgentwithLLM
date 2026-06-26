@@ -57,6 +57,11 @@ _MAX_EFFORT_MARKERS = ("opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-
 _BASE_EFFORT_LEVELS = ("low", "medium", "high")
 
 
+# Every effort level the provider knows, weakest → strongest. ``available_efforts``
+# filters this per model so the UI offers exactly what the model will accept.
+ALL_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
 def _effort_for_model(model: str, level: Any) -> str | None:
     """Resolve the ``effort`` level to send for ``model``, or ``None`` to omit it.
 
@@ -77,6 +82,16 @@ def _effort_for_model(model: str, level: Any) -> str | None:
     if level == "max" and any(marker in name for marker in _MAX_EFFORT_MARKERS):
         return level
     return None
+
+
+def available_efforts(model: str) -> tuple[str, ...]:
+    """Effort levels ``model`` actually accepts, weakest → strongest (``()`` for none).
+
+    Derived from :func:`_effort_for_model` so it can never drift from what the provider
+    sends: Haiku → ``()``, Sonnet 4.6 / Opus 4.6 → low/medium/high/max, Opus 4.7+ /
+    Fable / Mythos → all five, Opus 4.5 → low/medium/high.
+    """
+    return tuple(level for level in ALL_EFFORT_LEVELS if _effort_for_model(model, level) == level)
 
 
 class _StreamAccumulator:

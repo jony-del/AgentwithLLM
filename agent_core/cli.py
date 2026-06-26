@@ -5,6 +5,7 @@ import asyncio
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agent_core.config import (
     resolve_compression_config,
@@ -36,8 +37,12 @@ from agent_core.transcript import (
     load_transcript,
     new_session_id,
     project_dir,
+    session_label,
 )
 from agent_core.ui import AgentUI, ConsoleUI, NullUI
+
+if TYPE_CHECKING:
+    from prompt_toolkit.completion import Completer
 
 
 def _resolve(args: argparse.Namespace) -> dict:
@@ -254,12 +259,20 @@ def _resolve_session(
     return loaded.session_id, build_chain(loaded), []
 
 
-async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
+async def _async_input(
+    prompt: str,
+    ui: "AgentUI | None" = None,
+    completer: "Completer | None" = None,
+    bottom_toolbar: "Callable[[], Any] | None" = None,
+) -> str | None:
     """Read one chat message without blocking the loop; ``None`` on EOF (exit).
 
     On a real terminal this is a multi-line ``prompt_toolkit`` session (Enter
     sends, Shift+Enter/Alt+Enter/Ctrl+J inserts a newline, Ctrl+O toggles
-    verbose, Ctrl-C clears the current input in place via our keybinding). The
+    verbose, Ctrl-C clears the current input in place via our keybinding). When a
+    ``completer`` is supplied, typing ``/`` pops a styled dropdown of slash-commands
+    / skills (and session candidates for ``/resume``). ``bottom_toolbar`` (when
+    given) renders a persistent status line under the prompt. The
     ``KeyboardInterrupt`` branch below is a fallback for the rare terminal/race
     where the default abort still fires. When stdin is not a TTY (piped/CI)
     ``prompt_toolkit`` can't drive the terminal, so we fall back to a
@@ -269,17 +282,27 @@ async def _async_input(prompt: str, ui: "AgentUI | None" = None) -> str | None:
         return await _threaded_input(prompt)
 
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.shortcuts import CompleteStyle
     from prompt_toolkit.formatted_text import HTML
     from agent_core.terminal.keybindings import create_keybindings
+    from agent_core.terminal.theme import completion_menu_style
 
     session = getattr(_async_input, "_session", None)
     if session is None:
         toggle = getattr(ui, "toggle_verbose", None)
-        session = PromptSession(key_bindings=create_keybindings(toggle), multiline=True)
+        session = PromptSession(
+            key_bindings=create_keybindings(toggle),
+            multiline=True,
+            completer=completer,
+            complete_while_typing=True,  # menu pops the moment '/' is typed
+            complete_style=CompleteStyle.COLUMN,  # single column shows the description meta
+            style=completion_menu_style(),
+            bottom_toolbar=bottom_toolbar,
+        )
         _async_input._session = session
 
     try:
-        line = await session.prompt_async(HTML("<ansicyan>›</ansicyan> "))
+        line = await session.prompt_async(HTML(f"<ansicyan>{prompt}</ansicyan> "))
         return line
     except EOFError:
         return None  # Ctrl-D / closed stdin → leave the chat loop
@@ -382,8 +405,18 @@ def chat_command(args: argparse.Namespace) -> int:
         # so the agent finally has cross-turn memory within a session.
         await _seed_transcript(built)
         history: list[Message] = list(built.history)
+        from agent_core.terminal.completion import SlashCompleter
+
+        completer = SlashCompleter(agent)
+
+        def _toolbar() -> str:
+            # Persistent status line: the active model + effort, so the current config
+            # (and the effect of the /model picker) is always visible. Read per render.
+            effort = agent.config.effort or "—"
+            return f" model: {agent.config.model}  ·  effort: {effort}  ·  /help for commands "
+
         while True:
-            task = await _async_input("> ", ui)
+            task = await _async_input("›", ui, completer, _toolbar)
             if task is None:  # EOF
                 break
             task = task.strip()
@@ -441,7 +474,7 @@ def sessions_command(args: argparse.Namespace) -> int:
     print(f"Sessions for {cwd}:\n")
     for info in infos:
         when = _dt.datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
-        label = info.title or info.first_prompt or "(empty)"
+        label = session_label(info)
         branch = f" [{info.git_branch}]" if info.git_branch else ""
         print(f"  {info.session_id}  {when}  ({info.message_count} msgs){branch}")
         print(f"      {label}")

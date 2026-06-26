@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from prompt_toolkit.keys import Keys
 
 from agent_core.terminal import keybindings
@@ -46,6 +48,132 @@ def _ctrl_d(kb):
         if binding.keys == (Keys.ControlD,):
             return binding.handler
     raise AssertionError("no Ctrl+D binding registered")
+
+
+def _enter(kb):
+    # Enter is historically Ctrl+M; it is the binding registered via kb.add("enter").
+    for binding in kb.bindings:
+        if binding.keys == (Keys.ControlM,):
+            return binding.handler
+    raise AssertionError("no Enter binding registered")
+
+
+def _by_key(kb, key):
+    for binding in kb.bindings:
+        if binding.keys == (key,):
+            return binding.handler
+    raise AssertionError(f"no binding for {key}")
+
+
+class _CompletionBuffer(_Buffer):
+    """Buffer stand-in tracking submit / accept / completion-restart / cursor moves."""
+
+    def __init__(self, text: str = "", current_completion=None, has_state: bool = True) -> None:
+        super().__init__(text)
+        self.complete_state = (
+            SimpleNamespace(current_completion=current_completion) if has_state else None
+        )
+        self.submitted = 0
+        self.applied = []
+        self.started = []  # select_first args passed to start_completion
+        self.cursor_right_called = 0
+
+    @property
+    def document(self):
+        return SimpleNamespace(text_before_cursor=self.text)
+
+    def validate_and_handle(self) -> None:
+        self.submitted += 1
+
+    def apply_completion(self, completion) -> None:
+        self.applied.append(completion)
+
+    def start_completion(self, select_first: bool = False) -> None:
+        self.started.append(select_first)
+
+    def cursor_right(self) -> None:
+        self.cursor_right_called += 1
+
+    def delete_before_cursor(self, count: int = 1) -> None:
+        if self.text:
+            self.text = self.text[:-count]
+
+
+# --- Enter: accept AND run -----------------------------------------------------
+
+
+def test_enter_submits_when_no_completion_open() -> None:
+    handler = _enter(create_keybindings())
+    buffer = _CompletionBuffer("a message", current_completion=None)
+    handler(_Event(buffer))
+    assert buffer.submitted == 1 and buffer.applied == []
+
+
+def test_enter_accepts_and_runs_highlighted_completion() -> None:
+    handler = _enter(create_keybindings())
+    sentinel = object()
+    buffer = _CompletionBuffer("/res", current_completion=sentinel)
+    handler(_Event(buffer))
+    # one keypress both accepts the completion and submits — no second Enter needed
+    assert buffer.applied == [sentinel] and buffer.submitted == 1
+
+
+def test_enter_submits_when_complete_state_absent() -> None:
+    handler = _enter(create_keybindings())
+    buffer = _CompletionBuffer("hi", has_state=False)
+    handler(_Event(buffer))
+    assert buffer.submitted == 1 and buffer.applied == []
+
+
+# --- Tab / Right: accept WITHOUT running ---------------------------------------
+
+
+def test_tab_accepts_highlighted_without_running() -> None:
+    handler = _by_key(create_keybindings(), Keys.ControlI)
+    sentinel = object()
+    buffer = _CompletionBuffer("/res", current_completion=sentinel)
+    handler(_Event(buffer))
+    assert buffer.applied == [sentinel] and buffer.submitted == 0
+
+
+def test_tab_opens_completion_when_nothing_highlighted() -> None:
+    handler = _by_key(create_keybindings(), Keys.ControlI)
+    buffer = _CompletionBuffer("/re", current_completion=None)
+    handler(_Event(buffer))
+    assert buffer.applied == [] and buffer.started == [True]
+
+
+def test_right_accepts_highlighted_without_running() -> None:
+    handler = _by_key(create_keybindings(), Keys.Right)
+    sentinel = object()
+    buffer = _CompletionBuffer("/res", current_completion=sentinel)
+    handler(_Event(buffer))
+    assert buffer.applied == [sentinel] and buffer.submitted == 0
+
+
+def test_right_moves_cursor_when_nothing_highlighted() -> None:
+    handler = _by_key(create_keybindings(), Keys.Right)
+    buffer = _CompletionBuffer("hello", current_completion=None)
+    handler(_Event(buffer))
+    assert buffer.cursor_right_called == 1 and buffer.applied == []
+
+
+# --- Backspace: re-filter the menu in a slash context --------------------------
+
+
+def test_backspace_restarts_completion_in_slash_context() -> None:
+    handler = _by_key(create_keybindings(), Keys.ControlH)
+    buffer = _CompletionBuffer("/res")
+    handler(_Event(buffer))
+    assert buffer.text == "/re"  # deleted one char
+    assert buffer.started == [False]  # menu re-opened to re-filter
+
+
+def test_backspace_does_not_complete_on_prose() -> None:
+    handler = _by_key(create_keybindings(), Keys.ControlH)
+    buffer = _CompletionBuffer("hello")
+    handler(_Event(buffer))
+    assert buffer.text == "hell" and buffer.started == []
 
 
 def test_ctrl_d_exits_on_empty_buffer() -> None:

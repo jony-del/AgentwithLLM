@@ -458,6 +458,15 @@ def latest_session(proj_dir: str | Path) -> SessionInfo | None:
     return sessions[0] if sessions else None
 
 
+def session_label(info: SessionInfo) -> str:
+    """Human-readable one-liner for a session: custom title, else first prompt, else placeholder.
+
+    The single source of truth for how a session is named in the UI (``polaris sessions``,
+    the ``/resume`` list, and the slash-command completer) so a raw UUID is never shown.
+    """
+    return info.title or info.first_prompt or "(empty)"
+
+
 def find_session(root: str | Path, cwd: str | Path, session_id: str) -> Path | None:
     """Locate a session file by id: current project first, then across all projects.
 

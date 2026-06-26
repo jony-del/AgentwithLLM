@@ -19,6 +19,29 @@ claude_theme = Theme({
 })
 
 
+def completion_menu_style():
+    """prompt_toolkit ``Style`` for the slash-command dropdown.
+
+    White-on-black options with the highlighted command rendered blue+bold so the
+    current selection stands out; meta (the grey description) and scrollbar kept low
+    chrome. prompt_toolkit merges this over its default style, so only these classes
+    change. Imported lazily so ``theme`` stays rich-only at module load.
+    """
+    from prompt_toolkit.styles import Style
+
+    return Style.from_dict(
+        {
+            "completion-menu": "bg:#000000 #ffffff",
+            "completion-menu.completion": "bg:#000000 #ffffff",
+            "completion-menu.completion.current": "bg:#000000 #5fafff bold",
+            "completion-menu.meta.completion": "bg:#000000 #808080",
+            "completion-menu.meta.completion.current": "bg:#1c1c1c #5fafff",
+            "scrollbar.background": "bg:#1c1c1c",
+            "scrollbar.button": "bg:#5fafff",
+        }
+    )
+
+
 def risk_style(risk: str) -> str:
     """Theme style name for a tool risk, falling back to ``dim`` when unknown.
 

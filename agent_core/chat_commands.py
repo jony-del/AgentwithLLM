@@ -38,6 +38,7 @@ from agent_core.transcript import (
     list_sessions,
     load_transcript,
     project_dir,
+    session_label,
 )
 from agent_core.ui import AgentUI
 
@@ -76,8 +77,14 @@ async def _cmd_help(agent: "ReActAgent", ui: AgentUI, args: str, history: list[M
     print("Commands:")
     for name, (_, summary) in sorted(_COMMAND_HELP.items()):
         print(f"  /{name:<10} {summary}")
-    print("  /<skill> [args]  Run a skill (see /skills).")
-    print("  /exit, /quit     Leave the chat.")
+    print("  /exit, /quit  Leave the chat.")
+    skills = sorted(agent.skills.user_invocable(), key=lambda skill: skill.name)
+    if skills:
+        print("\nSkills (run as /<name> [args]):")
+        for skill in skills:
+            tag = " [fork]" if skill.context is SkillContext.FORK else ""
+            print(f"  /{skill.name}{tag} — {skill.description or '(no description)'}")
+    print("\nTip: type / to open a menu of commands and skills.")
     print("Anything else is sent to the agent as a normal message.")
     return ChatTurn()
 
@@ -101,8 +108,12 @@ async def _cmd_clear(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
 
 async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     mcp_servers = [s for s in resolve_mcp_config().servers if s.enabled]
+    thinking = agent.config.thinking_budget
+    thinking_label = f"{thinking:,} tokens" if isinstance(thinking, int) and thinking > 0 else "off"
     print("Status:")
     print(f"  model       {agent.config.model}")
+    print(f"  effort      {agent.config.effort or '—'}")
+    print(f"  thinking    {thinking_label}")
     print(f"  permission  {agent.config.permission}")
     print(f"  session     {agent.session_id}")
     print(f"  workspace   {agent.session.workspace}")
@@ -155,9 +166,20 @@ async def _cmd_compact(agent: "ReActAgent", ui: AgentUI, args: str, history: lis
 async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     target = args.strip()
     if not target:
-        print(f"Current model: {agent.config.model}")
-        print("Known families: claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5-*, claude-fable-5")
-        print("Switch with: /model <name>")
+        # Bare /model opens the interactive model + effort picker (↑/↓ model, ←/→ effort).
+        chosen = await ui.pick_model(agent.config.model, agent.config.effort)
+        if chosen is None:
+            # Non-interactive (or cancelled): fall back to a plain listing.
+            print(f"Current model: {agent.config.model}  ·  effort: {agent.config.effort or '—'}")
+            print("Known families: claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5-*, claude-fable-5")
+            print("Switch with: /model <name>  (or run /model in a terminal to pick interactively)")
+            return ChatTurn()
+        model, effort = chosen
+        agent.config.model = model
+        if effort is not None:
+            agent.config.effort = effort
+        tail = f"  ·  effort: {effort}" if effort is not None else "  ·  (no effort levels)"
+        print(f"Model switched to {model}{tail} (takes effect on your next message).")
         return ChatTurn()
     if not tokens.is_supported_model(target):
         print(f"Unsupported model {target!r}. Name a known family (e.g. claude-sonnet-4-6).")
@@ -210,8 +232,11 @@ async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list
             return ChatTurn()
         print("Resumable sessions (newest first):")
         for info in infos[:10]:
-            print(f"  {info.session_id}")
-        print("Resume with: /resume <id>")
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.modified))
+            branch = f" [{info.git_branch}]" if info.git_branch else ""
+            print(f"  {session_label(info)[:70]}")
+            print(f"      {when} · {info.message_count} msgs{branch} · id {info.session_id[:8]}")
+        print("Resume with: /resume <id>  (or type /resume and pick from the menu)")
         return ChatTurn()
 
     path = find_session(session_dir, workspace, target)
