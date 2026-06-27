@@ -25,11 +25,19 @@ from agent_core.context import (
     current_date_line,
     prepend_user_context,
 )
+from agent_core.builtin_hooks import (
+    CompactionLoggerHook,
+    PostSamplingObserverHook,
+    StopCompletionHook,
+    UserPromptContextHook,
+)
+from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapter
 from agent_core.hooks import (
     HookContext,
     HookEvent,
     HookOutcome,
     HookPipeline,
+    HooksConfig,
     MaxOutputPostHook,
     OutputLimitConfig,
 )
@@ -179,6 +187,9 @@ class ReActConfig:
     tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
     # Skill / slash-command subsystem (loaded eagerly at startup when enabled).
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    # Lifecycle-hook subsystem: built-in programmatic hook toggles + config-driven
+    # external hooks. Assembled into the shared HookPipeline by _build_hook_pipeline.
+    hooks: HooksConfig = field(default_factory=HooksConfig)
 
 
 @dataclass(slots=True)
@@ -289,14 +300,11 @@ class ReActAgent:
             prompter=self.ui.confirm_tool if self.ui.is_live else None,
         )
         # One pipeline shared by the executor (pre/post tool hooks) and the run loop
-        # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop).
-        self.hooks = hooks or HookPipeline(
-            post_hooks=[
-                MaxOutputPostHook.from_config(
-                    self.config.output, spill_dir=str(Path(self.config.run_dir) / "outputs")
-                )
-            ]
-        )
+        # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop). An
+        # injected pipeline (tests/library use) wins; otherwise assemble the default from
+        # config — the MaxOutput tool hook plus the enabled built-in + external lifecycle
+        # hooks. Built after session/logger exist so hooks can close over them.
+        self.hooks = hooks or self._build_hook_pipeline()
         self.executor = ToolExecutor(
             self.registry,
             permissions,
@@ -1244,6 +1252,58 @@ class ReActAgent:
             "effort": self.config.effort,
             "stream": self.config.stream,
         }
+
+    def _build_hook_pipeline(self) -> HookPipeline:
+        """Assemble the default HookPipeline from ``config.hooks``.
+
+        Always carries the ``MaxOutputPostHook`` tool post-hook (the prior default). When
+        the hook subsystem is enabled, layers in the toggled built-in programmatic
+        lifecycle hooks (closing over this run's session/logger) and any config-driven
+        external adapters (each appended to the pipeline list for its event). A bad spec or
+        a transport whose dependency is unavailable drops that one hook; assembly never
+        raises into construction, so a misconfigured ``[hooks]`` table degrades gracefully.
+        """
+        pipeline = HookPipeline(
+            post_hooks=[
+                MaxOutputPostHook.from_config(
+                    self.config.output, spill_dir=str(Path(self.config.run_dir) / "outputs")
+                )
+            ]
+        )
+        hooks_config = self.config.hooks
+        if not hooks_config.enabled:
+            return pipeline
+
+        builtin = hooks_config.builtin
+        if builtin.stop_completion:
+            pipeline.stop_hooks.append(StopCompletionHook(self.session))
+        if builtin.post_sampling_observer:
+            pipeline.post_sampling_hooks.append(PostSamplingObserverHook(self.logger))
+        if builtin.compaction_logger:
+            # One instance serves both Pre and PostCompact (it implements both methods).
+            compaction_hook = CompactionLoggerHook(self.logger)
+            pipeline.pre_compact_hooks.append(compaction_hook)
+            pipeline.post_compact_hooks.append(compaction_hook)
+        if builtin.user_prompt_context:
+            pipeline.user_prompt_hooks.append(UserPromptContextHook())
+
+        for spec in hooks_config.external:
+            attr = LIFECYCLE_EVENT_ATTRS.get(spec.event)
+            if attr is None:
+                continue  # non-lifecycle event (e.g. a tool event) — not handled here.
+            try:
+                adapter = build_external_adapter(
+                    spec,
+                    logger=self.logger,
+                    provider=self.provider,
+                    base_config=self._provider_config(),
+                    subagent_factory=self.session.subagent_factory,
+                )
+            except Exception:  # noqa: BLE001 - a bad spec must not sink construction.
+                adapter = None
+            if adapter is not None:
+                getattr(pipeline, attr).append(adapter)
+        return pipeline
 
     def _trace_fields(self) -> dict[str, object]:
         """Tracing metadata stamped on a run's opening log event.

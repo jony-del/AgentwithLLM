@@ -104,6 +104,53 @@ project_dir = ".polaris/skills"    # per-project skills, resolved against the wo
 skills_dirs = []               # extra highest-precedence directories to scan
 disabled = []                  # skill names to suppress (e.g. ["commit"])
 
+# --- Lifecycle hooks --------------------------------------------------------
+# Two sources feed the five lifecycle hooks (UserPromptSubmit / PostSampling /
+# PreCompact / PostCompact / Stop), both folded into one pipeline:
+#   * Built-in programmatic hooks (in-process, hold live objects) — toggled below.
+#   * Config-driven external hooks ([[hooks.external]]) — subprocess / HTTP / re-prompt
+#     / verifier agent, declared here without touching code.
+# Any hook failure degrades to "allow + log" and never sinks a run.
+[hooks]
+enabled = true                 # false (or AGENT_HOOKS=0) turns the whole subsystem off
+
+[hooks.builtin]
+stop_completion = true         # block a stop once if update_todos still has open items,
+                               #   injecting a continuation directive (capped by max_stop_blocks)
+post_sampling_observer = true  # fire-and-forget turn telemetry to runs/*.jsonl (hook_observe)
+compaction_logger = true       # log trigger + pre/post message & summary sizes around a fold
+user_prompt_context = false    # off by default (context.py already injects userContext);
+                               #   on = reject empty prompts + inject a per-prompt timestamp
+
+# External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
+# carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
+# {"hookSpecificOutput": {"additionalContext": "..."}} is injected). `prompt`/`agent` are
+# advisory (inject the model/sub-agent reply as context, never block). `matcher` only
+# applies to Pre/PostCompact (matched against the trigger: "auto" | "reactive"). Every call
+# is bounded by a single `timeout` (seconds) with kill-await; the hook receives a bounded
+# JSON projection of the context on stdin / as the request body.
+# SECURITY: these run arbitrary commands/URLs from THIS project's agent.toml — only enable
+# hooks you trust.
+#
+# [[hooks.external]]
+# event = "UserPromptSubmit"
+# type = "command"
+# command = "python3 ./.polaris/hooks/validate_prompt.py"
+# timeout = 5
+#
+# [[hooks.external]]
+# event = "PreCompact"
+# type = "command"
+# matcher = "auto"             # only on the proactive fold, not the 413-reactive path
+# command = "./.polaris/hooks/precompact.sh"
+#
+# [[hooks.external]]
+# event = "Stop"
+# type = "prompt"              # advisory: re-prompt the LLM for a completion check
+# prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
+# model = "claude-haiku-4-5-20251001"
+# timeout = 30
+
 # --- Context compaction -----------------------------------------------------
 # How the history is shrunk when it grows large. Cheap deterministic stages (snip,
 # microcompact) run every turn; the prefix-collapse stage folds old turns into one

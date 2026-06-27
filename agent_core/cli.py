@@ -12,6 +12,7 @@ from agent_core.config import (
     resolve_concurrency_config,
     resolve_config,
     resolve_context_config,
+    resolve_hooks_config,
     resolve_limits_config,
     resolve_mcp_config,
     resolve_memory_config,
@@ -187,6 +188,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         session_dir=_session_dir(args),
         persist_compaction_boundary=resolve_persist_compaction_boundary(),
         skills=resolve_skills_config(),
+        hooks=resolve_hooks_config(),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)

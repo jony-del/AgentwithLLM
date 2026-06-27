@@ -124,12 +124,23 @@ Cross-cutting:
 - `agent_core/chat_commands.py`: built-in interactive-chat `/commands` (`dispatch` →
   `ChatTurn`); also routes `/skill` invocations. CLI-only, imports no `cli`.
 - `agent_core/permissions.py`: permission modes and risk decisions.
-- `agent_core/hooks.py`: hook surface. Sync pre/post *tool* hooks run inside the
-  executor; async *lifecycle* hooks (`UserPromptSubmit`, `PostSampling`,
+- `agent_core/hooks.py`: hook surface + `[hooks]` config dataclasses
+  (`HooksConfig`/`BuiltinHooksConfig`/`ExternalHookSpec`). Sync pre/post *tool* hooks run
+  inside the executor; async *lifecycle* hooks (`UserPromptSubmit`, `PostSampling`,
   `PreCompact`, `PostCompact`, blockable `Stop`) fire at `react.py` loop
-  boundaries via `HookPipeline.run_*`. All are programmatic (constructor-injected);
-  a `HookOutcome.block` is event-specific (abort prompt / skip compaction / keep
-  running). Stop-blocking is bounded by `config.max_stop_blocks`.
+  boundaries via `HookPipeline.run_*`. A `HookOutcome.block` is event-specific (abort
+  prompt / skip compaction / keep running). Stop-blocking is bounded by
+  `config.max_stop_blocks`. The lifecycle pipeline has **two sources**, assembled by
+  `ReActAgent._build_hook_pipeline` from `config.hooks` (default content, no longer empty):
+  - `agent_core/builtin_hooks.py`: built-in *programmatic* hooks (hold live objects —
+    `StopCompletionHook` reads `session.todos`; observers write `runs/*.jsonl`), toggled by
+    `[hooks.builtin]` (observation/control on by default, injection off).
+  - `agent_core/hook_adapters.py`: config-driven *external* hooks from `[[hooks.external]]`
+    (`command`/`http`/`prompt`/`agent`), each adapter implements the lifecycle Protocols and
+    folds in the same pipeline. Every external call has a single non-stacked timeout +
+    kill-await and **degrades to allow + log on any failure — never sink a run**; the context
+    crosses the boundary as a bounded JSON projection (`project_hook_input`), never the full
+    history. A still-injectable override `hooks=` arg to `ReActAgent` bypasses assembly.
 - `agent_core/config.py`: config resolution (defaults → `agent.toml` → env → CLI).
 - `agent_core/memory/`: optional cross-conversation memory.
 - `agent_core/mcp/`: MCP client, config, tool adapter.

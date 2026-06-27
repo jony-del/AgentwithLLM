@@ -341,6 +341,34 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 > 「解析 + 适配器 + 投影」三块，把外部进程包装成同一接口的回调。**契约不变，循环不动，
 > 风险可控。**
 
+### 4.4 已实现（配置驱动加载器 + 内建默认钩子）✅
+
+§4.3 的演进指引已落地，**契约不变、循环不动**：
+
+- **解析**：`config.py:resolve_hooks_config()` 解析 `[hooks]` 表 ——
+  `enabled` 主开关 + `[hooks.builtin]` 内建钩子开关 + 扁平 `[[hooks.external]]` 外部规格数组
+  （`event`/`type` + 类型相关字段）。坏 event/type、缺必填字段的 spec 静默丢弃（不崩）。
+  配置模型在 `hooks.py`（`HooksConfig`/`BuiltinHooksConfig`/`ExternalHookSpec`）。
+- **内建默认钩子**（`builtin_hooks.py`，对标参考的内建 PostSampling/Stop）——填上「默认为空」的洞：
+  `StopCompletionHook`（读 `session.todos`，有未完成项时 block 一次并注入续跑指令，
+  受 `max_stop_blocks` 封顶）、`PostSamplingObserverHook`（fire-and-forget 写 `runs/*.jsonl`
+  观测）、`CompactionLoggerHook`（Pre/PostCompact 观测，一个实例挂两端）、
+  `UserPromptContextHook`（默认关：空 prompt 阻断 + 时间戳注入）。
+- **适配器 + 投影**：`hook_adapters.py` 四种 transport（`command` 子进程 stdin/stdout JSON +
+  退出码 2=block、`http` POST、`prompt` 复用 gated provider、`agent` 复用 depth-limited
+  `subagent_factory`），均实现全部生命周期 Protocol；`project_hook_input()` 产出**有界**
+  JSON 投影（最近 N 条消息 + 截断 content）。**单次非堆叠超时 + kill-await**，任何失败
+  **降级为放行 + 记日志，绝不 sink run**；matcher 仅对 Pre/PostCompact 匹配 `trigger`。
+- **装配**：`ReActAgent._build_hook_pipeline()`（在 `session`/`logger` 就绪后）把
+  `MaxOutputPostHook` + 启用的内建钩子 + 外部适配器装进同一 `HookPipeline`；`cli.build_agent`
+  仅多传 `hooks=resolve_hooks_config()`。构造参数 `hooks=` 仍是测试/库用的覆盖逃生口。
+- **安全/降级**：外部钩子仅从项目内 `agent.toml` 读取（信任边界）；`enabled=false`/`AGENT_HOOKS=0`
+  整体关闭；坏 spec/缺依赖的钩子被单独丢弃，构造不崩。
+
+**与参考的差异（务实简化）**：`prompt`/`agent` 钩子为 advisory（注入上下文，不 block），
+硬阻断只走 `command`/`http`；matcher 不实现参考的 `if`（permission-rule 语法），只做
+Pre/PostCompact 的 trigger 匹配。
+
 ---
 
 ## 结论
@@ -369,5 +397,9 @@ TombstoneMessage`，最终 `return` 一个 `Terminal`（带 `reason`）。`Query
 > - **skill / slash command 系统（§3.2-6）已完成**：新增 `agent_core/skills/`（Markdown
 >   `SKILL.md` 加载器 + bundled 内置技能 + 用户/项目技能目录）、chat 的 `/command` 派发、
 >   可被模型调用的 `skill` 工具（inline/fork 两种上下文），57 个新测试，全套 523 绿。
+> - **配置驱动外部钩子加载器 + 内建默认钩子（§4.4）已完成**：`resolve_hooks_config` +
+>   `builtin_hooks.py`（StopCompletion/PostSampling 观测/Compaction 日志/UserPrompt 注入）+
+>   `hook_adapters.py`（command/http/prompt/agent 适配器 + 有界 JSON 投影 + 超时/kill-await +
+>   降级放行），由 `ReActAgent._build_hook_pipeline` 装配。生命周期钩子不再「默认为空」。
 > - **仍未实现**：流式工具执行（§3.2-7）、413 分级恢复完整链（§3.2-8）、fallback 模型
->   切换（§3.2-9）、规则驱动权限（§3.2-4）、配置驱动外部钩子加载器（§4.3）。
+>   切换（§3.2-9）、规则驱动权限（§3.2-4）。

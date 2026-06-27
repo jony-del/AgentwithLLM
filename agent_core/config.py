@@ -358,6 +358,90 @@ def resolve_skills_config(config_file: str | Path = "agent.toml") -> "SkillsConf
     return config
 
 
+_HOOK_TYPES = frozenset({"command", "http", "prompt", "agent"})
+
+
+def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig":
+    """Resolve the lifecycle-hook subsystem from the ``[hooks]`` toml table, then env.
+
+    Shape::
+
+        [hooks]
+        enabled = true
+        [hooks.builtin]            # toggles for built-in programmatic hooks
+        stop_completion = true
+        ...
+        [[hooks.external]]         # config-driven external hooks (flat array)
+        event = "Stop"
+        type = "command"
+        command = "..."
+
+    Precedence: defaults → ``[hooks]`` → ``AGENT_HOOKS`` env (only toggles ``enabled``).
+    External specs are validated leniently: an entry with an unknown ``event``/``type``
+    or a missing required field for its type is dropped (not raised), so a sloppy config
+    degrades to fewer hooks instead of crashing construction. Unknown keys are ignored.
+    """
+    from agent_core.hooks import ExternalHookSpec, HookEvent, HooksConfig
+
+    table = load_agent_toml(config_file).get("hooks")
+    config = HooksConfig()
+    if isinstance(table, dict):
+        if "enabled" in table:
+            config.enabled = coerce_to_type(bool, table["enabled"])
+        builtin = table.get("builtin")
+        if isinstance(builtin, dict):
+            config.builtin = config.builtin.from_dict(builtin)
+        external = table.get("external")
+        if isinstance(external, list):
+            valid_events = {event.value for event in HookEvent}
+            for entry in external:
+                spec = _parse_external_hook(entry, valid_events)
+                if spec is not None:
+                    config.external.append(spec)
+
+    env = os.getenv("AGENT_HOOKS")
+    if env is not None:
+        config.enabled = env.strip().lower() in {"1", "true", "yes", "on"}
+    return config
+
+
+def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHookSpec | None":
+    """Validate one ``[[hooks.external]]`` entry into an ``ExternalHookSpec`` or ``None``.
+
+    Drops the entry (returns ``None``) when it is not a table, names an unknown event or
+    type, or omits the field its type needs (``command``/``url``/``prompt``). This is the
+    "degrade, don't crash" guard for untrusted-ish project config.
+    """
+    from agent_core.hooks import ExternalHookSpec
+
+    if not isinstance(entry, dict):
+        return None
+    event = str(entry.get("event", "")).strip()
+    hook_type = str(entry.get("type", "")).strip().lower()
+    if event not in valid_events or hook_type not in _HOOK_TYPES:
+        return None
+    required = {"command": "command", "http": "url", "prompt": "prompt", "agent": "prompt"}[hook_type]
+    if not entry.get(required):
+        return None
+    headers = entry.get("headers")
+    timeout_raw = entry.get("timeout", 30.0)
+    try:
+        timeout = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    return ExternalHookSpec(
+        event=event,
+        type=hook_type,
+        matcher=(str(entry["matcher"]) if entry.get("matcher") is not None else None),
+        command=(str(entry["command"]) if entry.get("command") is not None else None),
+        url=(str(entry["url"]) if entry.get("url") is not None else None),
+        prompt=(str(entry["prompt"]) if entry.get("prompt") is not None else None),
+        model=(str(entry["model"]) if entry.get("model") is not None else None),
+        headers=(dict(headers) if isinstance(headers, dict) else None),
+        timeout=max(0.1, timeout),
+    )
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

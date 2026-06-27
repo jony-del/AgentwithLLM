@@ -36,6 +36,67 @@ class OutputLimitConfig:
         return overlay_dataclass(cls(), data)
 
 
+# --- Hooks configuration (the ``[hooks]`` toml table) --------------------------
+#
+# Two sources feed the lifecycle ``HookPipeline`` (assembled in ``ReActAgent``):
+#   * ``BuiltinHooksConfig`` toggles a handful of always-available in-process hooks
+#     (``builtin_hooks.py``) — observation/steering that needs live objects.
+#   * ``ExternalHookSpec`` declares a config-driven external hook (subprocess / HTTP /
+#     re-prompt / verifier agent), wrapped by an adapter in ``hook_adapters.py`` so it
+#     implements the same Protocols and folds in the same pipeline.
+
+
+@dataclass(slots=True)
+class BuiltinHooksConfig:
+    """Per-hook on/off switches for the built-in programmatic lifecycle hooks.
+
+    Observation/control hooks default on; the injection hook defaults off to avoid
+    double-grounding the prompt (``context.py`` already injects a userContext block).
+    """
+
+    stop_completion: bool = True
+    post_sampling_observer: bool = True
+    compaction_logger: bool = True
+    user_prompt_context: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "BuiltinHooksConfig":
+        from agent_core.config import overlay_dataclass
+
+        return overlay_dataclass(cls(), data)
+
+
+@dataclass(slots=True)
+class ExternalHookSpec:
+    """One config-driven external hook entry from ``[[hooks.external]]``.
+
+    ``event`` names the :class:`HookEvent` it attaches to; ``type`` is one of
+    ``command`` / ``http`` / ``prompt`` / ``agent``. ``matcher`` only applies to the
+    compaction events (matched against the ``trigger``: ``auto`` / ``reactive``). The
+    remaining fields are type-specific; an adapter reads what it needs and ignores the
+    rest. Unparseable/incomplete specs are dropped at load time, never raised.
+    """
+
+    event: str
+    type: str
+    matcher: str | None = None
+    command: str | None = None
+    url: str | None = None
+    prompt: str | None = None
+    model: str | None = None
+    headers: dict[str, str] | None = None
+    timeout: float = 30.0
+
+
+@dataclass(slots=True)
+class HooksConfig:
+    """Resolved ``[hooks]`` table: master switch + builtin toggles + external specs."""
+
+    enabled: bool = True
+    builtin: BuiltinHooksConfig = field(default_factory=BuiltinHooksConfig)
+    external: list[ExternalHookSpec] = field(default_factory=list)
+
+
 @dataclass(slots=True)
 class HookResult:
     allowed: bool = True
