@@ -25,8 +25,12 @@ def test_missing_table_yields_defaults(tmp_path: Path) -> None:
     assert config.builtin.stop_completion is True
     assert config.builtin.post_sampling_observer is True
     assert config.builtin.compaction_logger is True
-    assert config.builtin.user_prompt_context is False
     assert config.external == []
+    # The prompt-input firewall is on by default with its baseline thresholds.
+    assert config.prompt_validation.enabled is True
+    assert config.prompt_validation.max_chars == 100_000
+    assert config.prompt_validation.reject_control_chars is True
+    assert config.prompt_validation.neutralize_framing is True
 
 
 def test_builtin_toggles_and_enabled(tmp_path: Path) -> None:
@@ -37,15 +41,34 @@ def test_builtin_toggles_and_enabled(tmp_path: Path) -> None:
         enabled = false
         [hooks.builtin]
         stop_completion = false
-        user_prompt_context = true
+        compaction_logger = false
         """,
     )
     config = resolve_hooks_config(path)
     assert config.enabled is False
     assert config.builtin.stop_completion is False
-    assert config.builtin.user_prompt_context is True
+    assert config.builtin.compaction_logger is False
     # Unmentioned toggles keep their defaults.
     assert config.builtin.post_sampling_observer is True
+
+
+def test_prompt_validation_table_resolves(tmp_path: Path) -> None:
+    path = _write_toml(
+        tmp_path,
+        """
+        [hooks.prompt_validation]
+        enabled = false
+        max_chars = 5000
+        neutralize_framing = false
+        bogus_key = "ignored"
+        """,
+    )
+    config = resolve_hooks_config(path)
+    assert config.prompt_validation.enabled is False
+    assert config.prompt_validation.max_chars == 5000
+    assert config.prompt_validation.neutralize_framing is False
+    # Unmentioned fields keep defaults; unknown keys are ignored (don't crash).
+    assert config.prompt_validation.reject_control_chars is True
 
 
 def test_external_specs_parse(tmp_path: Path) -> None:

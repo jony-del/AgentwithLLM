@@ -134,7 +134,12 @@ Cross-cutting:
   `ReActAgent._build_hook_pipeline` from `config.hooks` (default content, no longer empty):
   - `agent_core/builtin_hooks.py`: built-in *programmatic* hooks (hold live objects —
     `StopCompletionHook` reads `session.todos`; observers write `runs/*.jsonl`), toggled by
-    `[hooks.builtin]` (observation/control on by default, injection off).
+    `[hooks.builtin]` (observation/control all on by default). Plus `PromptValidationHook`, the
+    `UserPromptSubmit` input firewall (`[hooks.prompt_validation]`, **on by default**):
+    provenance-based — empty/oversize/control-char prompts are blocked, and reserved framing
+    tags inside the *user task* are *neutralized, not rejected* (escaped + wrapped in an
+    `<untrusted_user_input>` envelope + guard preamble + audited). It rewrites the task via
+    `HookOutcome.transformed_prompt`, which the loop persists/sends in place of the raw prompt.
   - `agent_core/hook_adapters.py`: config-driven *external* hooks from `[[hooks.external]]`
     (`command`/`http`/`prompt`/`agent`), each adapter implements the lifecycle Protocols and
     folds in the same pipeline. Every external call has a single non-stacked timeout +

@@ -119,8 +119,20 @@ stop_completion = true         # block a stop once if update_todos still has ope
                                #   injecting a continuation directive (capped by max_stop_blocks)
 post_sampling_observer = true  # fire-and-forget turn telemetry to runs/*.jsonl (hook_observe)
 compaction_logger = true       # log trigger + pre/post message & summary sizes around a fold
-user_prompt_context = false    # off by default (context.py already injects userContext);
-                               #   on = reject empty prompts + inject a per-prompt timestamp
+
+# UserPromptSubmit input firewall — validates each submitted task before the first model call.
+# Provenance-based: the harness's control framing (<system-reminder>, <tool_output_ref>, ...) is
+# trusted only because it comes from the framework's own injection path; the same tags appearing
+# inside a user task are untrusted DATA. Rules in priority order: empty -> block; over max_chars
+# -> block (paste-bomb / context-overflow guard); disallowed control chars -> block; reserved
+# framing tags -> NEUTRALIZE not reject (escape the tags, wrap the task in an
+# <untrusted_user_input> envelope, prepend a guard preamble, and audit it in runs/*.jsonl). A
+# neutralized prompt is what gets persisted + sent. Any internal error degrades to allow.
+[hooks.prompt_validation]
+enabled = true                 # on by default; false skips the firewall entirely
+max_chars = 100000             # reject prompts larger than this; 0 disables the size cap
+reject_control_chars = true    # reject NUL / C0 control chars (tab/newline/CR are allowed)
+neutralize_framing = true      # wrap+escape spoofed control framing instead of rejecting it
 
 # External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
 # carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
@@ -132,24 +144,24 @@ user_prompt_context = false    # off by default (context.py already injects user
 # SECURITY: these run arbitrary commands/URLs from THIS project's agent.toml — only enable
 # hooks you trust.
 #
-# [[hooks.external]]
-# event = "UserPromptSubmit"
-# type = "command"
-# command = "python3 ./.polaris/hooks/validate_prompt.py"
-# timeout = 5
+[[hooks.external]]
+event = "UserPromptSubmit"
+type = "command"
+command = "python3 ./.polaris/hooks/validate_prompt.py"
+timeout = 5
 #
-# [[hooks.external]]
-# event = "PreCompact"
-# type = "command"
-# matcher = "auto"             # only on the proactive fold, not the 413-reactive path
-# command = "./.polaris/hooks/precompact.sh"
+[[hooks.external]]
+event = "PreCompact"
+type = "command"
+matcher = "auto"             # only on the proactive fold, not the 413-reactive path
+command = "./.polaris/hooks/precompact.sh"
 #
-# [[hooks.external]]
-# event = "Stop"
-# type = "prompt"              # advisory: re-prompt the LLM for a completion check
-# prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
-# model = "claude-haiku-4-5-20251001"
-# timeout = 30
+[[hooks.external]]
+event = "Stop"
+type = "prompt"              # advisory: re-prompt the LLM for a completion check
+prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
+model = "claude-haiku-4-5-20251001"
+timeout = 30
 
 # --- Context compaction -----------------------------------------------------
 # How the history is shrunk when it grows large. Cheap deterministic stages (snip,

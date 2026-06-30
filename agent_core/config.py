@@ -371,6 +371,9 @@ def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig
         [hooks.builtin]            # toggles for built-in programmatic hooks
         stop_completion = true
         ...
+        [hooks.prompt_validation]  # UserPromptSubmit input firewall (on by default)
+        enabled = true
+        ...
         [[hooks.external]]         # config-driven external hooks (flat array)
         event = "Stop"
         type = "command"
@@ -391,6 +394,9 @@ def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig
         builtin = table.get("builtin")
         if isinstance(builtin, dict):
             config.builtin = config.builtin.from_dict(builtin)
+        prompt_validation = table.get("prompt_validation")
+        if isinstance(prompt_validation, dict):
+            config.prompt_validation = config.prompt_validation.from_dict(prompt_validation)
         external = table.get("external")
         if isinstance(external, list):
             valid_events = {event.value for event in HookEvent}

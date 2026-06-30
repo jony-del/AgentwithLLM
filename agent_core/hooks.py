@@ -50,17 +50,48 @@ class OutputLimitConfig:
 class BuiltinHooksConfig:
     """Per-hook on/off switches for the built-in programmatic lifecycle hooks.
 
-    Observation/control hooks default on; the injection hook defaults off to avoid
-    double-grounding the prompt (``context.py`` already injects a userContext block).
+    All three default on; they are observation/control only. Prompt-input validation is
+    configured separately under :class:`PromptValidationConfig` (it carries thresholds, not
+    just a toggle).
     """
 
     stop_completion: bool = True
     post_sampling_observer: bool = True
     compaction_logger: bool = True
-    user_prompt_context: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "BuiltinHooksConfig":
+        from agent_core.config import overlay_dataclass
+
+        return overlay_dataclass(cls(), data)
+
+
+@dataclass(slots=True)
+class PromptValidationConfig:
+    """Settings for the ``UserPromptSubmit`` prompt-input firewall (``PromptValidationHook``).
+
+    A production input-validation seam at the prompt boundary, on by default. The firewall is
+    provenance-based: framing tags are *trusted* only because they come from the framework's own
+    injection path (``context.py``); the same tags appearing inside a user task are DATA. The
+    deterministic rules in priority order:
+
+    - empty / whitespace-only prompt → block.
+    - prompt longer than ``max_chars`` → block (paste-bomb / context-overflow / cost guard;
+      ``0`` disables the cap).
+    - disallowed control chars (NUL / C0 except tab/newline/CR) → block, when
+      ``reject_control_chars`` (corrupt/binary input).
+    - reserved framing tags present → when ``neutralize_framing``, *neutralize rather than
+      reject*: escape the tags, wrap the task in an untrusted-data envelope, and prepend a guard
+      preamble. Never blocks (legitimate prompts — e.g. working on this repo — contain them).
+    """
+
+    enabled: bool = True
+    max_chars: int = 100_000
+    reject_control_chars: bool = True
+    neutralize_framing: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "PromptValidationConfig":
         from agent_core.config import overlay_dataclass
 
         return overlay_dataclass(cls(), data)
@@ -94,6 +125,7 @@ class HooksConfig:
 
     enabled: bool = True
     builtin: BuiltinHooksConfig = field(default_factory=BuiltinHooksConfig)
+    prompt_validation: PromptValidationConfig = field(default_factory=PromptValidationConfig)
     external: list[ExternalHookSpec] = field(default_factory=list)
 
 
@@ -185,11 +217,17 @@ class HookOutcome:
     ``<system-reminder>``) so a hook can steer the next turn — the continuation
     directive for a blocked Stop, or extra grounding for a submitted prompt. ``reason``
     is the human-readable explanation surfaced in logs and the injected message.
+
+    ``transformed_prompt`` is UserPromptSubmit-only: when set (and the prompt is not
+    blocked), it replaces the model-facing task text. The loop persists and sends the
+    transformed version, so a hook can neutralize untrusted framing in the user's input
+    before the first model call. Ignored on every other event.
     """
 
     block: bool = False
     additional_context: str | None = None
     reason: str | None = None
+    transformed_prompt: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -267,14 +305,29 @@ class HookPipeline:
     def _fold(outcomes: list[HookOutcome], blocked: HookOutcome | None) -> HookOutcome:
         contexts = [o.additional_context for o in outcomes if o.additional_context]
         joined = "\n".join(contexts) if contexts else None
+        # Last hook to rewrite the prompt wins (UserPromptSubmit only); carried on both paths.
+        transformed = next(
+            (o.transformed_prompt for o in reversed(outcomes) if o.transformed_prompt is not None),
+            None,
+        )
         if blocked is not None:
             return HookOutcome(
                 block=True,
                 additional_context=blocked.additional_context or joined,
                 reason=blocked.reason,
+                transformed_prompt=transformed,
                 metadata=blocked.metadata,
             )
-        return HookOutcome(block=False, additional_context=joined)
+        merged_meta: dict[str, object] = {}
+        for o in outcomes:
+            if o.metadata:
+                merged_meta.update(o.metadata)
+        return HookOutcome(
+            block=False,
+            additional_context=joined,
+            transformed_prompt=transformed,
+            metadata=merged_meta,
+        )
 
     async def run_user_prompt(self, ctx: HookContext) -> HookOutcome:
         seen: list[HookOutcome] = []
