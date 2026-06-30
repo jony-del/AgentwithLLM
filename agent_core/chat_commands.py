@@ -65,9 +65,12 @@ Handler = Callable[["ReActAgent", AgentUI, str, "list[Message]"], "Awaitable[Cha
 
 
 def _estimate_tokens(agent: "ReActAgent", history: list[Message]) -> int:
-    """Best current prompt-size estimate: the last real usage, or a char/4 fallback."""
-    chars = sum(len(m.content) for m in history)
-    return max(getattr(agent, "_last_usage_tokens", 0), chars // 4)
+    """Best current prompt-size estimate, identical to the auto-compact gate.
+
+    Delegates to the agent's own estimator (anchored real usage + rough delta) so
+    ``/context`` reports exactly what the gate thresholds against.
+    """
+    return agent._estimate_tokens(history)
 
 
 # --- handlers ----------------------------------------------------------------

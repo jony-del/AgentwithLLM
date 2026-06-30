@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from agent_core import tokens
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, TokenUsage, ToolCall
 from agent_core.providers.base import LLMProvider, StreamHandler
 
@@ -44,7 +45,7 @@ class FakeProvider(LLMProvider):
     @staticmethod
     def _estimate_usage(messages: list[Message]) -> TokenUsage:
         """Char/4 input estimate plus a small fixed output, deterministic by design."""
-        input_tokens = sum(len(m.content) for m in messages) // 4
+        input_tokens = tokens.rough_token_estimate_for_messages(messages)
         return TokenUsage(input_tokens=input_tokens, output_tokens=8)
 
     def _compute(self, messages: list[Message]) -> LLMResult:

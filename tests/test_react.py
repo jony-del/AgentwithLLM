@@ -8,6 +8,7 @@ from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCa
 from agent_core.providers.fake import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.storage import JSONLRunLogger
+from agent_core.ui import AgentUI
 
 
 class RejectEchoHook:
@@ -329,3 +330,87 @@ async def test_reactive_recovery_shrinks_single_oversized_round(tmp_path: Path) 
     assert result.answer == "done"
     # The giant assistant message was head/tail-truncated (carries the shrink marker).
     assert any(m.metadata.get("compressed") == "ptl_shrink" for m in provider.last_messages)
+
+
+class _RecordingUI(AgentUI):
+    """Captures the token-usage and recap events the loop emits."""
+
+    def __init__(self) -> None:
+        self.usages: list[dict] = []
+        self.recap: dict | None = None
+
+    def on_token_usage(self, usage: dict) -> None:
+        self.usages.append(usage)
+
+    def on_run_completed(self, stats: dict) -> None:
+        self.recap = stats
+
+
+async def test_run_emits_token_usage_and_recap_tokens(tmp_path: Path) -> None:
+    logger = JSONLRunLogger(tmp_path)
+    ui = _RecordingUI()
+    agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger, ui=ui)
+
+    await agent.run("hello")
+
+    # FakeProvider reports usage every turn → at least one live token line was emitted,
+    # carrying the running context size, the model window, and cumulative in/out.
+    assert ui.usages, "expected at least one on_token_usage emission"
+    last = ui.usages[-1]
+    assert last["window"] > 0
+    assert last["context_tokens"] >= 0
+    assert last["input_tokens"] > 0
+    # The recap carries the run's token totals (FakeProvider's fixed +8 output per turn).
+    assert ui.recap is not None
+    assert ui.recap["output_tokens"] > 0
+    assert "input_tokens" in ui.recap and "context_tokens" in ui.recap
+
+
+# --- _estimate_tokens: anchored real-usage + rough delta ---------------------
+
+
+def _estimate_agent(tmp_path: Path) -> ReActAgent:
+    logger = JSONLRunLogger(tmp_path)
+    return ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger)
+
+
+def test_estimate_tokens_no_anchor_is_rough_estimate_of_all(tmp_path: Path) -> None:
+    agent = _estimate_agent(tmp_path)
+    msgs = [Message("user", "x" * 40), Message("assistant", "y" * 8)]
+    # No message carries usage → full rough estimate (per-message len//4: 10 + 2).
+    assert agent._estimate_tokens(msgs) == 12
+
+
+def test_estimate_tokens_anchors_on_usage_plus_delta_since(tmp_path: Path) -> None:
+    agent = _estimate_agent(tmp_path)
+    msgs = [
+        Message("user", "x" * 4000),  # before the anchor — its real cost is folded into usage
+        Message("assistant", "done", metadata={"usage_tokens": 5000}),
+        Message("tool", "z" * 40),  # added since the anchor → rough estimate (40//4 = 10)
+        Message("user", "w" * 8),  # 8//4 = 2
+    ]
+    # anchor (5000) + rough(messages after it) = 5000 + 10 + 2. The pre-anchor 4000-char
+    # message is NOT char-counted — its real footprint is already inside the 5000 anchor.
+    assert agent._estimate_tokens(msgs) == 5012
+
+
+def test_estimate_tokens_uses_the_most_recent_anchor(tmp_path: Path) -> None:
+    agent = _estimate_agent(tmp_path)
+    msgs = [
+        Message("assistant", "a", metadata={"usage_tokens": 1000}),
+        Message("tool", "x" * 40),
+        Message("assistant", "b", metadata={"usage_tokens": 7000}),  # most recent anchor
+        Message("tool", "y" * 8),  # 8//4 = 2
+    ]
+    assert agent._estimate_tokens(msgs) == 7002
+
+
+def test_estimate_tokens_falls_back_when_anchor_folded_away(tmp_path: Path) -> None:
+    agent = _estimate_agent(tmp_path)
+    # After a compaction fold the anchor-bearing assistant turns are gone; the summary is
+    # a plain USER message with no usage_tokens → fall back to a full rough estimate.
+    msgs = [
+        Message("user", "summary " + "s" * 33, metadata={"post_compact": True}),  # 40//4 = 10
+        Message("user", "y" * 8),  # 8//4 = 2
+    ]
+    assert agent._estimate_tokens(msgs) == 12

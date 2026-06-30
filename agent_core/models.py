@@ -96,6 +96,16 @@ class TokenUsage:
     def context_tokens(self) -> int:
         return self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
 
+    @property
+    def total_tokens(self) -> int:
+        """Full per-response footprint: the sent prompt (incl. cache) plus the output.
+
+        Mirrors the reference ``getTokenCountFromUsage``. This is the value anchored on
+        an assistant turn for the next gate estimate — once the turn is in history, its
+        generated output counts toward the prompt the next request will carry.
+        """
+        return self.context_tokens + self.output_tokens
+
 
 @dataclass(slots=True)
 class LLMResult:

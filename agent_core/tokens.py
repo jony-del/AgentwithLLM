@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid an import cycle (models is import-light too, but stay defensive)
+    from agent_core.models import Message
 
 """Pure-stdlib token math for context-window accounting and the auto-compact gate.
 
@@ -62,6 +67,32 @@ MODEL_OUTPUT_TOKENS: tuple[tuple[str, int, int], ...] = (
 # Env override (percent of the effective window, 0 < p <= 100) that lowers the
 # auto-compact threshold for easier testing. Mirrors ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``.
 AUTOCOMPACT_PCT_OVERRIDE_ENV = "AGENT_AUTOCOMPACT_PCT_OVERRIDE"
+
+# Average characters per token for the cheap char-based fallback estimate. Mirrors the
+# reference ``roughTokenCountEstimation`` default; ~4 chars/token holds for English/code.
+ROUGH_BYTES_PER_TOKEN = 4
+
+
+def rough_token_estimate(text: str, *, bytes_per_token: int = ROUGH_BYTES_PER_TOKEN) -> int:
+    """Cheap char-based token estimate (``len // bytes_per_token``).
+
+    The single source of truth for the ``//4`` heuristic that used to be duplicated as
+    inline lambdas across the compaction layer and providers. Used only as a fallback /
+    mid-turn delta estimate — real API ``usage`` is preferred whenever it is available.
+    """
+    if not text:
+        return 0
+    return len(text) // max(1, bytes_per_token)
+
+
+def rough_token_estimate_for_messages(messages: Iterable["Message"]) -> int:
+    """Rough token estimate over a sequence of messages (sum of per-content estimates).
+
+    Mirrors ``roughTokenCountEstimationForMessages``. Sums ``len(content) // 4`` over the
+    messages — used both as the no-usage fallback and to estimate the messages added
+    since the last anchored API response.
+    """
+    return sum(rough_token_estimate(m.content) for m in messages)
 
 
 def context_window_for_model(model: str) -> int:

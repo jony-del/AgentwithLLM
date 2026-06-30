@@ -28,8 +28,8 @@ from agent_core.context import (
 from agent_core.builtin_hooks import (
     CompactionLoggerHook,
     PostSamplingObserverHook,
+    PromptValidationHook,
     StopCompletionHook,
-    UserPromptContextHook,
 )
 from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapter
 from agent_core.hooks import (
@@ -54,6 +54,7 @@ from agent_core.skills import (
     load_skills,
 )
 from agent_core.storage import JSONLRunLogger
+from agent_core import tokens
 from agent_core.tokens import is_supported_model
 from agent_core.tool_use_summary import (
     ToolUseSummaryConfig,
@@ -328,6 +329,11 @@ class ReActAgent:
         # commands. Summed across every run() on this agent (a chat session reuses one).
         self._session_input_tokens: int = 0
         self._session_output_tokens: int = 0
+        # Per-run token totals (reset each run() — see below), surfaced in the final recap.
+        # Unlike the ``_session_*`` counters these reflect only the current run.
+        self._run_input_tokens: int = 0
+        self._run_output_tokens: int = 0
+        self._run_context_tokens: int = 0
         # When this agent was created — a chat session builds one agent, so this doubles
         # as the session start for ``/cost`` duration.
         self._session_started: float = time.monotonic()
@@ -433,6 +439,9 @@ class ReActAgent:
         self._pending_tool_use_summary = None
         self._background_hook_tasks = set()
         self._run_start_time = time.monotonic()
+        self._run_input_tokens = 0
+        self._run_output_tokens = 0
+        self._run_context_tokens = 0
         # A live UI's interactive permission prompt runs on a worker thread; give it
         # the running loop so it can bridge the prompt back onto the main thread.
         if self.ui.is_live:
@@ -457,16 +466,12 @@ class ReActAgent:
                 messages.insert(insert_at, past)
                 insert_at += 1
                 self._last_message_uuid = past.uuid
-        # Chain + persist the new task (parent = last history message, or None).
-        user_message.parent_uuid = self._last_message_uuid
-        if self.transcript is not None:
-            await self.transcript.append_message(user_message)
-        self._last_message_uuid = user_message.uuid
-
         # UserPromptSubmit fires once the task is in place but before the first model
-        # call, so a hook can either abort the run (block) or inject extra grounding
-        # (additional_context) that the model sees this turn.
-        blocked = await self._run_user_prompt_hooks(messages, task)
+        # call, so a hook can abort the run (block), rewrite the task to neutralize untrusted
+        # framing (transformed_prompt), or inject extra grounding (additional_context). The new
+        # task is chained + persisted inside the helper, *after* the hook, so a rewrite is what
+        # gets recorded and sent to the model.
+        blocked = await self._run_user_prompt_hooks(messages, user_message, task)
         if blocked is not None:
             return blocked
 
@@ -627,9 +632,15 @@ class ReActAgent:
             # Also accumulate session-wide input/output totals for the chat ``/cost`` and
             # ``/status`` commands (cheap counters; not part of any contract).
             if result.usage is not None:
-                self._last_usage_tokens = result.usage.context_tokens
+                # ``total_tokens`` (prompt incl. cache + this turn's output) is the anchor
+                # the gate carries forward — once this turn is in history its output counts
+                # toward the next request's prompt.
+                self._last_usage_tokens = result.usage.total_tokens
                 self._session_input_tokens += result.usage.input_tokens
                 self._session_output_tokens += result.usage.output_tokens
+                self._run_input_tokens += result.usage.input_tokens
+                self._run_output_tokens += result.usage.output_tokens
+                self._run_context_tokens = result.usage.context_tokens
 
             # Re-poll after the turn completes: an Esc pressed *during* the model
             # call (including a single-turn final answer that requests no tools, and
@@ -663,7 +674,25 @@ class ReActAgent:
             # next turn (required by the API when thinking and tool use span turns).
             if result.thinking_blocks:
                 assistant_metadata["thinking_blocks"] = result.thinking_blocks
+            # Anchor this turn's full token footprint on the message itself so the gate
+            # estimate can walk back to it and add only the rough cost of messages added
+            # since (ports the reference's per-message ``tokenCountWithEstimation``).
+            if result.usage is not None:
+                assistant_metadata["usage_tokens"] = result.usage.total_tokens
             await self._emit(messages, Message("assistant", result.content, metadata=assistant_metadata))
+
+            # Surface the running token usage to a live UI, once per turn (the only
+            # granularity available — usage is known only after the response). Lands right
+            # under the streamed assistant block; NullUI ignores it.
+            if result.usage is not None:
+                self.ui.on_token_usage(
+                    {
+                        "context_tokens": self._run_context_tokens,
+                        "window": tokens.context_window_for_model(self.config.model),
+                        "input_tokens": self._run_input_tokens,
+                        "output_tokens": self._run_output_tokens,
+                    }
+                )
 
             # PostSampling: fire-and-forget after the assistant turn is in the history, so
             # an observational hook (e.g. background extraction) overlaps the next model
@@ -743,7 +772,10 @@ class ReActAgent:
             "duration": duration,
             "steps": step,
             "reason": reason,
-            "tool_counts": tool_counts
+            "tool_counts": tool_counts,
+            "input_tokens": self._run_input_tokens,
+            "output_tokens": self._run_output_tokens,
+            "context_tokens": self._run_context_tokens,
         }
         self.ui.on_run_completed(stats)
 
@@ -890,22 +922,41 @@ class ReActAgent:
     # flow. ``self.hooks`` is the same pipeline the executor uses for tool hooks.
 
     async def _run_user_prompt_hooks(
-        self, messages: list[Message], task: str
+        self, messages: list[Message], user_message: Message, task: str
     ) -> "AgentRunResult | None":
-        """Fire UserPromptSubmit. Returns a terminal result if a hook blocked the run,
-        else ``None`` (after injecting any additional_context for the model to see)."""
+        """Fire UserPromptSubmit, then chain + persist the (possibly neutralized) task.
+
+        Returns a terminal result if a hook blocked the run, else ``None`` (after persisting
+        the task and injecting any additional_context for the model to see). Persistence happens
+        here, *after* the hook, so a ``transformed_prompt`` rewrite is what gets recorded + sent;
+        with no user-prompt hooks the task is simply persisted unchanged.
+        """
+        outcome = HookOutcome()
+        if self.hooks.user_prompt_hooks:
+            ctx = HookContext(
+                event=HookEvent.USER_PROMPT_SUBMIT,
+                messages=messages,
+                session_id=self.session_id,
+                prompt=task,
+            )
+            outcome = await self.hooks.run_user_prompt(ctx)
+            if outcome.transformed_prompt is not None:
+                user_message.content = outcome.transformed_prompt
+        # Chain + persist the new task (parent = last history message, or None).
+        user_message.parent_uuid = self._last_message_uuid
+        if self.transcript is not None:
+            await self.transcript.append_message(user_message)
+        self._last_message_uuid = user_message.uuid
         if not self.hooks.user_prompt_hooks:
             return None
-        ctx = HookContext(
-            event=HookEvent.USER_PROMPT_SUBMIT,
-            messages=messages,
-            session_id=self.session_id,
-            prompt=task,
-        )
-        outcome = await self.hooks.run_user_prompt(ctx)
         await self.logger.write(
             "hook",
-            {"event": "UserPromptSubmit", "blocked": outcome.block, "reason": outcome.reason},
+            {
+                "event": "UserPromptSubmit",
+                "blocked": outcome.block,
+                "reason": outcome.reason,
+                **(outcome.metadata or {}),
+            },
         )
         if outcome.block:
             answer = outcome.reason or "Request blocked by a UserPromptSubmit hook."
@@ -1236,12 +1287,18 @@ class ReActAgent:
     def _estimate_tokens(self, messages: list[Message]) -> int:
         """Estimate the prompt token footprint for the auto-compact gate.
 
-        Uses the larger of the last response's reported context tokens and a cheap
-        char/4 estimate of the current history — so the gate reflects real usage once a
-        response arrives, but still rises with the not-yet-sent delta and works offline
-        (FakeProvider reports usage too, but char/4 keeps the gate honest mid-turn).
+        Ports the reference ``tokenCountWithEstimation``: walk back to the most recent
+        assistant turn that carries a real per-response token count (anchored in
+        ``metadata['usage_tokens']``) and add only a cheap char-based estimate of the
+        messages appended since it. So the gate reflects real API usage once a response
+        arrives, charges the not-yet-sent delta at ~4 chars/token, and falls back to a
+        full rough estimate offline or after a fold drops the anchor.
         """
-        return max(self._last_usage_tokens, sum(len(m.content) for m in messages) // 4)
+        for i in range(len(messages) - 1, -1, -1):
+            anchor = messages[i].metadata.get("usage_tokens")
+            if isinstance(anchor, int):
+                return anchor + tokens.rough_token_estimate_for_messages(messages[i + 1:])
+        return tokens.rough_token_estimate_for_messages(messages)
 
     def _provider_config(self) -> dict[str, object]:
         return {
@@ -1284,8 +1341,10 @@ class ReActAgent:
             compaction_hook = CompactionLoggerHook(self.logger)
             pipeline.pre_compact_hooks.append(compaction_hook)
             pipeline.post_compact_hooks.append(compaction_hook)
-        if builtin.user_prompt_context:
-            pipeline.user_prompt_hooks.append(UserPromptContextHook())
+        if hooks_config.prompt_validation.enabled:
+            pipeline.user_prompt_hooks.append(
+                PromptValidationHook(hooks_config.prompt_validation)
+            )
 
         for spec in hooks_config.external:
             attr = LIFECYCLE_EVENT_ATTRS.get(spec.event)

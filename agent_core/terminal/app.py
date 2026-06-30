@@ -38,6 +38,15 @@ _FOLD_VERB = {"read": "Read", "search": "Searched", "list": "Listed"}
 _FOLD_UNIT = {"read": "files", "search": "patterns", "list": "dirs"}
 
 
+def _human_count(n: int) -> str:
+    """Compact human count: ``45200 -> '45.2k'``, ``1_000_000 -> '1.0M'``, else plain."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(int(n))
+
+
 class TerminalRenderer:
     def __init__(self, color: bool = True, preview_chars: int = 240, verbose: bool = False):
         # no_color honors --color; force_terminal keeps ANSI when the CLI wired a
@@ -271,6 +280,22 @@ class TerminalRenderer:
         self.close_block()
         self.emit(Text(f"{SYMBOLS['stopped']} stopped: {human}", style="warning"))
 
+    def print_token_usage(self, usage: dict[str, Any]) -> None:
+        """Dim one-line running token figure, emitted under each model turn."""
+        self.close_block()
+        context = int(usage.get("context_tokens", 0) or 0)
+        window = int(usage.get("window", 0) or 0)
+        in_tok = int(usage.get("input_tokens", 0) or 0)
+        out_tok = int(usage.get("output_tokens", 0) or 0)
+        if context <= 0 and in_tok <= 0 and out_tok <= 0:
+            return
+        ctx_part = f"ctx {_human_count(context)}"
+        if window > 0:
+            pct = context / window * 100
+            ctx_part += f"/{_human_count(window)} ({pct:.1f}%)"
+        line = Text(f"{SYMBOLS['compacting']} {ctx_part} · {_human_count(in_tok)} in / {_human_count(out_tok)} out", style="dim")
+        self.emit(line)
+
     def print_run_completed(self, stats: dict[str, Any]) -> None:
         self.close_block()
         duration = stats.get("duration", 0)
@@ -290,6 +315,11 @@ class TerminalRenderer:
         details = [f"{c} {t}" for t, c in sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)]
         if details:
             line.append("  ·  " + ", ".join(details), style="dim")
+        in_tok = int(stats.get("input_tokens", 0) or 0)
+        out_tok = int(stats.get("output_tokens", 0) or 0)
+        if in_tok > 0 or out_tok > 0:
+            total = in_tok + out_tok
+            line.append(f"  ·  {_human_count(total)} tok ({_human_count(in_tok)} in / {_human_count(out_tok)} out)", style="dim")
         self.emit(line)
 
     # --- compaction --------------------------------------------------------

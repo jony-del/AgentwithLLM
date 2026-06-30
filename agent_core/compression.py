@@ -20,9 +20,10 @@ StageReporter = Callable[[int, int, "CompressionEvent"], None]
 Summarizer = Callable[[list[Message]], Awaitable[str]]
 
 # Injected sync callback that estimates the token footprint of a message list for the
-# auto-compact gate. Mirrors the ``summarizer`` injection seam: the real agent passes
-# ``max(last_usage, char/4)``; offline/test runs default to ``char_count // 4`` so the
-# gate stays deterministic for FakeProvider.
+# auto-compact gate. Mirrors the ``summarizer`` injection seam: the real agent passes the
+# last anchored API usage plus a rough estimate of the messages added since; offline/test
+# runs default to ``rough_token_estimate_for_messages`` so the gate stays deterministic
+# for FakeProvider.
 TokenEstimator = Callable[[list[Message]], int]
 
 # Markers stamped on a folded summary block (either track). A prior summary is itself
@@ -269,7 +270,7 @@ def truncate_head_for_ptl_retry(
     if len(rounds) < 2:
         return None
 
-    estimator = token_estimator or (lambda msgs: sum(len(m.content) for m in msgs) // 4)
+    estimator = token_estimator or tokens.rough_token_estimate_for_messages
     if token_gap is not None and token_gap > 0:
         drop = 0
         acc = 0
@@ -307,7 +308,7 @@ def shrink_oversize_messages(
     """
     if tokens_to_drop <= 0:
         return None
-    estimator = token_estimator or (lambda msgs: sum(len(m.content) for m in msgs) // 4)
+    estimator = token_estimator or tokens.rough_token_estimate_for_messages
     # Largest non-preserved messages first — shrink where it frees the most.
     order = sorted(
         (i for i, m in enumerate(messages) if not is_preserved(m)),
@@ -331,7 +332,7 @@ def shrink_oversize_messages(
             message.role, content, message.name, {**message.metadata, "compressed": "ptl_shrink"}
         )
         changed = True
-        dropped += max(0, saved_chars) // 4
+        dropped += max(0, saved_chars) // tokens.ROUGH_BYTES_PER_TOKEN
         if dropped >= tokens_to_drop:
             break
     if not changed:
@@ -454,8 +455,9 @@ class CompressionPipeline:
         """Proactive compaction, gated on the running token count crossing the threshold.
 
         The gate is token-based (parity with the reference): an injected
-        ``token_estimator`` (real agent: ``max(last_usage, char/4)``; default offline:
-        ``char_count // 4``) is compared against ``tokens.auto_compact_threshold(model)``.
+        ``token_estimator`` (real agent: last anchored API usage + a rough estimate of the
+        messages added since; default offline: ``rough_token_estimate_for_messages``) is
+        compared against ``tokens.auto_compact_threshold(model)``.
         Below the line we return unchanged; at/above it we run the shrink stages.
 
         A circuit breaker tracks consecutive failures (stages ran but the result is
@@ -519,7 +521,7 @@ class CompressionPipeline:
         )
 
     def _estimate(self, messages: list[Message], token_estimator: TokenEstimator | None) -> int:
-        estimator = token_estimator or (lambda msgs: self._char_count(msgs) // 4)
+        estimator = token_estimator or tokens.rough_token_estimate_for_messages
         return estimator(messages)
 
     async def _run_stages(

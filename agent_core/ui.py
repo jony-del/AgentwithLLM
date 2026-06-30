@@ -74,8 +74,17 @@ class AgentUI:
     def on_stopped(self, reason: str, human: str) -> None:
         """A safety-net guard (cancel / max_steps / deadline) ended the run."""
 
+    def on_token_usage(self, usage: dict[str, Any]) -> None:
+        """Running token usage after a model turn (UI-only; emitted once per response).
+
+        ``usage`` carries ``context_tokens`` (running prompt size), ``window`` (the
+        model's context window), and cumulative ``input_tokens``/``output_tokens`` for
+        the run. The base sink ignores it — only a live UI renders the figure.
+        """
+
     def on_run_completed(self, stats: dict[str, Any]) -> None:
-        """The run has finished. ``stats`` contains duration, steps, tool_counts, and reason."""
+        """The run has finished. ``stats`` carries duration, steps, tool_counts, reason,
+        and the run's input_tokens/output_tokens/context_tokens."""
 
     def on_compaction_start(self, reactive: bool) -> None:
         """Context compaction began (``reactive`` = emergency after an overflow)."""
@@ -171,6 +180,9 @@ class ConsoleUI(AgentUI):
 
     def on_stopped(self, reason: str, human: str) -> None:
         self._renderer.print_stopped(reason, human)
+
+    def on_token_usage(self, usage: dict[str, Any]) -> None:
+        self._renderer.print_token_usage(usage)
 
     def on_run_completed(self, stats: dict[str, Any]) -> None:
         self._renderer.print_run_completed(stats)

@@ -22,8 +22,37 @@ def test_token_usage_context_tokens_sums_input_and_cache() -> None:
     assert usage.context_tokens == 125
 
 
+def test_token_usage_total_tokens_adds_output_to_context() -> None:
+    usage = TokenUsage(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_input_tokens=20,
+        cache_creation_input_tokens=5,
+    )
+    # total_tokens = context (input + both caches) + output — the per-response footprint.
+    assert usage.total_tokens == 125 + 50
+
+
 def test_token_usage_defaults_are_zero() -> None:
     assert TokenUsage().context_tokens == 0
+    assert TokenUsage().total_tokens == 0
+
+
+# --- rough char-based estimate -----------------------------------------------
+
+
+def test_rough_token_estimate_is_chars_over_four() -> None:
+    assert tokens.rough_token_estimate("x" * 40) == 10
+    assert tokens.rough_token_estimate("") == 0
+    # Custom ratio (e.g. denser content) is honored; a 0 ratio never divides by zero.
+    assert tokens.rough_token_estimate("x" * 40, bytes_per_token=2) == 20
+    assert tokens.rough_token_estimate("xxxx", bytes_per_token=0) == 4
+
+
+def test_rough_token_estimate_for_messages_sums_per_message() -> None:
+    msgs = [Message("user", "x" * 40), Message("assistant", "y" * 8)]
+    assert tokens.rough_token_estimate_for_messages(msgs) == 10 + 2
+    assert tokens.rough_token_estimate_for_messages([]) == 0
 
 
 def test_llm_result_usage_defaults_to_none() -> None:
