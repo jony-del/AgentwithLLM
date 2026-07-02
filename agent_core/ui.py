@@ -78,8 +78,10 @@ class AgentUI:
         """Running token usage after a model turn (UI-only; emitted once per response).
 
         ``usage`` carries ``context_tokens`` (running prompt size), ``window`` (the
-        model's context window), and cumulative ``input_tokens``/``output_tokens`` for
-        the run. The base sink ignores it — only a live UI renders the figure.
+        model's context window), cumulative ``input_tokens``/``output_tokens`` for the
+        run, and ``conversation_tokens`` (the estimated conversation-only slice of
+        ``context_tokens``; the remainder is the fixed per-run baseline). The base sink
+        ignores it — only a live UI renders the figure.
         """
 
     def on_run_completed(self, stats: dict[str, Any]) -> None:

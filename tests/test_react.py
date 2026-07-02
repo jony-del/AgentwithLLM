@@ -360,6 +360,15 @@ async def test_run_emits_token_usage_and_recap_tokens(tmp_path: Path) -> None:
     assert last["window"] > 0
     assert last["context_tokens"] >= 0
     assert last["input_tokens"] > 0
+    # The gauge splits the prompt into conversation vs. the fixed run-start baseline
+    # (system prompt + pinned CLAUDE.md/userContext). A short task with no history is
+    # dominated by the baseline, so the conversation slice stays a small fraction of
+    # the total and never exceeds it.
+    assert "conversation_tokens" in last
+    assert 0 <= last["conversation_tokens"] <= last["context_tokens"]
+    assert last["conversation_tokens"] < last["context_tokens"], (
+        "baseline (system + pinned context) should dominate a fresh short task"
+    )
     # The recap carries the run's token totals (FakeProvider's fixed +8 output per turn).
     assert ui.recap is not None
     assert ui.recap["output_tokens"] > 0

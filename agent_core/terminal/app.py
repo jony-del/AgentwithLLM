@@ -293,6 +293,12 @@ class TerminalRenderer:
         if window > 0:
             pct = context / window * 100
             ctx_part += f"/{_human_count(window)} ({pct:.1f}%)"
+        # Split into conversation vs. the fixed per-run baseline (system prompt + CLAUDE.md
+        # + tool schemas) when the loop reports it, so a fresh/cleared session reads ~0 chat.
+        if "conversation_tokens" in usage:
+            conv = max(0, min(int(usage.get("conversation_tokens", 0) or 0), context))
+            base = max(0, context - conv)
+            ctx_part += f" · chat {_human_count(conv)} / base {_human_count(base)}"
         line = Text(f"{SYMBOLS['compacting']} {ctx_part} · {_human_count(in_tok)} in / {_human_count(out_tok)} out", style="dim")
         self.emit(line)
 

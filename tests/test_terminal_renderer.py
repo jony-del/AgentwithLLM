@@ -126,6 +126,57 @@ def test_run_recap_stopped_is_louder(capsys) -> None:
     assert "Stopped (max_steps)" in out
 
 
+# --- token usage gauge -------------------------------------------------------
+
+
+def test_token_usage_splits_chat_and_baseline(capsys) -> None:
+    r = TerminalRenderer(color=False)
+    r.print_token_usage(
+        {
+            "context_tokens": 12300,
+            "conversation_tokens": 300,
+            "window": 200000,
+            "input_tokens": 12300,
+            "output_tokens": 231,
+        }
+    )
+    out = capsys.readouterr().out
+    assert "ctx 12.3k/200.0k (6.2%)" in out
+    assert "chat 300 / base 12.0k" in out  # base = context - conversation
+    assert "12.3k in / 231 out" in out
+
+
+def test_token_usage_fresh_session_reads_zero_chat(capsys) -> None:
+    # A fresh / cleared session: almost all of the prompt is fixed baseline.
+    r = TerminalRenderer(color=False)
+    r.print_token_usage(
+        {"context_tokens": 12100, "conversation_tokens": 0, "window": 200000, "input_tokens": 12100, "output_tokens": 44}
+    )
+    out = capsys.readouterr().out
+    assert "chat 0 / base 12.1k" in out
+
+
+def test_token_usage_clamps_conversation_to_context(capsys) -> None:
+    # A conversation estimate above the real total must never render a negative base.
+    r = TerminalRenderer(color=False)
+    r.print_token_usage(
+        {"context_tokens": 500, "conversation_tokens": 9000, "window": 200000, "input_tokens": 500, "output_tokens": 10}
+    )
+    out = capsys.readouterr().out
+    assert "chat 500 / base 0" in out
+
+
+def test_token_usage_without_split_uses_legacy_line(capsys) -> None:
+    # No conversation_tokens key → the original single-figure line, no chat/base segment.
+    r = TerminalRenderer(color=False)
+    r.print_token_usage(
+        {"context_tokens": 12300, "window": 200000, "input_tokens": 12300, "output_tokens": 231}
+    )
+    out = capsys.readouterr().out
+    assert "ctx 12.3k/200.0k (6.2%)" in out
+    assert "chat" not in out and "base" not in out
+
+
 # --- color off ---------------------------------------------------------------
 
 

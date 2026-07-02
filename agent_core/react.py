@@ -708,9 +708,16 @@ class ReActAgent:
             # granularity available — usage is known only after the response). Lands right
             # under the streamed assistant block; NullUI ignores it.
             if result.usage is not None:
+                # Split the real prompt total into the per-run baseline (system prompt,
+                # gitStatus, recall, pinned CLAUDE.md/userContext, tool schemas) vs. what the
+                # conversation itself contributes, so a fresh or /clear'd session reads ~0 chat.
+                conversation = min(
+                    self._conversation_token_estimate(messages), self._run_context_tokens
+                )
                 self.ui.on_token_usage(
                     {
                         "context_tokens": self._run_context_tokens,
+                        "conversation_tokens": conversation,
                         "window": tokens.context_window_for_model(self.config.model),
                         "input_tokens": self._run_input_tokens,
                         "output_tokens": self._run_output_tokens,
@@ -1322,6 +1329,23 @@ class ReActAgent:
             if isinstance(anchor, int):
                 return anchor + tokens.rough_token_estimate_for_messages(messages[i + 1:])
         return tokens.rough_token_estimate_for_messages(messages)
+
+    def _conversation_token_estimate(self, messages: list[Message]) -> int:
+        """Rough token size of just the conversation, excluding the fixed run-start
+        context (system prompt, gitStatus, memory recall, pinned userContext/CLAUDE.md).
+
+        Lets the live gauge separate the per-run baseline overhead from what the
+        conversation itself contributes, so a fresh or ``/clear``'d session reads as
+        ~0 chat. The baseline predicate mirrors the history-splice skip rule in
+        ``run()`` (``role == 'system'`` or the pinned ``user_context`` message);
+        ``rough_token_estimate_for_messages`` is per-message additive, so subtracting
+        this from the real prompt total leaves the baseline.
+        """
+        convo = [
+            m for m in messages
+            if not (m.role == "system" or m.metadata.get("pinned") == "user_context")
+        ]
+        return tokens.rough_token_estimate_for_messages(convo)
 
     def _provider_config(self) -> dict[str, object]:
         return {
