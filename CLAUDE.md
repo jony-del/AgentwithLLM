@@ -123,7 +123,22 @@ Cross-cutting:
 - `agent_core/cli.py`: argparse CLI (real entry for `polaris` / `__main__`).
 - `agent_core/chat_commands.py`: built-in interactive-chat `/commands` (`dispatch` →
   `ChatTurn`); also routes `/skill` invocations. CLI-only, imports no `cli`.
-- `agent_core/permissions.py`: permission modes and risk decisions.
+- `agent_core/permissions.py`: `PermissionPolicy` — the argument-aware decision
+  pipeline (deny rules → sensitive-path safety net → ask rules → sandbox auto-allow →
+  `bypass` mode → allow rules → the legacy per-mode `ToolRisk` matrix). No rules + no
+  sandbox ⇒ identical to the old coarse gate. Modes: default/acceptedits/plan/auto/
+  dontask/bypass.
+- `agent_core/permission_rules.py`: cross-platform *policy layer* — `ToolName(content)`
+  allow/deny/ask rules, shell exact/prefix/wildcard matching, compound-command
+  decomposition (allow needs ALL sub-commands, deny needs ANY) + anti-evasion
+  (`SAFE_ENV_VARS`/`BINARY_HIJACK_VARS`/wrapper stripping), path-glob + `domain:` matching.
+  Parse failures degrade (drop the rule), never raise.
+- `agent_core/sandbox/`: OS *enforcement layer* — `SandboxManager` wraps
+  `run_command`/`run_tests` in `bwrap` (Linux) / `sandbox-exec` (macOS), **no-op on
+  Windows** (graceful degrade; `fail_if_unavailable` turns "can't sandbox" into a hard
+  startup error). Command tools reach it via `SandboxAwareMixin` (rebound by
+  `ReActAgent.__init__` like `SessionAwareMixin`). See
+  `docs/sandbox-openclaudecode-alignment.md`.
 - `agent_core/hooks.py`: hook surface + `[hooks]` config dataclasses
   (`HooksConfig`/`BuiltinHooksConfig`/`ExternalHookSpec`). Sync pre/post *tool* hooks run
   inside the executor; async *lifecycle* hooks (`UserPromptSubmit`, `PostSampling`,

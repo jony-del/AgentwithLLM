@@ -181,7 +181,7 @@ class ToolExecutor:
         self.ui.on_tool_call(
             tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
         )
-        decision = self.permissions.decide(tool)
+        decision = self.permissions.decide(tool, rewritten_call)
         # The confirm step may block on an interactive prompt (input()); run it on a
         # worker thread so a question to the user doesn't freeze other in-flight work.
         decision = await asyncio.to_thread(self.permissions.confirm, decision, tool, rewritten_call)

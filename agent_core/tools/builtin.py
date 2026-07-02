@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.sandbox import SandboxAwareMixin
 from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.catalog import builtin_tool
 
@@ -272,7 +273,7 @@ class SearchTextTool(WorkspacePathMixin, Tool):
 
 
 @builtin_tool
-class RunCommandTool(WorkspacePathMixin, Tool):
+class RunCommandTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
     name = "run_command"
     description = (
         "Run a shell command in the workspace and return its combined stdout/stderr and exit code. "
@@ -292,6 +293,9 @@ class RunCommandTool(WorkspacePathMixin, Tool):
         command = str(arguments["command"])
         timeout = min(int(arguments.get("timeout", 30)), _MAX_COMMAND_TIMEOUT)
         spec, shell = _shell_invocation(command)
+        # Wrap under the OS sandbox when active (no-op on Windows/unsupported). Pass the
+        # raw command so excluded_commands can opt specific commands out of isolation.
+        spec, shell = self.sandbox.wrap(spec, shell, command=command)
         return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
 
 
@@ -323,7 +327,7 @@ class GitDiffTool(WorkspacePathMixin, Tool):
 
 
 @builtin_tool
-class RunTestsTool(WorkspacePathMixin, Tool):
+class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
     name = "run_tests"
     description = (
         "Run the test suite with pytest in the workspace. Optionally scope to `target` "
@@ -348,7 +352,9 @@ class RunTestsTool(WorkspacePathMixin, Tool):
         if isinstance(extra, list):
             cmd += [str(a) for a in extra]
         timeout = min(int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT)
-        return _run_subprocess(self.name, cmd, cwd=self.workspace, timeout=timeout, shell=False)
+        # Sandbox the (argv) test invocation when active; no command string to exclude on.
+        spec, shell = self.sandbox.wrap(cmd, False, command=None)
+        return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
 
 
 def _shell_invocation(command: str):

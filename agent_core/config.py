@@ -448,6 +448,55 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
     )
 
 
+def resolve_sandbox_config(config_file: str | Path = "agent.toml") -> "SandboxConfig":
+    """Resolve the OS sandbox settings from the ``[sandbox]`` toml table, then env.
+
+    Precedence: defaults → ``[sandbox]`` (incl. ``[sandbox.network]`` /
+    ``[sandbox.filesystem]``) → ``AGENT_SANDBOX`` (toggles ``enabled``) /
+    ``AGENT_SANDBOX_FAIL_IF_UNAVAILABLE`` env. A ``--sandbox/--no-sandbox`` CLI flag is
+    layered on by the caller. Disabled by default; unknown keys are ignored.
+    """
+    from agent_core.sandbox import SandboxConfig
+
+    table = load_agent_toml(config_file).get("sandbox")
+    config = SandboxConfig.from_dict(table if isinstance(table, dict) else None)
+
+    env = os.getenv("AGENT_SANDBOX")
+    if env is not None:
+        config.enabled = env.strip().lower() in {"1", "true", "yes", "on"}
+    env_fail = os.getenv("AGENT_SANDBOX_FAIL_IF_UNAVAILABLE")
+    if env_fail is not None:
+        config.fail_if_unavailable = env_fail.strip().lower() in {"1", "true", "yes", "on"}
+    return config
+
+
+def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet":
+    """Resolve fine-grained allow/deny/ask rules from the ``[permissions]`` toml table.
+
+    Shape::
+
+        [permissions]
+        allow = ["run_command(git *)", "read_text_file(/src/**)"]
+        deny  = ["run_command(rm *)", "web_fetch(domain:evil.example)"]
+        ask   = ["run_command"]
+
+    Unparseable rule strings are dropped (not raised), so a sloppy table degrades to
+    fewer rules. CLI ``--allow/--deny/--ask`` rules are layered on by the caller via
+    :meth:`RuleSet.merge`. The permission *mode* stays the top-level ``permission`` key.
+    """
+    from agent_core.permission_rules import RuleSet
+
+    table = load_agent_toml(config_file).get("permissions")
+    if not isinstance(table, dict):
+        return RuleSet()
+
+    def _rules(key: str) -> list[str]:
+        value = table.get(key)
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    return RuleSet.from_lists(_rules("allow"), _rules("deny"), _rules("ask"))
+
+
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":
     """Resolve the MCP servers from the ``[mcp]`` toml table (``[mcp.servers.<name>]``).
 

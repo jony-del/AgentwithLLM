@@ -17,11 +17,14 @@ from agent_core.config import (
     resolve_mcp_config,
     resolve_memory_config,
     resolve_output_config,
+    resolve_permission_rules,
     resolve_persist_compaction_boundary,
+    resolve_sandbox_config,
     resolve_session_dir,
     resolve_skills_config,
     resolve_tool_use_summary_config,
 )
+from agent_core.permission_rules import RuleSet
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
 from agent_core.models import LLMTransientError, Message
@@ -61,6 +64,28 @@ def _memory_config(args: argparse.Namespace) -> MemoryConfig:
     # Numeric tunables come from the [memory] toml table; enabled is overridable
     # by AGENT_MEMORY / --memory. (resolve_config above already loaded the .env.)
     return resolve_memory_config(getattr(args, "memory", None))
+
+
+def _permission_rules(args: argparse.Namespace) -> RuleSet:
+    """Fine-grained rules from ``[permissions]`` toml, with CLI ``--allow/--deny/--ask``
+    session rules layered on top (they append, deny still wins in the decision pipeline)."""
+    rules = resolve_permission_rules()
+    cli = RuleSet.from_lists(
+        allow=getattr(args, "allow", None) or [],
+        deny=getattr(args, "deny", None) or [],
+        ask=getattr(args, "ask", None) or [],
+    )
+    return rules.merge(cli)
+
+
+def _sandbox_config(args: argparse.Namespace):
+    """Sandbox config from ``[sandbox]`` toml/env, with the ``--sandbox/--no-sandbox``
+    CLI flag layered on ``enabled`` (None = leave the resolved value untouched)."""
+    config = resolve_sandbox_config()
+    cli_sandbox = getattr(args, "sandbox", None)
+    if cli_sandbox is not None:
+        config.enabled = bool(cli_sandbox)
+    return config
 
 
 def _make_provider(values: dict):
@@ -189,6 +214,8 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         persist_compaction_boundary=resolve_persist_compaction_boundary(),
         skills=resolve_skills_config(),
         hooks=resolve_hooks_config(),
+        sandbox=_sandbox_config(args),
+        permission_rules=_permission_rules(args),
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry)
@@ -631,8 +658,33 @@ def main(argv: list[str] | None = None) -> int:
         subparser.add_argument("--model", default=None)
         subparser.add_argument(
             "--permission",
-            choices=["default", "acceptedits", "plan", "auto", "dontask"],
+            choices=["default", "acceptedits", "plan", "auto", "dontask", "bypass"],
             default=None,
+        )
+        subparser.add_argument(
+            "--sandbox",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Run dangerous commands under the OS sandbox (bwrap/sandbox-exec on "
+            "Linux/macOS; no-op on Windows). Overrides [sandbox].enabled.",
+        )
+        subparser.add_argument(
+            "--allow",
+            action="append",
+            metavar="RULE",
+            help="Add an allow rule, e.g. --allow 'run_command(git *)'. Repeatable.",
+        )
+        subparser.add_argument(
+            "--deny",
+            action="append",
+            metavar="RULE",
+            help="Add a deny rule, e.g. --deny 'run_command(rm *)'. Repeatable; deny wins.",
+        )
+        subparser.add_argument(
+            "--ask",
+            action="append",
+            metavar="RULE",
+            help="Add an ask rule (force confirmation), e.g. --ask 'run_command'. Repeatable.",
         )
         subparser.add_argument("--provider", choices=["claude", "fake"], default=None)
         subparser.add_argument(

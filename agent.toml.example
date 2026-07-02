@@ -6,7 +6,7 @@
 
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
-permission = "default"        # default | acceptedits | plan | auto | dontask
+permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
 provider = "claude"           # claude | fake
 # output_config.effort depth/cost control. low | medium | high | xhigh | max.
 # "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
@@ -330,3 +330,48 @@ max_tokens = 64                       # labels are short — keep the budget tin
 max_input_chars_per_tool = 300        # head-truncate each tool's input/output before labeling
 timeout_seconds = 8.0                 # single bound on the label call; on timeout, no label
 include_subagents = false             # default: only the leader narrates (not sub-agents)
+
+# --- Fine-grained permission rules (policy layer) ---------------------------
+# Argument-aware allow/deny/ask rules, evaluated BEFORE the coarse per-mode
+# ToolRisk gate. Each rule is "ToolName(content)" (or bare "ToolName" for the whole
+# tool). Precedence in the decision pipeline: deny > sensitive-path safety net >
+# ask > sandbox auto-allow > bypass mode > allow > per-mode matrix.
+#   - run_command content is matched with shell decomposition + anti-evasion:
+#     a compound command (a && b | c) must have EVERY sub-command covered to allow,
+#     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,
+#     "git * --force" = wildcard, "npm run build" = exact.
+#   - file tools match a path glob ("/src/**"); web tools match "domain:example.com".
+# CLI --allow/--deny/--ask append session rules on top of this table.
+[permissions]
+# allow = ["run_command(git *)", "run_command(npm run test:*)", "read_text_file(/src/**)"]
+# deny  = ["run_command(rm *)", "run_command(curl *)", "web_fetch(domain:evil.example)"]
+# ask   = ["run_command"]
+
+# --- OS sandbox (enforcement layer) -----------------------------------------
+# Wraps dangerous command execution (run_command / run_tests) in an OS sandbox:
+# bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
+# environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
+# the permission rules above are the boundary. Disabled by default.
+# Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
+[sandbox]
+enabled = false                        # master switch
+fail_if_unavailable = false            # true = hard-fail at startup if sandbox can't run
+                                       #   (instead of silently running unsandboxed)
+auto_allow_command_if_sandboxed = true # skip the permission prompt when a command WILL be
+                                       #   sandboxed (the OS sandbox is the real boundary)
+allow_unsandboxed_commands = true      # honor a per-call request to run outside the sandbox
+excluded_commands = []                 # commands that run OUTSIDE the sandbox, e.g. ["bazel:*"]
+                                       #   (NOT a security boundary — still hits permissions)
+
+[sandbox.filesystem]
+# The workspace is always writable; everything else is read-only under the sandbox.
+allow_write = []                       # extra writable paths, e.g. ["~/.cache"]
+deny_write  = []                       # carve read-only holes inside a writable region
+deny_read   = []                       # hide sensitive regions, e.g. ["~/.ssh", "~/.aws"]
+allow_read  = []                       # re-allow specific paths inside a deny_read region
+
+[sandbox.network]
+# Network is default-deny under the sandbox. Allowing any domain (or local binding)
+# currently shares the host network (no proxy is shipped); leave empty to isolate.
+allowed_domains = []                   # e.g. ["api.example.com"]
+allow_local_binding = false            # permit binding local ports (servers/tests)

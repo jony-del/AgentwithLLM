@@ -43,8 +43,10 @@ from agent_core.hooks import (
 )
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
+from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, gated_provider
+from agent_core.sandbox import SandboxAwareMixin, SandboxConfig, SandboxManager
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.skills import (
     SkillRegistry,
@@ -191,6 +193,12 @@ class ReActConfig:
     # Lifecycle-hook subsystem: built-in programmatic hook toggles + config-driven
     # external hooks. Assembled into the shared HookPipeline by _build_hook_pipeline.
     hooks: HooksConfig = field(default_factory=HooksConfig)
+    # OS sandbox (enforcement layer): wraps dangerous command execution in bwrap/
+    # sandbox-exec on Linux/macOS, no-op on Windows. Disabled by default.
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    # Fine-grained allow/deny/ask rules (policy layer). Empty by default → the run
+    # behaves exactly as the bare per-mode ToolRisk gate did.
+    permission_rules: RuleSet = field(default_factory=RuleSet)
 
 
 @dataclass(slots=True)
@@ -286,9 +294,15 @@ class ReActAgent:
             run_dir=self.config.run_dir,
             run_id=self.logger.run_id,
         )
+        # OS sandbox manager (enforcement layer), built eagerly per the eager-loading
+        # invariant. Constructed with fail_if_unavailable honored here (raises before the
+        # run starts). Bound into every sandbox-aware command tool alongside the session.
+        self.sandbox = SandboxManager(self.config.sandbox, workspace=self.session.workspace)
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(self.session)
+            if isinstance(tool, SandboxAwareMixin):
+                tool.bind_sandbox(self.sandbox)
         # The model-facing ``skill`` tool is dead weight when no skill is model-invocable,
         # so drop it from the advertised tool set in that case (saves tokens, avoids
         # offering the model a tool it can't use).
@@ -296,9 +310,12 @@ class ReActAgent:
             self.registry.unregister("skill")
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
+        # The fine-grained rule set + sandbox make the policy argument-aware.
         permissions = PermissionPolicy(
             self.config.permission,
             prompter=self.ui.confirm_tool if self.ui.is_live else None,
+            rules=self.config.permission_rules,
+            sandbox=self.sandbox,
         )
         # One pipeline shared by the executor (pre/post tool hooks) and the run loop
         # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop). An

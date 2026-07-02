@@ -6,14 +6,22 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from agent_core.models import ToolRisk
+from agent_core.permission_rules import _SHELL_COMMAND_TOOLS, RuleSet
 
 if TYPE_CHECKING:
     from agent_core.models import ToolCall
+    from agent_core.sandbox import SandboxManager
     from agent_core.tools.base import Tool
 
 # Asks the user about a pending tool. Args: tool name, risk value, arguments.
 # Returns "once" (run now), "always" (allow for the rest of the session), or "deny".
 Prompter = Callable[[str, str, dict[str, Any]], str]
+
+# File-write path arguments whose target is checked against the sensitive-path
+# "safety net" (bypass-immune ask). Mirrors the reference's safetyCheck on file tools.
+_SENSITIVE_PATH_KEYS = ("path", "file_path")
+_SENSITIVE_DIRS = frozenset({".git", ".polaris", ".claude"})
+_SENSITIVE_BASENAMES = frozenset({"agent.toml", "settings.json", "settings.local.json"})
 
 
 class PermissionMode(str, Enum):
@@ -22,6 +30,8 @@ class PermissionMode(str, Enum):
     PLAN = "plan"
     AUTO = "auto"
     DONTASK = "dontask"
+    # Allow everything except deny-rules, ask-rules, and the sensitive-path safety net.
+    BYPASS = "bypass"
 
 
 @dataclass(slots=True)
@@ -33,23 +43,72 @@ class PermissionDecision:
 
 
 class PermissionPolicy:
+    """Argument-aware permission gate: fine-grained rules + mode + sandbox coupling.
+
+    The decision pipeline (:meth:`decide`) mirrors Open-ClaudeCode's ordered evaluation:
+    deny rules → sensitive-path safety net → ask rules → sandbox auto-allow → bypass →
+    allow rules → the legacy per-mode ``ToolRisk`` matrix. The first four are
+    *argument-aware* (they inspect the actual command/path/URL); the final matrix is the
+    original coarse gate, preserved so a config with no rules behaves exactly as before.
+    """
+
     def __init__(
         self,
         mode: PermissionMode | str = PermissionMode.DEFAULT,
         prompter: Prompter | None = None,
+        rules: RuleSet | None = None,
+        sandbox: "SandboxManager | None" = None,
     ) -> None:
         self.mode = PermissionMode(mode)
         # We can only ask the user when a prompter is wired (an interactive UI).
         # Without one, an "ask" collapses into a denial (matches old non-interactive).
         self.prompter = prompter
         self.interactive = prompter is not None
+        # Fine-grained allow/deny/ask rules (empty by default → pure mode behavior).
+        self.rules = rules or RuleSet()
+        # The active OS sandbox manager, for the "auto-allow if sandboxed" coupling.
+        self.sandbox = sandbox
         # Tools the user chose to "always allow" for the lifetime of this session.
         self._session_allow: set[str] = set()
 
-    def decide(self, tool: "Tool") -> PermissionDecision:
-        risk = tool.risk
-        if tool.name in self._session_allow:
+    def decide(self, tool: "Tool", tool_call: "ToolCall | None" = None) -> PermissionDecision:
+        name = tool.name
+        arguments = tool_call.arguments if tool_call is not None else {}
+
+        if name in self._session_allow:
             return PermissionDecision(True, reason="allowed for this session")
+
+        # 1. Deny rules win outright (argument-aware; command decomposition inside).
+        if self.rules.deny_matches(name, arguments):
+            return PermissionDecision(False, reason="denied by rule")
+
+        # 2. Safety net (bypass-immune): writing a protected path always confirms.
+        if tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS} and _targets_sensitive_path(arguments):
+            return self._maybe_ask("writing a protected path requires confirmation")
+
+        # 3. Ask rules → confirm, UNLESS the command will run sandboxed (next step).
+        sandbox_allows = self._sandbox_auto_allows(name, arguments)
+        if self.rules.ask_matches(name, arguments) and not sandbox_allows:
+            return self._maybe_ask("confirmation required by rule")
+
+        # 4. Sandbox coupling: a command that will actually be sandboxed skips the prompt
+        #    (the OS sandbox is the real boundary).
+        if sandbox_allows:
+            return PermissionDecision(True, reason="allowed: command runs sandboxed")
+
+        # 5. Bypass mode allows everything that survived deny/safety/ask above.
+        if self.mode == PermissionMode.BYPASS:
+            return PermissionDecision(True, reason="bypass mode allows")
+
+        # 6. Explicit allow rules.
+        if self.rules.allow_matches(name, arguments):
+            return PermissionDecision(True, reason="allowed by rule")
+
+        # 7. Fall back to the original per-mode ToolRisk matrix (unchanged behavior).
+        return self._decide_by_mode(tool)
+
+    def _decide_by_mode(self, tool: "Tool") -> PermissionDecision:
+        risk = tool.risk
         if self.mode == PermissionMode.PLAN:
             if risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}:
                 return PermissionDecision(True, dry_run=True, reason="plan mode dry-run")
@@ -70,6 +129,18 @@ class PermissionPolicy:
             return PermissionDecision(True, reason="default allows read tools")
         return self._maybe_ask("default requires confirmation")
 
+    def _sandbox_auto_allows(self, name: str, arguments: dict[str, Any]) -> bool:
+        """True when ``name`` is a shell-command tool whose command will be sandboxed."""
+        if self.sandbox is None:
+            return False
+        command_arg = _SHELL_COMMAND_TOOLS.get(name)
+        if command_arg is None:
+            return False
+        if not self.sandbox.config.auto_allow_command_if_sandboxed:
+            return False
+        command = str(arguments.get(command_arg, ""))
+        return self.sandbox.should_sandbox(command)
+
     def confirm(self, decision: PermissionDecision, tool: "Tool", tool_call: "ToolCall") -> PermissionDecision:
         if not decision.ask_user or self.prompter is None:
             return decision
@@ -85,3 +156,22 @@ class PermissionPolicy:
         if self.interactive:
             return PermissionDecision(False, ask_user=True, reason=reason)
         return PermissionDecision(False, reason=f"{reason}; non-interactive")
+
+
+def _targets_sensitive_path(arguments: dict[str, Any]) -> bool:
+    """Whether a file-write argument targets a protected path (config / .git / .polaris).
+
+    Deliberately narrow (path-bearing tools only): a shell command that redirects into a
+    protected path is not caught here — that surface is covered by deny rules and the OS
+    sandbox instead.
+    """
+    for key in _SENSITIVE_PATH_KEYS:
+        value = arguments.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        segments = value.replace("\\", "/").lower().split("/")
+        if any(seg in _SENSITIVE_DIRS for seg in segments):
+            return True
+        if segments[-1] in _SENSITIVE_BASENAMES:
+            return True
+    return False

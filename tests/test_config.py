@@ -1,7 +1,13 @@
 import os
 from pathlib import Path
 
-from agent_core.config import load_dotenv, resolve_concurrency_config, resolve_config
+from agent_core.config import (
+    load_dotenv,
+    resolve_concurrency_config,
+    resolve_config,
+    resolve_permission_rules,
+    resolve_sandbox_config,
+)
 
 
 def test_load_dotenv_sets_missing_environment_variables(tmp_path: Path, monkeypatch) -> None:
@@ -74,3 +80,60 @@ def test_resolve_concurrency_config_from_toml(tmp_path: Path) -> None:
         "max_api_concurrency": 8,
         "api_rate_limit_per_min": 0,
     }
+
+
+def test_resolve_sandbox_config_defaults_disabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SANDBOX", raising=False)
+    config = resolve_sandbox_config(tmp_path / "absent.toml")
+    assert config.enabled is False
+
+
+def test_resolve_sandbox_config_from_toml(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SANDBOX", raising=False)
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        """
+        [sandbox]
+        enabled = true
+        excluded_commands = ["bazel:*"]
+        [sandbox.filesystem]
+        deny_read = ["~/.ssh"]
+        [sandbox.network]
+        allowed_domains = ["api.example.com"]
+        """,
+        encoding="utf-8",
+    )
+    config = resolve_sandbox_config(config_file)
+    assert config.enabled is True
+    assert config.excluded_commands == ["bazel:*"]
+    assert config.filesystem.deny_read == ["~/.ssh"]
+    assert config.network.allowed_domains == ["api.example.com"]
+
+
+def test_resolve_sandbox_config_env_overrides_toml(tmp_path: Path, monkeypatch) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text("[sandbox]\nenabled = false\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_SANDBOX", "true")
+    assert resolve_sandbox_config(config_file).enabled is True
+
+
+def test_resolve_permission_rules_from_toml(tmp_path: Path) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        """
+        [permissions]
+        allow = ["run_command(git *)"]
+        deny = ["run_command(rm *)", "bad("]
+        """,
+        encoding="utf-8",
+    )
+    rules = resolve_permission_rules(config_file)
+    assert rules.allow_matches("run_command", {"command": "git status"})
+    assert rules.deny_matches("run_command", {"command": "rm x"})
+    # The unparseable "bad(" entry was dropped, not raised.
+    assert len(rules.deny) == 1
+
+
+def test_resolve_permission_rules_absent_table(tmp_path: Path) -> None:
+    rules = resolve_permission_rules(tmp_path / "absent.toml")
+    assert rules.is_empty
