@@ -85,6 +85,9 @@ def _sandbox_config(args: argparse.Namespace):
     cli_sandbox = getattr(args, "sandbox", None)
     if cli_sandbox is not None:
         config.enabled = bool(cli_sandbox)
+    cli_backend = getattr(args, "sandbox_backend", None)
+    if cli_backend is not None:
+        config.backend = cli_backend
     return config
 
 
@@ -405,6 +408,7 @@ def run_command(args: argparse.Namespace) -> int:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
     finally:
+        agent.sandbox.teardown()
         if mcp is not None:
             mcp.close()
     # A live UI already streamed the answer via on_final; only print it ourselves
@@ -482,6 +486,7 @@ def chat_command(args: argparse.Namespace) -> int:
     try:
         asyncio.run(session())
     finally:
+        agent.sandbox.teardown()
         if mcp is not None:
             mcp.close()
     return 0
@@ -665,8 +670,15 @@ def main(argv: list[str] | None = None) -> int:
             "--sandbox",
             action=argparse.BooleanOptionalAction,
             default=None,
-            help="Run dangerous commands under the OS sandbox (bwrap/sandbox-exec on "
-            "Linux/macOS; no-op on Windows). Overrides [sandbox].enabled.",
+            help="Run dangerous commands under the OS sandbox. Overrides [sandbox].enabled.",
+        )
+        subparser.add_argument(
+            "--sandbox-backend",
+            choices=["auto", "native", "container", "vm"],
+            default=None,
+            help="Isolation tier: native (bwrap/sandbox-exec), container (podman/docker), "
+            "vm (Hyper-V/Kata/Lima), or auto (container→native→noop). "
+            "Overrides [sandbox].backend.",
         )
         subparser.add_argument(
             "--allow",

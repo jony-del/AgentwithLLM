@@ -355,6 +355,11 @@ include_subagents = false             # default: only the leader narrates (not s
 # Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
 [sandbox]
 enabled = false                        # master switch
+backend = "auto"                       # isolation tier: "auto" (container→native→noop),
+                                       #   "native" (bwrap/sandbox-exec), "container"
+                                       #   (podman/docker), or "vm" (Hyper-V/Kata/Lima).
+                                       #   An explicit tier degrades to the next weaker
+                                       #   available one; "auto" never auto-selects "vm".
 fail_if_unavailable = false            # true = hard-fail at startup if sandbox can't run
                                        #   (instead of silently running unsandboxed)
 auto_allow_command_if_sandboxed = true # skip the permission prompt when a command WILL be
@@ -375,3 +380,32 @@ allow_read  = []                       # re-allow specific paths inside a deny_r
 # currently shares the host network (no proxy is shipped); leave empty to isolate.
 allowed_domains = []                   # e.g. ["api.example.com"]
 allow_local_binding = false            # permit binding local ports (servers/tests)
+
+[sandbox.container]
+# Used when backend = "container" (or "auto" resolves to it). Runs each command inside a
+# hardened, ephemeral (--rm) container. On Windows this targets WSL2 Linux containers; the
+# workspace is bind-mounted (drive path E:\proj → /mnt/e/proj inside the container).
+runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
+image = "docker.io/library/debian:stable-slim"   # image the command runs inside
+auto_pull = false                      # pull the image at startup if missing
+oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
+read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
+drop_all_capabilities = true           # --cap-drop ALL
+no_new_privileges = true               # --security-opt no-new-privileges
+memory = ""                            # e.g. "512m" (empty = no limit)
+cpus = ""                              # e.g. "1.5"
+pids_limit = ""                        # e.g. "256"
+windows_isolation = "wsl2"             # "wsl2" (Linux containers) or "hyperv" (Windows containers)
+extra_run_args = []                    # raw flags appended to `run`, e.g. ["--dns", "1.1.1.1"]
+
+[sandbox.vm]
+# Used when backend = "vm" — the strongest, strict-mode tier: a dedicated VM with
+# snapshot/rollback. Heavy and host-dependent; falls back to the container tier if the VM
+# provider is unavailable.
+provider = "auto"                      # "auto" (Kata on Linux, Hyper-V on Windows, Lima on
+                                       #   macOS), or "kata" / "hyperv" / "lima"
+base_image = "docker.io/library/debian:stable-slim"   # image/template the VM runs
+vm_name = "polaris-sandbox"            # managed guest VM name (Hyper-V/Lima)
+snapshot_name = "polaris-base"         # snapshot restored on reset (Hyper-V checkpoint / Lima)
+guest_host = ""                        # SSH target for command exec (required for Hyper-V)
+reset_each_task = true                 # restore the base snapshot before every run/task

@@ -134,10 +134,15 @@ Cross-cutting:
   (`SAFE_ENV_VARS`/`BINARY_HIJACK_VARS`/wrapper stripping), path-glob + `domain:` matching.
   Parse failures degrade (drop the rule), never raise.
 - `agent_core/sandbox/`: OS *enforcement layer* — `SandboxManager` wraps
-  `run_command`/`run_tests` in `bwrap` (Linux) / `sandbox-exec` (macOS), **no-op on
-  Windows** (graceful degrade; `fail_if_unavailable` turns "can't sandbox" into a hard
-  startup error). Command tools reach it via `SandboxAwareMixin` (rebound by
-  `ReActAgent.__init__` like `SessionAwareMixin`). See
+  `run_command`/`run_tests` under a **pluggable backend chosen by isolation tier**
+  (`config.backend`): `NativeBackend` (bwrap/sandbox-exec, no-op on Windows),
+  `ContainerBackend` (podman/docker/nerdctl `run`), `VmBackend` (Kata/Hyper-V/Lima with
+  snapshot-rollback). `auto` prefers `container → native → noop` (never auto-selects vm);
+  an explicit tier degrades to the next weaker available one; `fail_if_unavailable` turns
+  "can't sandbox" into a hard startup error. All backends share the launcher-prefix
+  `wrap()` seam; container/vm add a lifecycle (`prepare` at construct, `reset` per run for
+  vm, `teardown` at close). Command tools reach the manager via `SandboxAwareMixin`
+  (rebound by `ReActAgent.__init__` like `SessionAwareMixin`). See
   `docs/sandbox-openclaudecode-alignment.md`.
 - `agent_core/hooks.py`: hook surface + `[hooks]` config dataclasses
   (`HooksConfig`/`BuiltinHooksConfig`/`ExternalHookSpec`). Sync pre/post *tool* hooks run

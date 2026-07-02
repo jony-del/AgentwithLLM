@@ -20,6 +20,9 @@ class NoopBackend(SandboxBackend):
     def available(self) -> bool:
         return True
 
+    def isolates(self) -> bool:
+        return False
+
     def wrap(
         self, spec, shell: bool, *, config: SandboxConfig, workspace: Path
     ) -> tuple[object, bool]:

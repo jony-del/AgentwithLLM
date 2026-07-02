@@ -13,10 +13,13 @@ Command tools reach the active manager via :class:`SandboxAwareMixin`, which
 
 from __future__ import annotations
 
+from agent_core.sandbox.backends import SandboxTier
 from agent_core.sandbox.config import (
     SandboxConfig,
+    SandboxContainerConfig,
     SandboxFilesystemConfig,
     SandboxNetworkConfig,
+    SandboxVmConfig,
 )
 from agent_core.sandbox.manager import NOOP_SANDBOX, SandboxManager, SandboxUnavailableError
 
@@ -40,8 +43,11 @@ class SandboxAwareMixin:
 
 __all__ = [
     "SandboxConfig",
+    "SandboxContainerConfig",
+    "SandboxVmConfig",
     "SandboxFilesystemConfig",
     "SandboxNetworkConfig",
+    "SandboxTier",
     "SandboxManager",
     "SandboxUnavailableError",
     "SandboxAwareMixin",

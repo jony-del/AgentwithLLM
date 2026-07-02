@@ -298,6 +298,9 @@ class ReActAgent:
         # invariant. Constructed with fail_if_unavailable honored here (raises before the
         # run starts). Bound into every sandbox-aware command tool alongside the session.
         self.sandbox = SandboxManager(self.config.sandbox, workspace=self.session.workspace)
+        # Ready the active backend now (verify container runtime + image, boot the VM +
+        # base snapshot). Degrades to passthrough on failure unless fail_if_unavailable.
+        self.sandbox.prepare()
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(self.session)
@@ -459,6 +462,9 @@ class ReActAgent:
         self._run_input_tokens = 0
         self._run_output_tokens = 0
         self._run_context_tokens = 0
+        # Per-task VM rollback: restore the base snapshot so each run starts from a clean
+        # guest (no-op for native/container tiers and when reset_each_task is off).
+        self.sandbox.reset()
         # A live UI's interactive permission prompt runs on a worker thread; give it
         # the running loop so it can bridge the prompt back onto the main thread.
         if self.ui.is_live:

@@ -117,6 +117,46 @@ def test_resolve_sandbox_config_env_overrides_toml(tmp_path: Path, monkeypatch) 
     assert resolve_sandbox_config(config_file).enabled is True
 
 
+def test_resolve_sandbox_config_backend_tables(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGENT_SANDBOX_BACKEND", raising=False)
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        """
+        [sandbox]
+        enabled = true
+        backend = "container"
+        [sandbox.container]
+        runtime = "docker"
+        image = "alpine"
+        memory = "512m"
+        [sandbox.vm]
+        provider = "hyperv"
+        guest_host = "sandbox-vm"
+        reset_each_task = false
+        """,
+        encoding="utf-8",
+    )
+    config = resolve_sandbox_config(config_file)
+    assert config.backend == "container"
+    assert config.container.runtime == "docker"
+    assert config.container.image == "alpine"
+    assert config.container.memory == "512m"
+    assert config.vm.provider == "hyperv"
+    assert config.vm.guest_host == "sandbox-vm"
+    assert config.vm.reset_each_task is False
+
+
+def test_resolve_sandbox_config_backend_env_overrides_and_degrades(tmp_path: Path, monkeypatch) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text('[sandbox]\nbackend = "native"\n', encoding="utf-8")
+    monkeypatch.setenv("AGENT_SANDBOX_BACKEND", "vm")
+    assert resolve_sandbox_config(config_file).backend == "vm"
+    # An unknown backend degrades to "auto" (parse-failure-degrade invariant).
+    monkeypatch.setenv("AGENT_SANDBOX_BACKEND", "nonsense")
+    assert resolve_sandbox_config(config_file).backend == "auto"
+
+
 def test_resolve_permission_rules_from_toml(tmp_path: Path) -> None:
     config_file = tmp_path / "agent.toml"
     config_file.write_text(

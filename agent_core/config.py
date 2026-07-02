@@ -452,11 +452,14 @@ def resolve_sandbox_config(config_file: str | Path = "agent.toml") -> "SandboxCo
     """Resolve the OS sandbox settings from the ``[sandbox]`` toml table, then env.
 
     Precedence: defaults → ``[sandbox]`` (incl. ``[sandbox.network]`` /
-    ``[sandbox.filesystem]``) → ``AGENT_SANDBOX`` (toggles ``enabled``) /
-    ``AGENT_SANDBOX_FAIL_IF_UNAVAILABLE`` env. A ``--sandbox/--no-sandbox`` CLI flag is
-    layered on by the caller. Disabled by default; unknown keys are ignored.
+    ``[sandbox.filesystem]`` / ``[sandbox.container]`` / ``[sandbox.vm]``) →
+    ``AGENT_SANDBOX`` (toggles ``enabled``) / ``AGENT_SANDBOX_FAIL_IF_UNAVAILABLE`` /
+    ``AGENT_SANDBOX_BACKEND`` (isolation tier) env. ``--sandbox/--no-sandbox`` and
+    ``--sandbox-backend`` CLI flags are layered on by the caller. Disabled by default;
+    unknown keys are ignored.
     """
     from agent_core.sandbox import SandboxConfig
+    from agent_core.sandbox.config import _normalize_backend
 
     table = load_agent_toml(config_file).get("sandbox")
     config = SandboxConfig.from_dict(table if isinstance(table, dict) else None)
@@ -467,6 +470,9 @@ def resolve_sandbox_config(config_file: str | Path = "agent.toml") -> "SandboxCo
     env_fail = os.getenv("AGENT_SANDBOX_FAIL_IF_UNAVAILABLE")
     if env_fail is not None:
         config.fail_if_unavailable = env_fail.strip().lower() in {"1", "true", "yes", "on"}
+    env_backend = os.getenv("AGENT_SANDBOX_BACKEND")
+    if env_backend is not None:
+        config.backend = _normalize_backend(env_backend)
     return config
 
 
