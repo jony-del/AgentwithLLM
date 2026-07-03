@@ -158,10 +158,17 @@ class SandboxConfig:
     backend: str = "auto"
     fail_if_unavailable: bool = False
     # Skip the interactive permission prompt for a command that *will* actually be
-    # sandboxed — the OS sandbox is the real boundary (reference: autoAllowBashIfSandboxed).
-    auto_allow_command_if_sandboxed: bool = True
+    # sandboxed. Default FALSE (decision D4): the sandbox is one protective layer,
+    # not a substitute for confirmation — container escapes and writable mounts are
+    # real. A dev/lax profile may opt back in explicitly.
+    auto_allow_command_if_sandboxed: bool = False
     # Honor a per-call ``dangerously_disable_sandbox`` request (run a command unsandboxed).
     allow_unsandboxed_commands: bool = True
+    # Opt-out of the D3 rule that unattended permission modes (auto/dontask/bypass)
+    # require a working sandbox. False (default) → constructing an agent in such a mode
+    # with no sandbox raises SandboxRequiredError (interactive runs get a confirm
+    # prompt instead). Also settable per-process via AGENT_SANDBOX_ALLOW_UNATTENDED.
+    allow_unattended_unsandboxed: bool = False
     # Commands that run OUTSIDE the sandbox (build tools that break under isolation).
     # NOT a security boundary — excluded commands still go through normal permissions.
     excluded_commands: list[str] = field(default_factory=list)
@@ -185,6 +192,8 @@ class SandboxConfig:
             config.auto_allow_command_if_sandboxed = _as_bool(data["auto_allow_command_if_sandboxed"])
         if "allow_unsandboxed_commands" in data:
             config.allow_unsandboxed_commands = _as_bool(data["allow_unsandboxed_commands"])
+        if "allow_unattended_unsandboxed" in data:
+            config.allow_unattended_unsandboxed = _as_bool(data["allow_unattended_unsandboxed"])
         if isinstance(data.get("excluded_commands"), list):
             config.excluded_commands = [str(c) for c in data["excluded_commands"]]
         config.network = SandboxNetworkConfig.from_dict(_as_table(data.get("network")))

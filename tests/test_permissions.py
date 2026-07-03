@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from agent_core.models import ToolCall
 from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.tools.builtin import EchoTool, RunCommandTool, WriteTextFileTool
+from agent_core.tools.builtin import EchoTool, ReadTextFileTool, RunCommandTool, WriteTextFileTool
 
 
 def test_plan_mode_dry_runs_write_tools() -> None:
@@ -115,6 +115,8 @@ def test_sensitive_path_safety_net_is_bypass_immune() -> None:
 
 @dataclass
 class _StubSandboxConfig:
+    # The stub opts IN explicitly — the real SandboxConfig default is False (D4),
+    # asserted separately below.
     auto_allow_command_if_sandboxed: bool = True
 
 
@@ -139,6 +141,20 @@ def test_sandbox_coupling_auto_allows_sandboxed_command() -> None:
     assert "sandboxed" in decision.reason
 
 
+def test_sandbox_auto_allow_defaults_off() -> None:
+    # D4: a sandboxed command still confirms unless the operator opted in explicitly.
+    from agent_core.sandbox import SandboxConfig
+
+    assert SandboxConfig().auto_allow_command_if_sandboxed is False
+
+    rules = RuleSet.from_lists(ask=["run_command"])
+    sandbox = _StubSandbox(True)
+    sandbox.config.auto_allow_command_if_sandboxed = False
+    policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=sandbox)
+    decision = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"}))
+    assert not decision.allowed  # ask rule stands; non-interactive → deny
+
+
 def test_sandbox_coupling_off_when_not_sandboxed() -> None:
     rules = RuleSet.from_lists(ask=["run_command"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=_StubSandbox(False))
@@ -153,4 +169,97 @@ def test_no_rules_preserves_legacy_behavior() -> None:
     policy = PermissionPolicy(PermissionMode.AUTO)
     assert policy.decide(EchoTool(), ToolCall("echo", {})).allowed
     assert not policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"})).allowed
+
+
+# -- secret-path safety net (reads included, bypass-immune) --------------------------
+
+
+def test_reading_env_file_requires_confirmation() -> None:
+    # READ tools are auto-allowed in general, but a secret-bearing path still confirms
+    # (non-interactive → deny). Reading a secret is an exfiltration channel.
+    policy = PermissionPolicy(PermissionMode.DEFAULT)
+    tool = ReadTextFileTool()
+    decision = policy.decide(tool, ToolCall("read_text_file", {"path": ".env"}))
+    assert not decision.allowed
+    assert "secret" in decision.reason
+    # An ordinary read is unaffected.
+    assert policy.decide(tool, ToolCall("read_text_file", {"path": "src/main.py"})).allowed
+
+
+def test_secret_path_safety_net_is_bypass_immune() -> None:
+    policy = PermissionPolicy(PermissionMode.BYPASS)
+    tool = ReadTextFileTool()
+    for path in (".env", "config/.env.production", "~/.ssh/known_hosts", "certs/server.pem", ".aws/credentials"):
+        decision = policy.decide(tool, ToolCall("read_text_file", {"path": path}))
+        assert not decision.allowed, path
+        assert "secret" in decision.reason
+
+
+def test_secret_path_applies_to_writes_too() -> None:
+    policy = PermissionPolicy(PermissionMode.ACCEPTEDITS)  # would normally allow writes
+    tool = WriteTextFileTool()
+    decision = policy.decide(tool, ToolCall("write_text_file", {"path": ".env", "content": "K=v"}))
+    assert not decision.allowed
+
+
+def test_secret_deny_rule_still_beats_the_ask() -> None:
+    # An explicit deny outranks the confirm-based safety net (hard no, even interactively).
+    rules = RuleSet.from_lists(deny=["read_text_file(**/.env)"])
+    policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("once"), rules=rules)
+    tool = ReadTextFileTool()
+    decision = policy.decide(tool, ToolCall("read_text_file", {"path": "app/.env"}))
+    assert not decision.allowed
+    assert "denied by rule" in decision.reason
+
+
+# -- session "always" granularity ------------------------------------------------------
+
+
+def test_always_for_shell_command_is_per_subcommand() -> None:
+    policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"))
+    tool = RunCommandTool()
+    call = ToolCall("run_command", {"command": "git status"})
+
+    first = policy.confirm(policy.decide(tool, call), tool, call)
+    assert first.allowed
+
+    # The same normalized command is now session-allowed...
+    again = policy.decide(tool, ToolCall("run_command", {"command": "git status"}))
+    assert again.allowed and not again.ask_user
+    # ...but a DIFFERENT command still asks — "always" must not be a whole-tool grant.
+    other = policy.decide(tool, ToolCall("run_command", {"command": "rm -rf build"}))
+    assert not other.allowed
+    assert other.ask_user
+
+
+def test_always_compound_command_requires_every_subcommand_granted() -> None:
+    policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"))
+    tool = RunCommandTool()
+    call = ToolCall("run_command", {"command": "git status"})
+    policy.confirm(policy.decide(tool, call), tool, call)
+
+    # A compound line is covered only when every sub-command was granted.
+    partial = policy.decide(tool, ToolCall("run_command", {"command": "git status && rm x"}))
+    assert not partial.allowed
+
+
+def test_session_always_does_not_override_deny_or_safety_net() -> None:
+    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
+    policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"), rules=rules)
+
+    write_tool = WriteTextFileTool()
+    write_call = ToolCall("write_text_file", {"path": "notes.txt", "content": "x"})
+    policy.confirm(policy.decide(write_tool, write_call), write_tool, write_call)
+    # write_text_file is session-allowed now, but a protected path still confirms.
+    guarded = policy.decide(write_tool, ToolCall("write_text_file", {"path": ".git/config", "content": "x"}))
+    assert not guarded.allowed
+    assert guarded.ask_user
+
+    run_tool = RunCommandTool()
+    ls_call = ToolCall("run_command", {"command": "ls"})
+    policy.confirm(policy.decide(run_tool, ls_call), run_tool, ls_call)
+    # A deny rule is immune to any prior "always".
+    denied = policy.decide(run_tool, ToolCall("run_command", {"command": "rm -rf /"}))
+    assert not denied.allowed
+    assert "denied by rule" in denied.reason
 
