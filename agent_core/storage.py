@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 
+# Schema version stamped on every event record (the "v" field), so replay/analysis
+# tooling can detect format changes instead of guessing. Bump on breaking changes to
+# the record shape and keep readers tolerant of older versions.
+SCHEMA_VERSION = 1
+
+
 class JSONLRunLogger:
     def __init__(self, run_dir: str | Path = "runs", run_id: str | None = None) -> None:
         self.run_dir = Path(run_dir)
@@ -26,7 +32,7 @@ class JSONLRunLogger:
         The actual locked file append runs on a worker thread; the ``threading.Lock``
         keeps concurrent appends (from overlapping ``to_thread`` workers) atomic.
         """
-        record = {"ts": time.time(), "event": event, **payload}
+        record = {"ts": time.time(), "v": SCHEMA_VERSION, "event": event, **payload}
         await asyncio.to_thread(self._write_sync, record)
 
     def _write_sync(self, record: dict[str, Any]) -> None:

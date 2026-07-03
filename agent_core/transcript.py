@@ -43,6 +43,10 @@ _TITLE = "custom-title"
 _TAG = "tag"
 _RELINK = "relink"
 
+# Schema version stamped on every transcript entry (the "v" field). Bump on breaking
+# changes to the entry shape; loaders stay tolerant of records without it (pre-v1).
+SCHEMA_VERSION = 1
+
 # Above this file size, the resume load skips everything before the last compaction
 # boundary (reading only post-boundary bytes + a cheap pre-boundary metadata rescue),
 # mirroring the reference's SKIP_PRECOMPACT_THRESHOLD. Small files are read whole.
@@ -124,6 +128,7 @@ class TranscriptStore:
     async def append_message(self, message: Message) -> None:
         record = {
             "type": "message",
+            "v": SCHEMA_VERSION,
             **message.to_dict(),
             "session_id": self.session_id,
             "cwd": self.workspace,
@@ -133,7 +138,13 @@ class TranscriptStore:
         await asyncio.to_thread(self._write_sync, record)
 
     async def append_meta(self, kind: str, payload: dict) -> None:
-        record = {"type": kind, "session_id": self.session_id, "ts": time.time(), **payload}
+        record = {
+            "type": kind,
+            "v": SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "ts": time.time(),
+            **payload,
+        }
         await asyncio.to_thread(self._write_sync, record)
 
     async def append_relink(self, uuid: str, parent_uuid: str | None) -> None:
@@ -246,8 +257,8 @@ class _Accumulator:
     def finish(self, path: Path) -> "LoadedTranscript":
         # Apply relinks: a compaction boundary re-points the kept tail's head at the
         # summary so the parent-walk stops at the boundary (pre-boundary turns drop out).
-        for uuid, parent in self.relinks.items():
-            msg = self.messages.get(uuid)
+        for msg_uuid, parent in self.relinks.items():
+            msg = self.messages.get(msg_uuid)
             if msg is not None:
                 msg.parent_uuid = parent
         return LoadedTranscript(
