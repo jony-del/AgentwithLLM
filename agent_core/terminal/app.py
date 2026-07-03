@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.padding import Padding
 from rich.text import Text
 
@@ -50,14 +50,17 @@ def _human_count(n: int) -> str:
 class TerminalRenderer:
     def __init__(self, color: bool = True, preview_chars: int = 240, verbose: bool = False):
         # no_color honors --color; force_terminal keeps ANSI when the CLI wired a
-        # live UI onto a real TTY, while leaving auto-detection (None) off when piped.
+        # live UI onto a real TTY. color=False pins force_terminal=False (not None):
+        # the contract is ZERO escape sequences, and auto-detection would let env
+        # vars like FORCE_COLOR (which Rich honors even under no_color, re-enabling
+        # bold/dim SGR) leak ANSI into piped/test output.
         # legacy_windows=False emits plain ANSI to the (UTF-8 reconfigured) stream
         # instead of Rich's Win32 console path — matching the old print()-based
         # renderer and avoiding narrow-codec (GBK) write failures on zh-CN Windows.
         self.console = Console(
             theme=claude_theme,
             no_color=not color,
-            force_terminal=True if color else None,
+            force_terminal=True if color else False,
             legacy_windows=False,
             highlight=False,
             soft_wrap=False,
