@@ -45,5 +45,7 @@ def test_available_efforts_never_drifts_from_effort_gating() -> None:
         "claude-opus-4-8",
         "claude-fable-5",
     ):
-        expected = tuple(l for l in ALL_EFFORT_LEVELS if _effort_for_model(model, l) == l)
+        expected = tuple(
+            level for level in ALL_EFFORT_LEVELS if _effort_for_model(model, level) == level
+        )
         assert available_efforts(model) == expected

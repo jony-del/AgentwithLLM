@@ -7,7 +7,6 @@ sandbox — platform + runtime availability are mocked via ``sys.platform`` and
 """
 
 import shutil
-import subprocess
 import sys
 
 import pytest

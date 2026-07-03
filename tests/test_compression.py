@@ -684,7 +684,8 @@ async def test_circuit_breaker_short_circuits_after_consecutive_failures() -> No
     # One un-foldable conversation message (conversation <= keep+1) so context_collapse
     # never reduces it below the line; the always-over estimator makes every run a fail.
     messages = [Message("user", "x" * 4000)]
-    over = lambda msgs: 10_000  # always over the ~400 threshold
+    def over(msgs):  # always over the ~400 threshold
+        return 10_000
 
     # First 3 attempts run the stages but stay over → counted as failures.
     for n in range(1, 4):
@@ -711,7 +712,9 @@ async def test_circuit_breaker_resets_on_success() -> None:
         )
     )
     failing = [Message("user", "x" * 4000)]  # un-foldable
-    over = lambda msgs: 10_000
+    def over(msgs):
+        return 10_000
+
     for _ in range(2):
         await pipeline.auto_compact(failing, model="m", token_estimator=over)
     assert pipeline._consecutive_autocompact_failures == 2

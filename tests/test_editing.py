@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import pytest
 
 from agent_core.models import ToolRisk
 from agent_core.tools.editing import ApplyPatchTool, GlobTool, MultiEditTool

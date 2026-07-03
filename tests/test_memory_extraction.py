@@ -1,8 +1,5 @@
-import json
 from pathlib import Path
-from typing import Any
 
-from agent_core.memory.config import MemoryConfig
 from agent_core.memory.extraction import MemoryExtractor, parse_memory_items
 from agent_core.memory.store import MemoryStore
 from agent_core.models import LLMResult, Message

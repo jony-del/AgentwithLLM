@@ -308,7 +308,8 @@ def shrink_oversize_messages(
     """
     if tokens_to_drop <= 0:
         return None
-    estimator = token_estimator or tokens.rough_token_estimate_for_messages
+    # (token_estimator is accepted for call-site symmetry; the shed accounting below
+    # works directly in chars via ROUGH_BYTES_PER_TOKEN.)
     # Largest non-preserved messages first — shrink where it frees the most.
     order = sorted(
         (i for i, m in enumerate(messages) if not is_preserved(m)),

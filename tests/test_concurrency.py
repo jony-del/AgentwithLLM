@@ -12,7 +12,7 @@ import pytest
 from agent_core.agents.multi import MultiAgentCoordinator
 from agent_core.models import LLMResult, ToolCall, ToolResult, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import GatedProvider, ProviderGate, _TokenBucket, gated_provider
+from agent_core.providers.base import GatedProvider, _TokenBucket, gated_provider
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.executor import ToolExecutor

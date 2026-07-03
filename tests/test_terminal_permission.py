@@ -9,7 +9,6 @@ because the app-session context var does not propagate across
 """
 import asyncio
 
-import pytest
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput

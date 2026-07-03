@@ -7,7 +7,7 @@ the memory package. ``config.resolve_skills_config`` builds one from toml + env.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def _as_str_tuple(value: object) -> tuple[str, ...]:

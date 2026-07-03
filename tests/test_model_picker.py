@@ -39,7 +39,9 @@ def test_up_down_clamp_at_edges() -> None:
     p = _picker()
     p.up()  # already at top
     assert p.model_idx == 0
-    p.down(); p.down(); p.down()  # past the bottom
+    p.down()
+    p.down()
+    p.down()  # past the bottom
     assert p.model_idx == len(_MODELS) - 1
 
 
@@ -51,7 +53,10 @@ def test_left_right_move_within_efforts_and_clamp() -> None:
     assert p.selection() == ("claude-opus-4-8", "max")
     p.right()  # clamp at the strongest
     assert p.selection() == ("claude-opus-4-8", "max")
-    p.left(); p.left(); p.left(); p.left()
+    p.left()
+    p.left()
+    p.left()
+    p.left()
     assert p.selection() == ("claude-opus-4-8", "low")
     p.left()  # clamp at the weakest
     assert p.selection() == ("claude-opus-4-8", "low")
@@ -75,11 +80,13 @@ def test_effort_clamps_when_label_unavailable_then_restores() -> None:
 
 def test_haiku_has_no_effort_selection_is_none() -> None:
     p = _picker("claude-opus-4-8", "high")
-    p.down(); p.down()  # → haiku
+    p.down()
+    p.down()  # → haiku
     assert p.current_model_id == "claude-haiku-4-5"
     assert p.selection() == ("claude-haiku-4-5", None)
     # left/right are no-ops on a model with no efforts
-    p.left(); p.right()
+    p.left()
+    p.right()
     assert p.selection() == ("claude-haiku-4-5", None)
 
 

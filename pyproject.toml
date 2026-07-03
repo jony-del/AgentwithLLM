@@ -3,10 +3,12 @@ name = "agent-with-llm"
 version = "0.1.0"
 description = "A Python ReAct agent framework with Claude, tools, hooks, permissions, and compression."
 requires-python = ">=3.11"
-# All runtime, MCP reference-server, and test deps are core, so `pip install -e .`
-# yields a fully working agent with no extras to remember. ddgs is the keyless default
-# search backend; Brave/Tavily are used instead when their API key env var is set (no
-# extra dep — they go over httpx).
+# Runtime deps are core so `pip install -e .` yields a fully working agent. ddgs is
+# the keyless default search backend; Brave/Tavily are used instead when their API key
+# env var is set (no extra dep — they go over httpx).
+# Development-only tooling (test runner, lint, type-check) lives in the [dev] extra —
+# it is NOT part of the runtime import surface: `pip install -e .[dev]` for hacking.
+# (Roadmap R2 will further split [mcp]/[terminal]/[sandbox]/[all]; see revision guide D1.)
 dependencies = [
     "httpx>=0.27",
     "markdownify>=0.11",
@@ -19,8 +21,14 @@ dependencies = [
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "ruff>=0.4",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
@@ -38,6 +46,29 @@ include = ["agent_core*"]
 # them straight from the source tree.
 [tool.setuptools.package-data]
 "agent_core.skills" = ["bundled/*.md"]
+
+# Lint/type-check are introduced incrementally (revision guide D6). Stage 1: ruff
+# E (pycodestyle errors) + F (pyflakes) with E501 excluded (long lines are pervasive
+# and cosmetic); mypy covers only the cross-layer contract modules. Widen both as
+# the codebase is brought along — never loosen back.
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.mypy]
+files = [
+    "agent_core/models.py",
+    "agent_core/providers/base.py",
+    "agent_core/permissions.py",
+    "agent_core/permission_rules.py",
+]
+follow_imports = "silent"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

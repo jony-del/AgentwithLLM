@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from agent_core.agents.team import TeamError, TeamPermissionError, TeamStore
 from agent_core.models import ToolRisk, ToolResult

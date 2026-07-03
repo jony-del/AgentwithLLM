@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agent_core.config import (
     resolve_compression_config,
@@ -512,7 +513,7 @@ def sessions_command(args: argparse.Namespace) -> int:
         branch = f" [{info.git_branch}]" if info.git_branch else ""
         print(f"  {info.session_id}  {when}  ({info.message_count} msgs){branch}")
         print(f"      {label}")
-    print(f"\nResume with: polaris run <task> --resume <id>   (or --continue for the newest)")
+    print("\nResume with: polaris run <task> --resume <id>   (or --continue for the newest)")
     return 0
 
 
@@ -578,7 +579,7 @@ def health_command(args: argparse.Namespace) -> int:
     
     # Check configuration
     try:
-        config = resolve_config()
+        resolve_config({})
         print("✓ Configuration loaded successfully")
     except Exception as e:
         print(f"✗ Configuration error: {e}")

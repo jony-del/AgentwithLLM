@@ -167,7 +167,6 @@ class TeamStore:
             raise TeamError("team goal must not be empty")
 
         team_id = f"team_{uuid.uuid4().hex[:12]}"
-        team_dir = self._team_dir(team_id)
         inbox_dir = self._inbox_dir(team_id)
         inbox_dir.mkdir(parents=True, exist_ok=False)
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import importlib.util
 import os
 import re
 import subprocess
@@ -345,6 +346,16 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
     risk = ToolRisk.DANGEROUS
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
+        # pytest is a [dev] extra, not a runtime dependency — probe for it and fail
+        # with an actionable install hint instead of a raw ModuleNotFoundError.
+        if importlib.util.find_spec("pytest") is None:
+            return ToolResult(
+                self.name,
+                "pytest is not installed in this environment. Install the dev extras "
+                "(pip install -e .[dev]) or pytest itself to run tests.",
+                ok=False,
+                metadata={"error_type": "MissingDependency"},
+            )
         cmd = [sys.executable, "-m", "pytest"]
         if arguments.get("target"):
             cmd.append(str(arguments["target"]))
