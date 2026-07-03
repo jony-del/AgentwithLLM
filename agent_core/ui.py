@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal
 
 from agent_core.models import ToolResult
+from agent_core.terminal.app import TerminalRenderer
 
 # What confirm_tool may return: run the tool once, allow it for the rest of the
 # session (never ask again for this tool name), or deny it.
@@ -107,6 +109,15 @@ class AgentUI:
         """Ask the user whether to run a tool. Base/non-interactive answer: deny."""
         return "deny"
 
+    def confirm_action(self, message: str) -> bool:
+        """A one-off yes/no safety confirmation (e.g. "continue without a sandbox?").
+
+        Called at agent construction time, before any event loop exists, so
+        implementations must not rely on ``bind_event_loop``. Base/non-interactive
+        answer: **no** — every caller treats False as the fail-closed path.
+        """
+        return False
+
     async def pick_model(
         self, current_model: str, current_effort: str | None
     ) -> tuple[str, str | None] | None:
@@ -123,11 +134,6 @@ class NullUI(AgentUI):
     """The default: a silent sink. Present so the loop can always emit events."""
 
     is_live = False
-
-
-import asyncio
-
-from agent_core.terminal.app import TerminalRenderer
 
 
 class ConsoleUI(AgentUI):
@@ -222,3 +228,14 @@ class ConsoleUI(AgentUI):
             return future.result()
         except Exception:
             return "deny"
+
+    def confirm_action(self, message: str) -> bool:
+        # Construction-time confirmation: no event loop is bound yet, so this is a
+        # plain blocking prompt on the CLI's own terminal. Anything but an explicit
+        # yes stays the fail-closed answer.
+        try:
+            self._renderer.emit(message)
+            answer = input("Continue? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt, OSError):
+            return False
+        return answer in {"y", "yes"}

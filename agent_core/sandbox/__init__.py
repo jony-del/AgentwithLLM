@@ -1,6 +1,6 @@
 """OS-level sandbox subsystem (enforcement layer).
 
-Two-layer design (see ``docs/sandbox-openclaudecode-alignment.md``):
+Two-layer design:
 
 - the cross-platform *policy layer* lives in :mod:`agent_core.permission_rules` and
   :mod:`agent_core.permissions` (fine-grained allow/deny/ask rules);
@@ -21,7 +21,12 @@ from agent_core.sandbox.config import (
     SandboxNetworkConfig,
     SandboxVmConfig,
 )
-from agent_core.sandbox.manager import NOOP_SANDBOX, SandboxManager, SandboxUnavailableError
+from agent_core.sandbox.manager import (
+    NOOP_SANDBOX,
+    SandboxManager,
+    SandboxRequiredError,
+    SandboxUnavailableError,
+)
 
 
 class SandboxAwareMixin:
@@ -49,6 +54,7 @@ __all__ = [
     "SandboxNetworkConfig",
     "SandboxTier",
     "SandboxManager",
+    "SandboxRequiredError",
     "SandboxUnavailableError",
     "SandboxAwareMixin",
     "NOOP_SANDBOX",

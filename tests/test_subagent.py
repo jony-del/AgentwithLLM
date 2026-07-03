@@ -227,6 +227,21 @@ async def test_agent_spawns_subagent_with_deterministic_answer(tmp_path) -> None
     assert answer == "Final answer: explore the repo"
 
 
+def test_child_permission_never_escalates(tmp_path) -> None:
+    # A broad parent grant (auto/bypass) must not launder into the child: children run
+    # the preset-mapped mode — default for read_only, acceptedits for full — never
+    # auto/dontask/bypass.
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path), permission="bypass"),
+    )
+    read_only_child = agent._make_subagent_child("read_only")
+    full_child = agent._make_subagent_child("full")
+    assert not isinstance(read_only_child, str) and not isinstance(full_child, str)
+    assert read_only_child.config.permission == PermissionMode.DEFAULT
+    assert full_child.config.permission == PermissionMode.ACCEPTEDITS
+
+
 def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
     agent = ReActAgent(provider=FakeProvider())
     # Re-derive what the read_only child would receive by replicating the filter the

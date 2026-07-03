@@ -295,6 +295,26 @@ async def test_react_spawn_teammate_can_update_task_and_message_leader(tmp_path:
     assert leader_messages[-1]["content"] == "done"
 
 
+async def test_teammate_no_longer_runs_blanket_auto(tmp_path: Path) -> None:
+    # Teammates used to be forced permission="auto" (a child-side escalation). Now they
+    # run the preset-mapped mode with explicit allow rules for the coordination tools.
+    store = TeamStore(tmp_path / "teams")
+    team = await store.create_team("alpha", "coordinate")
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), permission="auto"),
+        team_store=store,
+    )
+
+    built = await agent._make_teammate_child(team["id"], "worker", "researcher", None, "read_only")
+    assert not isinstance(built, str)
+    child, _prompt = built
+    assert child.config.permission == PermissionMode.DEFAULT
+    # Coordination tools are allow-ruled so a read_only teammate can still report back.
+    assert child.config.permission_rules.allow_matches("task_update", {})
+    assert child.config.permission_rules.allow_matches("team_message_send", {})
+
+
 # --- per-teammate model override (heterogeneous team) ------------------------
 
 

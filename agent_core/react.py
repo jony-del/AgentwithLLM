@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import time
 import json
 from collections.abc import Callable
@@ -46,7 +48,12 @@ from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolRes
 from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, gated_provider
-from agent_core.sandbox import SandboxAwareMixin, SandboxConfig, SandboxManager
+from agent_core.sandbox import (
+    SandboxAwareMixin,
+    SandboxConfig,
+    SandboxManager,
+    SandboxRequiredError,
+)
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.skills import (
     SkillRegistry,
@@ -69,6 +76,8 @@ from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.ui import AgentUI, NullUI
+
+logger = logging.getLogger(__name__)
 
 # Injected once as a system message when the run crosses its soft deadline, so the
 # model can land a useful final answer before the hard wall-clock stop discards work.
@@ -96,6 +105,30 @@ def _unsupported_model_refusal(tool: str, model: str) -> str:
         "(e.g. claude-haiku-4-5-*, claude-sonnet-4-6, claude-opus-4-8, claude-fable-5) "
         "or omit model to inherit the parent's."
     )
+
+
+def _child_permission_mode(preset: str) -> PermissionMode:
+    """The permission mode a spawned child runs under (decision: no privilege escalation).
+
+    Children never inherit ``auto``/``dontask``/``bypass`` — spawning must not launder a
+    broad parent grant into an unattended child. The preset maps to the narrowest mode
+    that lets it do its declared job: ``full`` (READ+WRITE tools) runs ``acceptedits``
+    (writes allowed, DANGEROUS still asks → denied in the child's non-interactive NullUI);
+    everything else (``read_only``, ``hook``) runs ``default``. This is safe because the
+    spawn call itself already passed the parent's permission gate (user confirmation,
+    allow rule, or an explicitly-broad parent mode) — that grant covers the preset's
+    declared capability, nothing more. A ``plan``-mode parent never reaches this point:
+    the spawn tool call is dry-run by the parent's own gate.
+    """
+    return PermissionMode.ACCEPTEDITS if preset == "full" else PermissionMode.DEFAULT
+
+
+# Teammates coordinate through the team store (inbox/status/tasks) — those tools write
+# shared team state, not the workspace, so they are allow-ruled in every teammate
+# regardless of the child's mode. Workspace tools still go through the child's own gate.
+_TEAMMATE_COORDINATION_RULES = RuleSet.from_lists(
+    allow=["task_update", "team_inbox_read", "team_message_send"]
+)
 
 
 @dataclass(slots=True)
@@ -311,6 +344,9 @@ class ReActAgent:
         # offering the model a tool it can't use).
         if not self.skills.model_invocable():
             self.registry.unregister("skill")
+        # D3: an unattended permission mode with no working sandbox refuses to start
+        # (interactive runs get a confirm prompt; the config/env opt-out is explicit).
+        self._enforce_unattended_sandbox_requirement()
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
         # The fine-grained rule set + sandbox make the policy argument-aware.
@@ -398,8 +434,57 @@ class ReActAgent:
             blocked = {name.strip().lower() for name in self.config.skills.disabled}
             programmatic = [s for s in builtin_programmatic_skills() if s.name.lower() not in blocked]
             return SkillRegistry(programmatic + markdown)
-        except Exception:  # noqa: BLE001 - skill loading must never crash agent construction
+        except Exception as exc:  # noqa: BLE001 - skill loading must never crash agent construction
+            logger.warning(
+                "skill loading failed; continuing with no skills: %s: %s",
+                type(exc).__name__, exc,
+            )
             return SkillRegistry()
+
+    def _enforce_unattended_sandbox_requirement(self) -> None:
+        """D3: unattended modes (auto/dontask/bypass) must not run with zero isolation.
+
+        Those modes execute WRITE (and for bypass, DANGEROUS) tools without per-call
+        confirmation, so the OS sandbox is the only remaining boundary — if it is
+        disabled or unavailable, refuse to construct. Interactive runs are offered a
+        one-off "continue unsandboxed?" confirmation instead. The explicit opt-out
+        (``[sandbox] allow_unattended_unsandboxed`` or ``AGENT_SANDBOX_ALLOW_UNATTENDED``,
+        read here so embedded/test constructions honor it too) is logged, never silent.
+        """
+        try:
+            mode = PermissionMode(self.config.permission)
+        except ValueError:
+            return  # unknown mode string — PermissionPolicy will reject it just below
+        if mode not in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}:
+            return
+        if self.sandbox.is_enabled():
+            return
+        env = os.getenv("AGENT_SANDBOX_ALLOW_UNATTENDED")
+        env_opt_out = env is not None and env.strip().lower() in {"1", "true", "yes", "on"}
+        if self.config.sandbox.allow_unattended_unsandboxed or env_opt_out:
+            logger.warning(
+                "permission mode %r runs without per-call confirmation AND without a "
+                "sandbox (explicit allow_unattended_unsandboxed opt-out)",
+                mode.value,
+            )
+            return
+        reason = (
+            self.sandbox.unavailable_reason()
+            or "the sandbox is disabled ([sandbox] enabled = false)"
+        )
+        message = (
+            f"Permission mode '{mode.value}' executes commands without per-call "
+            f"confirmation, but {reason}."
+        )
+        if self.ui.is_live and self.ui.confirm_action(message):
+            logger.warning("user confirmed running mode %r without a sandbox", mode.value)
+            return
+        raise SandboxRequiredError(
+            message
+            + " Enable the sandbox ([sandbox] enabled = true / --sandbox), switch to an "
+            "attended permission mode, or opt out explicitly with [sandbox] "
+            "allow_unattended_unsandboxed = true (env AGENT_SANDBOX_ALLOW_UNATTENDED=1)."
+        )
 
     async def compact_now(self, messages: list[Message]) -> tuple[list[Message], int]:
         """Force a compaction fold of ``messages`` now, ignoring the token gate.
@@ -417,7 +502,11 @@ class ReActAgent:
                 token_estimator=self._estimate_tokens,
                 summarizer=self._summarizer,
             )
-        except Exception:  # noqa: BLE001 - a manual compact must never crash the chat session
+        except Exception as exc:  # noqa: BLE001 - a manual compact must never crash the chat session
+            logger.warning(
+                "manual compaction failed; history left unchanged: %s: %s",
+                type(exc).__name__, exc,
+            )
             return messages, 0
         after = sum(len(m.content) for m in compacted)
         return compacted, max(0, before - after)
@@ -1405,7 +1494,11 @@ class ReActAgent:
                     base_config=self._provider_config(),
                     subagent_factory=self.session.subagent_factory,
                 )
-            except Exception:  # noqa: BLE001 - a bad spec must not sink construction.
+            except Exception as exc:  # noqa: BLE001 - a bad spec must not sink construction.
+                logger.warning(
+                    "dropping external hook %s/%s (failed to build): %s: %s",
+                    spec.event, spec.type, type(exc).__name__, exc,
+                )
                 adapter = None
             if adapter is not None:
                 getattr(pipeline, attr).append(adapter)
@@ -1463,9 +1556,12 @@ class ReActAgent:
                 continue  # never hand a child arbitrary command execution implicitly
             sub_registry.register(tool)
         # Disable memory (no independent recall/extract) and skills (the child never gets
-        # the ``skill`` tool, so there's nothing to load) in the child.
+        # the ``skill`` tool, so there's nothing to load) in the child. The child's
+        # permission mode comes from the preset, never inherited wholesale — see
+        # _child_permission_mode (no escalation via spawning).
         child_config = replace(
             self.config,
+            permission=_child_permission_mode(preset),
             memory=replace(self.config.memory, enabled=False),
             skills=replace(self.config.skills, enabled=False),
         )
@@ -1555,9 +1651,14 @@ class ReActAgent:
         sub_registry.register(TeamInboxReadTool())
         sub_registry.register(TeamMessageSendTool())
 
+        # Teammates used to run a blanket ``permission="auto"`` — a child-side privilege
+        # escalation. Now they get the preset-mapped mode like any child, plus explicit
+        # allow rules for the team-coordination tools (which write team state, not the
+        # workspace), so a read_only teammate can still claim tasks and report back.
         child_config = replace(
             self.config,
-            permission="auto",
+            permission=_child_permission_mode(preset),
+            permission_rules=self.config.permission_rules.merge(_TEAMMATE_COORDINATION_RULES),
             memory=replace(self.config.memory, enabled=False),
             skills=replace(self.config.skills, enabled=False),
         )

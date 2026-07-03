@@ -20,6 +20,7 @@ hard gate for deployments that must never run commands unsandboxed).
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -36,12 +37,25 @@ from agent_core.sandbox.backends.container import ContainerUnavailable
 from agent_core.sandbox.backends.vm import VmUnavailable
 from agent_core.sandbox.config import SandboxConfig
 
+logger = logging.getLogger(__name__)
+
 # Tier order, weakest → strongest. Downgrade walks this list *downward* from the request.
 _TIER_ORDER = (SandboxTier.NATIVE, SandboxTier.CONTAINER, SandboxTier.VM)
 
 
 class SandboxUnavailableError(RuntimeError):
     """Raised at construction when ``enabled + fail_if_unavailable`` but can't sandbox."""
+
+
+class SandboxRequiredError(SandboxUnavailableError):
+    """An unattended permission mode (auto/dontask/bypass) requires a working sandbox.
+
+    Decision D3: modes that execute commands without per-call confirmation must not run
+    with no isolation at all. Raised at agent construction; the interactive path offers
+    a "continue unsandboxed?" prompt instead, and
+    ``sandbox.allow_unattended_unsandboxed`` / ``AGENT_SANDBOX_ALLOW_UNATTENDED`` is the
+    explicit, audited opt-out.
+    """
 
 
 class SandboxManager:
@@ -166,15 +180,21 @@ class SandboxManager:
             return
         try:
             self._backend.reset()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - a failed snapshot restore must not sink the run
+            logger.warning(
+                "sandbox VM reset failed; run continues on the previous guest state: %s: %s",
+                type(exc).__name__, exc,
+            )
 
     def teardown(self) -> None:
         """Release backend resources (stop/remove container, power off VM)."""
         try:
             self._backend.teardown()
-        except Exception:  # teardown must never raise into shutdown
-            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must never raise into shutdown
+            logger.warning(
+                "sandbox teardown failed (resources may be left behind): %s: %s",
+                type(exc).__name__, exc,
+            )
 
     # -- the wrap seam called by command tools ---------------------------------------
 
