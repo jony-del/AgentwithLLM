@@ -228,7 +228,32 @@ async def test_command_adapter_timeout_degrades_to_allow(tmp_path: Path) -> None
     spec = ExternalHookSpec(event="Stop", type="command", command=_command(script), timeout=0.3)
     adapter = CommandHookAdapter(spec, JSONLRunLogger(tmp_path))
     outcome = await adapter.on_stop(HookContext(event=HookEvent.STOP, messages=[]))
-    # Killed on timeout → no block, run proceeds.
+    # Killed on timeout → fail_mode defaults to "open" → no block, run proceeds.
+    assert outcome.block is False
+
+
+async def test_command_adapter_timeout_fail_closed_blocks(tmp_path: Path) -> None:
+    # fail_mode=closed: the gate hook crashing/timing out must NOT swing open.
+    script = tmp_path / "slow.py"
+    script.write_text("import time; time.sleep(5)\n", encoding="utf-8")
+    spec = ExternalHookSpec(
+        event="Stop", type="command", command=_command(script), timeout=0.3, fail_mode="closed"
+    )
+    adapter = CommandHookAdapter(spec, JSONLRunLogger(tmp_path))
+    outcome = await adapter.on_stop(HookContext(event=HookEvent.STOP, messages=[]))
+    assert outcome.block is True
+    assert "fail_mode=closed" in (outcome.reason or "")
+
+
+async def test_command_adapter_success_ignores_fail_mode(tmp_path: Path) -> None:
+    # A hook that RUNS and says allow is an allow — fail_mode only covers hook failure.
+    script = tmp_path / "ok.py"
+    script.write_text("import sys; sys.stdin.read(); print('{}')\n", encoding="utf-8")
+    spec = ExternalHookSpec(
+        event="Stop", type="command", command=_command(script), timeout=10, fail_mode="closed"
+    )
+    adapter = CommandHookAdapter(spec, JSONLRunLogger(tmp_path))
+    outcome = await adapter.on_stop(HookContext(event=HookEvent.STOP, messages=[]))
     assert outcome.block is False
 
 

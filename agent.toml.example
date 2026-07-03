@@ -3,6 +3,16 @@
 #
 # Precedence (lowest to highest): built-in defaults -> this file ->
 # AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
+#
+# SECURITY — repo-config trust (D2): when THIS file lives inside a repository you cloned,
+# it is treated as repo-controlled input. It may freely TIGHTEN policy (deny/ask rules and
+# every ordinary table apply immediately), but PRIVILEGE-WIDENING settings —
+# [permissions].allow, [[hooks.external]], [sandbox].excluded_commands /
+# .auto_allow_command_if_sandboxed / .allow_unattended_unsandboxed, and [mcp.servers] —
+# are inert until you approve them once (trust-on-first-use, recorded per project in
+# ~/.polaris/trusted.json; you are re-asked if they later change). Unattended/CI runs drop
+# unapproved widening with a warning. This does not apply to a config you pass explicitly
+# with --config (that is your own, not the repo's).
 
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
@@ -141,14 +151,20 @@ neutralize_framing = true      # wrap+escape spoofed control framing instead of 
 # applies to Pre/PostCompact (matched against the trigger: "auto" | "reactive"). Every call
 # is bounded by a single `timeout` (seconds) with kill-await; the hook receives a bounded
 # JSON projection of the context on stdin / as the request body.
-# SECURITY: these run arbitrary commands/URLs from THIS project's agent.toml — only enable
-# hooks you trust.
+# `fail_mode` decides what happens when the hook ITSELF fails (timeout/crash/network):
+#   "open" (default) degrades to allow — right for observation; "closed" turns the failure
+#   into a block, so a crashed security gate does NOT swing open (honored by command/http
+#   only). A typo in fail_mode is treated as "closed" (a gate must not silently fail open).
+# SECURITY: external hooks run arbitrary commands/URLs. When they appear in an in-repo
+# agent.toml they are a PRIVILEGE-WIDENING setting and are gated by the repo-config trust
+# policy (see the top-of-file note) — inert on an untrusted clone until you approve them.
 #
 [[hooks.external]]
 event = "UserPromptSubmit"
 type = "command"
 command = "python3 ./.polaris/hooks/validate_prompt.py"
 timeout = 5
+# fail_mode = "closed"        # block the prompt if this validator can't run
 #
 [[hooks.external]]
 event = "PreCompact"
@@ -362,8 +378,10 @@ backend = "auto"                       # isolation tier: "auto" (container→nat
                                        #   available one; "auto" never auto-selects "vm".
 fail_if_unavailable = false            # true = hard-fail at startup if sandbox can't run
                                        #   (instead of silently running unsandboxed)
-auto_allow_command_if_sandboxed = true # skip the permission prompt when a command WILL be
-                                       #   sandboxed (the OS sandbox is the real boundary)
+auto_allow_command_if_sandboxed = false # skip the permission prompt when a command WILL be
+                                       #   sandboxed. Default false (decision D4): the sandbox
+                                       #   is one layer, not a substitute for confirmation.
+                                       #   Set true only in a trusted dev/lax profile.
 allow_unsandboxed_commands = true      # honor a per-call request to run outside the sandbox
 excluded_commands = []                 # commands that run OUTSIDE the sandbox, e.g. ["bazel:*"]
                                        #   (NOT a security boundary — still hits permissions)

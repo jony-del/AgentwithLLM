@@ -3,7 +3,17 @@ from __future__ import annotations
 import os
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+
+if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-resolver
+    from agent_core.compression import CompressionConfig
+    from agent_core.hooks import ExternalHookSpec, HooksConfig, OutputLimitConfig
+    from agent_core.mcp.config import MCPConfig
+    from agent_core.memory.config import MemoryConfig
+    from agent_core.permission_rules import RuleSet
+    from agent_core.sandbox import SandboxConfig
+    from agent_core.skills import SkillsConfig
+    from agent_core.tool_use_summary import ToolUseSummaryConfig
 
 _T = TypeVar("_T")
 
@@ -89,6 +99,17 @@ def load_dotenv(path: str | Path = ".env", *, override: bool = False) -> None:
         os.environ[key] = _unquote_env_value(value.strip())
 
 
+# The conventional in-repo config filename. ONLY this default relative path is treated
+# as repo-controlled input (D2 trust policy below); an explicitly passed path was chosen
+# by the caller (user/test) and is honored as user-level config.
+_REPO_DEFAULT_CONFIG = "agent.toml"
+
+# Per-process cache of the trust-filtered repo config, keyed by (project, mtime, store),
+# so the TOFU prompt fires at most once per process even though every resolver re-reads
+# the file.
+_TRUST_CACHE: dict[tuple[str, int, str], dict[str, Any]] = {}
+
+
 def load_agent_toml(path: str | Path = "agent.toml") -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
@@ -98,7 +119,45 @@ def load_agent_toml(path: str | Path = "agent.toml") -> dict[str, Any]:
     except ModuleNotFoundError:
         return {}
     with config_path.open("rb") as file:
-        return tomllib.load(file)
+        raw = tomllib.load(file)
+    if str(path) != _REPO_DEFAULT_CONFIG:
+        return raw
+    return _apply_repo_trust(config_path, raw)
+
+
+def _apply_repo_trust(config_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
+    """D2: filter privilege-widening keys of the in-repo agent.toml through TOFU.
+
+    Deny/ask rules and every non-widening table pass through; allow rules, external
+    hooks, sandbox relaxations, and MCP servers require recorded (or freshly granted)
+    user trust — see :mod:`agent_core.trust`. Failures degrade in the strict
+    direction: if the policy itself errors, the widening keys are stripped.
+    """
+    import copy
+
+    from agent_core import trust
+
+    project = config_path.resolve().parent
+    try:
+        mtime = config_path.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    key = (str(project), mtime, str(trust.trust_store_path()))
+    cached = _TRUST_CACHE.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+    try:
+        effective = trust.apply_repo_trust_policy(raw, project=project)
+    except Exception as exc:  # noqa: BLE001 - policy failure must not widen privileges
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "repo-config trust policy failed (%s: %s); stripping widening keys",
+            type(exc).__name__, exc,
+        )
+        effective = trust.strip_widening(raw)
+    _TRUST_CACHE[key] = effective
+    return copy.deepcopy(effective)
 
 
 def resolve_config(
@@ -384,7 +443,7 @@ def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig
     or a missing required field for its type is dropped (not raised), so a sloppy config
     degrades to fewer hooks instead of crashing construction. Unknown keys are ignored.
     """
-    from agent_core.hooks import ExternalHookSpec, HookEvent, HooksConfig
+    from agent_core.hooks import HookEvent, HooksConfig
 
     table = load_agent_toml(config_file).get("hooks")
     config = HooksConfig()
@@ -435,6 +494,14 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
         timeout = float(timeout_raw)
     except (TypeError, ValueError):
         timeout = 30.0
+    # fail_mode is a SECURITY option, so its parse failure degrades in the strict
+    # direction: anything that isn't exactly "open" becomes "closed" (a typo on a
+    # gate hook must not silently fail open). Absent → "open" (observational default).
+    fail_mode_raw = entry.get("fail_mode")
+    if fail_mode_raw is None:
+        fail_mode = "open"
+    else:
+        fail_mode = "open" if str(fail_mode_raw).strip().lower() == "open" else "closed"
     return ExternalHookSpec(
         event=event,
         type=hook_type,
@@ -445,6 +512,7 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
         model=(str(entry["model"]) if entry.get("model") is not None else None),
         headers=(dict(headers) if isinstance(headers, dict) else None),
         timeout=max(0.1, timeout),
+        fail_mode=fail_mode,
     )
 
 

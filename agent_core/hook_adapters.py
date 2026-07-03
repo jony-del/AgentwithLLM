@@ -15,8 +15,11 @@ Invariants (aligned with the project's timeout / degrade discipline):
 
 * A **single, non-stacked** timeout bounds every external call; a command that overruns is
   killed and awaited (no zombies).
-* Any failure (timeout, non-zero/garbled output, network/model error) **degrades to allow**
-  — the adapter returns an empty ``HookOutcome`` and logs, never raising into the run.
+* When the hook ITSELF fails (timeout, crash, network error), ``spec.fail_mode`` decides:
+  ``"open"`` (default) **degrades to allow** — an empty ``HookOutcome`` plus a log, never
+  raising into the run; ``"closed"`` converts the failure into a **block** decision, so a
+  crashed security gate does not silently swing open. ``fail_mode`` is honored only by the
+  transports that carry the block contract (``command`` / ``http``).
 * The context handed across the boundary is a **bounded JSON projection** (recent messages
   only, content truncated), never the full live history.
 * Only the compaction events honor ``matcher`` (matched against the ``trigger``).
@@ -89,6 +92,14 @@ def project_hook_input(
     return data
 
 
+class HookFailedError(RuntimeError):
+    """The external hook itself failed (timeout / transport error / crash).
+
+    Raised by transport ``_invoke`` implementations so :meth:`_ExternalHookAdapter._run`
+    can apply the spec's ``fail_mode`` uniformly (open → allow, closed → block).
+    """
+
+
 def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
     """Map a command/http hook's textual output + exit code to a :class:`HookOutcome`.
 
@@ -148,9 +159,26 @@ class _ExternalHookAdapter:
             return HookOutcome()
         try:
             return await self._invoke(ctx)
-        except Exception as exc:  # noqa: BLE001 - degrade to allow; never sink the run.
+        except HookFailedError as exc:
+            await self._log("hook_failed", str(exc))
+            return self._failure_outcome(str(exc))
+        except Exception as exc:  # noqa: BLE001 - never raise into the run.
             await self._log("exception", f"{type(exc).__name__}: {exc}")
-            return HookOutcome()
+            return self._failure_outcome(f"{type(exc).__name__}: {exc}")
+
+    def _failure_outcome(self, detail: str) -> HookOutcome:
+        """Apply ``fail_mode`` to a hook-side failure.
+
+        Only the block-contract transports (command/http) may fail closed; the advisory
+        transports (prompt/agent) always degrade to allow, matching their "never block"
+        contract.
+        """
+        if self.spec.fail_mode == "closed" and self.spec.type in {"command", "http"}:
+            return HookOutcome(
+                block=True,
+                reason=f"external {self.spec.type} hook failed and fail_mode=closed: {detail}",
+            )
+        return HookOutcome()
 
     async def _log(self, status: str, detail: str = "") -> None:
         try:
@@ -201,7 +229,7 @@ class CommandHookAdapter(_ExternalHookAdapter):
             proc.kill()
             await proc.wait()
             await self._log("timeout", f"{self.spec.timeout}s")
-            return HookOutcome()
+            raise HookFailedError(f"timed out after {self.spec.timeout}s") from None
         return outcome_from_output(stdout.decode("utf-8", "replace"), proc.returncode or 0)
 
 
@@ -225,12 +253,12 @@ class HttpHookAdapter(_ExternalHookAdapter):
 
         try:
             status, body = await asyncio.to_thread(_post)
-        except Exception as exc:  # noqa: BLE001 - network/timeout → degrade to allow.
+        except Exception as exc:  # noqa: BLE001 - network/timeout → fail_mode decides.
             await self._log("http_error", f"{type(exc).__name__}: {exc}")
-            return HookOutcome()
+            raise HookFailedError(f"{type(exc).__name__}: {exc}") from exc
         if status >= 400:
             await self._log("http_status", str(status))
-            return HookOutcome()
+            raise HookFailedError(f"HTTP {status}")
         # HTTP carries no exit code; only the JSON body drives the block decision.
         return outcome_from_output(body, 0)
 

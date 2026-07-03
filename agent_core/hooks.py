@@ -106,6 +106,13 @@ class ExternalHookSpec:
     compaction events (matched against the ``trigger``: ``auto`` / ``reactive``). The
     remaining fields are type-specific; an adapter reads what it needs and ignores the
     rest. Unparseable/incomplete specs are dropped at load time, never raised.
+
+    ``fail_mode`` decides what happens when the hook ITSELF fails (timeout, crash,
+    network error): ``"open"`` (default) degrades to allow — right for observational
+    hooks; ``"closed"`` treats the failure as a block decision — required when the hook
+    is a security gate, so a crashed gate does not silently swing open. Honored only by
+    the transports that carry the block contract (``command`` / ``http``); ``prompt`` /
+    ``agent`` stay advisory regardless.
     """
 
     event: str
@@ -117,6 +124,7 @@ class ExternalHookSpec:
     model: str | None = None
     headers: dict[str, str] | None = None
     timeout: float = 30.0
+    fail_mode: str = "open"
 
 
 @dataclass(slots=True)

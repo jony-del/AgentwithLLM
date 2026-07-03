@@ -94,6 +94,29 @@ def test_external_specs_parse(tmp_path: Path) -> None:
     assert stop.event == "Stop" and stop.type == "command"
     assert stop.command == "python check.py" and stop.timeout == 7.0
     assert pre.matcher == "auto"
+    # fail_mode defaults to "open" (observational hooks are the common case).
+    assert stop.fail_mode == "open"
+
+
+def test_fail_mode_parses_strict_on_typos(tmp_path: Path) -> None:
+    path = _write_toml(
+        tmp_path,
+        """
+        [[hooks.external]]
+        event = "Stop"
+        type = "command"
+        command = "gate.py"
+        fail_mode = "closed"
+
+        [[hooks.external]]
+        event = "Stop"
+        type = "command"
+        command = "gate2.py"
+        fail_mode = "clsoed"   # typo — a gate option must not silently fail open
+        """,
+    )
+    config = resolve_hooks_config(path)
+    assert [spec.fail_mode for spec in config.external] == ["closed", "closed"]
 
 
 def test_bad_specs_are_dropped(tmp_path: Path) -> None:
