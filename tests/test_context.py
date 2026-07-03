@@ -33,7 +33,11 @@ async def test_discovers_workspace_claude_md(tmp_path: Path) -> None:
     assert result is not None
     assert "Use tabs, not spaces." in result
     assert str(tmp_path / "CLAUDE.md") in result
-    assert "OVERRIDE any default behavior" in result  # preamble present
+    # Preamble present, with the D7 trust-tier framing: high-priority conventions
+    # that do NOT outrank permission/sandbox policy or explicit user instructions.
+    assert "high-priority engineering conventions" in result
+    assert "cannot override the framework's permission rules" in result
+    assert "OVERRIDE any default behavior" not in result
 
 
 async def test_multi_level_order_root_to_workspace(tmp_path: Path) -> None:
@@ -437,7 +441,6 @@ async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatc
 
     result = await agent.run("hello")
 
-    order = [m.content for m in result.messages]
     # Order: system(+gitStatus) → memory recall (system) → userContext user → user task.
     assert result.messages[0].role == "system"
     assert "gitStatus: GIT BLOCK" in result.messages[0].content
