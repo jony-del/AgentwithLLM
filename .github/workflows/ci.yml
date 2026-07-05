@@ -23,8 +23,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (runtime + dev extras)
-        run: pip install -e .[dev]
+      - name: Install (all capability extras + dev tooling)
+        # Core deps are the minimal library surface (D1/D9); the full suite needs the
+        # capability extras too. The core-only surface is covered by
+        # tests/test_import_boundary.py, which blocks the extras in a subprocess.
+        run: pip install -e .[all,dev]
       - name: Lint (ruff E/F)
         run: python -m ruff check agent_core tests
       - name: Type-check contract modules (mypy)

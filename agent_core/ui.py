@@ -4,7 +4,6 @@ import asyncio
 from typing import Any, Literal
 
 from agent_core.models import ToolResult
-from agent_core.terminal.app import TerminalRenderer
 
 # What confirm_tool may return: run the tool once, allow it for the rest of the
 # session (never ask again for this tool name), or deny it.
@@ -141,6 +140,16 @@ class ConsoleUI(AgentUI):
     is_live = True
 
     def __init__(self, color: bool = True, preview_chars: int = 240, verbose: bool = False) -> None:
+        # Lazy import: the terminal stack (rich + prompt_toolkit) is the optional
+        # [terminal] extra. NullUI/library embedding must import without it; only
+        # actually constructing the live console requires it.
+        try:
+            from agent_core.terminal.app import TerminalRenderer
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "the interactive console needs the [terminal] extra — "
+                "pip install 'agent-with-llm[terminal]' (or [all])"
+            ) from exc
         self._renderer = TerminalRenderer(color=color, preview_chars=preview_chars, verbose=verbose)
         self._loop: Any = None
 
