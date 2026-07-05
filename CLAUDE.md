@@ -57,7 +57,7 @@ the staged roadmap (R0–R3). Consult it before large structural changes.
    - *Repo config must not widen privileges (enforced).* An in-repo `agent.toml`
      may tighten policy (deny/ask rules and every ordinary table apply); the
      privilege-widening subset (allow rules, external hooks, sandbox exclusions/
-     relaxations, MCP servers) is gated by trust-on-first-use in
+     relaxations, MCP servers, `[web].allowed_domains`) is gated by trust-on-first-use in
      `agent_core/trust.py`: inert until the user approves it once (recorded per
      project in `~/.polaris/trusted.json`, re-prompted on change), dropped with an
      audit line on unattended/CI runs. A config passed explicitly via `--config`
@@ -67,12 +67,23 @@ the staged roadmap (R0–R3). Consult it before large structural changes.
      raises `SandboxRequiredError`; interactive runs get a one-off confirmation,
      and `[sandbox] allow_unattended_unsandboxed` / `AGENT_SANDBOX_ALLOW_UNATTENDED`
      is the explicit, logged opt-out.
+   - *Unattended web egress is allowlist-only (enforced).* The `[web]` domain
+     policy (`tools/web.py`, decision D10): `blocked_domains` always refuse; in
+     unattended modes a domain not in `allowed_domains` is refused fail-closed
+     (checked on every redirect hop, and against the search backend's host for
+     `web_search`). Attended runs stay open unless blocked.
    - *Degrade-to-allow is only for observation.* Observational hooks and
      context injection may fail open (a run is never sunk by telemetry).
      Control-path mechanisms must support fail-closed behavior: external hooks
      carry `fail_mode = "open"|"closed"` (command/http), and a child's effective
      permissions never exceed its parent's (`_child_permission_mode`). New
      control-path features default to fail-closed.
+   - *Programmatic approval of asks (`PermissionRequest` hook).* Fires only when
+     the pipeline reached an *ask* (interactive, or its headless collapse) — never
+     for hard denies, so a hook cannot launder a deny rule. Folding is fail-closed
+     (any deny wins); a crashed hook yields no opinion (the normal ask path
+     resumes, never a silent allow); external adapters on this event default to
+     `fail_mode = "closed"`. This is the headless deployment's ask outlet.
    - Every tool sets a correct `ToolRisk` (`READ`/`WRITE`/`DANGEROUS`); the
      permission pipeline (`permissions.py`: deny → sensitive-path safety net →
      ask → sandbox auto-allow → bypass → allow → per-mode matrix) depends on it.
@@ -114,11 +125,22 @@ polaris chat --provider fake          # interactive chat, one event loop per ses
 $env:ANTHROPIC_API_KEY="your-key"
 polaris run "Use the echo tool" --provider claude --model claude-haiku-4-5-20251001
 
+# OpenAI-compatible endpoint (OpenAI / vLLM / Groq / ... — see .env.example)
+$env:OPENAI_API_KEY="your-key"
+polaris run "Use the echo tool" --provider openai --model gpt-4o-mini
+
 # Live-display flags (CLI-only): --quiet, --no-stream, --thinking-budget N
 # Other subcommands: sessions / dream / memory / mcp / health
+polaris replay <run_id>                  # re-render a runs/*.jsonl as a timeline (no API)
+# --config PATH reads settings from another toml (explicit path = user-chosen,
+# no TOFU filtering) — e.g. the shipped agent.strict.toml / agent.lax.toml profiles
+polaris run "task" --provider fake --config agent.strict.toml
+
+# Install: core is the minimal library surface (httpx+pyyaml); capabilities are
+# extras — [web] (fetch/search), [mcp], [terminal] (interactive console), [all].
+pip install -e .[all,dev]                # recommended: everything + test/lint tooling
 
 # Tests
-pip install -e .
 pytest                                   # full suite must stay green
 pytest tests/test_react.py::test_react_executes_demo_tool
 ```
@@ -146,21 +168,30 @@ Core loop & contracts:
   pinned user-context message.
 - `agent_core/transcript.py` — resumable session transcripts (uuid/parent_uuid
   chains, compact boundaries, fork); `agent_core/storage.py` — per-run JSONL
-  event log.
+  event log (`JSONLRunLogger` writer + `read_events` reader; `polaris replay`
+  renders a log as a timeline).
 
 Providers:
-- `agent_core/providers/base.py` — `LLMProvider` interface, `GatedProvider`
-  (shared semaphore + token-bucket across the multi-agent fan-out).
+- `agent_core/providers/base.py` — `LLMProvider` interface, `ProviderConfig`
+  (the frozen per-call parameter contract of `complete`; derived calls override
+  via `dataclasses.replace`), `GatedProvider` (shared semaphore + token-bucket
+  across the multi-agent fan-out).
 - `agent_core/providers/claude.py` — Messages API over httpx: streaming,
   retries with jitter, model-aware request shape (adaptive thinking vs legacy),
-  effort levels. `fake.py` — deterministic offline provider for tests/demos.
+  effort levels. `openai_compat.py` — the second protocol family (D5):
+  `/v1/chat/completions` over httpx (`OPENAI_API_KEY`/`OPENAI_BASE_URL`; OpenAI,
+  vLLM, Groq, …), streaming + non-streaming + tool calls, `thinking_budget`/
+  `effort` safely ignored. `fake.py` — deterministic offline provider for
+  tests/demos.
 
 Tools:
 - `agent_core/tools/base.py` — `Tool`, `ToolRisk`, `WorkspacePathMixin`
   (workspace confinement), concurrency specs; `catalog.py` — `@builtin_tool`
   self-registration; `registry.py` / `executor.py` — registry and wave-partitioned
   parallel execution; `adapters.py` — adapter base.
-- `builtin.py` (fs/search/command/tests), `editing.py`, `web.py` (SSRF-guarded),
+- `builtin.py` (fs/search/command/tests; `search_text` probes for ripgrep and
+  uses it when present, falling back to the pure-Python scan — identical output
+  either way), `editing.py`, `web.py` (SSRF-guarded + `[web]` domain policy),
   `planning.py`, `subagent.py`, `team.py`, `skill.py`.
 
 Permissions & sandbox:
@@ -173,14 +204,23 @@ Permissions & sandbox:
 - `agent_core/sandbox/` — OS enforcement layer: `SandboxManager` selects a
   backend by tier (`native` bwrap/seatbelt, `container` podman/docker/nerdctl,
   `vm` Kata/Hyper-V/Lima) with downgrade-on-unavailable; `fail_if_unavailable`
-  turns "can't sandbox" into a hard startup error. Command tools reach it via
-  `SandboxAwareMixin`.
+  turns "can't sandbox" into a hard startup error. `prepare()` is idempotent and
+  managers are process-shared via `get_shared_manager` (children reuse their
+  parent's via `ReActAgent(sandbox=…)`), so heavyweight readying runs once per
+  process. Command tools reach it via `SandboxAwareMixin`.
 
 Hooks:
-- `agent_core/hooks.py` — tool hooks (sync, in-executor) + five async lifecycle
-  events (`UserPromptSubmit`, `PostSampling`, `PreCompact`, `PostCompact`,
-  blockable `Stop`) and `MaxOutputPostHook` (oversized output → on-disk spill +
-  `<tool_output_ref>` pointer).
+- `agent_core/hooks.py` — tool hooks (sync, in-executor) + async lifecycle
+  events: the decision events (`UserPromptSubmit`, `PreCompact`, `PostCompact`,
+  blockable `Stop`), fire-and-forget `PostSampling`, and the observational C5
+  events (`SessionStart`/`SessionEnd`, `SubagentStart`/`SubagentStop`,
+  `PostToolUseFailure`) which are awaited but fail-open and never alter control
+  flow, plus the control-path `PermissionRequest` (programmatic ask approval,
+  fail-closed — see the security principles). `SessionEnd` is host-driven: the
+  CLI calls `agent.fire_session_end()` at run/chat exit; library embedders call
+  it at their own session boundary. Also
+  `MaxOutputPostHook` (oversized output → on-disk spill + `<tool_output_ref>`
+  pointer).
 - `agent_core/builtin_hooks.py` — in-process hooks (stop-on-open-todos,
   observers, `PromptValidationHook` input firewall: provenance-based,
   neutralize-not-reject).
@@ -290,14 +330,17 @@ Scalar precedence: built-in defaults → `agent.toml` → env → CLI flags.
 Tables resolved separately in `config.py`: `[memory]`, `[limits]`, `[session]`,
 `[context]`, `[compression]`, `[concurrency]`, `[mcp]`, `[output]`,
 `[tool_use_summary]`, `[skills]`, `[hooks]` (+ `[hooks.builtin]`,
-`[hooks.prompt_validation]`, `[[hooks.external]]`), `[permissions]`,
+`[hooks.prompt_validation]`, `[[hooks.external]]`), `[permissions]`, `[web]`,
 `[sandbox]` (+ filesystem/network/container/vm). Live-display knobs are
 CLI-only. See `agent.toml.example` for the full supported shape; keep it in
-sync with code.
+sync with code. Two ready-made posture profiles ship at the repo root —
+`agent.strict.toml` (web denied, mandatory sandbox, everything asks) and
+`agent.lax.toml` (trusted-dev: pre-approved read-only commands, sandbox
+auto-allow) — usable via `--config <file>` or by copying over `agent.toml`.
 
 Security note: an in-repo `agent.toml` is repo-controlled input. Its
 privilege-widening keys (allow rules, external hooks, sandbox exclusions/
-relaxations, MCP servers) are filtered through the trust-on-first-use policy in
+relaxations, MCP servers, `[web].allowed_domains`) are filtered through the trust-on-first-use policy in
 `agent_core/trust.py` — inert on an untrusted clone until approved. Because this
 repo's own `agent.toml` declares MCP servers, working here interactively prompts
 once to trust them (headless runs drop them with a warning). Never extend the set
@@ -305,7 +348,7 @@ of keys repo config can widen.
 
 ## Testing & Acceptance
 
-- The full suite stays green (`pytest`, currently ~700 tests); run the focused
+- The full suite stays green (`pytest`, currently ~780 tests); run the focused
   file(s) for the area touched plus the full suite for shared behavior.
 - Security-affecting changes ship with paired tests: the blocked case, the
   allowed case, and the degradation path (what happens when the mechanism

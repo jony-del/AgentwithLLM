@@ -8,7 +8,8 @@
 # it is treated as repo-controlled input. It may freely TIGHTEN policy (deny/ask rules and
 # every ordinary table apply immediately), but PRIVILEGE-WIDENING settings —
 # [permissions].allow, [[hooks.external]], [sandbox].excluded_commands /
-# .auto_allow_command_if_sandboxed / .allow_unattended_unsandboxed, and [mcp.servers] —
+# .auto_allow_command_if_sandboxed / .allow_unattended_unsandboxed, [mcp.servers],
+# and [web].allowed_domains —
 # are inert until you approve them once (trust-on-first-use, recorded per project in
 # ~/.polaris/trusted.json; you are re-asked if they later change). Unattended/CI runs drop
 # unapproved widening with a warning. This does not apply to a config you pass explicitly
@@ -115,8 +116,22 @@ skills_dirs = []               # extra highest-precedence directories to scan
 disabled = []                  # skill names to suppress (e.g. ["commit"])
 
 # --- Lifecycle hooks --------------------------------------------------------
-# Two sources feed the five lifecycle hooks (UserPromptSubmit / PostSampling /
-# PreCompact / PostCompact / Stop), both folded into one pipeline:
+# Two sources feed the lifecycle hooks (UserPromptSubmit / PostSampling /
+# PreCompact / PostCompact / Stop, plus the observational SessionStart /
+# SessionEnd / SubagentStart / SubagentStop / PostToolUseFailure — those are
+# watch-only: any block decision they return is discarded), both folded into
+# one pipeline. The control-path PermissionRequest event is the exception: it
+# fires when a tool call needs confirmation ("ask") and lets a hook approve or
+# refuse it programmatically — the headless deployment's ask outlet. Its stdout
+# contract: {"decision": "allow"} approves, {"decision": "deny"} (or exit code 2)
+# refuses, anything else = no opinion (the interactive prompt / headless denial
+# proceeds). Unspecified fail_mode on this event defaults to "closed":
+#
+# [[hooks.external]]
+# event = "PermissionRequest"
+# type = "command"
+# command = "python ./.polaris/hooks/approve_tool.py"
+# timeout = 10
 #   * Built-in programmatic hooks (in-process, hold live objects) — toggled below.
 #   * Config-driven external hooks ([[hooks.external]]) — subprocess / HTTP / re-prompt
 #     / verifier agent, declared here without touching code.
@@ -346,6 +361,23 @@ max_tokens = 64                       # labels are short — keep the budget tin
 max_input_chars_per_tool = 300        # head-truncate each tool's input/output before labeling
 timeout_seconds = 8.0                 # single bound on the label call; on timeout, no label
 include_subagents = false             # default: only the leader narrates (not sub-agents)
+
+# --- Web outbound domain policy (decision D10) -------------------------------
+# The S4 exfiltration guard for web_fetch / web_search (SSRF is guarded separately
+# and always). blocked_domains ALWAYS refuse (tightening — applies immediately even
+# from a repo config). allowed_domains matter only in the unattended permission
+# modes (auto / dontask / bypass): there, a domain not on the list is refused
+# (fail-closed) because nobody is present to notice an injection-driven fetch.
+# Attended (default/acceptedits/plan) runs stay open unless blocked.
+# Matching is the same host-suffix form as permission rules' "domain:example.com".
+# For web_search the policy is checked against the search backend's own host
+# (duckduckgo.com / api.search.brave.com / api.tavily.com) — the query itself is
+# the data that leaves the machine.
+# SECURITY: in an in-repo agent.toml, allowed_domains is a PRIVILEGE-WIDENING key
+# gated by trust-on-first-use (see the top-of-file note); blocked_domains is not.
+[web]
+allowed_domains = []                   # e.g. ["docs.python.org", "github.com"]
+blocked_domains = []                   # e.g. ["evil.example"]
 
 # --- Fine-grained permission rules (policy layer) ---------------------------
 # Argument-aware allow/deny/ask rules, evaluated BEFORE the coarse per-mode
