@@ -67,6 +67,10 @@ class PermissionDecision:
     dry_run: bool = False
     ask_user: bool = False
     reason: str = ""
+    # True when this denial IS a collapsed ask (non-interactive run, nobody to ask) —
+    # distinct from a hard deny (deny rule / mode matrix), which no hook may override.
+    # The PermissionRequest hook seam treats ask_user OR ask_collapsed as "askable".
+    ask_collapsed: bool = False
 
 
 class PermissionPolicy:
@@ -224,7 +228,7 @@ class PermissionPolicy:
     def _maybe_ask(self, reason: str) -> PermissionDecision:
         if self.interactive:
             return PermissionDecision(False, ask_user=True, reason=reason)
-        return PermissionDecision(False, reason=f"{reason}; non-interactive")
+        return PermissionDecision(False, reason=f"{reason}; non-interactive", ask_collapsed=True)
 
 
 def _targets_secret_path(arguments: dict[str, Any]) -> bool:

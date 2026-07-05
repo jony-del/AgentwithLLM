@@ -175,6 +175,14 @@ class HookEvent(str, Enum):
     PRE_COMPACT = "PreCompact"
     POST_COMPACT = "PostCompact"
     STOP = "Stop"
+    # Observational events (C5): awaited but fail-open, never alter control flow.
+    SESSION_START = "SessionStart"
+    SESSION_END = "SessionEnd"
+    SUBAGENT_START = "SubagentStart"
+    SUBAGENT_STOP = "SubagentStop"
+    POST_TOOL_USE_FAILURE = "PostToolUseFailure"
+    # Control-path event (R1): programmatic approval of an "ask" permission decision.
+    PERMISSION_REQUEST = "PermissionRequest"
 
 
 @dataclass(slots=True)
@@ -194,6 +202,12 @@ class HookContext:
     - ``stop_hook_active`` — Stop: True once a stop hook has already blocked the stop
       at least once this run, so a hook can avoid blocking forever (parity with the
       reference's ``stop_hook_active``).
+    - ``detail`` — the observational events' payload, keys per event:
+      SessionStart/SessionEnd carry run/agent identity (``run_id``, ``agent_name``,
+      ``parent_run_id``, and ``reason`` on End); SubagentStart/SubagentStop carry the
+      spawn shape (``kind``, ``preset``, ``model``, ``depth``, plus ``ok``/``duration``
+      on Stop); PostToolUseFailure carries ``tool``, ``error_type`` and a truncated
+      ``content``.
     """
 
     event: HookEvent
@@ -204,6 +218,7 @@ class HookContext:
     summary: str | None = None
     last_assistant_message: str | None = None
     stop_hook_active: bool = False
+    detail: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -230,12 +245,18 @@ class HookOutcome:
     blocked), it replaces the model-facing task text. The loop persists and sends the
     transformed version, so a hook can neutralize untrusted framing in the user's input
     before the first model call. Ignored on every other event.
+
+    ``decision`` is PermissionRequest-only: ``"allow"`` approves the asked-about tool
+    call, ``"deny"`` refuses it, ``None`` expresses no opinion (the normal ask path —
+    interactive prompt, or headless denial — proceeds). Any deny among the fired hooks
+    wins over any allow (fail-closed folding). Ignored on every other event.
     """
 
     block: bool = False
     additional_context: str | None = None
     reason: str | None = None
     transformed_prompt: str | None = None
+    decision: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -264,6 +285,50 @@ class StopHook(Protocol):
         ...
 
 
+# Observational protocols (C5): return nothing, may not block. The host decides the
+# session boundary — ``ReActAgent`` fires SessionStart on its first run() and exposes
+# ``fire_session_end()`` for the embedding host (the CLI calls it at run/chat exit).
+
+
+class SessionStartHook(Protocol):
+    async def on_session_start(self, ctx: HookContext) -> None:
+        ...
+
+
+class SessionEndHook(Protocol):
+    async def on_session_end(self, ctx: HookContext) -> None:
+        ...
+
+
+class SubagentStartHook(Protocol):
+    async def on_subagent_start(self, ctx: HookContext) -> None:
+        ...
+
+
+class SubagentStopHook(Protocol):
+    async def on_subagent_stop(self, ctx: HookContext) -> None:
+        ...
+
+
+class PostToolUseFailureHook(Protocol):
+    async def on_tool_failure(self, ctx: HookContext) -> None:
+        ...
+
+
+class PermissionRequestHook(Protocol):
+    """Programmatic approval seam (R1): fires when the pipeline reached an *ask*.
+
+    The headless outlet for ask decisions — without it, unattended asks collapse to
+    denial. ``ctx.detail`` carries ``tool``/``risk`` plus a bounded ``arguments``
+    projection. Control path: the runner folds fail-closed (any deny wins), and a
+    hook that cannot run must not open the gate (external command/http adapters on
+    this event default to ``fail_mode = "closed"``).
+    """
+
+    async def on_permission_request(self, ctx: HookContext) -> HookOutcome:
+        ...
+
+
 class HookPipeline:
     def __init__(
         self,
@@ -275,6 +340,12 @@ class HookPipeline:
         pre_compact_hooks: list[PreCompactHook] | None = None,
         post_compact_hooks: list[PostCompactHook] | None = None,
         stop_hooks: list[StopHook] | None = None,
+        session_start_hooks: list[SessionStartHook] | None = None,
+        session_end_hooks: list[SessionEndHook] | None = None,
+        subagent_start_hooks: list[SubagentStartHook] | None = None,
+        subagent_stop_hooks: list[SubagentStopHook] | None = None,
+        tool_failure_hooks: list[PostToolUseFailureHook] | None = None,
+        permission_request_hooks: list[PermissionRequestHook] | None = None,
     ) -> None:
         self.pre_hooks = pre_hooks or []
         self.post_hooks = post_hooks or []
@@ -283,6 +354,12 @@ class HookPipeline:
         self.pre_compact_hooks = pre_compact_hooks or []
         self.post_compact_hooks = post_compact_hooks or []
         self.stop_hooks = stop_hooks or []
+        self.session_start_hooks = session_start_hooks or []
+        self.session_end_hooks = session_end_hooks or []
+        self.subagent_start_hooks = subagent_start_hooks or []
+        self.subagent_stop_hooks = subagent_stop_hooks or []
+        self.tool_failure_hooks = tool_failure_hooks or []
+        self.permission_request_hooks = permission_request_hooks or []
 
     def run_pre(self, tool_call: ToolCall) -> tuple[ToolCall, list[HookResult]]:
         current = tool_call
@@ -382,6 +459,45 @@ class HookPipeline:
     async def run_post_sampling(self, ctx: HookContext) -> None:
         for hook in self.post_sampling_hooks:
             await hook.after_sampling(ctx)
+
+    # Observational runners: fire each hook in order, return nothing. Callers wrap
+    # them fail-open (an observer crash is logged, never surfaced as control flow).
+
+    async def run_session_start(self, ctx: HookContext) -> None:
+        for hook in self.session_start_hooks:
+            await hook.on_session_start(ctx)
+
+    async def run_session_end(self, ctx: HookContext) -> None:
+        for hook in self.session_end_hooks:
+            await hook.on_session_end(ctx)
+
+    async def run_subagent_start(self, ctx: HookContext) -> None:
+        for hook in self.subagent_start_hooks:
+            await hook.on_subagent_start(ctx)
+
+    async def run_subagent_stop(self, ctx: HookContext) -> None:
+        for hook in self.subagent_stop_hooks:
+            await hook.on_subagent_stop(ctx)
+
+    async def run_tool_failure(self, ctx: HookContext) -> None:
+        for hook in self.tool_failure_hooks:
+            await hook.on_tool_failure(ctx)
+
+    async def run_permission_request(self, ctx: HookContext) -> HookOutcome:
+        """Fold PermissionRequest hooks fail-closed: any deny wins immediately;
+        otherwise the first allow wins; otherwise no opinion (empty outcome)."""
+        allow: HookOutcome | None = None
+        for hook in self.permission_request_hooks:
+            outcome = await hook.on_permission_request(ctx)
+            if outcome is None:
+                continue
+            if outcome.decision == "deny" or outcome.block:
+                return HookOutcome(
+                    block=True, decision="deny", reason=outcome.reason, metadata=outcome.metadata
+                )
+            if outcome.decision == "allow" and allow is None:
+                allow = outcome
+        return allow or HookOutcome()
 
 
 class MaxOutputPostHook:

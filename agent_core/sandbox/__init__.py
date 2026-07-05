@@ -26,6 +26,8 @@ from agent_core.sandbox.manager import (
     SandboxManager,
     SandboxRequiredError,
     SandboxUnavailableError,
+    get_shared_manager,
+    reset_shared_managers,
 )
 
 
@@ -58,4 +60,6 @@ __all__ = [
     "SandboxUnavailableError",
     "SandboxAwareMixin",
     "NOOP_SANDBOX",
+    "get_shared_manager",
+    "reset_shared_managers",
 ]

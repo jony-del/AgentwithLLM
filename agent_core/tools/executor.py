@@ -6,9 +6,9 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import PurePath
 
-from agent_core.hooks import HookPipeline
+from agent_core.hooks import HookContext, HookEvent, HookOutcome, HookPipeline
 from agent_core.models import ToolCall, ToolResult
-from agent_core.permissions import PermissionPolicy
+from agent_core.permissions import PermissionDecision, PermissionPolicy
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.registry import ToolRegistry
@@ -182,11 +182,32 @@ class ToolExecutor:
             tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
         )
         decision = self.permissions.decide(tool, rewritten_call)
+        # PermissionRequest (R1 programmatic approval): consulted only for ASK decisions
+        # — interactive asks (ask_user) and their headless collapse (ask_collapsed) —
+        # never for hard denies, so a hook cannot launder a deny rule. A hook allow
+        # resolves the ask; a deny refuses it; no opinion falls through to the normal
+        # path (interactive prompt / collapsed denial).
+        hook_verdict: dict[str, object] | None = None
+        if (decision.ask_user or decision.ask_collapsed) and self.hooks.permission_request_hooks:
+            outcome = await self._run_permission_request(tool, rewritten_call, decision.reason)
+            if outcome is not None and outcome.decision in {"allow", "deny"}:
+                hook_verdict = {"decision": outcome.decision, "reason": outcome.reason}
+                allowed = outcome.decision == "allow"
+                decision = PermissionDecision(
+                    allowed,
+                    reason=(
+                        f"PermissionRequest hook {'allowed' if allowed else 'denied'}"
+                        + (f": {outcome.reason}" if outcome.reason else "")
+                    ),
+                )
         # The confirm step may block on an interactive prompt (input()); run it on a
         # worker thread so a question to the user doesn't freeze other in-flight work.
         decision = await asyncio.to_thread(self.permissions.confirm, decision, tool, rewritten_call)
         if self.logger:
-            await self.logger.write("permission", {"tool": tool.name, "decision": asdict(decision)})
+            payload: dict[str, object] = {"tool": tool.name, "decision": asdict(decision)}
+            if hook_verdict is not None:
+                payload["permission_request_hook"] = hook_verdict
+            await self.logger.write("permission", payload)
         if not decision.allowed:
             result = ToolResult(tool.name, f"Tool denied: {decision.reason}", ok=False)
             return await self._finish(rewritten_call, result, decision.reason)
@@ -210,9 +231,69 @@ class ToolExecutor:
     ) -> ToolResult:
         """Log, surface the observation to the UI, and return one exit for every path."""
         await self._log_result(tool_call, result, reason)
+        if not result.ok:
+            # Every failed result (denied, unknown tool, tool error) funnels through
+            # here — the one seam for the observational PostToolUseFailure event.
+            await self._fire_tool_failure(tool_call, result)
         diff = self._render_result(tool, tool_call, result) if tool is not None else None
         self.ui.on_tool_result(result, diff=diff)
         return result
+
+    async def _run_permission_request(
+        self, tool: Tool, tool_call: ToolCall, ask_reason: str
+    ) -> HookOutcome | None:
+        """Run the control-path PermissionRequest fold over a bounded projection.
+
+        A crash in the runner itself yields NO opinion — the gated action does not
+        silently proceed; it falls back to the normal ask path (interactive prompt,
+        or the already-collapsed headless denial). External command/http adapters
+        additionally carry their own ``fail_mode`` (default closed on this event).
+        """
+        arguments = {key: str(value)[:200] for key, value in tool_call.arguments.items()}
+        ctx = HookContext(
+            event=HookEvent.PERMISSION_REQUEST,
+            messages=[],
+            detail={
+                "tool": tool.name,
+                "risk": tool.risk.value,
+                "ask_reason": ask_reason,
+                "arguments": arguments,
+            },
+        )
+        try:
+            return await self.hooks.run_permission_request(ctx)
+        except Exception as exc:  # noqa: BLE001 - crash → no opinion, never a silent allow
+            if self.logger:
+                await self.logger.write(
+                    "hook",
+                    {"event": "PermissionRequest", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            return None
+
+    async def _fire_tool_failure(self, tool_call: ToolCall, result: ToolResult) -> None:
+        """Fire PostToolUseFailure (C5): awaited, fail-open, logged only when subscribed
+        (the failed ``tool_result`` record itself is already in the JSONL)."""
+        if not self.hooks.tool_failure_hooks:
+            return
+        ctx = HookContext(
+            event=HookEvent.POST_TOOL_USE_FAILURE,
+            messages=[],
+            detail={
+                "tool": tool_call.name,
+                "error_type": result.metadata.get("error_type"),
+                "content": (result.content or "")[:300],
+            },
+        )
+        error: str | None = None
+        try:
+            await self.hooks.run_tool_failure(ctx)
+        except Exception as exc:  # noqa: BLE001 - observational; must never sink a run
+            error = f"{type(exc).__name__}: {exc}"
+        if self.logger:
+            payload: dict[str, object] = {"event": "PostToolUseFailure", "tool": tool_call.name}
+            if error:
+                payload["error"] = error
+            await self.logger.write("hook", payload)
 
     @staticmethod
     def _render_args(tool: Tool, tool_call: ToolCall) -> str | None:

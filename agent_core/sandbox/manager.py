@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from agent_core.permission_rules import PermissionBehavior, _match_shell_command
@@ -65,6 +66,9 @@ class SandboxManager:
         # (backend name, missing deps) for each candidate tried — powers a still-actionable
         # unavailable_reason() after a degrade-to-noop.
         self._selection_diagnostics: list[tuple[str, list[str]]] = []
+        # prepare() is idempotent (heavyweight readying runs once per manager); teardown
+        # resets this so a torn-down manager could be re-readied.
+        self._prepared = False
         self._backend = self._select_backend()
         # Fail-fast gate: an operator asked for sandboxing AND declared it mandatory,
         # but this environment can't provide it — refuse to start rather than silently
@@ -151,11 +155,13 @@ class SandboxManager:
     def prepare(self) -> None:
         """Ready the active backend (verify runtime, pull image, boot VM + base snapshot).
 
-        Degrades gracefully: a backend that cannot ready itself becomes a no-op passthrough
+        Idempotent: the heavyweight readying runs at most once per manager, so agents
+        (and sub-agents) sharing one manager can all call ``prepare()`` cheaply. Degrades
+        gracefully: a backend that cannot ready itself becomes a no-op passthrough
         (so the run continues unsandboxed) unless ``fail_if_unavailable`` is set, in which
         case the failure is escalated to :class:`SandboxUnavailableError`.
         """
-        if not self.is_enabled():
+        if self._prepared or not self.is_enabled():
             return
         try:
             self._backend.prepare()
@@ -166,6 +172,7 @@ class SandboxManager:
                 ) from exc
             # Fall back to passthrough — never sink a run on a prepare failure.
             self._backend = NoopBackend()
+        self._prepared = True
 
     def reset(self) -> None:
         """Restore the VM to its base snapshot before a task.
@@ -195,6 +202,8 @@ class SandboxManager:
                 "sandbox teardown failed (resources may be left behind): %s: %s",
                 type(exc).__name__, exc,
             )
+        finally:
+            self._prepared = False
 
     # -- the wrap seam called by command tools ---------------------------------------
 
@@ -238,3 +247,42 @@ class SandboxManager:
 # A shared disabled manager used as the default for unbound command tools (before the
 # agent rebinds the real one). Passthrough on every platform.
 NOOP_SANDBOX = SandboxManager(SandboxConfig())
+
+
+# --- process-level sharing (§5.6 / E4) --------------------------------------------
+#
+# Constructing an agent must not repeat heavyweight sandbox side effects (verify the
+# container runtime, pull an image, boot a VM) per instance: managers are cached per
+# (config fingerprint, workspace) so every agent in this process with the same settings
+# reuses one prepared manager, and sub-agents are handed their parent's directly.
+
+_shared_lock = threading.Lock()
+_shared_managers: dict[tuple[str, str], SandboxManager] = {}
+
+
+def get_shared_manager(config: SandboxConfig | None, workspace: str | Path | None = None) -> SandboxManager:
+    """The process-shared :class:`SandboxManager` for this (config, workspace) pair.
+
+    The first request constructs it (which may raise ``SandboxUnavailableError`` when
+    ``fail_if_unavailable`` is set — failures are never cached) and logs the choice once;
+    later requests return the same instance, whose idempotent :meth:`~SandboxManager.prepare`
+    makes repeated readying free.
+    """
+    resolved_config = config or SandboxConfig()
+    key = (repr(resolved_config), str(Path(workspace or Path.cwd()).resolve()))
+    with _shared_lock:
+        manager = _shared_managers.get(key)
+        if manager is None:
+            manager = SandboxManager(resolved_config, workspace=workspace)
+            _shared_managers[key] = manager
+            logger.info(
+                "sandbox manager created for this process: backend=%s enabled=%s workspace=%s",
+                manager.backend_name, manager.is_enabled(), manager.workspace,
+            )
+        return manager
+
+
+def reset_shared_managers() -> None:
+    """Drop the process-level manager cache (test isolation seam)."""
+    with _shared_lock:
+        _shared_managers.clear()

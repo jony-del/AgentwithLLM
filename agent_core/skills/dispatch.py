@@ -7,10 +7,13 @@ arguments substituted. Pure functions, no I/O.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
 from agent_core.skills.models import Skill
+
+logger = logging.getLogger(__name__)
 
 # A command name is a leading word of letters/digits/_/-/: (the ``:`` allows
 # plugin-style ``ns:name``). Crucially it has no ``/`` or ``.``, so ``/path/to/file``
@@ -90,6 +93,10 @@ async def build_skill_prompt(skill: Skill, args: str, ctx) -> str:
     try:
         return await skill.prompt_fn(args, ctx)
     except Exception as exc:  # noqa: BLE001 - a skill's prompt builder must not crash the run
+        logger.warning(
+            "skill %s prompt build failed, degrading to raw render: %s: %s",
+            skill.name, type(exc).__name__, exc,
+        )
         return (
             f"The skill {skill.name!r} failed to build its prompt "
             f"({type(exc).__name__}: {exc}). {render_skill_prompt(skill, args)}"

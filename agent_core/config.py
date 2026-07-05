@@ -14,6 +14,7 @@ if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-
     from agent_core.sandbox import SandboxConfig
     from agent_core.skills import SkillsConfig
     from agent_core.tool_use_summary import ToolUseSummaryConfig
+    from agent_core.tools.web import WebPolicyConfig
 
 _T = TypeVar("_T")
 
@@ -206,6 +207,19 @@ def resolve_memory_config(cli_enabled: bool | None, config_file: str | Path = "a
     if cli_enabled is not None:
         config.enabled = cli_enabled
     return config
+
+
+def resolve_web_config(config_file: str | Path = "agent.toml") -> "WebPolicyConfig":
+    """Resolve the ``[web]`` outbound domain policy (decision D10).
+
+    ``blocked_domains`` tightens and always applies; ``allowed_domains`` from an
+    in-repo file is a privilege-widening key filtered through the TOFU trust policy
+    (``load_agent_toml`` applies it before this function sees the table).
+    """
+    from agent_core.tools.web import WebPolicyConfig
+
+    table = load_agent_toml(config_file).get("web")
+    return WebPolicyConfig.from_dict(table if isinstance(table, dict) else None)
 
 
 def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimitConfig":
@@ -496,10 +510,12 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
         timeout = 30.0
     # fail_mode is a SECURITY option, so its parse failure degrades in the strict
     # direction: anything that isn't exactly "open" becomes "closed" (a typo on a
-    # gate hook must not silently fail open). Absent → "open" (observational default).
+    # gate hook must not silently fail open). Absent → "open" for the observational
+    # events, but "closed" for the control-path PermissionRequest event (a crashed
+    # approval gate must refuse, not wave things through — new gates default closed).
     fail_mode_raw = entry.get("fail_mode")
     if fail_mode_raw is None:
-        fail_mode = "open"
+        fail_mode = "closed" if event == "PermissionRequest" else "open"
     else:
         fail_mode = "open" if str(fail_mode_raw).strip().lower() == "open" else "closed"
     return ExternalHookSpec(

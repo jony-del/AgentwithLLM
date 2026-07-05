@@ -31,10 +31,12 @@ import asyncio
 import json
 import urllib.request
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from agent_core.hooks import ExternalHookSpec, HookContext, HookOutcome
 from agent_core.models import Message
+from agent_core.providers.base import ProviderConfig
 
 if TYPE_CHECKING:
     from agent_core.providers.base import LLMProvider
@@ -53,6 +55,14 @@ LIFECYCLE_EVENT_ATTRS: dict[str, str] = {
     "PreCompact": "pre_compact_hooks",
     "PostCompact": "post_compact_hooks",
     "Stop": "stop_hooks",
+    # Observational events (C5) — an external hook may watch them; decisions are discarded.
+    "SessionStart": "session_start_hooks",
+    "SessionEnd": "session_end_hooks",
+    "SubagentStart": "subagent_start_hooks",
+    "SubagentStop": "subagent_stop_hooks",
+    "PostToolUseFailure": "tool_failure_hooks",
+    # Control-path event (R1): programmatic approval of an "ask" permission decision.
+    "PermissionRequest": "permission_request_hooks",
 }
 
 
@@ -81,6 +91,9 @@ def project_hook_input(
         data["summary"] = ctx.summary
     if ctx.last_assistant_message is not None:
         data["last_assistant_message"] = ctx.last_assistant_message
+    if ctx.detail is not None:
+        # Already a small, JSON-safe payload built at the firing seam (see HookContext).
+        data["detail"] = ctx.detail
     tail = ctx.messages[-max_messages:] if max_messages > 0 else []
     projected = []
     for message in tail:
@@ -106,11 +119,14 @@ def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
     Block when the exit code is 2 (reference convention) or the JSON says so
     (``continue: false`` / ``decision: "block"``). ``hookSpecificOutput.additionalContext``
     (or top-level ``additionalContext``) is injected; ``stopReason`` / ``reason`` is surfaced.
-    Non-JSON stdout is ignored except for the exit-code signal.
+    On the PermissionRequest event, ``decision: "allow"`` approves the asked-about call
+    and ``decision: "deny"`` / ``"block"`` (or exit code 2) refuses it. Non-JSON stdout
+    is ignored except for the exit-code signal.
     """
     block = returncode == 2
     additional: str | None = None
     reason: str | None = None
+    decision: str | None = "deny" if block else None
     text = stdout.strip()
     if text:
         try:
@@ -118,15 +134,19 @@ def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
         except (ValueError, TypeError):
             data = None
         if isinstance(data, dict):
-            if data.get("continue") is False or data.get("decision") == "block":
+            raw_decision = data.get("decision")
+            if data.get("continue") is False or raw_decision in {"block", "deny"}:
                 block = True
+                decision = "deny"
+            elif raw_decision == "allow":
+                decision = "allow"
             reason = data.get("stopReason") or data.get("reason")
             spec_out = data.get("hookSpecificOutput")
             if isinstance(spec_out, dict):
                 additional = spec_out.get("additionalContext")
             if additional is None:
                 additional = data.get("additionalContext")
-    return HookOutcome(block=block, additional_context=additional, reason=reason)
+    return HookOutcome(block=block, additional_context=additional, reason=reason, decision=decision)
 
 
 class _ExternalHookAdapter:
@@ -206,6 +226,32 @@ class _ExternalHookAdapter:
         # PostSampling is observational; run the side effect, discard any decision.
         await self._run(ctx)
 
+    # The C5 observational events: side effect only, any decision is discarded.
+    async def on_session_start(self, ctx: HookContext) -> None:
+        await self._run(ctx)
+
+    async def on_session_end(self, ctx: HookContext) -> None:
+        await self._run(ctx)
+
+    async def on_subagent_start(self, ctx: HookContext) -> None:
+        await self._run(ctx)
+
+    async def on_subagent_stop(self, ctx: HookContext) -> None:
+        await self._run(ctx)
+
+    async def on_tool_failure(self, ctx: HookContext) -> None:
+        await self._run(ctx)
+
+    async def on_permission_request(self, ctx: HookContext) -> HookOutcome:
+        # Control path: a block (from output, or from fail_mode=closed on a hook
+        # failure) IS a deny; only an explicit {"decision": "allow"} approves. The
+        # advisory transports (prompt/agent) can never block, so at most they deny
+        # nothing and allow nothing — their replies are informational only.
+        outcome = await self._run(ctx)
+        if outcome.block and outcome.decision is None:
+            outcome.decision = "deny"
+        return outcome
+
 
 class CommandHookAdapter(_ExternalHookAdapter):
     """Spawn a subprocess, feed projected JSON on stdin, read stdout/exit-code decision."""
@@ -276,7 +322,7 @@ class PromptHookAdapter(_ExternalHookAdapter):
         spec: ExternalHookSpec,
         logger: "JSONLRunLogger",
         provider: "LLMProvider",
-        base_config: dict[str, Any],
+        base_config: "ProviderConfig",
     ) -> None:
         super().__init__(spec, logger)
         self.provider = provider
@@ -285,10 +331,11 @@ class PromptHookAdapter(_ExternalHookAdapter):
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
         if not self.spec.prompt:
             return HookOutcome()
-        config = dict(self.base_config)
-        if self.spec.model:
-            config["model"] = self.spec.model
-        config["max_tokens"] = min(int(config.get("max_tokens", 1024) or 1024), 1024)
+        config = replace(
+            self.base_config,
+            model=self.spec.model or self.base_config.model,
+            max_tokens=min(self.base_config.max_tokens or 1024, 1024),
+        )
         snapshot = json.dumps(project_hook_input(ctx), ensure_ascii=False)
         messages = [
             Message(
@@ -332,7 +379,7 @@ def build_external_adapter(
     *,
     logger: "JSONLRunLogger",
     provider: "LLMProvider | None" = None,
-    base_config: dict[str, Any] | None = None,
+    base_config: "ProviderConfig | None" = None,
     subagent_factory: Callable[[str, str, str | None], Awaitable[str]] | None = None,
 ) -> _ExternalHookAdapter | None:
     """Build the adapter for one spec, or ``None`` when its dependencies are unavailable.
@@ -349,7 +396,7 @@ def build_external_adapter(
     if spec.type == "prompt":
         if provider is None:
             return None
-        return PromptHookAdapter(spec, logger, provider, base_config or {})
+        return PromptHookAdapter(spec, logger, provider, base_config or ProviderConfig())
     if spec.type == "agent":
         if subagent_factory is None:
             return None

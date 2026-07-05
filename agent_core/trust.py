@@ -2,7 +2,8 @@
 
 An in-repo ``agent.toml`` is repo-controlled input: cloning a repository must not be
 able to grant itself allow rules, external hooks (arbitrary commands/URLs), sandbox
-relaxations, or MCP servers (arbitrary subprocesses launched at startup). The rule:
+relaxations, MCP servers (arbitrary subprocesses launched at startup), or a web
+egress allowlist (unattended exfiltration targets). The rule:
 
 - Repo config may always TIGHTEN policy — deny/ask rules and every non-widening table
   pass through untouched.
@@ -70,6 +71,12 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(mcp, dict) and mcp.get("servers"):
         subset["mcp.servers"] = mcp["servers"]
 
+    # [web].allowed_domains widens egress in unattended modes (D10). blocked_domains
+    # only tightens and passes through freely.
+    web = raw.get("web")
+    if isinstance(web, dict) and web.get("allowed_domains"):
+        subset["web.allowed_domains"] = web["allowed_domains"]
+
     return subset
 
 
@@ -94,6 +101,9 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
     mcp = out.get("mcp")
     if isinstance(mcp, dict):
         mcp.pop("servers", None)
+    web = out.get("web")
+    if isinstance(web, dict):
+        web.pop("allowed_domains", None)
     return out
 
 
@@ -165,7 +175,7 @@ def _render_prompt(project: Path, subset: dict[str, Any], changed: bool) -> str:
     head = (
         f"The repository config at {project} {'CHANGED its' if changed else 'requests'} "
         "privilege-widening settings (allow rules / external hooks / sandbox relaxations "
-        "/ MCP servers). Repo config can tighten policy freely, but widening needs your "
+        "/ MCP servers / web egress allowlist). Repo config can tighten policy freely, but widening needs your "
         "approval (recorded per project; you will be re-asked if it changes):"
     )
     body = json.dumps(subset, indent=2, ensure_ascii=False, default=str)

@@ -11,8 +11,10 @@ from __future__ import annotations
 import difflib
 import fnmatch
 import importlib.util
+import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +69,12 @@ _IGNORED_DIRS = frozenset(
 # Search guards so one giant or binary file can't wedge a scan.
 _MAX_SEARCH_FILE_BYTES = 2_000_000
 _MAX_COMMAND_TIMEOUT = 600  # hard cap (seconds) regardless of requested timeout
+# Single (non-stacked) bound on one ripgrep subprocess; on expiry the child is
+# killed and reaped (subprocess.run's TimeoutExpired handling), then the search
+# falls back to the pure-Python scan.
+_RG_TIMEOUT_SECONDS = 30
+
+logger = logging.getLogger(__name__)
 # Default line window for an unguided read_text_file (mirrors Claude Code's Read).
 _DEFAULT_READ_LINES = 2000
 
@@ -226,6 +234,27 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         if not base.exists():
             return ToolResult(self.name, f"No such path: {base}", ok=False, metadata={"error_type": "NotFound"})
 
+        # ripgrep fast path (R3): probe for `rg` and use it when present; ANY
+        # degradation (missing binary, timeout, rust-regex syntax gap, error exit)
+        # falls back to the pure-Python scan so behavior never depends on rg.
+        scanned = None
+        rg = shutil.which("rg")
+        if rg:
+            scanned = self._search_with_ripgrep(rg, pattern, base, arguments, max_results)
+        if scanned is None:
+            scanned = self._search_pure_python(matcher, base, glob, max_results)
+        results, truncated = scanned
+
+        if not results:
+            return ToolResult(self.name, "No matches.")
+        body = "\n".join(results)
+        if truncated:
+            body += f"\n[... stopped at {max_results} matches ...]"
+        return ToolResult(self.name, body, metadata={"matches": len(results), "truncated": truncated})
+
+    def _search_pure_python(
+        self, matcher: "re.Pattern[str]", base: Path, glob: object, max_results: int
+    ) -> tuple[list[str], bool]:
         results: list[str] = []
         truncated = False
         for file in self._iter_files(base, glob):
@@ -238,13 +267,74 @@ class SearchTextTool(WorkspacePathMixin, Tool):
                 if len(results) >= max_results:
                     truncated = True
                     break
+        return results, truncated
 
-        if not results:
-            return ToolResult(self.name, "No matches.")
-        body = "\n".join(results)
-        if truncated:
-            body += f"\n[... stopped at {max_results} matches ...]"
-        return ToolResult(self.name, body, metadata={"matches": len(results), "truncated": truncated})
+    def _search_with_ripgrep(
+        self, rg: str, pattern: str, base: Path, arguments: dict[str, object], max_results: int
+    ) -> "tuple[list[str], bool] | None":
+        """Run one bounded ``rg`` subprocess; ``None`` means "fall back to Python".
+
+        Flags reproduce the pure-Python scan's semantics — ``--no-config --no-ignore
+        --hidden`` (we honor only ``_IGNORED_DIRS``, not .gitignore), the same
+        max-filesize guard, fixed-string vs regex, basename glob — and the output is
+        re-rendered into the identical ``relpath:line: text`` shape, so the two
+        backends are interchangeable.
+        """
+        try:
+            rel_base = base.relative_to(self.workspace)
+        except ValueError:
+            return None
+        cmd = [
+            rg,
+            "--no-config",
+            "--no-heading",
+            "--with-filename",
+            "--line-number",
+            "--no-ignore",
+            "--hidden",
+            f"--max-filesize={_MAX_SEARCH_FILE_BYTES}",
+            "--max-count",
+            str(max(1, max_results)),
+        ]
+        if not arguments.get("regex"):
+            cmd.append("--fixed-strings")
+        if arguments.get("ignore_case"):
+            cmd.append("--ignore-case")
+        if arguments.get("glob"):
+            cmd.extend(["--glob", str(arguments["glob"])])
+        for name in sorted(_IGNORED_DIRS):
+            cmd.extend(["--glob", f"!**/{name}/**"])
+        cmd.extend(["--regexp", pattern, "--", str(rel_base) or "."])
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(self.workspace), capture_output=True, timeout=_RG_TIMEOUT_SECONDS
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.debug("ripgrep failed (%s); falling back to pure-Python scan", exc)
+            return None
+        if proc.returncode not in (0, 1):  # 0 = matches, 1 = none, else = error
+            logger.debug(
+                "ripgrep exited %s (%s); falling back to pure-Python scan",
+                proc.returncode,
+                proc.stderr.decode("utf-8", errors="replace")[:200],
+            )
+            return None
+        results: list[str] = []
+        truncated = False
+        for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+            if len(results) >= max_results:
+                truncated = True
+                break
+            # Paths are workspace-relative (rg ran with cwd=workspace), so the first
+            # two ':' split path and line number — no drive letters possible.
+            path_part, _, rest = line.partition(":")
+            lineno, _, text = rest.partition(":")
+            if not lineno.isdigit():
+                continue
+            results.append(f"{path_part.replace(os.sep, '/')}:{lineno}: {text.strip()}")
+        if len(results) >= max_results:
+            truncated = True
+        return results, truncated
 
     def _iter_files(self, base: Path, glob: object):
         candidates = [base] if base.is_file() else base.rglob("*")
