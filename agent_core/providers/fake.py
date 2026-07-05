@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_core import tokens
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, TokenUsage, ToolCall
-from agent_core.providers.base import LLMProvider, StreamHandler
+from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
 
 
 class FakeProvider(LLMProvider):
@@ -24,7 +24,7 @@ class FakeProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
-        config: dict[str, Any],
+        config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:

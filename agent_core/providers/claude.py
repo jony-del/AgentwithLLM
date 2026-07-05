@@ -20,7 +20,7 @@ from agent_core.models import (
     TokenUsage,
     ToolCall,
 )
-from agent_core.providers.base import LLMProvider, StreamHandler
+from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
 
 # HTTP statuses worth retrying: request timeout / lock conflict, rate limiting, and
 # transient upstream failures. 529 is Anthropic's "overloaded" signal. Everything
@@ -159,7 +159,7 @@ class ClaudeProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
-        config: dict[str, Any],
+        config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
@@ -173,10 +173,10 @@ class ClaudeProvider(LLMProvider):
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
 
-        streaming = stream is not None and config.get("stream", True)
+        streaming = stream is not None and config.stream
         client = await self._get_client()
         body = self._build_body(messages, tools, config, streaming=streaming)
-        timeout = config.get("timeout", 60)
+        timeout = config.timeout
         url = f"{self.base_url}/v1/messages"
 
         if not streaming:
@@ -257,25 +257,25 @@ class ClaudeProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
-        config: dict[str, Any],
+        config: ProviderConfig,
         streaming: bool = False,
     ) -> dict[str, Any]:
         """Build the Anthropic Messages request body (pure; shared by sync + async)."""
         system, anthropic_messages = self._format_messages(messages)
-        model = config.get("model", "claude-opus-4-8")
+        model = config.model or "claude-opus-4-8"
         body: dict[str, Any] = {
             "model": model,
-            "max_tokens": config.get("max_tokens", 1024),
+            "max_tokens": config.max_tokens,
             "messages": anthropic_messages,
         }
         if _is_adaptive_thinking_model(model):
             # Opus 4.7+/Fable/Mythos: NO sampling params (they 400), adaptive-only thinking.
-            self._apply_adaptive_thinking(body, config.get("thinking_budget"))
+            self._apply_adaptive_thinking(body, config.thinking_budget)
         else:
             # Legacy shape (Haiku 4.5, Sonnet, Opus <= 4.6): temperature + manual thinking.
-            body["temperature"] = config.get("temperature", 0.2)
-            self._apply_thinking(body, config.get("thinking_budget"))
-        effort = _effort_for_model(model, config.get("effort"))
+            body["temperature"] = 0.2 if config.temperature is None else config.temperature
+            self._apply_thinking(body, config.thinking_budget)
+        effort = _effort_for_model(model, config.effort)
         if effort is not None:
             body["output_config"] = {"effort": effort}
         if streaming:

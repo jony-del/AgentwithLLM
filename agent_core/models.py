@@ -115,9 +115,12 @@ class LLMResult:
     raw: dict[str, Any] = field(default_factory=dict)
     # Human-readable extended-thinking text for display.
     thinking: str = ""
-    # The raw thinking / redacted_thinking blocks (with their signatures), kept so
-    # they can be replayed verbatim on later turns — the Anthropic API requires the
-    # prior turn's thinking block when thinking and tool use span multiple turns.
+    # PROVIDER-OWNED OPAQUE DATA (E8): the raw thinking / redacted_thinking blocks
+    # (with their signatures), preserved and round-tripped verbatim across turns —
+    # e.g. the Anthropic API requires the prior turn's thinking block when thinking
+    # and tool use span multiple turns. The core loop and other providers must never
+    # interpret, edit, or depend on the contents; a provider with no equivalent
+    # simply leaves it empty.
     thinking_blocks: list[dict[str, Any]] = field(default_factory=list)
     # Token accounting for this response, when the provider reports it. Appended last
     # so existing positional ``LLMResult(...)`` construction stays valid. Compaction

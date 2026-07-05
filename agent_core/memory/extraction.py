@@ -8,7 +8,7 @@ from agent_core.memory.models import MEMORY_KINDS, MemoryRecord
 from agent_core.memory.store import MemoryStore
 from agent_core.memory.text import lexical_relevance, tokenize
 from agent_core.models import Message
-from agent_core.providers.base import LLMProvider
+from agent_core.providers.base import LLMProvider, ProviderConfig
 
 # Embedded verbatim in the extraction/dreaming system prompts. Providers can detect
 # it to behave deterministically (FakeProvider does), and it documents intent inline.
@@ -55,12 +55,12 @@ class MemoryExtractor:
         provider: LLMProvider,
         store: MemoryStore,
         config: MemoryConfig | None = None,
-        provider_config: dict[str, Any] | None = None,
+        provider_config: ProviderConfig | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
         self.config = config or MemoryConfig()
-        self.provider_config = provider_config or {}
+        self.provider_config = provider_config or ProviderConfig()
 
     async def extract(self, messages: list[Message], source_run_id: str | None = None) -> list[MemoryRecord]:
         """Distil and store durable memories from a finished conversation.

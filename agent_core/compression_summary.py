@@ -12,12 +12,12 @@ tools, and parses the result — borrowing the prompt shape from Claude Code's
 from __future__ import annotations
 
 import re
-from typing import Any
+from dataclasses import replace
 
 from agent_core import tokens
 from agent_core.compression import CompressionConfig, Summarizer
 from agent_core.models import Message
-from agent_core.providers.base import GatedProvider, LLMProvider
+from agent_core.providers.base import GatedProvider, LLMProvider, ProviderConfig
 from agent_core.providers.fake import FakeProvider
 
 # Aggressive no-tools preamble (ported from the reference ``NO_TOOLS_PREAMBLE``). Put
@@ -214,7 +214,7 @@ def _budget_ladder(config: CompressionConfig, ceiling: int) -> list[int]:
 
 def build_summarizer(
     provider: LLMProvider,
-    provider_config: dict[str, Any],
+    provider_config: ProviderConfig,
     config: CompressionConfig,
 ) -> Summarizer | None:
     """Build the Track A summarizer, or ``None`` to force deterministic Track B.
@@ -233,7 +233,7 @@ def build_summarizer(
     async def summarize(prefix: list[Message]) -> str:
         convo = render_prefix(prefix, config.summary_input_max_chars)
         messages = [Message("system", SUMMARY_SYSTEM), Message("user", convo)]
-        model = str(provider_config.get("model", ""))
+        model = provider_config.model
         ceiling = tokens.model_output_tokens(model)[1]
         ladder = _budget_ladder(config, ceiling)
         sink = _NullStreamHandler()
@@ -244,12 +244,9 @@ def build_summarizer(
         # live-run knobs: bounded output, streamed, no thinking, no tools (empty list).
         result_content = ""
         for budget in ladder:
-            summary_config = {
-                **provider_config,
-                "max_tokens": budget,
-                "stream": True,
-                "thinking_budget": None,
-            }
+            summary_config = replace(
+                provider_config, max_tokens=budget, stream=True, thinking_budget=None
+            )
             result = await provider.complete(messages, [], summary_config, stream=sink)
             result_content = result.content
             if result.stop_reason != "max_tokens":

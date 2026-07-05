@@ -26,13 +26,13 @@ byte-stable and never issue an API call.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 from agent_core import tokens
 from agent_core.compression_summary import _NullStreamHandler, _unwrap
 from agent_core.models import Message, ToolCall, ToolResult
-from agent_core.providers.base import LLMProvider
+from agent_core.providers.base import LLMProvider, ProviderConfig
 from agent_core.providers.fake import FakeProvider
 
 # Injected async callback: given this turn's (call, result) pairs plus the assistant text
@@ -140,7 +140,7 @@ def clean_label(text: str) -> str | None:
 
 def build_tool_use_summarizer(
     provider: LLMProvider,
-    provider_config: dict[str, Any],
+    provider_config: ProviderConfig,
     config: ToolUseSummaryConfig,
 ) -> ToolUseSummarizer | None:
     """Build the tool-use label callback, or ``None`` to disable it.
@@ -163,13 +163,13 @@ def build_tool_use_summarizer(
         messages = [Message("system", TOOL_USE_SUMMARY_SYSTEM), Message("user", convo)]
         ceiling = tokens.model_output_tokens(config.model)[1]
         budget = max(1, min(config.max_tokens, ceiling))
-        label_config = {
-            **provider_config,
-            "model": config.model,
-            "max_tokens": budget,
-            "stream": True,
-            "thinking_budget": None,
-        }
+        label_config = replace(
+            provider_config,
+            model=config.model,
+            max_tokens=budget,
+            stream=True,
+            thinking_budget=None,
+        )
         sink = _NullStreamHandler()
         try:
             # Single, non-stacked timeout around the whole (streamed, no-tools) call so a

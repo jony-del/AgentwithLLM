@@ -1,12 +1,60 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Protocol, runtime_checkable
 
 from agent_core.models import LLMResult, Message
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderConfig:
+    """Per-call completion parameters — the cross-layer contract of ``complete``.
+
+    Provider-neutral by construction: each field is a concept every chat-completion
+    protocol has some answer to. A provider that has no equivalent for a field
+    ignores it (and says so in its docstring) rather than erroring; a provider MUST
+    NOT require keys outside this contract — provider-specific connection settings
+    (base URL, API key, retries) belong on the provider's constructor.
+
+    ``model = ""`` means "the provider's own default model"; ``temperature = None``
+    means "the provider's own default sampling" (some model families reject explicit
+    sampling parameters entirely). Derived calls (summaries, hook prompts) override
+    fields with :func:`dataclasses.replace` instead of mutating.
+    """
+
+    model: str = ""
+    temperature: float | None = None
+    max_tokens: int = 1024
+    thinking_budget: int | None = None
+    effort: str | None = None
+    stream: bool = True
+    timeout: float = 60.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ProviderConfig":
+        """Build from a loose mapping, dropping (and debug-logging) unknown keys.
+
+        The tolerant entry point for config files and tests; typed call sites should
+        construct the dataclass directly so typos fail loudly.
+        """
+        if not data:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            logger.debug("ProviderConfig.from_dict dropping unknown keys: %s", unknown)
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+    def to_dict(self) -> dict[str, Any]:
+        """A plain-JSON projection (for logs and external-hook payload bounds)."""
+        return asdict(self)
 
 
 @runtime_checkable
@@ -31,7 +79,7 @@ class LLMProvider(ABC):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
-        config: dict[str, Any],
+        config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
@@ -126,7 +174,7 @@ class GatedProvider(LLMProvider):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]],
-        config: dict[str, Any],
+        config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> LLMResult:
