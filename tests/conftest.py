@@ -14,7 +14,24 @@ Two process-wide arrangements:
 import os
 import tempfile
 
+import pytest
+
 os.environ.setdefault("AGENT_SANDBOX_ALLOW_UNATTENDED", "1")
 os.environ.setdefault(
     "AGENT_TRUST_STORE", os.path.join(tempfile.mkdtemp(prefix="polaris-test-trust-"), "trusted.json")
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_shared_sandbox_managers():
+    """Isolate the process-level SandboxManager cache (§5.6) between tests.
+
+    Without this, a test that constructs an agent while backend probing is
+    monkeypatched would leak its manager to any later test using an identical
+    sandbox config.
+    """
+    from agent_core.sandbox import reset_shared_managers
+
+    reset_shared_managers()
+    yield
+    reset_shared_managers()

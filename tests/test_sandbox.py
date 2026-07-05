@@ -16,6 +16,7 @@ from agent_core.sandbox import (
     SandboxManager,
     SandboxTier,
     SandboxUnavailableError,
+    get_shared_manager,
 )
 from agent_core.sandbox.backends import (
     BubblewrapBackend,
@@ -87,6 +88,44 @@ def test_config_defaults() -> None:
 def test_config_bad_backend_degrades_to_auto() -> None:
     assert SandboxConfig.from_dict({"backend": "nonsense"}).backend == "auto"
     assert SandboxConfig.from_dict({"backend": "VM"}).backend == "vm"  # case-normalised
+
+
+# -- prepare idempotence + process-level sharing (§5.6) --------------------------------
+
+
+def test_prepare_is_idempotent_and_teardown_rearms(monkeypatch) -> None:
+    _force_linux(monkeypatch, "bwrap")
+    manager = SandboxManager(_native())
+    calls = {"n": 0}
+    original = manager._backend.prepare
+
+    def counting() -> None:
+        calls["n"] += 1
+        original()
+
+    monkeypatch.setattr(manager._backend, "prepare", counting)
+    manager.prepare()
+    manager.prepare()
+    manager.prepare()
+    assert calls["n"] == 1  # heavyweight readying ran once
+
+    manager.teardown()  # releases resources → the manager may be readied again
+    manager.prepare()
+    assert calls["n"] == 2
+
+
+def test_get_shared_manager_reuses_one_instance_per_config(monkeypatch) -> None:
+    _force_linux(monkeypatch, "bwrap")
+    first = get_shared_manager(_native())
+    second = get_shared_manager(_native())  # equal config + workspace → same manager
+    assert first is second
+
+
+def test_get_shared_manager_distinct_configs_get_distinct_managers(monkeypatch) -> None:
+    _force_linux(monkeypatch, "bwrap")
+    enabled = get_shared_manager(_native())
+    disabled = get_shared_manager(SandboxConfig())
+    assert enabled is not disabled
 
 
 # -- native tier selection -----------------------------------------------------------

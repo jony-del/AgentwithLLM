@@ -119,6 +119,44 @@ def test_fail_mode_parses_strict_on_typos(tmp_path: Path) -> None:
     assert [spec.fail_mode for spec in config.external] == ["closed", "closed"]
 
 
+def test_permission_request_defaults_fail_closed(tmp_path: Path) -> None:
+    # The control-path event defaults to fail_mode="closed" when unspecified; an
+    # explicit "open" is honored (the operator's informed choice).
+    path = _write_toml(
+        tmp_path,
+        """
+        [[hooks.external]]
+        event = "PermissionRequest"
+        type = "command"
+        command = "approve.py"
+
+        [[hooks.external]]
+        event = "PermissionRequest"
+        type = "command"
+        command = "advisory.py"
+        fail_mode = "open"
+
+        [[hooks.external]]
+        event = "Stop"
+        type = "command"
+        command = "watch.py"
+        """,
+    )
+    config = resolve_hooks_config(path)
+    assert [spec.fail_mode for spec in config.external] == ["closed", "open", "open"]
+
+
+def test_observational_event_names_are_accepted(tmp_path: Path) -> None:
+    # C5: the new observational events are config-usable ([[hooks.external]] watchers).
+    events = ["SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "PostToolUseFailure"]
+    body = "\n".join(
+        f'[[hooks.external]]\nevent = "{event}"\ntype = "command"\ncommand = "watch.py"\n'
+        for event in events
+    )
+    config = resolve_hooks_config(_write_toml(tmp_path, body))
+    assert [spec.event for spec in config.external] == events
+
+
 def test_bad_specs_are_dropped(tmp_path: Path) -> None:
     path = _write_toml(
         tmp_path,

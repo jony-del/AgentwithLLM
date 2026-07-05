@@ -12,7 +12,7 @@ import pytest
 from agent_core.agents.multi import MultiAgentCoordinator
 from agent_core.models import LLMResult, ToolCall, ToolResult, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import GatedProvider, _TokenBucket, gated_provider
+from agent_core.providers.base import GatedProvider, ProviderConfig, _TokenBucket, gated_provider
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.executor import ToolExecutor
@@ -50,7 +50,7 @@ def test_gate_caps_concurrency() -> None:
     provider = gated_provider(inner, max_concurrency=2)
 
     async def drive() -> None:
-        await asyncio.gather(*(provider.complete([], [], {}) for _ in range(8)))
+        await asyncio.gather(*(provider.complete([], [], ProviderConfig()) for _ in range(8)))
 
     asyncio.run(drive())
     assert inner.calls == 8
@@ -62,7 +62,7 @@ def test_gate_allows_overlap_under_default_cap() -> None:
     provider = gated_provider(inner)  # default cap 8
 
     async def drive() -> None:
-        await asyncio.gather(*(provider.complete([], [], {}) for _ in range(4)))
+        await asyncio.gather(*(provider.complete([], [], ProviderConfig()) for _ in range(4)))
 
     asyncio.run(drive())
     assert inner.max_active == 4  # all four ran at once
@@ -86,7 +86,7 @@ def test_gate_refuses_to_start_after_cancel() -> None:
 
     async def drive() -> None:
         with pytest.raises(asyncio.CancelledError):
-            await provider.complete([], [], {}, should_cancel=lambda: True)
+            await provider.complete([], [], ProviderConfig(), should_cancel=lambda: True)
 
     asyncio.run(drive())
     assert inner.calls == 0  # the inner provider was never invoked

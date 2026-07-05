@@ -322,3 +322,102 @@ async def test_pre_compact_block_skips_compaction(tmp_path: Path) -> None:
     from agent_core.compression import is_summary_message
 
     assert not any(is_summary_message(m) for m in result.messages)
+
+
+# --- observational events (C5): SessionStart/End, SubagentStart/Stop, tool failure
+
+
+class RecordingObservationalHook:
+    """One stub matching every observational Protocol; records (event, detail)."""
+
+    def __init__(self, boom: bool = False) -> None:
+        self.boom = boom
+        self.seen: list[tuple[HookEvent, dict]] = []
+
+    async def _record(self, ctx: HookContext) -> None:
+        self.seen.append((ctx.event, dict(ctx.detail or {})))
+        if self.boom:
+            raise RuntimeError("observer crashed")
+
+    async def on_session_start(self, ctx: HookContext) -> None:
+        await self._record(ctx)
+
+    async def on_session_end(self, ctx: HookContext) -> None:
+        await self._record(ctx)
+
+    async def on_subagent_start(self, ctx: HookContext) -> None:
+        await self._record(ctx)
+
+    async def on_subagent_stop(self, ctx: HookContext) -> None:
+        await self._record(ctx)
+
+    async def on_tool_failure(self, ctx: HookContext) -> None:
+        await self._record(ctx)
+
+
+async def test_session_start_fires_once_and_end_is_host_driven(tmp_path: Path) -> None:
+    hook = RecordingObservationalHook()
+    agent = ReActAgent(
+        FakeProvider(), _hermetic_config(tmp_path),
+        hooks=HookPipeline(session_start_hooks=[hook], session_end_hooks=[hook]),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    await agent.fire_session_end()  # before any run: a no-op
+    assert hook.seen == []
+
+    first = await agent.run("hello")
+    await agent.run("again", history=first.messages)
+    starts = [d for e, d in hook.seen if e is HookEvent.SESSION_START]
+    assert len(starts) == 1  # once per agent, not per run
+    assert starts[0]["run_id"] == agent.logger.run_id
+
+    await agent.fire_session_end("test_exit")
+    ends = [d for e, d in hook.seen if e is HookEvent.SESSION_END]
+    assert len(ends) == 1 and ends[0]["reason"] == "test_exit"
+
+
+async def test_subagent_start_stop_wrap_dispatch(tmp_path: Path) -> None:
+    hook = RecordingObservationalHook()
+    agent = ReActAgent(
+        FakeProvider(), _hermetic_config(tmp_path),
+        hooks=HookPipeline(subagent_start_hooks=[hook], subagent_stop_hooks=[hook]),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    answer = await agent._spawn_subagent("explore", "read_only")
+    assert "explore" in answer
+    events = [e for e, _ in hook.seen]
+    assert events == [HookEvent.SUBAGENT_START, HookEvent.SUBAGENT_STOP]
+    start_detail, stop_detail = hook.seen[0][1], hook.seen[1][1]
+    assert start_detail["kind"] == "subagent" and start_detail["preset"] == "read_only"
+    assert start_detail["child_run_id"]  # spawn lineage is observable
+    assert stop_detail["ok"] is True and stop_detail["duration_s"] >= 0
+
+
+async def test_tool_failure_event_fires_on_failed_result(tmp_path: Path) -> None:
+    hook = RecordingObservationalHook()
+    agent = ReActAgent(
+        FakeProvider(), _hermetic_config(tmp_path),
+        hooks=HookPipeline(tool_failure_hooks=[hook]),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    # FakeProvider calls whatever tool the task names; an unknown tool fails in the
+    # executor's single _finish funnel, which must fire the event.
+    await agent.run("tool: no_such_tool please")
+    failures = [d for e, d in hook.seen if e is HookEvent.POST_TOOL_USE_FAILURE]
+    assert failures and failures[0]["tool"] == "no_such_tool"
+    assert failures[0]["error_type"] == "UnknownTool"
+
+
+async def test_observational_hook_crash_never_sinks_the_run(tmp_path: Path) -> None:
+    hook = RecordingObservationalHook(boom=True)
+    agent = ReActAgent(
+        FakeProvider(), _hermetic_config(tmp_path),
+        hooks=HookPipeline(
+            session_start_hooks=[hook], subagent_start_hooks=[hook],
+            subagent_stop_hooks=[hook], tool_failure_hooks=[hook],
+        ),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    result = await agent.run("tool: no_such_tool x")  # session start + tool failure crash
+    assert result.answer  # run completed anyway (fail-open)
+    assert await agent._spawn_subagent("probe") != ""  # spawn survives crashing observers

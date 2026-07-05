@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from agent_core.models import LLMContextTooLongError, LLMResult, LLMTransientError, Message
+from agent_core.providers.base import ProviderConfig
 from agent_core.providers.claude import ClaudeProvider
 
 
@@ -49,7 +50,9 @@ async def test_complete_non_streaming_parses_response() -> None:
         )
 
     provider = _provider(handler)
-    result = await provider.complete([Message("user", "hi")], [], {"model": "claude-test", "stream": False})
+    result = await provider.complete(
+        [Message("user", "hi")], [], ProviderConfig(model="claude-test", stream=False)
+    )
     assert isinstance(result, LLMResult)
     assert result.content == "Hello there"
     assert result.stop_reason == "end_turn"
@@ -61,7 +64,7 @@ async def test_complete_context_too_long_maps_error() -> None:
 
     provider = _provider(handler)
     with pytest.raises(LLMContextTooLongError):
-        await provider.complete([Message("user", "hi")], [], {"stream": False})
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
 
 
 # --- retry / backoff ---------------------------------------------------------
@@ -84,7 +87,7 @@ async def test_complete_retries_on_429(monkeypatch) -> None:
         return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
 
     provider = _provider(handler, max_retries=2)
-    result = await provider.complete([Message("user", "hi")], [], {"stream": False})
+    result = await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
     assert result.content == "ok"
     assert calls["n"] == 2
     assert len(sleeps) == 1  # one backoff between the two attempts
@@ -105,7 +108,7 @@ async def test_complete_retries_transient_transport_error_then_succeeds(monkeypa
         return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
 
     provider = _provider(handler, max_retries=2)
-    result = await provider.complete([Message("user", "hi")], [], {"stream": False})
+    result = await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
     assert result.content == "ok"
     assert calls["n"] == 2
 
@@ -127,7 +130,7 @@ async def test_complete_honors_retry_after_header(monkeypatch) -> None:
         return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"})
 
     provider = _provider(handler, max_retries=2)
-    await provider.complete([Message("user", "hi")], [], {"stream": False})
+    await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
     assert sleeps == [2.0]  # honored the server-supplied delay exactly
 
 
@@ -142,7 +145,7 @@ async def test_complete_raises_transient_after_retries_exhausted(monkeypatch) ->
 
     provider = _provider(handler, max_retries=1)
     with pytest.raises(LLMTransientError):
-        await provider.complete([Message("user", "hi")], [], {"stream": False})
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
 
 
 async def test_complete_non_retryable_status_raises_immediately() -> None:
@@ -154,7 +157,7 @@ async def test_complete_non_retryable_status_raises_immediately() -> None:
 
     provider = _provider(handler, max_retries=3)
     with pytest.raises(RuntimeError) as exc_info:
-        await provider.complete([Message("user", "hi")], [], {"stream": False})
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
 
     assert calls["n"] == 1  # not retried
     assert "401" in str(exc_info.value)
@@ -185,7 +188,7 @@ async def test_complete_streaming_assembles_and_pushes_deltas() -> None:
 
     provider = _provider(handler)
     recorder = _Recorder()
-    result = await provider.complete([Message("user", "hi")], [], {"stream": True}, stream=recorder)
+    result = await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=True), stream=recorder)
     assert result.content == "Hello world"
     assert result.stop_reason == "end_turn"
     assert recorder.text == "Hello world"  # deltas were streamed live
@@ -218,7 +221,7 @@ async def test_streaming_cancel_aborts_mid_stream() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await provider.complete(
-            [Message("user", "hi")], [], {"stream": True}, stream=recorder, should_cancel=should_cancel
+            [Message("user", "hi")], [], ProviderConfig(stream=True), stream=recorder, should_cancel=should_cancel
         )
     assert recorder.text == "Hello"  # interrupted before the " world" delta
 
@@ -231,4 +234,4 @@ async def test_complete_streaming_error_event_is_transient() -> None:
 
     provider = _provider(handler)
     with pytest.raises(LLMTransientError):
-        await provider.complete([Message("user", "hi")], [], {"stream": True}, stream=_Recorder())
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=True), stream=_Recorder())

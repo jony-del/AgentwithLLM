@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_core.models import LLMResult, Message, ToolCall, ToolResult
-from agent_core.providers.base import LLMProvider, gated_provider
+from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
 from agent_core.providers.fake import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.storage import JSONLRunLogger
@@ -55,14 +55,14 @@ def _batch() -> list[tuple[ToolCall, ToolResult]]:
 
 
 def test_summarizer_is_none_when_disabled() -> None:
-    assert build_tool_use_summarizer(_RecordingProvider(), {}, ToolUseSummaryConfig(enabled=False)) is None
+    assert build_tool_use_summarizer(_RecordingProvider(), ProviderConfig(), ToolUseSummaryConfig(enabled=False)) is None
 
 
 def test_summarizer_is_none_for_fake_provider() -> None:
     cfg = ToolUseSummaryConfig(enabled=True)
-    assert build_tool_use_summarizer(FakeProvider(), {}, cfg) is None
+    assert build_tool_use_summarizer(FakeProvider(), ProviderConfig(), cfg) is None
     # Detected even through the shared concurrency gate.
-    assert build_tool_use_summarizer(gated_provider(FakeProvider()), {}, cfg) is None
+    assert build_tool_use_summarizer(gated_provider(FakeProvider()), ProviderConfig(), cfg) is None
 
 
 # --- seam: the call shape ----------------------------------------------------
@@ -72,7 +72,7 @@ async def test_summarizer_issues_no_tools_streamed_bounded_call() -> None:
     provider = _RecordingProvider(content="Echoed hello")
     summarizer = build_tool_use_summarizer(
         provider,
-        {"model": "claude-opus-4-8", "max_tokens": 4096, "stream": False, "thinking_budget": 4096},
+        ProviderConfig(model="claude-opus-4-8", max_tokens=4096, stream=False, thinking_budget=4096),
         ToolUseSummaryConfig(enabled=True, model="claude-haiku-4-5-20251001", max_tokens=64),
     )
     assert summarizer is not None
@@ -82,10 +82,10 @@ async def test_summarizer_issues_no_tools_streamed_bounded_call() -> None:
     assert label == "Echoed hello"
     (messages, tools, config), = provider.calls
     assert tools == []  # no tool use while writing a label
-    assert config["model"] == "claude-haiku-4-5-20251001"  # forced to the cheap model
-    assert config["max_tokens"] == 64  # tiny budget — labels are short
-    assert config["stream"] is True
-    assert config["thinking_budget"] is None
+    assert config.model == "claude-haiku-4-5-20251001"  # forced to the cheap model
+    assert config.max_tokens == 64  # tiny budget — labels are short
+    assert config.stream is True
+    assert config.thinking_budget is None
     assert provider.streams[0] is not None  # a (no-op) sink is passed
     # The transcript is framed as untrusted data, bounded in delimiters.
     assert "<tool_batch>" in messages[1].content
@@ -93,7 +93,7 @@ async def test_summarizer_issues_no_tools_streamed_bounded_call() -> None:
 
 async def test_summarizer_empty_batch_makes_no_call() -> None:
     provider = _RecordingProvider()
-    summarizer = build_tool_use_summarizer(provider, {}, ToolUseSummaryConfig(enabled=True))
+    summarizer = build_tool_use_summarizer(provider, ProviderConfig(), ToolUseSummaryConfig(enabled=True))
     assert summarizer is not None
     assert await summarizer([], "context") is None
     assert provider.calls == []
@@ -105,7 +105,7 @@ async def test_summarizer_empty_batch_makes_no_call() -> None:
 async def test_summarizer_times_out_to_none() -> None:
     provider = _RecordingProvider(sleep=0.5)
     summarizer = build_tool_use_summarizer(
-        provider, {}, ToolUseSummaryConfig(enabled=True, timeout_seconds=0.05)
+        provider, ProviderConfig(), ToolUseSummaryConfig(enabled=True, timeout_seconds=0.05)
     )
     assert summarizer is not None
     assert await summarizer(_batch(), "ctx") is None  # timed out → no label, no raise
@@ -116,14 +116,14 @@ async def test_summarizer_swallows_provider_error() -> None:
         async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
             raise RuntimeError("provider down")
 
-    summarizer = build_tool_use_summarizer(_Boom(), {}, ToolUseSummaryConfig(enabled=True))
+    summarizer = build_tool_use_summarizer(_Boom(), ProviderConfig(), ToolUseSummaryConfig(enabled=True))
     assert summarizer is not None
     assert await summarizer(_batch(), "ctx") is None
 
 
 async def test_summarizer_empty_reply_is_none() -> None:
     provider = _RecordingProvider(content="   \n  ")
-    summarizer = build_tool_use_summarizer(provider, {}, ToolUseSummaryConfig(enabled=True))
+    summarizer = build_tool_use_summarizer(provider, ProviderConfig(), ToolUseSummaryConfig(enabled=True))
     assert summarizer is not None
     assert await summarizer(_batch(), "ctx") is None
 

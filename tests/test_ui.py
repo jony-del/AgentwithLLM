@@ -130,7 +130,9 @@ class _RecordingStream:
 async def test_fake_provider_streams_chunks_matching_content() -> None:
     sink = _RecordingStream()
     provider = FakeProvider()
-    result = await provider.complete([Message("user", "say hi please")], [], {}, stream=sink)
+    from agent_core.providers.base import ProviderConfig
+
+    result = await provider.complete([Message("user", "say hi please")], [], ProviderConfig(), stream=sink)
     # The streamed chunks reassemble exactly into the returned content.
     assert "".join(sink.text) == result.content
     assert len(sink.text) > 1  # actually chunked, not one blob

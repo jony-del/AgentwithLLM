@@ -17,7 +17,7 @@ from agent_core.compression import (
 )
 from agent_core.compression_summary import build_summarizer, extract_summary
 from agent_core.models import LLMResult, Message
-from agent_core.providers.base import LLMProvider, gated_provider
+from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
 from agent_core.providers.fake import FakeProvider
 
 # The fixed continuation-wrapper fragments the summary USER message is built from.
@@ -369,20 +369,20 @@ async def test_repeated_track_a_refolds_prior_summary() -> None:
 
 
 def test_build_summarizer_is_none_for_fake_provider() -> None:
-    assert build_summarizer(FakeProvider(), {}, CompressionConfig()) is None
+    assert build_summarizer(FakeProvider(), ProviderConfig(), CompressionConfig()) is None
     # Even wrapped in the shared gate, the concrete fake is detected.
-    assert build_summarizer(gated_provider(FakeProvider()), {}, CompressionConfig()) is None
+    assert build_summarizer(gated_provider(FakeProvider()), ProviderConfig(), CompressionConfig()) is None
 
 
 def test_build_summarizer_is_none_when_disabled() -> None:
-    assert build_summarizer(_RecordingProvider(), {}, CompressionConfig(use_llm_summary=False)) is None
+    assert build_summarizer(_RecordingProvider(), ProviderConfig(), CompressionConfig(use_llm_summary=False)) is None
 
 
 async def test_build_summarizer_issues_no_tools_streamed_bounded_call() -> None:
     provider = _RecordingProvider()
     summarizer = build_summarizer(
         provider,
-        {"model": "claude-opus-4-8", "max_tokens": 2048, "stream": False, "thinking_budget": 4096},
+        ProviderConfig(model="claude-opus-4-8", max_tokens=2048, stream=False, thinking_budget=4096),
         CompressionConfig(compact_summary_start_tokens=8000, compact_max_output_tokens=20000),
     )
     assert summarizer is not None
@@ -393,9 +393,9 @@ async def test_build_summarizer_issues_no_tools_streamed_bounded_call() -> None:
     # stop_reason is None (success) → no escalation, a single attempt.
     (_messages, tools, config), = provider.calls
     assert tools == []  # no tool use during summary
-    assert config["max_tokens"] == 8000  # first ladder tier = compact_summary_start_tokens
-    assert config["stream"] is True  # summary call streams (dodges non-streaming timeout)
-    assert config["thinking_budget"] is None
+    assert config.max_tokens == 8000  # first ladder tier = compact_summary_start_tokens
+    assert config.stream is True  # summary call streams (dodges non-streaming timeout)
+    assert config.thinking_budget is None
     assert provider.streams[0] is not None  # a (no-op) StreamHandler sink is passed
 
 
@@ -404,7 +404,7 @@ async def test_build_summarizer_escalates_budget_on_max_tokens() -> None:
     provider = _RecordingProvider(stop_reasons=["max_tokens", "max_tokens", "end_turn"])
     summarizer = build_summarizer(
         provider,
-        {"model": "claude-opus-4-8"},
+        ProviderConfig(model="claude-opus-4-8"),
         CompressionConfig(
             compact_summary_start_tokens=8000,
             compact_max_output_tokens=20000,
@@ -416,7 +416,7 @@ async def test_build_summarizer_escalates_budget_on_max_tokens() -> None:
     out = await summarizer([Message("user", "x" * 200)])
 
     assert out == "DONE"
-    budgets = [config["max_tokens"] for (_m, _t, config) in provider.calls]
+    budgets = [config.max_tokens for (_m, _t, config) in provider.calls]
     assert budgets == [8000, 20000, 128_000]  # Opus hard ceiling from tokens.model_output_tokens
 
 
@@ -425,7 +425,7 @@ async def test_build_summarizer_stops_escalating_after_retry_budget() -> None:
     provider = _RecordingProvider(stop_reasons=["max_tokens"])
     summarizer = build_summarizer(
         provider,
-        {"model": "claude-opus-4-8"},
+        ProviderConfig(model="claude-opus-4-8"),
         CompressionConfig(
             compact_summary_start_tokens=8000,
             compact_max_output_tokens=20000,
@@ -436,7 +436,7 @@ async def test_build_summarizer_stops_escalating_after_retry_budget() -> None:
 
     await summarizer([Message("user", "x" * 200)])
 
-    budgets = [config["max_tokens"] for (_m, _t, config) in provider.calls]
+    budgets = [config.max_tokens for (_m, _t, config) in provider.calls]
     assert budgets == [8000, 20000]  # 1 attempt + 1 escalation, ceiling tier not reached
 
 

@@ -4,6 +4,11 @@ from agent_core.config import resolve_memory_config
 from agent_core.memory.config import MemoryConfig
 
 
+def test_builtin_default_is_off() -> None:
+    # CLAUDE.md invariant: memory is off by built-in default; only config opts in.
+    assert MemoryConfig().enabled is False
+
+
 def test_from_dict_applies_known_fields_and_coerces() -> None:
     config = MemoryConfig.from_dict(
         {"enabled": "true", "recall_k": "9", "merge_threshold": "0.4", "unknown": "x"}

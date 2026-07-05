@@ -3,6 +3,7 @@ import json
 import pytest
 
 from agent_core.models import LLMTransientError, Message
+from agent_core.providers.base import ProviderConfig
 from agent_core.providers.claude import ClaudeProvider
 
 
@@ -102,7 +103,7 @@ def test_claude_provider_serializes_restructured_context_assembly() -> None:
 
 
 def _request_body(provider: ClaudeProvider, config: dict) -> dict:
-    return provider._build_body([Message("user", "hi")], [], config)
+    return provider._build_body([Message("user", "hi")], [], ProviderConfig.from_dict(config))
 
 
 # Legacy models (Haiku 4.5, Sonnet, Opus <= 4.6) keep the temperature + manual
@@ -317,8 +318,8 @@ async def test_stream_error_event_raises_transient() -> None:
 
 def test_build_body_sets_stream_flag_only_when_streaming() -> None:
     provider = ClaudeProvider(api_key="test-key")
-    streamed = provider._build_body([Message("user", "hi")], [], {}, streaming=True)
-    plain = provider._build_body([Message("user", "hi")], [], {}, streaming=False)
+    streamed = provider._build_body([Message("user", "hi")], [], ProviderConfig(), streaming=True)
+    plain = provider._build_body([Message("user", "hi")], [], ProviderConfig(), streaming=False)
     assert streamed["stream"] is True
     assert "stream" not in plain
 
@@ -348,4 +349,4 @@ async def test_missing_api_key_raises() -> None:
     provider = ClaudeProvider(api_key="placeholder")
     provider.api_key = None
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
-        await provider.complete([], [], {})
+        await provider.complete([], [], ProviderConfig())

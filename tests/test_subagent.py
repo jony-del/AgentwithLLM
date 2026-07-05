@@ -242,6 +242,15 @@ def test_child_permission_never_escalates(tmp_path) -> None:
     assert full_child.config.permission == PermissionMode.ACCEPTEDITS
 
 
+def test_child_shares_parent_sandbox_manager(tmp_path) -> None:
+    # §5.6: a spawned child must reuse the parent's (already prepared) SandboxManager,
+    # never construct and re-prepare its own.
+    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(run_dir=str(tmp_path)))
+    child = agent._make_subagent_child("read_only")
+    assert not isinstance(child, str)
+    assert child.sandbox is agent.sandbox
+
+
 def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
     agent = ReActAgent(provider=FakeProvider())
     # Re-derive what the read_only child would receive by replicating the filter the

@@ -22,6 +22,32 @@ async def test_run_logger_stamps_schema_version(tmp_path: Path) -> None:
     assert record["event"] == "unit_test"
 
 
+async def test_run_logger_write_after_close_reopens(tmp_path: Path) -> None:
+    # close() is idempotent and never bricks the logger: a later write reopens.
+    logger = JSONLRunLogger(tmp_path)
+    await logger.write("first", {})
+    logger.close()
+    logger.close()  # idempotent
+    await logger.write("second", {})
+    logger.close()
+
+    events = [json.loads(line)["event"] for line in logger.path.read_text(encoding="utf-8").splitlines()]
+    assert events == ["first", "second"]
+
+
+async def test_run_logger_concurrent_writes_stay_line_atomic(tmp_path: Path) -> None:
+    # Overlapping to_thread writers share one held handle; every line must parse.
+    import asyncio
+
+    logger = JSONLRunLogger(tmp_path)
+    await asyncio.gather(*(logger.write("evt", {"i": i, "pad": "x" * 200}) for i in range(50)))
+    logger.close()
+
+    lines = logger.path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]  # raises on a torn line
+    assert sorted(record["i"] for record in records) == list(range(50))
+
+
 async def test_transcript_stamps_schema_version(tmp_path: Path) -> None:
     store = TranscriptStore(tmp_path, tmp_path, "sess-schema")
     await store.append_message(Message("user", "hello"))

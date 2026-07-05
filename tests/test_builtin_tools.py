@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -108,6 +109,73 @@ async def test_search_text_skips_ignored_dirs(tmp_path: Path) -> None:
 async def test_search_text_no_matches(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("nothing here", encoding="utf-8")
     assert (await SearchTextTool(tmp_path).run({"pattern": "zzz"})).content == "No matches."
+
+
+# --- search_text ripgrep backend (R3): probe, parity, degradation --------------
+
+
+def _search_fixture(tmp_path: Path) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "mod.py").write_text("import os\nvalue = compute()\nCOMPUTE = 1\n", encoding="utf-8")
+    (tmp_path / "notes.md").write_text("compute the answer\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "x.js").write_text("compute()\n", encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+async def test_search_text_rg_and_python_backends_agree(tmp_path: Path, monkeypatch) -> None:
+    _search_fixture(tmp_path)
+    for args in (
+        {"pattern": "compute"},
+        {"pattern": "compute", "ignore_case": True},
+        {"pattern": r"compute\(\)", "regex": True},
+        {"pattern": "compute", "glob": "*.py"},
+        {"pattern": "compute", "path": "pkg"},
+    ):
+        with_rg = (await SearchTextTool(tmp_path).run(dict(args))).content
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        pure = (await SearchTextTool(tmp_path).run(dict(args))).content
+        monkeypatch.undo()
+        assert sorted(with_rg.splitlines()) == sorted(pure.splitlines()), args
+
+
+async def test_search_text_parses_rg_output_shape(tmp_path: Path, monkeypatch) -> None:
+    # A stubbed rg (runs everywhere): output must be re-rendered into the exact
+    # `relpath:line: text` shape of the pure-Python backend.
+    _search_fixture(tmp_path)
+    from agent_core.tools import builtin
+
+    fake_stdout = f"pkg{os.sep}mod.py:2:value = compute()\nnotes.md:1:compute the answer\n"
+
+    class _Proc:
+        returncode = 0
+        stdout = fake_stdout.encode("utf-8")
+        stderr = b""
+
+    monkeypatch.setattr(shutil, "which", lambda name: "C:/fake/rg.exe")
+    monkeypatch.setattr(builtin.subprocess, "run", lambda *a, **k: _Proc())
+    out = (await SearchTextTool(tmp_path).run({"pattern": "compute"})).content
+    assert "pkg/mod.py:2: value = compute()" in out
+    assert "notes.md:1: compute the answer" in out
+
+
+async def test_search_text_falls_back_when_rg_errors(tmp_path: Path, monkeypatch, caplog) -> None:
+    _search_fixture(tmp_path)
+    from agent_core.tools import builtin
+
+    class _Broken:
+        returncode = 2
+        stdout = b""
+        stderr = b"rg: bad flag"
+
+    monkeypatch.setattr(shutil, "which", lambda name: "C:/fake/rg.exe")
+    monkeypatch.setattr(builtin.subprocess, "run", lambda *a, **k: _Broken())
+    with caplog.at_level("DEBUG", logger="agent_core.tools.builtin"):
+        out = (await SearchTextTool(tmp_path).run({"pattern": "compute"})).content
+    # The pure-Python fallback still finds everything (and skips ignored dirs).
+    assert "pkg/mod.py:2:" in out and "notes.md:1:" in out
+    assert "node_modules" not in out
+    assert any("falling back" in record.getMessage() for record in caplog.records)
 
 
 # --- command execution -------------------------------------------------------

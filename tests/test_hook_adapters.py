@@ -323,6 +323,32 @@ def test_external_spec_lands_in_right_list(tmp_path: Path) -> None:
     assert any(isinstance(h, CommandHookAdapter) for h in agent.hooks.stop_hooks)
 
 
+def test_external_observational_specs_land_in_right_lists(tmp_path: Path) -> None:
+    # C5 events are subscribable from config and route to their own pipeline lists.
+    events_to_attr = {
+        "SessionStart": "session_start_hooks",
+        "SessionEnd": "session_end_hooks",
+        "SubagentStart": "subagent_start_hooks",
+        "SubagentStop": "subagent_stop_hooks",
+        "PostToolUseFailure": "tool_failure_hooks",
+    }
+    cfg = _hermetic_config(
+        tmp_path,
+        hooks=HooksConfig(
+            external=[
+                ExternalHookSpec(event=event, type="command", command="watch.py")
+                for event in events_to_attr
+            ]
+        ),
+    )
+    agent = ReActAgent(FakeProvider(), cfg, logger=JSONLRunLogger(tmp_path))
+    for event, attr in events_to_attr.items():
+        hooks = getattr(agent.hooks, attr)
+        assert any(
+            isinstance(h, CommandHookAdapter) and h.event == event for h in hooks
+        ), f"{event} adapter missing from {attr}"
+
+
 async def test_builtin_stop_completion_forces_continuation(tmp_path: Path) -> None:
     agent = ReActAgent(FakeProvider(), _hermetic_config(tmp_path), logger=JSONLRunLogger(tmp_path))
     agent.session.todos.replace([{"content": "finish the work", "status": "pending"}])

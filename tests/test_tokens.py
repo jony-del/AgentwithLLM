@@ -184,7 +184,9 @@ def test_pct_override_resolver_rejects_out_of_range(monkeypatch) -> None:
 async def test_fake_provider_populates_deterministic_usage() -> None:
     provider = FakeProvider()
     messages = [Message("user", "x" * 40), Message("user", "y" * 8)]
-    result = await provider.complete(messages, [], {})
+    from agent_core.providers.base import ProviderConfig
+
+    result = await provider.complete(messages, [], ProviderConfig())
     assert result.usage is not None
     # char/4 of the input: (40 + 8) // 4 == 12.
     assert result.usage.input_tokens == 12

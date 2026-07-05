@@ -34,14 +34,20 @@ async def test_build_skill_prompt_falls_back_to_body_for_markdown() -> None:
     assert out == render_skill_prompt(skill, "Y") == "Body Y"
 
 
-async def test_prompt_fn_failure_degrades_not_raises() -> None:
+async def test_prompt_fn_failure_degrades_not_raises(caplog) -> None:
     async def boom(args: str, ctx: SkillPromptContext) -> str:
         raise RuntimeError("kaboom")
 
     skill = Skill(name="bad", description="d", body="fallback body", prompt_fn=boom)
-    out = await build_skill_prompt(skill, "", SkillPromptContext(workspace=Path.cwd()))
+    with caplog.at_level("WARNING", logger="agent_core.skills.dispatch"):
+        out = await build_skill_prompt(skill, "", SkillPromptContext(workspace=Path.cwd()))
     assert "failed to build its prompt" in out
     assert "fallback body" in out  # still includes the static fallback
+    # The degradation must be observable, not just inlined into the model-facing text.
+    assert any(
+        "prompt build failed" in record.getMessage() and "kaboom" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_programmatic_skill_decorator_registers() -> None:
