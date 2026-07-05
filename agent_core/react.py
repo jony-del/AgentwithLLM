@@ -47,12 +47,13 @@ from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, Me
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import LLMProvider, gated_provider
+from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
 from agent_core.sandbox import (
     SandboxAwareMixin,
     SandboxConfig,
     SandboxManager,
     SandboxRequiredError,
+    get_shared_manager,
 )
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.skills import (
@@ -75,6 +76,7 @@ from agent_core.tools.catalog import default_tools
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
+from agent_core.tools.web import WebPolicyAwareMixin, WebPolicyConfig
 from agent_core.ui import AgentUI, NullUI
 
 logger = logging.getLogger(__name__)
@@ -232,6 +234,10 @@ class ReActConfig:
     # Fine-grained allow/deny/ask rules (policy layer). Empty by default → the run
     # behaves exactly as the bare per-mode ToolRisk gate did.
     permission_rules: RuleSet = field(default_factory=RuleSet)
+    # Outbound domain policy for the web tools ([web] table, decision D10):
+    # blocked_domains always refuse; in unattended modes (auto/dontask/bypass) a
+    # domain not in allowed_domains is refused too (fail-closed exfiltration guard).
+    web: WebPolicyConfig = field(default_factory=WebPolicyConfig)
 
 
 @dataclass(slots=True)
@@ -257,6 +263,7 @@ class ReActAgent:
         ui: AgentUI | None = None,
         session_id: str | None = None,
         transcript: "TranscriptStore | None" = None,
+        sandbox: SandboxManager | None = None,
     ) -> None:
         self.config = config or ReActConfig()
         # Effective monotonic deadline of the in-flight run(), shared with children
@@ -307,6 +314,11 @@ class ReActAgent:
         # itself only returns the label string).
         self._pending_tool_use_summary: "asyncio.Task[str | None] | None" = None
         self._pending_tool_use_names: list[str] = []
+        # SessionStart fires once per agent (on the first run()); SessionEnd is
+        # host-driven — the embedding host calls fire_session_end() at its own
+        # session boundary (the CLI does so at run/chat exit). (Distinct from
+        # ``_session_started``, the /cost timestamp.)
+        self._session_start_fired = False
         self.ui = ui or NullUI()
         self.team_store = team_store or TeamStore(Path(self.config.run_dir) / "teams")
         # Skill / slash-command registry, loaded eagerly from disk (bundled + user +
@@ -329,16 +341,24 @@ class ReActAgent:
         )
         # OS sandbox manager (enforcement layer), built eagerly per the eager-loading
         # invariant. Constructed with fail_if_unavailable honored here (raises before the
-        # run starts). Bound into every sandbox-aware command tool alongside the session.
-        self.sandbox = SandboxManager(self.config.sandbox, workspace=self.session.workspace)
+        # run starts). An injected manager wins (children receive their parent's, see
+        # _make_subagent_child); otherwise the process-shared instance for this
+        # (config, workspace) is used, so heavyweight readying happens once per process,
+        # not once per agent. Bound into every sandbox-aware command tool below.
+        self.sandbox = sandbox if sandbox is not None else get_shared_manager(
+            self.config.sandbox, workspace=self.session.workspace
+        )
         # Ready the active backend now (verify container runtime + image, boot the VM +
-        # base snapshot). Degrades to passthrough on failure unless fail_if_unavailable.
+        # base snapshot). Idempotent — a shared, already-prepared manager returns
+        # immediately. Degrades to passthrough on failure unless fail_if_unavailable.
         self.sandbox.prepare()
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(self.session)
             if isinstance(tool, SandboxAwareMixin):
                 tool.bind_sandbox(self.sandbox)
+            if isinstance(tool, WebPolicyAwareMixin):
+                tool.bind_web_policy(self.config.web, unattended=self._is_unattended_mode())
         # The model-facing ``skill`` tool is dead weight when no skill is model-invocable,
         # so drop it from the advertised tool set in that case (saves tokens, avoids
         # offering the model a tool it can't use).
@@ -440,6 +460,15 @@ class ReActAgent:
                 type(exc).__name__, exc,
             )
             return SkillRegistry()
+
+    def _is_unattended_mode(self) -> bool:
+        """True for the modes that execute without per-call confirmation (auto/dontask/
+        bypass) — the modes where fail-closed defaults (D3, D10) apply."""
+        try:
+            mode = PermissionMode(self.config.permission)
+        except ValueError:
+            return False  # unknown mode string — PermissionPolicy rejects it at construction
+        return mode in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
 
     def _enforce_unattended_sandbox_requirement(self) -> None:
         """D3: unattended modes (auto/dontask/bypass) must not run with zero isolation.
@@ -578,6 +607,15 @@ class ReActAgent:
                 messages.insert(insert_at, past)
                 insert_at += 1
                 self._last_message_uuid = past.uuid
+        # SessionStart (observational) fires once per agent, on its first run —
+        # before UserPromptSubmit so subscribers see the session open first.
+        if not self._session_start_fired:
+            self._session_start_fired = True
+            await self._fire_observational(
+                HookEvent.SESSION_START,
+                {"run_id": self.logger.run_id, **self._trace_fields()},
+                messages,
+            )
         # UserPromptSubmit fires once the task is in place but before the first model
         # call, so a hook can abort the run (block), rewrite the task to neutralize untrusted
         # framing (transformed_prompt), or inject extra grounding (additional_context). The new
@@ -1189,6 +1227,47 @@ class ReActAgent:
                 "hook", {"event": "PostSampling", "error": f"{type(exc).__name__}: {exc}"}
             )
 
+    async def _fire_observational(
+        self, event: HookEvent, detail: dict[str, object], messages: list[Message]
+    ) -> None:
+        """Fire one C5 observational event: awaited, fail-open, always JSONL-logged.
+
+        Subscribers run to completion (so an external watcher's side effect lands
+        before the loop moves on), but any failure is reduced to a log field — these
+        events never alter control flow.
+        """
+        runner = {
+            HookEvent.SESSION_START: self.hooks.run_session_start,
+            HookEvent.SESSION_END: self.hooks.run_session_end,
+            HookEvent.SUBAGENT_START: self.hooks.run_subagent_start,
+            HookEvent.SUBAGENT_STOP: self.hooks.run_subagent_stop,
+        }[event]
+        ctx = HookContext(
+            event=event, messages=messages, session_id=self.session_id, detail=detail
+        )
+        error: str | None = None
+        try:
+            await runner(ctx)
+        except Exception as exc:  # noqa: BLE001 - observational; must never sink a run
+            error = f"{type(exc).__name__}: {exc}"
+        payload: dict[str, object] = {"event": event.value, **detail}
+        if error:
+            payload["error"] = error
+        await self.logger.write("hook", payload)
+
+    async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+        """Fire SessionEnd (observational). The HOST owns the session boundary:
+        the CLI calls this after a one-shot run and at chat exit; library embedders
+        call it when their session concept closes. No-op before the first run()."""
+        if not self._session_start_fired:
+            return
+        self._session_start_fired = False
+        await self._fire_observational(
+            HookEvent.SESSION_END,
+            {"run_id": self.logger.run_id, "reason": reason, **self._trace_fields()},
+            [],
+        )
+
     async def _reap_background_hooks(self) -> None:
         """Await any in-flight PostSampling tasks at a terminal return (best-effort)."""
         tasks = list(self._background_hook_tasks)
@@ -1436,15 +1515,15 @@ class ReActAgent:
         ]
         return tokens.rough_token_estimate_for_messages(convo)
 
-    def _provider_config(self) -> dict[str, object]:
-        return {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "thinking_budget": self.config.thinking_budget,
-            "effort": self.config.effort,
-            "stream": self.config.stream,
-        }
+    def _provider_config(self) -> ProviderConfig:
+        return ProviderConfig(
+            model=self.config.model,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            thinking_budget=self.config.thinking_budget,
+            effort=self.config.effort,
+            stream=self.config.stream,
+        )
 
     def _build_hook_pipeline(self) -> HookPipeline:
         """Assemble the default HookPipeline from ``config.hooks``.
@@ -1576,6 +1655,7 @@ class ReActAgent:
             ui=NullUI(),
             session_id=self.session_id,
             transcript=self._child_transcript(agent_id),
+            sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -1598,11 +1678,41 @@ class ReActAgent:
     async def _spawn_subagent(
         self, task: str, preset: str = "read_only", model: str | None = None
     ) -> str:
-        """``dispatch_agent`` factory — awaits the child on the shared event loop."""
+        """``dispatch_agent`` factory — awaits the child on the shared event loop.
+
+        Fires SubagentStart/SubagentStop (observational) around the child run; a
+        cancellation skips the Stop event (best-effort — never await new work while
+        being torn down).
+        """
         child = self._make_subagent_child(preset, model)
         if isinstance(child, str):
             return child
-        return (await child.run(task, deadline=self._active_deadline)).answer
+        # getattr-guarded: the factory seam may be stubbed (tests/embedding) and an
+        # observational payload must never be the thing that breaks spawning.
+        detail: dict[str, object] = {
+            "kind": "subagent",
+            "preset": preset,
+            "model": model or self.config.model,
+            "depth": getattr(getattr(child, "session", None), "depth", None),
+            "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
+        }
+        await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
+        started = time.monotonic()
+        try:
+            result = await child.run(task, deadline=self._active_deadline)
+        except Exception:
+            await self._fire_observational(
+                HookEvent.SUBAGENT_STOP,
+                {**detail, "ok": False, "duration_s": round(time.monotonic() - started, 3)},
+                [],
+            )
+            raise
+        await self._fire_observational(
+            HookEvent.SUBAGENT_STOP,
+            {**detail, "ok": True, "duration_s": round(time.monotonic() - started, 3)},
+            [],
+        )
+        return result.answer
 
     async def _make_teammate_child(
         self,
@@ -1672,6 +1782,7 @@ class ReActAgent:
             ui=NullUI(),
             session_id=self.session_id,
             transcript=self._child_transcript(new_session_id()),
+            sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -1690,12 +1801,40 @@ class ReActAgent:
         preset: str = "read_only",
         model: str | None = None,
     ) -> str:
-        """Teammate factory — awaits the teammate turn on the shared event loop."""
+        """Teammate factory — awaits the teammate turn on the shared event loop.
+
+        Fires SubagentStart/SubagentStop (observational, ``kind="teammate"``) around
+        the child run; a cancellation skips the Stop event (best-effort)."""
         built = await self._make_teammate_child(team_id, name, role, task_id, preset, model)
         if isinstance(built, str):
             return built
         child, prompt = built
-        return (await child.run(prompt, deadline=self._active_deadline)).answer
+        detail: dict[str, object] = {
+            "kind": "teammate",
+            "team_id": team_id,
+            "name": name,
+            "preset": preset,
+            "model": model or self.config.model,
+            "depth": getattr(getattr(child, "session", None), "depth", None),
+            "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
+        }
+        await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
+        started = time.monotonic()
+        try:
+            result = await child.run(prompt, deadline=self._active_deadline)
+        except Exception:
+            await self._fire_observational(
+                HookEvent.SUBAGENT_STOP,
+                {**detail, "ok": False, "duration_s": round(time.monotonic() - started, 3)},
+                [],
+            )
+            raise
+        await self._fire_observational(
+            HookEvent.SUBAGENT_STOP,
+            {**detail, "ok": True, "duration_s": round(time.monotonic() - started, 3)},
+            [],
+        )
+        return result.answer
 
     @staticmethod
     def _teammate_prompt(

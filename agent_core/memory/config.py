@@ -9,10 +9,13 @@ class MemoryConfig:
     """Tunables for the memory subsystem.
 
     Disabled by default: an agent built without opting in behaves exactly as before
-    (no recall injection, no extraction calls, no files written).
+    (no recall injection, no extraction calls, no files written). This repo's own
+    ``agent.toml`` opts in via ``[memory] enabled = true``; the built-in default
+    staying ``False`` is a documented invariant (CLAUDE.md "Memory is off by
+    built-in default").
     """
 
-    enabled: bool = True
+    enabled: bool = False
     dir: str = "memory"
 
     # --- Recall ---------------------------------------------------------------

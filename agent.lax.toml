@@ -1,0 +1,59 @@
+# agent.lax.toml — trusted-dev convenience profile (Q9 / revision guide §6, R1 D4).
+#
+# For YOUR OWN machine on code you trust: fewer confirmation prompts, memory on.
+# Use it as your own config (copy to `agent.toml`, or pass --config agent.lax.toml —
+# a --config file is user-chosen and skips repo-config trust filtering). If this
+# file is instead committed as a repository's `agent.toml`, its widening keys
+# ([permissions].allow, auto_allow_command_if_sandboxed) are inert until you
+# approve them once (trust-on-first-use) — that is by design.
+#
+# Posture summary:
+#   * common read-only commands pre-approved (allow rules)
+#   * a sandboxed command skips the prompt (D4 default flipped back on, dev-only)
+#   * destructive commands still denied outright
+#   * cross-conversation memory enabled
+
+permission = "acceptedits"      # file edits proceed; DANGEROUS actions still ask
+
+[memory]
+enabled = true
+
+# --- Fine-grained permission rules -------------------------------------------
+[permissions]
+# Read-only / everyday commands that never need a prompt. Compound commands
+# (a && b) are allowed only when EVERY sub-command matches an allow rule.
+allow = [
+    "run_command(git status)",
+    "run_command(git diff*)",
+    "run_command(git log*)",
+    "run_command(git show*)",
+    "run_command(git branch)",
+    "run_command(ls*)",
+    "run_command(dir*)",
+    "run_command(python -m pytest*)",
+    "run_command(pytest*)",
+    "run_tests",
+]
+# Convenience must not extend to the obviously destructive.
+deny = [
+    "run_command(rm -rf *)",
+    "run_command(git push --force*)",
+    "run_command(git reset --hard*)",
+]
+
+# --- Web outbound domain policy (D10) -----------------------------------------
+# Attended dev runs stay open by default; list the domains you actually rely on so
+# an occasional unattended (--permission auto) run keeps working instead of
+# refusing every fetch fail-closed.
+[web]
+allowed_domains = ["github.com", "docs.python.org", "pypi.org", "duckduckgo.com"]
+blocked_domains = []
+
+# --- OS sandbox: on, and trusted to relax prompts (dev-only) -------------------
+[sandbox]
+enabled = true
+backend = "auto"
+fail_if_unavailable = false            # no sandbox on this host? run anyway (dev box)
+auto_allow_command_if_sandboxed = true # D4: lax profile explicitly opts back in —
+                                       #   a command that WILL be sandboxed skips the prompt
+allow_unsandboxed_commands = true

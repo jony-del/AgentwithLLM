@@ -24,12 +24,13 @@ from agent_core.config import (
     resolve_session_dir,
     resolve_skills_config,
     resolve_tool_use_summary_config,
+    resolve_web_config,
 )
 from agent_core.permission_rules import RuleSet
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
 from agent_core.models import LLMTransientError, Message
-from agent_core.providers import ClaudeProvider, FakeProvider
+from agent_core.providers import ClaudeProvider, FakeProvider, OpenAICompatProvider, ProviderConfig
 from agent_core.chat_commands import dispatch as dispatch_chat_command
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.tools.registry import ToolRegistry
@@ -50,6 +51,16 @@ if TYPE_CHECKING:
     from prompt_toolkit.completion import Completer
 
 
+def _config_file(args: argparse.Namespace) -> str:
+    """The toml file every resolver reads: ``--config PATH`` or the in-repo default.
+
+    Only the default relative ``agent.toml`` is treated as repo-controlled input and
+    trust-filtered (D2); an explicit ``--config`` path is user-chosen and honored as
+    user-level config (see ``config.load_agent_toml``).
+    """
+    return getattr(args, "config", None) or "agent.toml"
+
+
 def _resolve(args: argparse.Namespace) -> dict:
     return resolve_config(
         {
@@ -57,20 +68,21 @@ def _resolve(args: argparse.Namespace) -> dict:
             "permission": args.permission,
             "provider": args.provider,
             "effort": getattr(args, "effort", None),
-        }
+        },
+        config_file=_config_file(args),
     )
 
 
 def _memory_config(args: argparse.Namespace) -> MemoryConfig:
     # Numeric tunables come from the [memory] toml table; enabled is overridable
     # by AGENT_MEMORY / --memory. (resolve_config above already loaded the .env.)
-    return resolve_memory_config(getattr(args, "memory", None))
+    return resolve_memory_config(getattr(args, "memory", None), _config_file(args))
 
 
 def _permission_rules(args: argparse.Namespace) -> RuleSet:
     """Fine-grained rules from ``[permissions]`` toml, with CLI ``--allow/--deny/--ask``
     session rules layered on top (they append, deny still wins in the decision pipeline)."""
-    rules = resolve_permission_rules()
+    rules = resolve_permission_rules(_config_file(args))
     cli = RuleSet.from_lists(
         allow=getattr(args, "allow", None) or [],
         deny=getattr(args, "deny", None) or [],
@@ -82,7 +94,7 @@ def _permission_rules(args: argparse.Namespace) -> RuleSet:
 def _sandbox_config(args: argparse.Namespace):
     """Sandbox config from ``[sandbox]`` toml/env, with the ``--sandbox/--no-sandbox``
     CLI flag layered on ``enabled`` (None = leave the resolved value untouched)."""
-    config = resolve_sandbox_config()
+    config = resolve_sandbox_config(_config_file(args))
     cli_sandbox = getattr(args, "sandbox", None)
     if cli_sandbox is not None:
         config.enabled = bool(cli_sandbox)
@@ -93,7 +105,14 @@ def _sandbox_config(args: argparse.Namespace):
 
 
 def _make_provider(values: dict):
-    return FakeProvider() if values["provider"] == "fake" else ClaudeProvider()
+    provider = values["provider"]
+    if provider == "fake":
+        return FakeProvider()
+    if provider == "openai":
+        # OpenAI-shaped endpoint (OPENAI_API_KEY / OPENAI_BASE_URL): OpenAI itself,
+        # vLLM, llama.cpp server, Groq, DeepSeek, ... (decision D5).
+        return OpenAICompatProvider()
+    return ClaudeProvider()
 
 
 def _make_ui(args: argparse.Namespace) -> AgentUI:
@@ -154,13 +173,13 @@ def _connect_mcp(mcp_config):
     return manager
 
 
-def _start_mcp(registry: ToolRegistry):
+def _start_mcp(registry: ToolRegistry, config_file: str = "agent.toml"):
     """Connect any configured MCP servers and register their tools, or return ``None``.
 
     Only connects when ``[mcp.servers.*]`` is non-empty. The caller owns the returned
     manager and must ``close()`` it.
     """
-    mcp_config = resolve_mcp_config()
+    mcp_config = resolve_mcp_config(config_file)
     if not any(server.enabled for server in mcp_config.servers):
         return None
     from agent_core.mcp import MCPAdapter
@@ -172,9 +191,10 @@ def _start_mcp(registry: ToolRegistry):
 
 def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     values = _resolve(args)
+    config_file = _config_file(args)
     provider = _make_provider(values)
     ui = _make_ui(args)
-    concurrency = resolve_concurrency_config()
+    concurrency = resolve_concurrency_config(config_file)
     cli_api_concurrency = getattr(args, "max_api_concurrency", None)
     max_api_concurrency = (
         max(1, int(cli_api_concurrency)) if cli_api_concurrency is not None
@@ -182,7 +202,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     )
     # Run-level safety limits: [limits]/env resolved here, CLI flags layered on top.
     # A CLI value of 0 disables the cap (None), mirroring the toml/env convention.
-    limits = resolve_limits_config()
+    limits = resolve_limits_config(config_file)
     cli_wall = getattr(args, "max_wall_seconds", None)
     max_wall_seconds = (
         (None if cli_wall <= 0 else float(cli_wall)) if cli_wall is not None
@@ -193,14 +213,14 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         (None if cli_steps <= 0 else int(cli_steps)) if cli_steps is not None
         else limits["max_steps"]
     )
-    context = resolve_context_config()
+    context = resolve_context_config(config_file)
     config = ReActConfig(
         model=values["model"],
         permission=values["permission"],
         memory=_memory_config(args),
-        output=resolve_output_config(),
-        compression=resolve_compression_config(),
-        tool_use_summary=resolve_tool_use_summary_config(),
+        output=resolve_output_config(config_file),
+        compression=resolve_compression_config(config_file),
+        tool_use_summary=resolve_tool_use_summary_config(config_file),
         project_instructions=bool(context["project_instructions"]),
         git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),
@@ -215,14 +235,15 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         max_steps=max_steps,
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
         session_dir=_session_dir(args),
-        persist_compaction_boundary=resolve_persist_compaction_boundary(),
-        skills=resolve_skills_config(),
-        hooks=resolve_hooks_config(),
+        persist_compaction_boundary=resolve_persist_compaction_boundary(config_file),
+        skills=resolve_skills_config(config_file),
+        hooks=resolve_hooks_config(config_file),
         sandbox=_sandbox_config(args),
         permission_rules=_permission_rules(args),
+        web=resolve_web_config(config_file),
     )
     registry = ReActAgent.default_registry()
-    manager = _start_mcp(registry)
+    manager = _start_mcp(registry, config_file)
     # Resolve which session this run writes to (new / resumed / continued / forked) and
     # load any prior conversation to seed it. ``seed`` is the fork's cloned chain that
     # must be written into the fresh transcript before the run; for plain resume it is
@@ -249,7 +270,7 @@ def _session_dir(args: argparse.Namespace) -> str:
     if getattr(args, "no_session_persistence", False):
         return ""
     cli = getattr(args, "session_dir", None)
-    return cli if cli else resolve_session_dir()
+    return cli if cli else resolve_session_dir(_config_file(args))
 
 
 def _resolve_session(
@@ -397,10 +418,14 @@ def run_command(args: argparse.Namespace) -> int:
 
     async def run_once():
         await _seed_transcript(built)
-        with KeyInterrupt(confirm=True) as interrupt:
-            return await agent.run(
-                args.task, should_cancel=interrupt.is_set, history=built.history or None
-            )
+        try:
+            with KeyInterrupt(confirm=True) as interrupt:
+                return await agent.run(
+                    args.task, should_cancel=interrupt.is_set, history=built.history or None
+                )
+        finally:
+            # SessionEnd is host-driven: a one-shot run IS the whole session.
+            await agent.fire_session_end("run_exit")
 
     try:
         result = asyncio.run(run_once())
@@ -410,6 +435,7 @@ def run_command(args: argparse.Namespace) -> int:
         return 1
     finally:
         agent.sandbox.teardown()
+        agent.logger.close()
         if mcp is not None:
             mcp.close()
     # A live UI already streamed the answer via on_final; only print it ourselves
@@ -449,45 +475,50 @@ def chat_command(args: argparse.Namespace) -> int:
             effort = agent.config.effort or "—"
             return f" model: {agent.config.model}  ·  effort: {effort}  ·  /help for commands "
 
-        while True:
-            task = await _async_input("›", ui, completer, _toolbar)
-            if task is None:  # EOF
-                break
-            task = task.strip()
-            if not task:
-                continue
-            # Resolve /commands and skills. A fully-handled command (/help, /clear, a
-            # fork skill, …) yields no prompt; a plain message or inline skill yields the
-            # prompt to run; /clear and /resume replace the loop's history; /exit quits.
-            turn = await dispatch_chat_command(task, agent, ui, history)
-            if turn.quit:
-                break
-            if turn.history is not None:
-                history = turn.history
-            if turn.prompt is None:
-                continue
-            try:
-                with KeyInterrupt(confirm=True) as interrupt:
-                    result = await agent.run(
-                        turn.prompt, should_cancel=interrupt.is_set, history=history or None
-                    )
-                history = result.messages
-            except LLMTransientError as exc:
-                # A network hiccup must not tear down the whole session: report it and
-                # keep the loop (and the accumulated context) alive for a retry.
-                print(f"[network] {exc}", file=sys.stderr)
-                print("The session is still alive — please send your message again.", file=sys.stderr)
-                continue
-            except RuntimeError as exc:
-                print(f"[error] {exc}", file=sys.stderr)
-                continue
-            if not ui.is_live:
-                print(result.answer)
+        try:
+            while True:
+                task = await _async_input("›", ui, completer, _toolbar)
+                if task is None:  # EOF
+                    break
+                task = task.strip()
+                if not task:
+                    continue
+                # Resolve /commands and skills. A fully-handled command (/help, /clear, a
+                # fork skill, …) yields no prompt; a plain message or inline skill yields the
+                # prompt to run; /clear and /resume replace the loop's history; /exit quits.
+                turn = await dispatch_chat_command(task, agent, ui, history)
+                if turn.quit:
+                    break
+                if turn.history is not None:
+                    history = turn.history
+                if turn.prompt is None:
+                    continue
+                try:
+                    with KeyInterrupt(confirm=True) as interrupt:
+                        result = await agent.run(
+                            turn.prompt, should_cancel=interrupt.is_set, history=history or None
+                        )
+                    history = result.messages
+                except LLMTransientError as exc:
+                    # A network hiccup must not tear down the whole session: report it and
+                    # keep the loop (and the accumulated context) alive for a retry.
+                    print(f"[network] {exc}", file=sys.stderr)
+                    print("The session is still alive — please send your message again.", file=sys.stderr)
+                    continue
+                except RuntimeError as exc:
+                    print(f"[error] {exc}", file=sys.stderr)
+                    continue
+                if not ui.is_live:
+                    print(result.answer)
+        finally:
+            # SessionEnd is host-driven: leaving the chat loop closes the session.
+            await agent.fire_session_end("chat_exit")
 
     try:
         asyncio.run(session())
     finally:
         agent.sandbox.teardown()
+        agent.logger.close()
         if mcp is not None:
             mcp.close()
     return 0
@@ -495,7 +526,7 @@ def chat_command(args: argparse.Namespace) -> int:
 
 def sessions_command(args: argparse.Namespace) -> int:
     """List resumable sessions saved for the current project, newest first."""
-    root = getattr(args, "session_dir", None) or resolve_session_dir()
+    root = getattr(args, "session_dir", None) or resolve_session_dir(_config_file(args))
     if not root:
         print("Session persistence is disabled (empty session dir).")
         return 0
@@ -526,7 +557,7 @@ def dream_command(args: argparse.Namespace) -> int:
     values = _resolve(args)
     config = _memory_config(args)
     store = _open_store(config)
-    dreamer = Dreamer(store, config, _make_provider(values), {"model": values["model"]})
+    dreamer = Dreamer(store, config, _make_provider(values), ProviderConfig(model=values["model"]))
     try:
         report = asyncio.run(dreamer.dream(commit=not args.dry_run))
     except RuntimeError as exc:
@@ -572,6 +603,99 @@ def memory_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _short(value: object, limit: int = 160) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _render_replay_event(record: dict) -> str:
+    """One human-readable timeline line per JSONL record (unknown events included)."""
+    import datetime as _dt
+
+    ts = record.get("ts")
+    try:
+        when = _dt.datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S") if ts else "--:--:--"
+    except (ValueError, OSError, OverflowError):
+        when = "--:--:--"
+    event = str(record.get("event", "?"))
+
+    if event == "user":
+        detail = _short(record.get("content", ""), 200)
+    elif event == "permission":
+        decision = record.get("decision") or {}
+        detail = (
+            f"{record.get('tool')} -> "
+            f"{'allowed' if decision.get('allowed') else 'denied'}"
+            f" ({_short(decision.get('reason', ''), 80)})"
+        )
+    elif event == "tool_pre":
+        call = record.get("tool_call") or {}
+        detail = f"{call.get('name')} args={_short(call.get('arguments', {}), 120)}"
+    elif event == "tool_result":
+        call = record.get("tool_call") or {}
+        result = record.get("result") or {}
+        status = "ok" if result.get("ok", True) else "FAILED"
+        detail = f"{call.get('name')} [{status}] {_short(result.get('content', ''), 140)}"
+    elif event == "compression":
+        detail = ", ".join(
+            f"{key}={_short(value, 40)}" for key, value in record.items()
+            if key not in {"ts", "v", "event"}
+        )
+    elif event == "final":
+        stopped = record.get("stopped")
+        suffix = f" [stopped: {stopped}]" if stopped else ""
+        detail = _short(record.get("answer", ""), 300) + suffix
+    elif event == "_unparseable":
+        detail = f"line {record.get('line')}: {_short(record.get('raw', ''), 120)}"
+    else:
+        # Generic (and forward-compatible) rendering for every other/unknown event.
+        detail = ", ".join(
+            f"{key}={_short(value, 60)}" for key, value in record.items()
+            if key not in {"ts", "v", "event"}
+        )
+    return f"{when}  {event:<16} {detail}"
+
+
+def replay_command(args: argparse.Namespace) -> int:
+    """Re-render a recorded run's JSONL event log as a readable timeline.
+
+    Post-hoc debugging only: reads ``runs/<run_id>.jsonl`` (exact id or unique
+    prefix), never constructs an agent and never issues an API call.
+    """
+    from agent_core.storage import read_events
+
+    run_dir = Path(getattr(args, "run_dir", None) or "runs")
+    if not run_dir.is_dir():
+        print(f"[error] no run directory at {run_dir}", file=sys.stderr)
+        return 1
+    path = run_dir / f"{args.run_id}.jsonl"
+    if not path.exists():
+        matches = [p for p in sorted(run_dir.glob("*.jsonl")) if p.stem.startswith(args.run_id)]
+        if not matches:
+            recent = [p.stem for p in sorted(run_dir.glob("*.jsonl"))[-5:]]
+            print(
+                f"[error] no run matching {args.run_id!r} in {run_dir}"
+                + (f"; most recent: {', '.join(recent)}" if recent else ""),
+                file=sys.stderr,
+            )
+            return 1
+        if len(matches) > 1:
+            print(
+                f"[error] {args.run_id!r} is ambiguous: {', '.join(p.stem for p in matches)}",
+                file=sys.stderr,
+            )
+            return 1
+        path = matches[0]
+
+    print(f"Replay of {path.stem}  ({path})\n")
+    count = 0
+    for record in read_events(path):
+        print(_render_replay_event(record))
+        count += 1
+    print(f"\n{count} event(s).")
+    return 0
+
+
 def health_command(args: argparse.Namespace) -> int:
     """Check the health status of the agent system."""
     print("Agent System Health Check")
@@ -579,7 +703,7 @@ def health_command(args: argparse.Namespace) -> int:
     
     # Check configuration
     try:
-        resolve_config({})
+        resolve_config({}, config_file=_config_file(args))
         print("✓ Configuration loaded successfully")
     except Exception as e:
         print(f"✗ Configuration error: {e}")
@@ -622,7 +746,7 @@ def health_command(args: argparse.Namespace) -> int:
 
 def mcp_command(args: argparse.Namespace) -> int:
     """List the tools exposed by the configured MCP servers (a verification aid)."""
-    mcp_config = resolve_mcp_config()
+    mcp_config = resolve_mcp_config(_config_file(args))
     if not any(server.enabled for server in mcp_config.servers):
         print("(no MCP servers configured in agent.toml — see [mcp.servers.*])")
         return 0
@@ -660,7 +784,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="polaris")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_config_flag(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--config",
+            metavar="PATH",
+            default=None,
+            help="Read settings from this toml file instead of ./agent.toml. An explicit "
+            "path is user-chosen config: the repo-config trust filter (TOFU) does not apply.",
+        )
+
     def add_common(subparser: argparse.ArgumentParser) -> None:
+        add_config_flag(subparser)
         subparser.add_argument("--model", default=None)
         subparser.add_argument(
             "--permission",
@@ -699,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
             metavar="RULE",
             help="Add an ask rule (force confirmation), e.g. --ask 'run_command'. Repeatable.",
         )
-        subparser.add_argument("--provider", choices=["claude", "fake"], default=None)
+        subparser.add_argument("--provider", choices=["claude", "openai", "fake"], default=None)
         subparser.add_argument(
             "--memory",
             action=argparse.BooleanOptionalAction,
@@ -812,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
         "action", nargs="?", choices=["list"], default="list", help="list: show saved sessions."
     )
     sessions_parser.add_argument("--session-dir", metavar="PATH", default=None)
+    add_config_flag(sessions_parser)
     sessions_parser.set_defaults(func=sessions_command)
 
     dream_parser = subparsers.add_parser("dream", help="Consolidate memory (decay, merge, insights).")
@@ -826,11 +961,22 @@ def main(argv: list[str] | None = None) -> int:
     memory_parser = subparsers.add_parser("memory", help="Inspect or curate stored memories.")
     memory_parser.add_argument("action", choices=["list", "add", "forget"])
     memory_parser.add_argument("value", nargs="?", default=None, help="Text for add, id for forget.")
+    add_config_flag(memory_parser)
     memory_parser.set_defaults(func=memory_command)
 
     mcp_parser = subparsers.add_parser("mcp", help="Inspect configured MCP servers and their tools.")
     mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
+    add_config_flag(mcp_parser)
     mcp_parser.set_defaults(func=mcp_command)
+
+    replay_parser = subparsers.add_parser(
+        "replay", help="Re-render a recorded run's JSONL event log as a readable timeline."
+    )
+    replay_parser.add_argument("run_id", help="Run id (or unique prefix) of a runs/*.jsonl log.")
+    replay_parser.add_argument(
+        "--run-dir", metavar="PATH", default="runs", help="Directory holding the run logs."
+    )
+    replay_parser.set_defaults(func=replay_command)
 
     health_parser = subparsers.add_parser("health", help="Check the health status of the agent system.")
     add_common(health_parser)

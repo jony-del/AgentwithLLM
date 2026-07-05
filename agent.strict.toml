@@ -1,0 +1,71 @@
+# agent.strict.toml — hardened security profile (Q9 / revision guide §6).
+#
+# Use it as your own config (either copy to `agent.toml`, or pass it explicitly:
+#   polaris run "..." --config agent.strict.toml
+# A --config file is user-chosen, so nothing in it is filtered by the repo-config
+# trust policy). Every key here also exists in agent.toml.example — this file only
+# pins the SECURITY-RELEVANT knobs to their most conservative supported values;
+# anything omitted keeps the built-in default.
+#
+# Posture summary:
+#   * web egress denied outright (no fetch/search — the exfiltration channel is closed)
+#   * every command asks, even when sandboxed
+#   * sandbox is mandatory: if the host can't provide one, the agent refuses to start
+#   * the input firewall stays on; external security gates should use fail_mode="closed"
+#   * no MCP servers, no allow rules, no sandbox exclusions (nothing widening)
+
+permission = "default"          # every WRITE/DANGEROUS action is confirmed interactively
+
+# --- Web outbound domain policy (D10) -----------------------------------------
+# The permission rules below already deny the web tools outright; this table is the
+# second, independent layer for the day you relax those rules: an empty allowlist
+# means any unattended (auto/dontask/bypass) run refuses every domain fail-closed.
+[web]
+allowed_domains = []
+blocked_domains = []
+
+# --- Fine-grained permission rules -------------------------------------------
+[permissions]
+# Deny the whole web surface. To relax per-domain instead, replace the bare tool
+# names with domain-scoped rules, e.g.:
+#   deny = ["web_fetch", "web_search"]        -> everything blocked (this profile)
+#   ask  = ["web_fetch(domain:github.com)"]   -> confirm GitHub fetches one by one
+deny = ["web_fetch", "web_search"]
+# Commands always require an explicit yes — even ones an allow rule or the
+# sandbox auto-allow would otherwise wave through.
+ask = ["run_command", "run_tests"]
+
+# --- OS sandbox: mandatory --------------------------------------------------
+[sandbox]
+enabled = true
+backend = "auto"                       # container -> native; "vm" only if you opt in
+fail_if_unavailable = true             # can't sandbox => refuse to start (fail-closed)
+auto_allow_command_if_sandboxed = false # sandbox is a layer, never a substitute for asking
+allow_unsandboxed_commands = false     # ignore per-call requests to escape the sandbox
+excluded_commands = []                 # nothing runs outside the sandbox
+
+[sandbox.filesystem]
+deny_read = ["~/.ssh", "~/.aws", "~/.gnupg"]   # hide credential regions from sandboxed commands
+
+[sandbox.network]
+allowed_domains = []                   # default-deny network inside the sandbox
+allow_local_binding = false
+
+# --- Hooks: firewall on; gates fail closed ------------------------------------
+[hooks]
+enabled = true
+
+[hooks.prompt_validation]
+enabled = true                 # provenance firewall: neutralize spoofed control framing
+max_chars = 100000
+reject_control_chars = true
+neutralize_framing = true
+
+# External hooks used as SECURITY GATES must declare fail_mode = "closed" so a
+# crashed/timed-out gate blocks instead of silently allowing:
+# [[hooks.external]]
+# event = "UserPromptSubmit"
+# type = "command"
+# command = "python ./.polaris/hooks/audit_prompt.py"
+# timeout = 5
+# fail_mode = "closed"
