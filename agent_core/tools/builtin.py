@@ -331,7 +331,10 @@ class SearchTextTool(WorkspacePathMixin, Tool):
             lineno, _, text = rest.partition(":")
             if not lineno.isdigit():
                 continue
-            results.append(f"{path_part.replace(os.sep, '/')}:{lineno}: {text.strip()}")
+            normalized_path = path_part.replace(os.sep, "/")
+            if normalized_path.startswith("./"):
+                normalized_path = normalized_path[2:]
+            results.append(f"{normalized_path}:{lineno}: {text.strip()}")
         if len(results) >= max_results:
             truncated = True
         return results, truncated
