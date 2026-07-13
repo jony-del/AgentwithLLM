@@ -41,14 +41,15 @@ def _call(call_id: str, name: str = "echo", arguments: str = '{"text":"hi"}'):
 class _Recorder:
     def __init__(self) -> None:
         self.text = ""
+        self.thinking = ""
         self.tool_args = ""
         self.tool_names: list[str] = []
 
     def on_text_delta(self, text: str) -> None:
         self.text += text
 
-    def on_thinking_delta(self, text: str) -> None:  # pragma: no cover
-        pass
+    def on_thinking_delta(self, text: str) -> None:
+        self.thinking += text
 
     def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None:
         self.tool_names.append(tool_name)
@@ -264,6 +265,37 @@ async def test_reasoning_and_output_items_are_preserved_and_replayed() -> None:
     assert requests[1]["input"][1:5] == [*output, {"type": "function_call_output", "call_id": "call_1", "output": "echo: hi"}]
 
 
+async def test_reasoning_summary_is_displayed_but_encrypted_content_is_opaque() -> None:
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "checked constraints"}],
+        "encrypted_content": "cipher",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_response([reasoning, _message("done")]))
+
+    result = await _provider(handler).complete([Message("user", "go")], [], ProviderConfig(model="gpt-5.6"))
+
+    assert result.content == "done"
+    assert result.thinking == "checked constraints"
+    assert result.provider_state == {"output": [reasoning, _message("done")]}
+    assert "cipher" not in result.thinking
+
+
+async def test_encrypted_reasoning_without_summary_is_not_displayed() -> None:
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "cipher"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_response([reasoning, _message("done")]))
+
+    result = await _provider(handler).complete([Message("user", "go")], [], ProviderConfig(model="gpt-5.6"))
+
+    assert result.thinking == ""
+    assert result.provider_state == {"output": [reasoning, _message("done")]}
+
+
 async def test_reasoning_output_is_not_replayed_to_non_reasoning_gpt() -> None:
     seen: dict = {}
     output = [
@@ -369,6 +401,32 @@ async def test_non_retryable_4xx_raises_runtime_error() -> None:
 
     with pytest.raises(RuntimeError, match="401"):
         await _provider(handler).complete([Message("user", "hi")], [], _CONFIG)
+
+
+async def test_unsupported_parameter_error_is_actionable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unsupported parameter: reasoning",
+                    "code": "unsupported_parameter",
+                    "param": "reasoning",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _provider(handler).complete(
+            [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="high")
+        )
+
+    message = str(excinfo.value)
+    assert "OpenAI Responses" in message
+    assert "gpt-5.6" in message
+    assert "reasoning" in message
+    assert "does not infer" in message
 
 
 async def test_missing_api_key_is_actionable() -> None:
@@ -479,6 +537,54 @@ async def test_response_completed_final_response_is_authoritative() -> None:
         [Message("user", "hi")], [], ProviderConfig(model="gpt-test", stream=True), stream=_Recorder()
     )
     assert result.content == "final"
+
+
+async def test_streaming_reasoning_summary_deltas_are_displayed() -> None:
+    final = _response([_message("done")])
+    body = _sse(
+        {"type": "response.reasoning_summary_text.delta", "delta": "checked "},
+        {"type": "response.reasoning_summary_text.delta", "delta": "constraints"},
+        {"type": "response.completed", "response": final},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    recorder = _Recorder()
+    result = await _provider(handler).complete(
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", stream=True), stream=recorder
+    )
+
+    assert recorder.thinking == "checked constraints"
+    assert result.thinking == "checked constraints"
+    assert result.content == "done"
+
+
+async def test_streaming_reasoning_output_item_display_keeps_encrypted_opaque() -> None:
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "safe summary"}],
+        "encrypted_content": "cipher",
+    }
+    body = _sse(
+        {"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning", "id": "rs_1"}},
+        {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    recorder = _Recorder()
+    result = await _provider(handler).complete(
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", stream=True), stream=recorder
+    )
+
+    assert recorder.thinking == "safe summary"
+    assert result.thinking == "safe summary"
+    assert result.provider_state == {"output": [reasoning]}
+    assert "cipher" not in recorder.thinking
+    assert "cipher" not in result.thinking
 
 
 # --- ReAct/transcript integration --------------------------------------------

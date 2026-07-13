@@ -878,8 +878,8 @@ def main(argv: list[str] | None = None) -> int:
             "--effort",
             choices=["low", "medium", "high", "xhigh", "max"],
             default=None,
-            help="output_config.effort depth/cost level (effort-capable models only; "
-            "dropped for models that don't support the level).",
+            help="Reasoning/effort depth level; Claude gates xhigh/max by model family, "
+            "OpenAI Responses maps low/medium/high for profiled reasoning models and drops unsupported levels.",
         )
         subparser.add_argument(
             "--max-api-concurrency",

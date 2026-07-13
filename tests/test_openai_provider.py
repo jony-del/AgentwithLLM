@@ -68,6 +68,25 @@ async def test_non_streaming_parses_content_and_usage() -> None:
     assert result.thinking_blocks == []  # provider-owned opaque data: this provider owns none
 
 
+async def test_chat_completions_request_omits_responses_only_fields() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    await _provider(handler).complete(
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="high", thinking_budget=2048)
+    )
+
+    assert "reasoning" not in seen
+    assert "include" not in seen
+    assert "thinking" not in seen
+    assert "provider_state" not in seen
+    assert seen["max_tokens"] == 1024
+    assert "max_output_tokens" not in seen
+
+
 async def test_tool_schema_and_history_round_trip() -> None:
     """The neutral tool schema and tool-call history project into function shapes."""
     seen: dict = {}
@@ -132,6 +151,30 @@ async def test_context_overflow_maps_to_contract_error() -> None:
 
     with pytest.raises(LLMContextTooLongError):
         await _provider(handler).complete([Message("user", "hi")], [], _CONFIG)
+
+
+async def test_unsupported_chat_parameter_error_is_actionable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unsupported parameter: max_output_tokens",
+                    "code": "unsupported_parameter",
+                    "param": "max_output_tokens",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _provider(handler).complete([Message("user", "hi")], [], _CONFIG)
+
+    message = str(excinfo.value)
+    assert "OpenAI-compatible Chat Completions" in message
+    assert "test-model" in message
+    assert "max_output_tokens" in message
+    assert "does not infer" in message
 
 
 async def test_retries_on_429_then_succeeds(monkeypatch) -> None:

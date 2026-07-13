@@ -26,6 +26,11 @@ from agent_core.models import (
     ToolCall,
 )
 from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.openai_capabilities import (
+    capabilities_for_responses_model,
+    reasoning_effort_for_model,
+)
+from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _MAX_RETRY_AFTER = 30.0
@@ -36,23 +41,7 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "too many tokens",
     "prompt is too long",
 )
-_SUPPORTED_REASONING_EFFORTS = {"low", "medium", "high"}
-_REASONING_MODEL_MARKERS = ("gpt-5", "o1", "o3", "o4")
 _REPLAY_OUTPUT_TYPES = {"message", "function_call", "reasoning", "output_text"}
-
-
-def _supports_reasoning(model: str) -> bool:
-    """Return whether ``model`` accepts Responses reasoning-only request fields."""
-    name = (model or "").lower()
-    return any(marker in name for marker in _REASONING_MODEL_MARKERS)
-
-
-def _reasoning_effort_for_model(model: str, level: Any) -> str | None:
-    """Resolve a Responses reasoning effort, or ``None`` to omit unsupported values."""
-    if not _supports_reasoning(model) or not isinstance(level, str):
-        return None
-    normalized = level.lower()
-    return normalized if normalized in _SUPPORTED_REASONING_EFFORTS else None
 
 
 def _default_retry_notice(message: str) -> None:
@@ -68,6 +57,7 @@ class _ResponsesStreamAccumulator:
     def __init__(self) -> None:
         self.completed_response: dict[str, Any] | None = None
         self.text_parts: list[str] = []
+        self.thinking_parts: list[str] = []
         self.output_items: dict[str, dict[str, Any]] = {}
         self.output_order: list[str] = []
         self.function_args: dict[str, list[str]] = {}
@@ -76,15 +66,20 @@ class _ResponsesStreamAccumulator:
 
     def result(self) -> LLMResult:
         if self.completed_response is not None:
-            return OpenAIResponsesProvider._parse_response(self.completed_response)
+            parsed = OpenAIResponsesProvider._parse_response(self.completed_response)
+            if not parsed.thinking and self.thinking_parts:
+                parsed.thinking = "".join(self.thinking_parts)
+            return parsed
         output = [self.output_items[key] for key in self.output_order if key in self.output_items]
         text = "".join(self.text_parts)
         calls = OpenAIResponsesProvider._parse_function_calls(output)
+        thinking_parts = OpenAIResponsesProvider._parse_reasoning_display_parts(output) or self.thinking_parts
         return LLMResult(
             content=text,
             tool_calls=calls,
             stop_reason=self.stop_reason,
             raw={},
+            thinking="".join(thinking_parts),
             usage=self.usage,
             provider_state={"output": _json_clone(output)} if output else {},
         )
@@ -142,7 +137,7 @@ class OpenAIResponsesProvider(LLMProvider):
                     raise httpx.HTTPStatusError("error", request=response.request, response=response)
                 return response.json()
 
-            payload = await self._request_with_retry(send_once)
+            payload = await self._request_with_retry(send_once, model=config.model)
             return self._parse_response(payload)
 
         async def open_stream():
@@ -154,7 +149,7 @@ class OpenAIResponsesProvider(LLMProvider):
                 raise httpx.HTTPStatusError("error", request=request, response=response)
             return response
 
-        response = await self._request_with_retry(open_stream)
+        response = await self._request_with_retry(open_stream, model=config.model)
         try:
             return await self._consume_stream(response, stream, should_cancel)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
@@ -173,16 +168,17 @@ class OpenAIResponsesProvider(LLMProvider):
         config: ProviderConfig,
         streaming: bool = False,
     ) -> dict[str, Any]:
-        preserve_reasoning = _supports_reasoning(config.model)
+        capabilities = capabilities_for_responses_model(config.model)
+        preserve_reasoning = capabilities.supports_reasoning
         body: dict[str, Any] = {
             "model": config.model,
             "input": self._format_input(messages, preserve_reasoning=preserve_reasoning),
             "max_output_tokens": config.max_tokens,
             "store": False,
         }
-        if preserve_reasoning:
+        if capabilities.include_encrypted_reasoning:
             body["include"] = ["reasoning.encrypted_content"]
-        effort = _reasoning_effort_for_model(config.model, config.effort)
+        effort = reasoning_effort_for_model(config.model, config.effort)
         if effort is not None:
             body["reasoning"] = {"effort": effort}
         if streaming:
@@ -280,6 +276,7 @@ class OpenAIResponsesProvider(LLMProvider):
             tool_calls=tool_calls,
             stop_reason=OpenAIResponsesProvider._stop_reason(payload, tool_calls),
             raw=payload,
+            thinking="".join(OpenAIResponsesProvider._parse_reasoning_display_parts(output)),
             usage=OpenAIResponsesProvider._parse_usage(payload.get("usage")),
             provider_state={"output": _json_clone(output)} if output else {},
         )
@@ -301,6 +298,46 @@ class OpenAIResponsesProvider(LLMProvider):
                             parts.append(str(block.get("text") or ""))
             elif item_type in {"output_text", "text"}:
                 parts.append(str(item.get("text") or ""))
+        return parts
+
+    @classmethod
+    def _parse_reasoning_display_parts(cls, output: list[Any]) -> list[str]:
+        parts: list[str] = []
+        for item in output:
+            parts.extend(cls._extract_reasoning_display_parts(item))
+        return parts
+
+    @classmethod
+    def _extract_reasoning_display_parts(cls, value: Any) -> list[str]:
+        """Return human-readable reasoning summary text, never encrypted state."""
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                parts.extend(cls._extract_reasoning_display_parts(item))
+            return parts
+        if not isinstance(value, dict):
+            return []
+
+        kind = str(value.get("type") or "").lower()
+        is_reasoning = "reasoning" in kind or kind in {"summary_text", "summary"}
+        parts: list[str] = []
+        if is_reasoning:
+            if "encrypted" in kind:
+                return []
+            for key in ("summary", "content"):
+                parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
+            for key in ("text", "delta"):
+                text = value.get(key)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        else:
+            # Some streaming events carry a top-level summary even when their event
+            # type, not the nested block, names the reasoning summary shape.
+            for key in ("summary", "reasoning", "reasoning_summary"):
+                if key in value:
+                    parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
         return parts
 
     @staticmethod
@@ -399,6 +436,12 @@ class OpenAIResponsesProvider(LLMProvider):
                     if key not in acc.output_items:
                         acc.output_order.append(key)
                     acc.output_items[key] = clean
+                display_parts = self._extract_reasoning_display_parts(clean) if etype == "response.output_item.done" else []
+                if display_parts:
+                    text = "".join(display_parts)
+                    acc.thinking_parts.append(text)
+                    if sink is not None:
+                        sink.on_thinking_delta(text)
                 if clean.get("type") == "function_call" and key in acc.function_args:
                     clean["arguments"] = "".join(acc.function_args[key]) or clean.get("arguments", "")
                     acc.output_items[key] = clean
@@ -418,6 +461,13 @@ class OpenAIResponsesProvider(LLMProvider):
             item = acc.output_items.get(key)
             if item is not None:
                 item["arguments"] = "".join(acc.function_args.get(key, [])) or item.get("arguments", "")
+            return
+        if etype in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta"}:
+            chunk = str(event.get("delta") or event.get("text") or "")
+            if chunk:
+                acc.thinking_parts.append(chunk)
+                if sink is not None:
+                    sink.on_thinking_delta(chunk)
             return
         if etype == "response.completed":
             response_payload = event.get("response")
@@ -475,7 +525,7 @@ class OpenAIResponsesProvider(LLMProvider):
             self._client_loop = loop
         return self._client
 
-    async def _request_with_retry(self, op):
+    async def _request_with_retry(self, op, *, model: str | None = None):
         attempt = 0
         while True:
             try:
@@ -490,7 +540,7 @@ class OpenAIResponsesProvider(LLMProvider):
                     await asyncio.sleep(delay)
                     attempt += 1
                     continue
-                raise self._http_error(code, text) from exc
+                raise self._http_error(code, text, model=model) from exc
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempt < self.max_retries:
                     delay = self._retry_delay(attempt, None)
@@ -504,13 +554,14 @@ class OpenAIResponsesProvider(LLMProvider):
                 ) from exc
 
     @staticmethod
-    def _http_error(code: int, text: str) -> Exception:
+    def _http_error(code: int, text: str, *, model: str | None = None) -> Exception:
         lowered = text.lower()
         if code == 400 and any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS):
             return LLMContextTooLongError(f"OpenAI Responses context overflow: {text[:300]}")
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"OpenAI Responses API error {code} after retries: {text[:300]}")
-        return RuntimeError(f"OpenAI Responses API error {code}: {text[:300]}")
+        info = parse_openai_error(text)
+        return RuntimeError(format_openai_error("OpenAI Responses", model, code, info))
 
     def _retry_delay(self, attempt: int, retry_after: float | None) -> float:
         if retry_after is not None:

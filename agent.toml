@@ -18,11 +18,12 @@
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
-provider = "claude"           # claude | fake
+provider = "claude"           # claude | openai | openai-compat | fake
 # output_config.effort depth/cost control. low | medium | high | xhigh | max.
-# "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
-# Sonnet 4.6 / Opus <= 4.6 (the provider drops a level the model can't honor). Overridable
-# by AGENT_EFFORT or --effort. Only effort-capable models (Opus 4.5+, Sonnet 4.6, Fable) use it.
+# "high" is the safe agentic default. Claude gates xhigh/max by model family; OpenAI
+# Responses maps low/medium/high to reasoning.effort only for profiled GPT/o-series
+# reasoning models and omits it for gpt-4.1-nano/unknown models. Overridable by
+# AGENT_EFFORT or --effort.
 effort = "high"
 
 # --- Live display (CLI-only, NOT configured here) ----------------------------

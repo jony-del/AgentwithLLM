@@ -30,11 +30,11 @@ the staged roadmap (R0–R3). Consult it before large structural changes.
    `claude` → Anthropic Messages (`/v1/messages`), `openai` → OpenAI Responses
    (`/v1/responses`), and `openai-compat` → OpenAI-compatible Chat Completions
    (`/v1/chat/completions`) for DeepSeek/Qwen/GLM/Moonshot/vLLM/LM Studio/Groq
-   style endpoints. `fake` remains the deterministic offline provider. Any new
-   provider must fit behind `LLMProvider.complete` unchanged. Provider-specific
-   payloads (e.g. `LLMResult.thinking_blocks` and `provider_state`) are
-   provider-owned opaque data: preserved and round-tripped, never interpreted by
-   the core loop.
+   style endpoints. Never infer or switch the protocol from a model name or base
+   URL. `fake` remains the deterministic offline provider. Any new provider must
+   fit behind `LLMProvider.complete` unchanged. Provider-specific payloads (e.g.
+   `LLMResult.thinking_blocks` and `provider_state`) are provider-owned opaque
+   data: preserved and round-tripped, never interpreted by the core loop.
 
 2. **Clear capability boundaries.** A capability (web, MCP, memory, skills,
    sandbox, terminal UI) is enabled via config, initialized at startup with an
@@ -188,13 +188,17 @@ Providers:
   across the multi-agent fan-out).
 - `agent_core/providers/claude.py` — Anthropic Messages API (`/v1/messages`) over
   httpx: streaming, retries with jitter, model-aware request shape (adaptive
-  thinking vs legacy), effort levels. `openai_responses.py` — OpenAI official
-  Responses API (`/v1/responses`): manual item replay (`store=false`), model-gated
-  encrypted reasoning include/replay, flat function tools, streaming typed SSE,
-  provider-state preservation. `openai_compat.py` — OpenAI-compatible Chat Completions
-  (`/v1/chat/completions`; `OPENAI_COMPAT_API_KEY`/`OPENAI_COMPAT_BASE_URL`,
-  with deprecated fallback to `OPENAI_API_KEY`/`OPENAI_BASE_URL`) for vLLM, LM
-  Studio, Groq, DeepSeek, Qwen, GLM, Moonshot, etc. `fake.py` — deterministic
+  thinking vs legacy), effort levels. `openai_capabilities.py` — provider-local
+  GPT/Responses capability profiles (anchored model-family matching, conservative
+  defaults for unknown models). `openai_responses.py` — OpenAI official Responses
+  API (`/v1/responses`): manual item replay (`store=false`), model-gated encrypted
+  reasoning include/replay, displayable reasoning summaries, flat function tools,
+  streaming typed SSE, provider-state preservation, structured OpenAI errors.
+  `openai_compat.py` — OpenAI-compatible Chat Completions (`/v1/chat/completions`;
+  `OPENAI_COMPAT_API_KEY`/`OPENAI_COMPAT_BASE_URL`, with deprecated fallback to
+  `OPENAI_API_KEY`/`OPENAI_BASE_URL`) for vLLM, LM Studio, Groq, DeepSeek, Qwen,
+  GLM, Moonshot, etc. `openai_errors.py` — shared OpenAI error envelope parsing
+  and actionable unsupported-parameter diagnostics. `fake.py` — deterministic
   offline provider for tests/demos.
 
 Tools:
@@ -344,7 +348,10 @@ provider scalar is an explicit protocol selector: `claude` uses `/v1/messages`,
 `openai` uses `/v1/responses`, `openai-compat` uses `/v1/chat/completions`, and
 `fake` is offline. Do not infer or change provider from model ID or base URL;
 legacy `--provider openai + OPENAI_BASE_URL=<compat endpoint>` users must migrate
-to `--provider openai-compat`.
+to `--provider openai-compat`. The OpenAI Responses capability matrix is
+provider-local and fail-safe: unknown models do not receive reasoning-only fields,
+unsupported effort values are omitted, and encrypted reasoning stays in opaque
+`provider_state` while only displayable reasoning summaries reach the UI.
 Tables resolved separately in `config.py`: `[memory]`, `[limits]`, `[session]`,
 `[context]`, `[compression]`, `[concurrency]`, `[mcp]`, `[output]`,
 `[tool_use_summary]`, `[skills]`, `[hooks]` (+ `[hooks.builtin]`,

@@ -35,6 +35,7 @@ from agent_core.models import (
     ToolCall,
 )
 from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _MAX_RETRY_AFTER = 30.0
@@ -134,7 +135,7 @@ class OpenAICompatProvider(LLMProvider):
                     raise httpx.HTTPStatusError("error", request=response.request, response=response)
                 return response.json()
 
-            payload = await self._request_with_retry(send_once)
+            payload = await self._request_with_retry(send_once, model=config.model)
             return self._parse_response(payload)
 
         # Streaming: retry only connection setup; never mid-stream (no half-reprints).
@@ -149,7 +150,7 @@ class OpenAICompatProvider(LLMProvider):
                 raise httpx.HTTPStatusError("error", request=request, response=response)
             return response
 
-        response = await self._request_with_retry(open_stream)
+        response = await self._request_with_retry(open_stream, model=config.model)
         try:
             return await self._consume_stream(response, stream, should_cancel)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
@@ -377,7 +378,7 @@ class OpenAICompatProvider(LLMProvider):
             self._client_loop = loop
         return self._client
 
-    async def _request_with_retry(self, op):
+    async def _request_with_retry(self, op, *, model: str | None = None):
         attempt = 0
         while True:
             try:
@@ -392,7 +393,7 @@ class OpenAICompatProvider(LLMProvider):
                     await asyncio.sleep(delay)
                     attempt += 1
                     continue
-                raise self._http_error(code, text) from exc
+                raise self._http_error(code, text, model=model) from exc
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempt < self.max_retries:
                     delay = self._retry_delay(attempt, None)
@@ -406,13 +407,14 @@ class OpenAICompatProvider(LLMProvider):
                 ) from exc
 
     @staticmethod
-    def _http_error(code: int, text: str) -> Exception:
+    def _http_error(code: int, text: str, *, model: str | None = None) -> Exception:
         lowered = text.lower()
         if code == 400 and any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS):
             return LLMContextTooLongError(f"chat-completions context overflow: {text[:300]}")
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"chat-completions API error {code} after retries: {text[:300]}")
-        return RuntimeError(f"chat-completions API error {code}: {text[:300]}")
+        info = parse_openai_error(text)
+        return RuntimeError(format_openai_error("OpenAI-compatible Chat Completions", model, code, info))
 
     def _retry_delay(self, attempt: int, retry_after: float | None) -> float:
         if retry_after is not None:

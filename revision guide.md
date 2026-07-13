@@ -56,9 +56,11 @@
   指数退避 + full jitter + Retry-After、thinking blocks 跨轮保留、
   model-aware 请求形状（adaptive thinking vs legacy）、effort。
 - Provider 协议选择已显式拆分：`claude` → `/v1/messages`，`openai` → OpenAI
-  Responses `/v1/responses`（本地手工回放 items，`store=false`，对支持 reasoning 的模型保留 encrypted reasoning），
+  Responses `/v1/responses`（本地手工回放 items，`store=false`，provider-local capability profile 对支持
+  reasoning 的模型保留 encrypted reasoning，并只展示 displayable reasoning summary），
   `openai-compat` → `/v1/chat/completions`（DeepSeek/Qwen/GLM/Moonshot/vLLM/LM Studio/Groq
-  等兼容端点），`fake` 保持离线测试。禁止按模型名或 base URL 猜协议。
+  等兼容端点），`fake` 保持离线测试。禁止按模型名或 base URL 猜协议；unknown GPT model
+  默认不发送 reasoning-only 字段。
 
 ### 1.7 其他
 - Skills（markdown + `@programmatic_skill` 双源）、跨对话 memory（recall/extract/dream）、
@@ -367,13 +369,16 @@ notebook）。
   输出重排成与纯 Python 相同的 `relpath:line: text`），单一 timeout + kill 后回收；
   任何失败回退纯 Python + debug 日志。parity 测试在装有 rg 的环境（CI runner）跑，
   本地无 rg 时 skip；解析/降级测试各环境均跑。（2026-07-04）
-- [x] **W12** OpenAI-compatible provider（D5）：`providers/openai_compat.py`
-  （httpx 直连 `/v1/chat/completions`，流式+非流式、tool-call 往返、重试退避、
-  context-overflow → `LLMContextTooLongError`、`should_cancel` 轮询；
-  `OPENAI_API_KEY`/`OPENAI_BASE_URL`）。**验收达成**：接入未改 `providers/base.py`
-  与 `react.py` 一行；`test_provider_drives_the_react_loop_end_to_end` 用
-  MockTransport 驱动真实 ReAct 双轮 tool 往返证明。CLI `--provider openai`。
-  （2026-07-04）
+- [x] **W12** OpenAI providers（D5）：`providers/openai_responses.py` 直连 OpenAI
+  Responses `/v1/responses`（`store=false` 本地 item replay、GPT/o-series capability profile、
+  encrypted reasoning opaque replay、reasoning summary display、typed SSE）；`providers/openai_compat.py`
+  直连 `/v1/chat/completions`（DeepSeek/Qwen/GLM/Moonshot/vLLM/LM Studio/Groq 等兼容端点）。
+  两者均使用 httpx，覆盖流式+非流式、tool-call 往返、重试退避、context-overflow →
+  `LLMContextTooLongError`、`should_cancel` 轮询、OpenAI structured error 诊断。
+  **验收达成**：接入未改 `providers/base.py` 与 `react.py` 一行；
+  MockTransport 驱动真实 ReAct 双轮 tool 往返证明。CLI `--provider openai` = `/v1/responses`，
+  `--provider openai-compat` = `/v1/chat/completions`。
+  （2026-07-04，GPT capability industrialization 2026-07-13）
 
 **明确延后（观察需求再排期，见 R3 / D8）：**
 - AskUserQuestion 工具（C2，依赖 terminal 栈）。
