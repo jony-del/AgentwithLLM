@@ -19,11 +19,11 @@
 model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
 provider = "claude"           # claude | openai | openai-compat | fake
-# output_config.effort depth/cost control. low | medium | high | xhigh | max.
-# "high" is the safe agentic default. Claude gates xhigh/max by model family; OpenAI
-# Responses maps low/medium/high to reasoning.effort only for profiled GPT/o-series
-# reasoning models and omits it for gpt-4.1-nano/unknown models. Overridable by
-# AGENT_EFFORT or --effort.
+# output_config.effort depth/cost control. none | minimal | low | medium | high | xhigh | max.
+# "high" is the safe agentic default. Providers gate levels by model: Claude gates
+# xhigh/max by model family; OpenAI Responses uses a model-specific capability matrix,
+# sends "none" explicitly when supported, and omits unsupported levels or unknown models.
+# Overridable by AGENT_EFFORT or --effort.
 effort = "high"
 
 # --- Live display (CLI-only, NOT configured here) ----------------------------

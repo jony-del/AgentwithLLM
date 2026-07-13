@@ -76,7 +76,7 @@ async def test_chat_completions_request_omits_responses_only_fields() -> None:
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
 
     await _provider(handler).complete(
-        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="high", thinking_budget=2048)
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="none", thinking_budget=2048)
     )
 
     assert "reasoning" not in seen

@@ -92,12 +92,29 @@ async def test_reasoning_capable_gpt_requests_encrypted_reasoning_and_safe_effor
         return httpx.Response(200, json=_response([_message("ok")]))
 
     await _provider(handler).complete(
-        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="high")
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="max")
     )
     assert seen["store"] is False
     assert seen["include"] == ["reasoning.encrypted_content"]
-    assert seen["reasoning"] == {"effort": "high"}
+    assert seen["reasoning"] == {"effort": "max"}
     assert "temperature" not in seen
+
+
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [("gpt-5.6", "none"), ("gpt-5", "minimal"), ("gpt-5.5", "xhigh")],
+)
+async def test_model_specific_reasoning_efforts_are_sent(model: str, effort: str) -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=_response([_message("ok")]))
+
+    await _provider(handler).complete([Message("user", "hi")], [], ProviderConfig(model=model, effort=effort))
+
+    assert seen["include"] == ["reasoning.encrypted_content"]
+    assert seen["reasoning"] == {"effort": effort}
 
 
 async def test_non_reasoning_gpt_omits_reasoning_only_fields() -> None:
@@ -124,7 +141,7 @@ async def test_reasoning_gpt_omits_unsupported_effort_but_keeps_include() -> Non
         return httpx.Response(200, json=_response([_message("ok")]))
 
     await _provider(handler).complete(
-        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="xhigh")
+        [Message("user", "hi")], [], ProviderConfig(model="gpt-5.6", effort="minimal")
     )
     assert seen["include"] == ["reasoning.encrypted_content"]
     assert "reasoning" not in seen

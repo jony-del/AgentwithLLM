@@ -189,8 +189,8 @@ Providers:
 - `agent_core/providers/claude.py` — Anthropic Messages API (`/v1/messages`) over
   httpx: streaming, retries with jitter, model-aware request shape (adaptive
   thinking vs legacy), effort levels. `openai_capabilities.py` — provider-local
-  GPT/Responses capability profiles (anchored model-family matching, conservative
-  defaults for unknown models). `openai_responses.py` — OpenAI official Responses
+  GPT/Responses capability profiles (explicit model-specific effort matrix,
+  conservative defaults for unknown models). `openai_responses.py` — OpenAI official Responses
   API (`/v1/responses`): manual item replay (`store=false`), model-gated encrypted
   reasoning include/replay, displayable reasoning summaries, flat function tools,
   streaming typed SSE, provider-state preservation, structured OpenAI errors.
@@ -349,8 +349,10 @@ provider scalar is an explicit protocol selector: `claude` uses `/v1/messages`,
 `fake` is offline. Do not infer or change provider from model ID or base URL;
 legacy `--provider openai + OPENAI_BASE_URL=<compat endpoint>` users must migrate
 to `--provider openai-compat`. The OpenAI Responses capability matrix is
-provider-local and fail-safe: unknown models do not receive reasoning-only fields,
-unsupported effort values are omitted, and encrypted reasoning stays in opaque
+provider-local and fail-safe: known reasoning models use their explicit supported
+`reasoning.effort` set (`none` is sent explicitly when supported), unknown models
+do not receive reasoning-only fields, unsupported effort values are omitted, and
+encrypted reasoning stays in opaque
 `provider_state` while only displayable reasoning summaries reach the UI.
 Tables resolved separately in `config.py`: `[memory]`, `[limits]`, `[session]`,
 `[context]`, `[compression]`, `[concurrency]`, `[mcp]`, `[output]`,

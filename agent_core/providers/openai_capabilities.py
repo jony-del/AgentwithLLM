@@ -1,11 +1,40 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
 
-_BASE_REASONING_EFFORTS = ("low", "medium", "high")
+OPENAI_REASONING_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
+    # GPT-5.6
+    "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-terra": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+    # GPT-5.5
+    "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.5-pro": ("medium", "high", "xhigh"),
+    # GPT-5.4
+    "gpt-5.4": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4-pro": ("medium", "high", "xhigh"),
+    "gpt-5.4-mini": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4-nano": ("none", "low", "medium", "high", "xhigh"),
+    # Codex
+    "gpt-5.3-codex": ("low", "medium", "high", "xhigh"),
+    # GPT-5.2
+    "gpt-5.2": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.2-pro": ("medium", "high", "xhigh"),
+    # GPT-5.1
+    "gpt-5.1": ("none", "low", "medium", "high"),
+    # Original GPT-5 family
+    "gpt-5": ("minimal", "low", "medium", "high"),
+    "gpt-5-mini": ("minimal", "low", "medium", "high"),
+    "gpt-5-nano": ("minimal", "low", "medium", "high"),
+    "gpt-5-pro": ("high",),
+    # Current non-deprecated o-series
+    "o3": ("low", "medium", "high"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,19 +52,6 @@ class OpenAIResponsesCapabilities:
 
 
 _DEFAULT_RESPONSES_CAPABILITIES = OpenAIResponsesCapabilities()
-_REASONING_RESPONSES_CAPABILITIES = OpenAIResponsesCapabilities(
-    supports_reasoning=True,
-    reasoning_efforts=_BASE_REASONING_EFFORTS,
-    include_encrypted_reasoning=True,
-    supports_reasoning_summary=True,
-)
-
-# Anchored family patterns only: avoid accidental matches such as
-# "local-gpt-5-compatible" while still accepting version/snapshot suffixes.
-_REASONING_MODEL_PATTERNS = (
-    re.compile(r"^gpt-5(?:[.-].*)?$"),
-    re.compile(r"^o(?:1|3|4)(?:[.-].*)?$"),
-)
 
 
 def _normalize_model_id(model: str | None) -> str:
@@ -45,10 +61,15 @@ def _normalize_model_id(model: str | None) -> str:
 def capabilities_for_responses_model(model: str | None) -> OpenAIResponsesCapabilities:
     """Return the conservative Responses API capability profile for ``model``."""
 
-    model_id = _normalize_model_id(model)
-    if any(pattern.match(model_id) for pattern in _REASONING_MODEL_PATTERNS):
-        return _REASONING_RESPONSES_CAPABILITIES
-    return _DEFAULT_RESPONSES_CAPABILITIES
+    efforts = MODEL_EFFORTS.get(_normalize_model_id(model))
+    if efforts is None:
+        return _DEFAULT_RESPONSES_CAPABILITIES
+    return OpenAIResponsesCapabilities(
+        supports_reasoning=True,
+        reasoning_efforts=efforts,
+        include_encrypted_reasoning=True,
+        supports_reasoning_summary=True,
+    )
 
 
 def reasoning_effort_for_model(model: str | None, level: Any) -> str | None:

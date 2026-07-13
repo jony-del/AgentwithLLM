@@ -876,10 +876,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         subparser.add_argument(
             "--effort",
-            choices=["low", "medium", "high", "xhigh", "max"],
+            choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
             default=None,
-            help="Reasoning/effort depth level; Claude gates xhigh/max by model family, "
-            "OpenAI Responses maps low/medium/high for profiled reasoning models and drops unsupported levels.",
+            help="Reasoning/effort depth level; providers gate levels by model, "
+            "OpenAI Responses uses model-specific none/minimal/low/medium/high/xhigh/max support "
+            "and drops unsupported levels.",
         )
         subparser.add_argument(
             "--max-api-concurrency",
