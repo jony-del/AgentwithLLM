@@ -18,7 +18,7 @@
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
-provider = "claude"           # claude | fake
+provider = "claude"           # claude | openai | openai-compat | fake
 # output_config.effort depth/cost control. low | medium | high | xhigh | max.
 # "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
 # Sonnet 4.6 / Opus <= 4.6 (the provider drops a level the model can't honor). Overridable

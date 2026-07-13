@@ -178,6 +178,32 @@ async def test_missing_model_is_actionable() -> None:
         await provider.complete([Message("user", "hi")], [], ProviderConfig(model=""))
 
 
+async def test_compat_provider_prefers_new_env_vars(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "compat-key")
+    monkeypatch.setenv("OPENAI_COMPAT_BASE_URL", "https://compat-env.example")
+    monkeypatch.setenv("OPENAI_API_KEY", "legacy-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://legacy.example")
+
+    provider = OpenAICompatProvider()
+
+    assert provider.api_key == "compat-key"
+    assert provider.base_url == "https://compat-env.example"
+
+
+async def test_compat_provider_legacy_env_fallback_warns_once(monkeypatch, capsys) -> None:
+    from agent_core.providers.openai_compat import _WARNED_DEPRECATED_ENV
+
+    monkeypatch.delenv("OPENAI_COMPAT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "legacy-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://legacy.example")
+    _WARNED_DEPRECATED_ENV.clear()
+
+    OpenAICompatProvider()
+
+    assert "deprecated" in capsys.readouterr().err
+
+
 # --- streaming ----------------------------------------------------------------
 
 

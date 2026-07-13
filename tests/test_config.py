@@ -61,7 +61,16 @@ def test_cli_values_override_dotenv_values(tmp_path: Path, monkeypatch) -> None:
     assert values["model"] == "claude-from-cli"
 
 
-def test_resolve_concurrency_config_from_toml(tmp_path: Path) -> None:
+def test_resolve_config_accepts_openai_compat_provider_from_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "openai-compat")
+    values = resolve_config(
+        {"model": None, "permission": None, "provider": None},
+        config_file=tmp_path / "absent.toml",
+        env_file=tmp_path / "absent.env",
+    )
+    assert values["provider"] == "openai-compat"
+
+
     config_file = tmp_path / "agent.toml"
     config_file.write_text(
         """

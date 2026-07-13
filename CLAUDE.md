@@ -25,11 +25,16 @@ the staged roadmap (R0–R3). Consult it before large structural changes.
 
 1. **Provider-neutral core.** `agent_core.models` and `providers/base.py` are the
    contracts. No provider SDK types may leak into them. `ClaudeProvider` speaks
-   the Anthropic Messages protocol directly over httpx (which also covers
-   Anthropic-compatible endpoints — see `.env.example`); any second provider must
-   fit behind `LLMProvider.complete` unchanged. Provider-specific payloads (e.g.
-   `LLMResult.thinking_blocks`) are provider-owned opaque data: preserved and
-   round-tripped, never interpreted by the core loop.
+   the Anthropic Messages protocol directly over httpx. External protocol
+   choices are explicit, never inferred from model names or base URLs:
+   `claude` → Anthropic Messages (`/v1/messages`), `openai` → OpenAI Responses
+   (`/v1/responses`), and `openai-compat` → OpenAI-compatible Chat Completions
+   (`/v1/chat/completions`) for DeepSeek/Qwen/GLM/Moonshot/vLLM/LM Studio/Groq
+   style endpoints. `fake` remains the deterministic offline provider. Any new
+   provider must fit behind `LLMProvider.complete` unchanged. Provider-specific
+   payloads (e.g. `LLMResult.thinking_blocks` and `provider_state`) are
+   provider-owned opaque data: preserved and round-tripped, never interpreted by
+   the core loop.
 
 2. **Clear capability boundaries.** A capability (web, MCP, memory, skills,
    sandbox, terminal UI) is enabled via config, initialized at startup with an
@@ -125,9 +130,14 @@ polaris chat --provider fake          # interactive chat, one event loop per ses
 $env:ANTHROPIC_API_KEY="your-key"
 polaris run "Use the echo tool" --provider claude --model claude-haiku-4-5-20251001
 
-# OpenAI-compatible endpoint (OpenAI / vLLM / Groq / ... — see .env.example)
+# OpenAI Responses API
 $env:OPENAI_API_KEY="your-key"
-polaris run "Use the echo tool" --provider openai --model gpt-4o-mini
+polaris run "Use the echo tool" --provider openai --model gpt-4.1-mini
+
+# OpenAI-compatible chat-completions endpoint (vLLM / Groq / DeepSeek / Qwen / ...)
+$env:OPENAI_COMPAT_API_KEY="your-key"
+$env:OPENAI_COMPAT_BASE_URL="https://compat.example.com"
+polaris run "Use the echo tool" --provider openai-compat --model your-endpoint-model
 
 # Live-display flags (CLI-only): --quiet, --no-stream, --thinking-budget N
 # Other subcommands: sessions / dream / memory / mcp / health
@@ -176,13 +186,16 @@ Providers:
   (the frozen per-call parameter contract of `complete`; derived calls override
   via `dataclasses.replace`), `GatedProvider` (shared semaphore + token-bucket
   across the multi-agent fan-out).
-- `agent_core/providers/claude.py` — Messages API over httpx: streaming,
-  retries with jitter, model-aware request shape (adaptive thinking vs legacy),
-  effort levels. `openai_compat.py` — the second protocol family (D5):
-  `/v1/chat/completions` over httpx (`OPENAI_API_KEY`/`OPENAI_BASE_URL`; OpenAI,
-  vLLM, Groq, …), streaming + non-streaming + tool calls, `thinking_budget`/
-  `effort` safely ignored. `fake.py` — deterministic offline provider for
-  tests/demos.
+- `agent_core/providers/claude.py` — Anthropic Messages API (`/v1/messages`) over
+  httpx: streaming, retries with jitter, model-aware request shape (adaptive
+  thinking vs legacy), effort levels. `openai_responses.py` — OpenAI official
+  Responses API (`/v1/responses`): manual item replay (`store=false`), model-gated
+  encrypted reasoning include/replay, flat function tools, streaming typed SSE,
+  provider-state preservation. `openai_compat.py` — OpenAI-compatible Chat Completions
+  (`/v1/chat/completions`; `OPENAI_COMPAT_API_KEY`/`OPENAI_COMPAT_BASE_URL`,
+  with deprecated fallback to `OPENAI_API_KEY`/`OPENAI_BASE_URL`) for vLLM, LM
+  Studio, Groq, DeepSeek, Qwen, GLM, Moonshot, etc. `fake.py` — deterministic
+  offline provider for tests/demos.
 
 Tools:
 - `agent_core/tools/base.py` — `Tool`, `ToolRisk`, `WorkspacePathMixin`
@@ -326,7 +339,12 @@ UI, memory, state:
 
 ## Configuration
 
-Scalar precedence: built-in defaults → `agent.toml` → env → CLI flags.
+Scalar precedence: built-in defaults → `agent.toml` → env → CLI flags. The
+provider scalar is an explicit protocol selector: `claude` uses `/v1/messages`,
+`openai` uses `/v1/responses`, `openai-compat` uses `/v1/chat/completions`, and
+`fake` is offline. Do not infer or change provider from model ID or base URL;
+legacy `--provider openai + OPENAI_BASE_URL=<compat endpoint>` users must migrate
+to `--provider openai-compat`.
 Tables resolved separately in `config.py`: `[memory]`, `[limits]`, `[session]`,
 `[context]`, `[compression]`, `[concurrency]`, `[mcp]`, `[output]`,
 `[tool_use_summary]`, `[skills]`, `[hooks]` (+ `[hooks.builtin]`,

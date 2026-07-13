@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from agent_core import tokens
 from agent_core.config import resolve_mcp_config
+from agent_core.model_validation import CLAUDE_PROVIDER, FAKE_PROVIDER, is_model_allowed
 from agent_core.models import Message
 from agent_core.skills import (
     SkillContext,
@@ -168,12 +169,19 @@ async def _cmd_compact(agent: "ReActAgent", ui: AgentUI, args: str, history: lis
 async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     target = args.strip()
     if not target:
-        # Bare /model opens the interactive model + effort picker (↑/↓ model, ←/→ effort).
+        if agent.config.provider != CLAUDE_PROVIDER:
+            print(
+                f"Current provider/model: {agent.config.provider} / {agent.config.model}  ·  "
+                f"effort: {agent.config.effort or '—'}"
+            )
+            print("Switch with: /model <non-empty model id>; provider stays unchanged.")
+            return ChatTurn()
+        # Bare /model opens the interactive Claude model + effort picker (↑/↓ model, ←/→ effort).
         chosen = await ui.pick_model(agent.config.model, agent.config.effort)
         if chosen is None:
             # Non-interactive (or cancelled): fall back to a plain listing.
             print(f"Current model: {agent.config.model}  ·  effort: {agent.config.effort or '—'}")
-            print("Known families: claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5-*, claude-fable-5")
+            print("Known Claude families: claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5-*, claude-fable-5")
             print("Switch with: /model <name>  (or run /model in a terminal to pick interactively)")
             return ChatTurn()
         model, effort = chosen
@@ -183,8 +191,13 @@ async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
         tail = f"  ·  effort: {effort}" if effort is not None else "  ·  (no effort levels)"
         print(f"Model switched to {model}{tail} (takes effect on your next message).")
         return ChatTurn()
-    if not tokens.is_supported_model(target):
-        print(f"Unsupported model {target!r}. Name a known family (e.g. claude-sonnet-4-6).")
+    if not is_model_allowed(agent.config.provider, target):
+        if agent.config.provider == CLAUDE_PROVIDER:
+            print(f"Unsupported model {target!r}. Name a known Claude family (e.g. claude-sonnet-4-6).")
+        elif agent.config.provider == FAKE_PROVIDER:
+            print(f"Unsupported model {target!r}.")
+        else:
+            print("Model id must not be empty.")
         return ChatTurn()
     agent.config.model = target
     print(f"Model switched to {target} (takes effect on your next message).")

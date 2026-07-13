@@ -130,7 +130,7 @@ class ClaudeProvider(LLMProvider):
     def __init__(
         self,
         api_key: str | None = None,
-        base_url: str = "https://api.anthropic.com",
+        base_url: str | None = None,
         *,
         max_retries: int = 2,
         initial_backoff: float = 0.5,
@@ -139,7 +139,7 @@ class ClaudeProvider(LLMProvider):
         on_retry: Callable[[str], None] | None = _default_retry_notice,
     ) -> None:
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
         self.max_retries = max(0, max_retries)
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff

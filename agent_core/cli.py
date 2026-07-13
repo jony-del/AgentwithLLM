@@ -29,8 +29,15 @@ from agent_core.config import (
 from agent_core.permission_rules import RuleSet
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
+from agent_core.model_validation import PROVIDERS
 from agent_core.models import LLMTransientError, Message
-from agent_core.providers import ClaudeProvider, FakeProvider, OpenAICompatProvider, ProviderConfig
+from agent_core.providers import (
+    ClaudeProvider,
+    FakeProvider,
+    OpenAICompatProvider,
+    OpenAIResponsesProvider,
+    ProviderConfig,
+)
 from agent_core.chat_commands import dispatch as dispatch_chat_command
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.tools.registry import ToolRegistry
@@ -106,13 +113,17 @@ def _sandbox_config(args: argparse.Namespace):
 
 def _make_provider(values: dict):
     provider = values["provider"]
+    if provider == "claude":
+        return ClaudeProvider()
+    if provider == "openai":
+        return OpenAIResponsesProvider()
+    if provider == "openai-compat":
+        return OpenAICompatProvider()
     if provider == "fake":
         return FakeProvider()
-    if provider == "openai":
-        # OpenAI-shaped endpoint (OPENAI_API_KEY / OPENAI_BASE_URL): OpenAI itself,
-        # vLLM, llama.cpp server, Groq, DeepSeek, ... (decision D5).
-        return OpenAICompatProvider()
-    return ClaudeProvider()
+    raise RuntimeError(
+        f"unknown provider {provider!r}; choose one of: {', '.join(PROVIDERS)}"
+    )
 
 
 def _make_ui(args: argparse.Namespace) -> AgentUI:
@@ -215,6 +226,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     )
     context = resolve_context_config(config_file)
     config = ReActConfig(
+        provider=values["provider"],
         model=values["model"],
         permission=values["permission"],
         memory=_memory_config(args),
@@ -711,7 +723,7 @@ def health_command(args: argparse.Namespace) -> int:
     
     # Check provider
     try:
-        provider = _make_provider({"model": args.model, "provider": args.provider})
+        provider = _make_provider(_resolve(args))
         print(f"✓ Provider initialized: {type(provider).__name__}")
     except Exception as e:
         print(f"✗ Provider error: {e}")
@@ -833,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
             metavar="RULE",
             help="Add an ask rule (force confirmation), e.g. --ask 'run_command'. Repeatable.",
         )
-        subparser.add_argument("--provider", choices=["claude", "openai", "fake"], default=None)
+        subparser.add_argument("--provider", choices=list(PROVIDERS), default=None)
         subparser.add_argument(
             "--memory",
             action=argparse.BooleanOptionalAction,

@@ -122,10 +122,15 @@ class LLMResult:
     # interpret, edit, or depend on the contents; a provider with no equivalent
     # simply leaves it empty.
     thinking_blocks: list[dict[str, Any]] = field(default_factory=list)
-    # Token accounting for this response, when the provider reports it. Appended last
-    # so existing positional ``LLMResult(...)`` construction stays valid. Compaction
-    # reads ``usage.context_tokens`` as the running prompt size.
+    # Token accounting for this response, when the provider reports it. Appended after
+    # thinking blocks so existing positional ``LLMResult(...)`` construction stays valid.
+    # Compaction reads ``usage.context_tokens`` as the running prompt size.
     usage: "TokenUsage | None" = None
+    # PROVIDER-OWNED OPAQUE DATA: generic JSON-serializable state a provider needs to
+    # replay future turns (e.g. Responses API output items). The core persists it but
+    # never interprets it. Prefer this for new provider state; ``thinking_blocks`` stays
+    # for the established Anthropic thinking invariant.
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
 
 class LLMContextTooLongError(RuntimeError):

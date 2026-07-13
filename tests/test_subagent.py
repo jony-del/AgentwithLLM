@@ -335,6 +335,17 @@ async def test_subagent_unknown_model_refused(tmp_path) -> None:
     assert isinstance(agent._make_subagent_child("read_only", "gpt-4"), str)
 
 
+async def test_subagent_openai_provider_accepts_custom_model(tmp_path) -> None:
+    agent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(provider="openai", run_dir=str(tmp_path), model="gpt-4.1-mini"),
+    )
+    child = agent._make_subagent_child("read_only", "custom-openai-model")
+    assert not isinstance(child, str)
+    assert child.config.provider == "openai"
+    assert child.config.model == "custom-openai-model"
+
+
 # --- MultiAgentCoordinator ---------------------------------------------------
 
 

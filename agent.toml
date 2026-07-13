@@ -3,10 +3,21 @@
 #
 # Precedence (lowest to highest): built-in defaults -> this file ->
 # AGENT_MODEL / AGENT_PERMISSION / AGENT_PROVIDER / AGENT_MEMORY env vars -> CLI flags.
+#
+# SECURITY — repo-config trust (D2): when THIS file lives inside a repository you cloned,
+# it is treated as repo-controlled input. It may freely TIGHTEN policy (deny/ask rules and
+# every ordinary table apply immediately), but PRIVILEGE-WIDENING settings —
+# [permissions].allow, [[hooks.external]], [sandbox].excluded_commands /
+# .auto_allow_command_if_sandboxed / .allow_unattended_unsandboxed, [mcp.servers],
+# and [web].allowed_domains —
+# are inert until you approve them once (trust-on-first-use, recorded per project in
+# ~/.polaris/trusted.json; you are re-asked if they later change). Unattended/CI runs drop
+# unapproved widening with a warning. This does not apply to a config you pass explicitly
+# with --config (that is your own, not the repo's).
 
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
-permission = "default"        # default | acceptedits | plan | auto | dontask
+permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
 provider = "claude"           # claude | fake
 # output_config.effort depth/cost control. low | medium | high | xhigh | max.
 # "high" is the safe agentic default; "xhigh" is Opus 4.8-best for coding but errors on
@@ -89,6 +100,99 @@ persist_compaction_boundary = true
 project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAUDE.md injection
 git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
+
+# --- Skills / slash commands ------------------------------------------------
+# A skill is a Markdown file (SKILL.md + frontmatter) holding a reusable prompt.
+# Skills load eagerly at startup from (low->high precedence): bundled (shipped) ->
+# user_dir -> project_dir -> skills_dirs. A human triggers one with `/name args` in
+# chat; the model can invoke one via the `skill` tool (hidden when nothing is
+# model-invocable). Each skill's frontmatter sets context (inline|fork),
+# user-invocable, and disable-model-invocation. AGENT_SKILLS=0 disables the system.
+[skills]
+enabled = true                 # false (or AGENT_SKILLS=0) turns the subsystem off
+user_dir = "~/.polaris/skills"     # per-user skills (<name>/SKILL.md or <name>.md)
+project_dir = ".polaris/skills"    # per-project skills, resolved against the workspace
+skills_dirs = []               # extra highest-precedence directories to scan
+disabled = []                  # skill names to suppress (e.g. ["commit"])
+
+# --- Lifecycle hooks --------------------------------------------------------
+# Two sources feed the lifecycle hooks (UserPromptSubmit / PostSampling /
+# PreCompact / PostCompact / Stop, plus the observational SessionStart /
+# SessionEnd / SubagentStart / SubagentStop / PostToolUseFailure — those are
+# watch-only: any block decision they return is discarded), both folded into
+# one pipeline. The control-path PermissionRequest event is the exception: it
+# fires when a tool call needs confirmation ("ask") and lets a hook approve or
+# refuse it programmatically — the headless deployment's ask outlet. Its stdout
+# contract: {"decision": "allow"} approves, {"decision": "deny"} (or exit code 2)
+# refuses, anything else = no opinion (the interactive prompt / headless denial
+# proceeds). Unspecified fail_mode on this event defaults to "closed":
+#
+# [[hooks.external]]
+# event = "PermissionRequest"
+# type = "command"
+# command = "python ./.polaris/hooks/approve_tool.py"
+# timeout = 10
+#   * Built-in programmatic hooks (in-process, hold live objects) — toggled below.
+#   * Config-driven external hooks ([[hooks.external]]) — subprocess / HTTP / re-prompt
+#     / verifier agent, declared here without touching code.
+# Any hook failure degrades to "allow + log" and never sinks a run.
+[hooks]
+enabled = true                 # false (or AGENT_HOOKS=0) turns the whole subsystem off
+
+[hooks.builtin]
+stop_completion = true         # block a stop once if update_todos still has open items,
+                               #   injecting a continuation directive (capped by max_stop_blocks)
+post_sampling_observer = true  # fire-and-forget turn telemetry to runs/*.jsonl (hook_observe)
+compaction_logger = true       # log trigger + pre/post message & summary sizes around a fold
+
+# UserPromptSubmit input firewall — validates each submitted task before the first model call.
+# Provenance-based: the harness's control framing (<system-reminder>, <tool_output_ref>, ...) is
+# trusted only because it comes from the framework's own injection path; the same tags appearing
+# inside a user task are untrusted DATA. Rules in priority order: empty -> block; over max_chars
+# -> block (paste-bomb / context-overflow guard); disallowed control chars -> block; reserved
+# framing tags -> NEUTRALIZE not reject (escape the tags, wrap the task in an
+# <untrusted_user_input> envelope, prepend a guard preamble, and audit it in runs/*.jsonl). A
+# neutralized prompt is what gets persisted + sent. Any internal error degrades to allow.
+[hooks.prompt_validation]
+enabled = true                 # on by default; false skips the firewall entirely
+max_chars = 100000             # reject prompts larger than this; 0 disables the size cap
+reject_control_chars = true    # reject NUL / C0 control chars (tab/newline/CR are allowed)
+neutralize_framing = true      # wrap+escape spoofed control framing instead of rejecting it
+
+# External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
+# carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
+# {"hookSpecificOutput": {"additionalContext": "..."}} is injected). `prompt`/`agent` are
+# advisory (inject the model/sub-agent reply as context, never block). `matcher` only
+# applies to Pre/PostCompact (matched against the trigger: "auto" | "reactive"). Every call
+# is bounded by a single `timeout` (seconds) with kill-await; the hook receives a bounded
+# JSON projection of the context on stdin / as the request body.
+# `fail_mode` decides what happens when the hook ITSELF fails (timeout/crash/network):
+#   "open" (default) degrades to allow — right for observation; "closed" turns the failure
+#   into a block, so a crashed security gate does NOT swing open (honored by command/http
+#   only). A typo in fail_mode is treated as "closed" (a gate must not silently fail open).
+# SECURITY: external hooks run arbitrary commands/URLs. When they appear in an in-repo
+# agent.toml they are a PRIVILEGE-WIDENING setting and are gated by the repo-config trust
+# policy (see the top-of-file note) — inert on an untrusted clone until you approve them.
+#
+[[hooks.external]]
+event = "UserPromptSubmit"
+type = "command"
+command = "python3 ./.polaris/hooks/validate_prompt.py"
+timeout = 5
+# fail_mode = "closed"        # block the prompt if this validator can't run
+#
+[[hooks.external]]
+event = "PreCompact"
+type = "command"
+matcher = "auto"             # only on the proactive fold, not the 413-reactive path
+command = "./.polaris/hooks/precompact.sh"
+#
+[[hooks.external]]
+event = "Stop"
+type = "prompt"              # advisory: re-prompt the LLM for a completion check
+prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
+model = "claude-haiku-4-5-20251001"
+timeout = 30
 
 # --- Context compaction -----------------------------------------------------
 # How the history is shrunk when it grows large. Cheap deterministic stages (snip,
@@ -225,12 +329,11 @@ args = ["-m", "mcp_server_time", "--local-timezone=Asia/Shanghai"]
 risk = "read"
 
 # --- Single tool-output truncation ------------------------------------------
-# When one tool call's output exceeds these limits, only head+tail (with a
-# "[... omitted N lines ...]" notice) enters the context; the full, untouched
-# output is written to runs/<run>/outputs/ for later retrieval.
+# When one tool call's output exceeds these limits, only a head preview (with the
+# full output spilled to runs/<run>/outputs/) enters the context. Sized for a
+# coding agent (Claude-Code-like): ordinary files come back whole, only huge output
+# spills. read_text_file is always exempt — it self-pages via offset/limit.
 [output]
-# Coding-agent sized (Claude-Code-like): ordinary source/doc files come back in
-# full; only genuinely huge output spills. read_text_file is exempt (it self-pages).
 max_lines = 2000              # truncate when output has more lines than this
 max_chars = 50000             # fallback cap for pathological single-line output
 head_lines = 20               # lines kept from the start (legacy mode, pointer=false)
@@ -247,6 +350,10 @@ preview_chars = 4000          # head kept inline in the pointer (pointer mode on
 # to the model's context and never written to the resumable transcript (only the live UI
 # and the runs/*.jsonl event log see it). Off by default — it costs one extra (small) API
 # call per tool batch and only helps when a live terminal UI is attached.
+
+# The tool_use_summary for the agent's nth operation appears before the output for the (n+1)th
+# operation, which can confuse users (leading them to mistakenly believe it is the (n+1)th operation),
+# so set it to false.
 [tool_use_summary]
 enabled = false                       # opt-in; also requires a live UI + a real provider
 model = "claude-haiku-4-5-20251001"   # the cheap model used to write the label
@@ -254,3 +361,101 @@ max_tokens = 64                       # labels are short — keep the budget tin
 max_input_chars_per_tool = 300        # head-truncate each tool's input/output before labeling
 timeout_seconds = 8.0                 # single bound on the label call; on timeout, no label
 include_subagents = false             # default: only the leader narrates (not sub-agents)
+
+# --- Web outbound domain policy (decision D10) -------------------------------
+# The S4 exfiltration guard for web_fetch / web_search (SSRF is guarded separately
+# and always). blocked_domains ALWAYS refuse (tightening — applies immediately even
+# from a repo config). allowed_domains matter only in the unattended permission
+# modes (auto / dontask / bypass): there, a domain not on the list is refused
+# (fail-closed) because nobody is present to notice an injection-driven fetch.
+# Attended (default/acceptedits/plan) runs stay open unless blocked.
+# Matching is the same host-suffix form as permission rules' "domain:example.com".
+# For web_search the policy is checked against the search backend's own host
+# (duckduckgo.com / api.search.brave.com / api.tavily.com) — the query itself is
+# the data that leaves the machine.
+# SECURITY: in an in-repo agent.toml, allowed_domains is a PRIVILEGE-WIDENING key
+# gated by trust-on-first-use (see the top-of-file note); blocked_domains is not.
+[web]
+allowed_domains = []                   # e.g. ["docs.python.org", "github.com"]
+blocked_domains = []                   # e.g. ["evil.example"]
+
+# --- Fine-grained permission rules (policy layer) ---------------------------
+# Argument-aware allow/deny/ask rules, evaluated BEFORE the coarse per-mode
+# ToolRisk gate. Each rule is "ToolName(content)" (or bare "ToolName" for the whole
+# tool). Precedence in the decision pipeline: deny > sensitive-path safety net >
+# ask > sandbox auto-allow > bypass mode > allow > per-mode matrix.
+#   - run_command content is matched with shell decomposition + anti-evasion:
+#     a compound command (a && b | c) must have EVERY sub-command covered to allow,
+#     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,
+#     "git * --force" = wildcard, "npm run build" = exact.
+#   - file tools match a path glob ("/src/**"); web tools match "domain:example.com".
+# CLI --allow/--deny/--ask append session rules on top of this table.
+[permissions]
+# allow = ["run_command(git *)", "run_command(npm run test:*)", "read_text_file(/src/**)"]
+# deny  = ["run_command(rm *)", "run_command(curl *)", "web_fetch(domain:evil.example)"]
+# ask   = ["run_command"]
+
+# --- OS sandbox (enforcement layer) -----------------------------------------
+# Wraps dangerous command execution (run_command / run_tests) in an OS sandbox:
+# bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
+# environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
+# the permission rules above are the boundary. Disabled by default.
+# Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
+[sandbox]
+enabled = false                        # master switch
+backend = "auto"                       # isolation tier: "auto" (container→native→noop),
+                                       #   "native" (bwrap/sandbox-exec), "container"
+                                       #   (podman/docker), or "vm" (Hyper-V/Kata/Lima).
+                                       #   An explicit tier degrades to the next weaker
+                                       #   available one; "auto" never auto-selects "vm".
+fail_if_unavailable = false            # true = hard-fail at startup if sandbox can't run
+                                       #   (instead of silently running unsandboxed)
+auto_allow_command_if_sandboxed = false # skip the permission prompt when a command WILL be
+                                       #   sandboxed. Default false (decision D4): the sandbox
+                                       #   is one layer, not a substitute for confirmation.
+                                       #   Set true only in a trusted dev/lax profile.
+allow_unsandboxed_commands = true      # honor a per-call request to run outside the sandbox
+excluded_commands = []                 # commands that run OUTSIDE the sandbox, e.g. ["bazel:*"]
+                                       #   (NOT a security boundary — still hits permissions)
+
+[sandbox.filesystem]
+# The workspace is always writable; everything else is read-only under the sandbox.
+allow_write = []                       # extra writable paths, e.g. ["~/.cache"]
+deny_write  = []                       # carve read-only holes inside a writable region
+deny_read   = []                       # hide sensitive regions, e.g. ["~/.ssh", "~/.aws"]
+allow_read  = []                       # re-allow specific paths inside a deny_read region
+
+[sandbox.network]
+# Network is default-deny under the sandbox. Allowing any domain (or local binding)
+# currently shares the host network (no proxy is shipped); leave empty to isolate.
+allowed_domains = []                   # e.g. ["api.example.com"]
+allow_local_binding = false            # permit binding local ports (servers/tests)
+
+[sandbox.container]
+# Used when backend = "container" (or "auto" resolves to it). Runs each command inside a
+# hardened, ephemeral (--rm) container. On Windows this targets WSL2 Linux containers; the
+# workspace is bind-mounted (drive path E:\proj → /mnt/e/proj inside the container).
+runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
+image = "docker.io/library/debian:stable-slim"   # image the command runs inside
+auto_pull = false                      # pull the image at startup if missing
+oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
+read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
+drop_all_capabilities = true           # --cap-drop ALL
+no_new_privileges = true               # --security-opt no-new-privileges
+memory = ""                            # e.g. "512m" (empty = no limit)
+cpus = ""                              # e.g. "1.5"
+pids_limit = ""                        # e.g. "256"
+windows_isolation = "wsl2"             # "wsl2" (Linux containers) or "hyperv" (Windows containers)
+extra_run_args = []                    # raw flags appended to `run`, e.g. ["--dns", "1.1.1.1"]
+
+[sandbox.vm]
+# Used when backend = "vm" — the strongest, strict-mode tier: a dedicated VM with
+# snapshot/rollback. Heavy and host-dependent; falls back to the container tier if the VM
+# provider is unavailable.
+provider = "auto"                      # "auto" (Kata on Linux, Hyper-V on Windows, Lima on
+                                       #   macOS), or "kata" / "hyperv" / "lima"
+base_image = "docker.io/library/debian:stable-slim"   # image/template the VM runs
+vm_name = "polaris-sandbox"            # managed guest VM name (Hyper-V/Lima)
+snapshot_name = "polaris-base"         # snapshot restored on reset (Hyper-V checkpoint / Lima)
+guest_host = ""                        # SSH target for command exec (required for Hyper-V)
+reset_each_task = true                 # restore the base snapshot before every run/task

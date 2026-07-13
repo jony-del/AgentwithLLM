@@ -289,6 +289,13 @@ def truncate_head_for_ptl_retry(
     return _ensure_user_first([*preserved, *kept_conversation])
 
 
+def _metadata_for_compressed(message: Message, marker: str) -> dict[str, object]:
+    """Copy metadata for a transformed message, dropping stale provider replay state."""
+    metadata = {**message.metadata, "compressed": marker}
+    metadata.pop("provider_state", None)
+    return metadata
+
+
 def shrink_oversize_messages(
     messages: list[Message],
     *,
@@ -330,7 +337,7 @@ def shrink_oversize_messages(
         content = f"{head}\n[truncated {omitted} chars]\n{tail}"
         saved_chars = len(message.content) - len(content)
         result[i] = Message(
-            message.role, content, message.name, {**message.metadata, "compressed": "ptl_shrink"}
+            message.role, content, message.name, _metadata_for_compressed(message, "ptl_shrink")
         )
         changed = True
         dropped += max(0, saved_chars) // tokens.ROUGH_BYTES_PER_TOKEN
@@ -562,7 +569,7 @@ class CompressionPipeline:
             if message.role == "tool" and len(message.content) > limit:
                 half = max(100, limit // 2)
                 content = f"{message.content[:half]}\n[snip]\n{message.content[-half:]}"
-                snipped.append(Message(message.role, content, message.name, {**message.metadata, "compressed": "snip"}))
+                snipped.append(Message(message.role, content, message.name, _metadata_for_compressed(message, "snip")))
                 count += 1
             else:
                 snipped.append(message)
@@ -585,7 +592,7 @@ class CompressionPipeline:
                 continue
             if len(message.content) > limit:
                 content = f"{message.content[:limit]} [microcompact: omitted {len(message.content) - limit} chars]"
-                compacted.append(Message(message.role, content, message.name, {**message.metadata, "compressed": "microcompact"}))
+                compacted.append(Message(message.role, content, message.name, _metadata_for_compressed(message, "microcompact")))
                 count += 1
             else:
                 compacted.append(message)

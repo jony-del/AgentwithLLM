@@ -122,10 +122,26 @@ async def test_model_switches_to_supported(capsys) -> None:
 
 
 async def test_model_rejects_unsupported(capsys) -> None:
-    agent = _agent(model="claude-opus-4-8")
+    agent = _agent(provider="claude", model="claude-opus-4-8")
     await dispatch("/model gpt-4", agent, NullUI(), [])
     assert agent.config.model == "claude-opus-4-8"  # unchanged
     assert "Unsupported" in capsys.readouterr().out
+
+
+async def test_model_accepts_openai_model_without_switching_provider(capsys) -> None:
+    agent = _agent(provider="openai", model="gpt-4.1-mini")
+    await dispatch("/model gpt-5.1", agent, NullUI(), [])
+    assert agent.config.provider == "openai"
+    assert agent.config.model == "gpt-5.1"
+    assert "switched" in capsys.readouterr().out.lower()
+
+
+async def test_model_accepts_openai_compat_custom_model(capsys) -> None:
+    agent = _agent(provider="openai-compat", model="local-model")
+    await dispatch("/model qwen3-coder", agent, NullUI(), [])
+    assert agent.config.provider == "openai-compat"
+    assert agent.config.model == "qwen3-coder"
+    assert "switched" in capsys.readouterr().out.lower()
 
 
 async def test_memory_disabled_message(capsys) -> None:

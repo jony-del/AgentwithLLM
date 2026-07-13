@@ -17,7 +17,7 @@ from agent_core.transcript import (
 
 
 class ToolThenDoneProvider:
-    """One tool call (with thinking blocks) then a final answer — exercises the full
+    """One tool call (with opaque provider state) then a final answer — exercises the full
     assistant/tool message shapes the transcript must round-trip."""
 
     def __init__(self) -> None:
@@ -31,6 +31,7 @@ class ToolThenDoneProvider:
                 tool_calls=[ToolCall("echo", {"text": "hi"}, id="toolu_1")],
                 stop_reason="tool_use",
                 thinking_blocks=[{"type": "thinking", "thinking": "ponder", "signature": "sig"}],
+                provider_state={"output": [{"type": "reasoning", "id": "rs_1"}]},
             )
         return LLMResult("all done", stop_reason="end")
 
@@ -46,7 +47,11 @@ def test_message_round_trip_preserves_identity_and_metadata() -> None:
     msg = Message(
         "assistant",
         "body",
-        metadata={"tool_calls": [{"name": "echo"}], "thinking_blocks": [{"signature": "s"}]},
+        metadata={
+            "tool_calls": [{"name": "echo"}],
+            "thinking_blocks": [{"signature": "s"}],
+            "provider_state": {"output": [{"type": "reasoning", "encrypted_content": "abc"}]},
+        },
         parent_uuid="parent123",
     )
     restored = Message.from_dict(msg.to_dict())
@@ -54,6 +59,9 @@ def test_message_round_trip_preserves_identity_and_metadata() -> None:
     assert restored.uuid == msg.uuid
     assert restored.parent_uuid == "parent123"
     assert restored.metadata["thinking_blocks"] == [{"signature": "s"}]
+    assert restored.metadata["provider_state"] == {
+        "output": [{"type": "reasoning", "encrypted_content": "abc"}]
+    }
 
 
 def test_message_uuid_excluded_from_equality() -> None:
@@ -84,8 +92,10 @@ async def test_run_persists_faithful_chain(tmp_path: Path) -> None:
     # parent_uuid forms an unbroken chain rooted at the first user message.
     assert chain[0].parent_uuid is None
     assert all(chain[i].parent_uuid == chain[i - 1].uuid for i in range(1, len(chain)))
-    # Thinking blocks and tool linkage survive the round trip (the API replay invariant).
+    # Thinking blocks, generic provider state, and tool linkage survive the round trip
+    # (the API replay invariant).
     assert chain[1].metadata["thinking_blocks"][0]["signature"] == "sig"
+    assert chain[1].metadata["provider_state"] == {"output": [{"type": "reasoning", "id": "rs_1"}]}
     assert chain[2].metadata["tool_call_id"] == "toolu_1"
     assert result.answer == "all done"
 
@@ -138,7 +148,7 @@ async def test_chat_style_history_carries_across_turns(tmp_path: Path) -> None:
 
 async def test_fork_clones_tree_without_touching_source(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
-    agent = ReActAgent(provider=FakeProvider(), config=cfg)
+    agent = ReActAgent(provider=ToolThenDoneProvider(), config=cfg)
     await agent.run("original")
     source_bytes = agent.transcript.path.read_bytes()
 
@@ -152,6 +162,7 @@ async def test_fork_clones_tree_without_touching_source(tmp_path: Path) -> None:
     assert {m.uuid for m in cloned}.isdisjoint(set(loaded.messages))
     # Source file is byte-for-byte untouched.
     assert agent.transcript.path.read_bytes() == source_bytes
+    assert cloned[1].metadata["provider_state"] == {"output": [{"type": "reasoning", "id": "rs_1"}]}
 
 
 async def test_list_and_latest_and_find(tmp_path: Path) -> None:

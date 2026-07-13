@@ -1,8 +1,16 @@
 import json
 import sys
 
-from agent_core.cli import _clean_surrogates, _force_utf8_output
+from agent_core.cli import _clean_surrogates, _force_utf8_output, _make_provider
+from agent_core.providers import ClaudeProvider, FakeProvider, OpenAICompatProvider, OpenAIResponsesProvider
 from agent_core.storage import JSONLRunLogger
+
+
+def test_make_provider_routes_explicit_protocols() -> None:
+    assert isinstance(_make_provider({"provider": "claude"}), ClaudeProvider)
+    assert isinstance(_make_provider({"provider": "openai"}), OpenAIResponsesProvider)
+    assert isinstance(_make_provider({"provider": "openai-compat"}), OpenAICompatProvider)
+    assert isinstance(_make_provider({"provider": "fake"}), FakeProvider)
 
 
 class _RecordingStream:

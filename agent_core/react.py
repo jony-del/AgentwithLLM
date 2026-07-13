@@ -45,6 +45,7 @@ from agent_core.hooks import (
 )
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
+from agent_core.model_validation import is_model_allowed, unsupported_model_message
 from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
@@ -65,7 +66,6 @@ from agent_core.skills import (
 )
 from agent_core.storage import JSONLRunLogger
 from agent_core import tokens
-from agent_core.tokens import is_supported_model
 from agent_core.tool_use_summary import (
     ToolUseSummaryConfig,
     ToolUseSummarizer,
@@ -95,20 +95,6 @@ WRAPUP_TEXT = (
 MAX_PTL_RETRIES = 5
 
 
-def _unsupported_model_refusal(tool: str, model: str) -> str:
-    """Actionable refusal when a spawn names a model from no known family.
-
-    An unrecognised id would silently fall back to the conservative 200k window in
-    ``tokens`` and be sent verbatim to the provider (a likely API 404), so spawns name
-    a known family or omit ``model`` to inherit the parent's.
-    """
-    return (
-        f"[{tool}] unsupported model {model!r}; refusing to spawn. Name a known family "
-        "(e.g. claude-haiku-4-5-*, claude-sonnet-4-6, claude-opus-4-8, claude-fable-5) "
-        "or omit model to inherit the parent's."
-    )
-
-
 def _child_permission_mode(preset: str) -> PermissionMode:
     """The permission mode a spawned child runs under (decision: no privilege escalation).
 
@@ -136,6 +122,7 @@ _TEAMMATE_COORDINATION_RULES = RuleSet.from_lists(
 @dataclass(slots=True)
 class ReActConfig:
     model: str = "claude-opus-4-8"
+    provider: str = "claude"
     # NOTE: temperature applies only to legacy models (Haiku 4.5, Sonnet, Opus <= 4.6).
     # Opus 4.7+/Fable/Mythos reject sampling params, so the Claude provider drops it for
     # them (see providers/claude.py _is_adaptive_thinking_model). Left for debug runs
@@ -824,6 +811,10 @@ class ReActAgent:
             # next turn (required by the API when thinking and tool use span turns).
             if result.thinking_blocks:
                 assistant_metadata["thinking_blocks"] = result.thinking_blocks
+            # Preserve provider-owned opaque state so the provider can replay future turns
+            # without leaking protocol-specific shapes into the core loop.
+            if result.provider_state:
+                assistant_metadata["provider_state"] = result.provider_state
             # Anchor this turn's full token footprint on the message itself so the gate
             # estimate can walk back to it and add only the rough cost of messages added
             # since (ports the reference's per-message ``tokenCountWithEstimation``).
@@ -1612,8 +1603,8 @@ class ReActAgent:
         """
         if self.session.depth >= self.session.max_depth:
             return "[dispatch_agent] max sub-agent depth reached; refusing to spawn deeper."
-        if model and not is_supported_model(model):
-            return _unsupported_model_refusal("dispatch_agent", model)
+        if model and not is_model_allowed(self.config.provider, model):
+            return unsupported_model_message("dispatch_agent", self.config.provider, model)
         sub_registry = ToolRegistry()
         excluded = {
             "dispatch_agent",
@@ -1731,8 +1722,8 @@ class ReActAgent:
         """
         if self.session.depth >= self.session.max_depth:
             return "[teammate_spawn] max sub-agent depth reached; refusing to spawn deeper."
-        if model and not is_supported_model(model):
-            return _unsupported_model_refusal("teammate_spawn", model)
+        if model and not is_model_allowed(self.config.provider, model):
+            return unsupported_model_message("teammate_spawn", self.config.provider, model)
 
         store = self.team_store
         await store.add_member(team_id, name, role)

@@ -55,8 +55,10 @@
 - `ClaudeProvider` 直连 Messages API（httpx，无 anthropic SDK）：流式/非流式、
   指数退避 + full jitter + Retry-After、thinking blocks 跨轮保留、
   model-aware 请求形状（adaptive thinking vs legacy）、effort。
-- `.env.example` 展示 Anthropic 兼容端点（MiniMax/GLM/Kimi/DeepSeek）——
-  实际中立性是"Anthropic 协议中立"，基类 `LLMProvider` 本身干净（`providers/base.py:28`）。
+- Provider 协议选择已显式拆分：`claude` → `/v1/messages`，`openai` → OpenAI
+  Responses `/v1/responses`（本地手工回放 items，`store=false`，对支持 reasoning 的模型保留 encrypted reasoning），
+  `openai-compat` → `/v1/chat/completions`（DeepSeek/Qwen/GLM/Moonshot/vLLM/LM Studio/Groq
+  等兼容端点），`fake` 保持离线测试。禁止按模型名或 base URL 猜协议。
 
 ### 1.7 其他
 - Skills（markdown + `@programmatic_skill` 双源）、跨对话 memory（recall/extract/dream）、
