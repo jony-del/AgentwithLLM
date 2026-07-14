@@ -302,6 +302,23 @@ def test_container_prefers_podman_over_docker(monkeypatch, tmp_path) -> None:
     assert manager._backend.runtime == "podman"
 
 
+def test_container_prepare_falls_through_broken_runtime(monkeypatch, tmp_path) -> None:
+    _force_linux(monkeypatch, "podman", "docker")
+
+    def fake_probe(argv):
+        return argv[0] == "docker" and "inspect" in argv
+
+    monkeypatch.setattr("agent_core.sandbox.backends.container._run_probe", fake_probe)
+    cfg = SandboxConfig.from_dict(
+        {"enabled": True, "backend": "container", "container": {"image": "alpine"}}
+    )
+    manager = SandboxManager(cfg, workspace=tmp_path)
+    assert manager._backend.runtime == "podman"  # PATH preference before readiness
+    manager.prepare()
+    assert manager._backend.runtime == "docker"  # first actually usable runtime
+    assert manager.is_enabled()
+
+
 def test_container_network_opt_in(monkeypatch, tmp_path) -> None:
     manager = _container_manager(monkeypatch, tmp_path, "podman")
     manager.config.network.allowed_domains = ["api.example.com"]

@@ -1,0 +1,56 @@
+name: Release installer assets
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate tag and installer sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open("pyproject.toml", "rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"tag {tag!r} does not match project version v{version}")
+          PY
+          bash -n install.sh
+          python installer/install.py --help
+      - name: Build reproducible source assets
+        shell: bash
+        run: |
+          git archive --format=zip --output=polaris-source.zip "$GITHUB_SHA"
+          git archive --format=tar.gz --output=polaris-source.tar.gz "$GITHUB_SHA"
+          sha256sum polaris-source.zip polaris-source.tar.gz install.ps1 install.sh > SHA256SUMS
+      - name: Smoke-test release archives
+        shell: bash
+        run: |
+          mkdir smoke-zip smoke-tar
+          unzip -q polaris-source.zip -d smoke-zip
+          tar -xzf polaris-source.tar.gz -C smoke-tar
+          python smoke-zip/installer/install.py --help
+          python smoke-tar/installer/install.py --help
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" \
+            polaris-source.zip polaris-source.tar.gz SHA256SUMS install.ps1 install.sh --clobber
+

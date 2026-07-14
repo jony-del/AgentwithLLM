@@ -709,51 +709,51 @@ def replay_command(args: argparse.Namespace) -> int:
 
 
 def health_command(args: argparse.Namespace) -> int:
-    """Check the health status of the agent system."""
-    print("Agent System Health Check")
-    print("=" * 40)
-    
-    # Check configuration
+    """Aggregate application and installation checks without failing early."""
+    from agent_core.health import HealthCheck, HealthReport, collect_dependency_checks, render_human
+
+    checks: list[HealthCheck] = []
     try:
         resolve_config({}, config_file=_config_file(args))
-        print("✓ Configuration loaded successfully")
+        checks.append(HealthCheck("configuration", True, "ok", detail="loaded successfully"))
     except Exception as e:
-        print(f"✗ Configuration error: {e}")
-        return 1
-    
-    # Check provider
+        checks.append(HealthCheck("configuration", True, "error", detail=str(e)))
+
     try:
         provider = _make_provider(_resolve(args))
-        print(f"✓ Provider initialized: {type(provider).__name__}")
+        checks.append(
+            HealthCheck("provider", True, "ok", version=type(provider).__name__)
+        )
     except Exception as e:
-        print(f"✗ Provider error: {e}")
-        return 1
-    
-    # Check tool registry
+        checks.append(HealthCheck("provider", True, "error", detail=str(e)))
+
     try:
-        registry = ToolRegistry()
-        tool_count = len(registry.list_tools())
-        print(f"✓ Tool registry loaded: {tool_count} tools available")
+        from agent_core.tools import default_tools
+
+        tool_count = len(default_tools(Path.cwd()))
+        checks.append(
+            HealthCheck("tool-registry", True, "ok", detail=f"{tool_count} tools available")
+        )
     except Exception as e:
-        print(f"✗ Tool registry error: {e}")
-        return 1
-    
-    # Check memory if enabled
+        checks.append(HealthCheck("tool-registry", True, "error", detail=str(e)))
+
     try:
         memory_config = _memory_config(args)
         if memory_config.enabled:
             store = _open_store(memory_config)
             memory_count = len(store.all())
-            print(f"✓ Memory store accessible: {memory_count} memories stored")
+            checks.append(
+                HealthCheck("memory", True, "ok", detail=f"{memory_count} memories stored")
+            )
         else:
-            print("○ Memory disabled")
+            checks.append(HealthCheck("memory", False, "ok", detail="disabled"))
     except Exception as e:
-        print(f"✗ Memory error: {e}")
-        return 1
-    
-    print("=" * 40)
-    print("All systems operational!")
-    return 0
+        checks.append(HealthCheck("memory", True, "error", detail=str(e)))
+
+    checks.extend(collect_dependency_checks(args.profile))
+    report = HealthReport(args.profile, tuple(checks))
+    print(report.to_json() if args.json else render_human(report))
+    return 0 if report.status != "error" else 1
 
 
 def mcp_command(args: argparse.Namespace) -> int:
@@ -993,6 +993,15 @@ def main(argv: list[str] | None = None) -> int:
 
     health_parser = subparsers.add_parser("health", help="Check the health status of the agent system.")
     add_common(health_parser)
+    health_parser.add_argument(
+        "--profile",
+        choices=["runtime", "dev"],
+        default="runtime",
+        help="Dependency profile to validate (default: runtime).",
+    )
+    health_parser.add_argument(
+        "--json", action="store_true", help="Emit a machine-readable health report."
+    )
     health_parser.set_defaults(func=health_command)
 
     # Default to `chat` when invoked with no subcommand, so a bare `polaris`

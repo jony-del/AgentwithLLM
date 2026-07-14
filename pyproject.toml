@@ -5,9 +5,10 @@ description = "A Python ReAct agent framework with Claude, tools, hooks, permiss
 requires-python = ">=3.11"
 # Layered dependencies (revision guide D1/D9): core is the minimal library import
 # surface — `import agent_core` and a working (NullUI, no-web) agent need only these.
-# Optional capabilities are extras; the recommended full install is
-#   pip install -e .[all]          # everything a CLI user expects
-#   pip install -e .[all,dev]      # + test runner / lint / type-check for hacking
+# Optional capabilities are extras. Ordinary users should run install.ps1/install.sh,
+# which also install host binaries; direct pip commands remain Python-only escape hatches.
+#   pip install -e .[all]          # Python capabilities only
+#   pip install -e .[all,dev]      # + Python test/lint/type tooling
 # Each capability degrades with an actionable error / logged skip when its extra is
 # missing (ConsoleUI → [terminal], web tools → [web], MCP → [mcp]); the sandbox layer
 # needs NO extra Python deps (it shells out to podman/docker/bwrap).
@@ -45,6 +46,10 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
 
 [project.scripts]
 polaris = "agent_core.cli:main"

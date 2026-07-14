@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "python_series": "3.12",
+  "uv_version": "0.11.28",
+  "node_version": "v24.14.1",
+  "minimum_node_major": 24,
+  "sandbox_image": "docker.io/library/debian:stable-slim"
+}

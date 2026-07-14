@@ -146,9 +146,12 @@ polaris replay <run_id>                  # re-render a runs/*.jsonl as a timelin
 # no TOFU filtering) — e.g. the shipped agent.strict.toml / agent.lax.toml profiles
 polaris run "task" --provider fake --config agent.strict.toml
 
-# Install: core is the minimal library surface (httpx+pyyaml); capabilities are
-# extras — [web] (fetch/search), [mcp], [terminal] (interactive console), [all].
-pip install -e .[all,dev]                # recommended: everything + test/lint tooling
+# Full host + Python install (Git/rg/Node/container runtime included).
+.\install.ps1 -Dev                        # Windows development checkout
+# bash install.sh --dev                   # macOS/Linux development checkout
+
+# Python-only escape hatch: capabilities are [web], [mcp], [terminal], [all].
+pip install -e .[all,dev]
 
 # Tests
 pytest                                   # full suite must stay green
@@ -339,7 +342,8 @@ UI, memory, state:
 - `runs/`, `memory/`, and user/project skill dirs (`.polaris/skills/`) are
   runtime state, gitignored; only `agent_core/skills/bundled/*.md` is in-repo.
 - Built-in chat `/commands` live in `chat_commands.py` (CLI-only); `/model`
-  mutates `config.model` only, never rebuilds the agent.
+  mutates `config.model` (and picker-selected `config.effort` for providers with
+  an effort-aware picker), never rebuilds the agent.
 
 ## Configuration
 
@@ -350,9 +354,10 @@ provider scalar is an explicit protocol selector: `claude` uses `/v1/messages`,
 legacy `--provider openai + OPENAI_BASE_URL=<compat endpoint>` users must migrate
 to `--provider openai-compat`. The OpenAI Responses capability matrix is
 provider-local and fail-safe: known reasoning models use their explicit supported
-`reasoning.effort` set (`none` is sent explicitly when supported), unknown models
-do not receive reasoning-only fields, unsupported effort values are omitted, and
-encrypted reasoning stays in opaque
+`reasoning.effort` set (`none` is sent explicitly when supported), known
+non-reasoning models may appear in `/model` but receive the conservative
+non-reasoning request shape, unknown models do not receive reasoning-only fields,
+unsupported effort values are omitted, and encrypted reasoning stays in opaque
 `provider_state` while only displayable reasoning summaries reach the UI.
 Tables resolved separately in `config.py`: `[memory]`, `[limits]`, `[session]`,
 `[context]`, `[compression]`, `[concurrency]`, `[mcp]`, `[output]`,

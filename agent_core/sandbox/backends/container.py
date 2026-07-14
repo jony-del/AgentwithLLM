@@ -49,6 +49,7 @@ class ContainerBackend(SandboxBackend):
         # A copy of the container settings is enough to resolve the runtime; the full
         # config is still passed to wrap() by the manager.
         self._container = (config or SandboxConfig()).container
+        self._requested_runtime = self._container.runtime
         self._runtime: str | None = _resolve_runtime(self._container.runtime)
 
     # -- capability ------------------------------------------------------------------
@@ -75,18 +76,29 @@ class ContainerBackend(SandboxBackend):
         Degrades to :class:`ContainerUnavailable` (the manager decides fail-vs-fallback);
         never raises a raw subprocess error into the run.
         """
-        if self._runtime is None:
+        candidates = _runtime_candidates(self._requested_runtime)
+        if not candidates:
             raise ContainerUnavailable("no container runtime on PATH")
         image = self._container.image
-        if _image_exists(self._runtime, image):
-            return
-        if not self._container.auto_pull:
+        # ``auto`` means usable-runtime fallback, not merely first executable on PATH.
+        # A stale Podman client or stopped Docker daemon must not hide a later working
+        # candidate. Image inspect is both the readiness probe and the state check.
+        for runtime in candidates:
+            if _image_exists(runtime, image):
+                self._runtime = runtime
+                return
+            if self._container.auto_pull and _pull_image(runtime, image):
+                self._runtime = runtime
+                return
+        names = ", ".join(candidates)
+        if self._container.auto_pull:
             raise ContainerUnavailable(
-                f"image {image!r} not present (set [sandbox.container].auto_pull = true "
-                f"or pre-pull it)"
+                f"container runtimes ({names}) could not pull image {image!r}"
             )
-        if not _pull_image(self._runtime, image):
-            raise ContainerUnavailable(f"failed to pull image {image!r}")
+        raise ContainerUnavailable(
+            f"image {image!r} is unavailable in container runtimes ({names}); set "
+            "[sandbox.container].auto_pull = true or pre-pull it"
+        )
 
     # -- the wrap seam ---------------------------------------------------------------
 
@@ -140,12 +152,14 @@ class ContainerBackend(SandboxBackend):
 
 
 def _resolve_runtime(requested: str) -> str | None:
+    candidates = _runtime_candidates(requested)
+    return candidates[0] if candidates else None
+
+
+def _runtime_candidates(requested: str) -> list[str]:
     if requested and requested != "auto":
-        return requested if shutil.which(requested) else None
-    for candidate in _RUNTIME_PREFERENCE:
-        if shutil.which(candidate):
-            return candidate
-    return None
+        return [requested] if shutil.which(requested) else []
+    return [candidate for candidate in _RUNTIME_PREFERENCE if shutil.which(candidate)]
 
 
 def _image_exists(runtime: str, image: str) -> bool:
