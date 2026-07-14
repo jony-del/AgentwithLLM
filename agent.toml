@@ -18,6 +18,10 @@
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
 permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
+# Live chat: /permissions opens the six-mode picker; /permissions <mode> switches
+# directly. Shift+Tab cycles default -> acceptedits -> plan -> auto -> default.
+# default=manual confirmation; acceptedits=native workspace edits; plan=strict read-only;
+# auto=AI-classify pending actions; dontask=deny prompts; bypass=allow unmatched actions.
 provider = "claude"           # claude | openai | openai-compat | fake
 # output_config.effort depth/cost control. none | minimal | low | medium | high | xhigh | max.
 # "high" is the safe agentic default. Providers gate levels by model: Claude gates
@@ -256,8 +260,9 @@ api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
 # to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official
 # git/fetch/time reference servers are core deps, available by default.
-# Every tool defaults to risk = "dangerous" (so it's denied in auto/dontask and
-# confirmed in default); set risk per server to "read" or "write" to relax that.
+# Every tool defaults to risk = "dangerous" (confirmed in default/acceptedits,
+# classified in auto, denied in plan/dontask); set risk per server to "read" or
+# "write" only after reviewing what the server can actually do.
 # Inspect what a server exposes with:  python -m agent_core mcp list
 #
 # # stdio transport — launch a server as a subprocess:
@@ -381,10 +386,10 @@ allowed_domains = []                   # e.g. ["docs.python.org", "github.com"]
 blocked_domains = []                   # e.g. ["evil.example"]
 
 # --- Fine-grained permission rules (policy layer) ---------------------------
-# Argument-aware allow/deny/ask rules, evaluated BEFORE the coarse per-mode
-# ToolRisk gate. Each rule is "ToolName(content)" (or bare "ToolName" for the whole
-# tool). Precedence in the decision pipeline: deny > sensitive-path safety net >
-# ask > sandbox auto-allow > bypass mode > allow > per-mode matrix.
+# Argument-aware allow/deny/ask rules plus capability-aware permission modes. Each rule
+# is "ToolName(content)" (or bare "ToolName" for the whole tool). Precedence:
+# deny > strict plan write block > secret/sensitive-path safety nets > session grant >
+# ask > sandbox auto-allow > bypass mode > allow > mode decision/auto classifier.
 #   - run_command content is matched with shell decomposition + anti-evasion:
 #     a compound command (a && b | c) must have EVERY sub-command covered to allow,
 #     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,

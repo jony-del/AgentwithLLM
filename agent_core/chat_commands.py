@@ -24,6 +24,8 @@ from agent_core.config import resolve_mcp_config
 from agent_core.model_catalog import picker_spec_for_provider
 from agent_core.model_validation import CLAUDE_PROVIDER, FAKE_PROVIDER, is_model_allowed
 from agent_core.models import Message
+from agent_core.permissions import PermissionMode, permission_mode_label
+from agent_core.sandbox import SandboxRequiredError
 from agent_core.skills import (
     SkillContext,
     SkillPromptContext,
@@ -118,7 +120,8 @@ async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     print(f"  model       {agent.config.model}")
     print(f"  effort      {agent.config.effort or '—'}")
     print(f"  thinking    {thinking_label}")
-    print(f"  permission  {agent.config.permission}")
+    mode = PermissionMode(agent.config.permission)
+    print(f"  permission  {mode.value} ({permission_mode_label(mode)})")
     print(f"  session     {agent.session_id}")
     print(f"  workspace   {agent.session.workspace}")
     print(f"  skills      {len(agent.skills)}  ({len(agent.skills.model_invocable())} model-invocable)")
@@ -208,6 +211,46 @@ async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
     return ChatTurn()
 
 
+def _print_permission_modes(current: PermissionMode) -> None:
+    print(f"Current permission mode: {current.value} ({permission_mode_label(current)})")
+    print("Available modes:")
+    for mode in PermissionMode:
+        marker = "*" if mode == current else " "
+        print(f"  {marker} {mode.value:<12} {permission_mode_label(mode)}")
+    print("Switch with: /permissions <mode>  (or run /permissions in a terminal to pick)")
+
+
+async def _cmd_permissions(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    current = PermissionMode(agent.config.permission)
+    raw_target = args.strip().lower()
+    if raw_target:
+        try:
+            target = PermissionMode(raw_target)
+        except ValueError:
+            valid = ", ".join(mode.value for mode in PermissionMode)
+            print(f"Unknown permission mode {raw_target!r}. Choose one of: {valid}.")
+            return ChatTurn()
+    else:
+        selected = await ui.pick_permission_mode(current.value)
+        if selected is None:
+            _print_permission_modes(current)
+            return ChatTurn()
+        target = PermissionMode(selected)
+
+    if target == current:
+        print(f"Permission mode unchanged: {target.value} ({permission_mode_label(target)}).")
+        return ChatTurn()
+    try:
+        agent.set_permission_mode(target, source="slash")
+    except SandboxRequiredError as exc:
+        print(f"[permission] {exc}")
+        return ChatTurn()
+    print(f"Permission mode switched to {target.value} ({permission_mode_label(target)}).")
+    return ChatTurn()
+
+
 async def _cmd_mcp(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     servers = resolve_mcp_config().servers
     if not servers:
@@ -284,6 +327,7 @@ _COMMANDS: dict[str, Handler] = {
     "cost": _cmd_cost,
     "compact": _cmd_compact,
     "model": _cmd_model,
+    "permissions": _cmd_permissions,
     "mcp": _cmd_mcp,
     "memory": _cmd_memory,
     "resume": _cmd_resume,
@@ -300,6 +344,7 @@ _COMMAND_HELP: dict[str, tuple[Handler, str]] = {
     "cost": (_cmd_cost, "Show session token usage and duration."),
     "compact": (_cmd_compact, "Compact the conversation now."),
     "model": (_cmd_model, "Show or switch the model."),
+    "permissions": (_cmd_permissions, "Show or switch the permission mode."),
     "mcp": (_cmd_mcp, "List configured MCP servers."),
     "memory": (_cmd_memory, "List stored memories."),
     "resume": (_cmd_resume, "List or resume a saved session (alias /continue)."),

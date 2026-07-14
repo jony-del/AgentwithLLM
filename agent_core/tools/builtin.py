@@ -163,6 +163,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
         "required": ["path", "old_string", "new_string"],
     }
     risk = ToolRisk.WRITE
+    accept_edits_safe = True
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
@@ -600,6 +601,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
         "required": ["path", "content"],
     }
     risk = ToolRisk.WRITE
+    accept_edits_safe = True
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))

@@ -7,7 +7,11 @@ from dataclasses import asdict
 from pathlib import PurePath
 
 from agent_core.hooks import HookContext, HookEvent, HookOutcome, HookPipeline
-from agent_core.models import ToolCall, ToolResult
+from agent_core.models import Message, ToolCall, ToolResult
+from agent_core.permission_classifier import (
+    AutoPermissionClassifier,
+    AutoPermissionVerdict,
+)
 from agent_core.permissions import PermissionDecision, PermissionPolicy
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
@@ -39,6 +43,7 @@ class ToolExecutor:
         hooks: HookPipeline | None = None,
         logger: JSONLRunLogger | None = None,
         ui: AgentUI | None = None,
+        permission_classifier: AutoPermissionClassifier | None = None,
         *,
         parallel_tools: bool = True,
         max_workers: int = 4,
@@ -48,6 +53,7 @@ class ToolExecutor:
         self.hooks = hooks or HookPipeline()
         self.logger = logger
         self.ui = ui or NullUI()
+        self.permission_classifier = permission_classifier
         self.parallel_tools = parallel_tools
         self.max_workers = max(1, int(max_workers))
 
@@ -55,6 +61,7 @@ class ToolExecutor:
         self,
         tool_calls: list[ToolCall],
         should_cancel: Callable[[], bool] | None = None,
+        messages: list[Message] | None = None,
     ) -> list[ToolResult]:
         """Execute a turn's tool calls, used by ``ReActAgent.run``.
 
@@ -67,7 +74,7 @@ class ToolExecutor:
         if not tool_calls:
             return []
         if not self.parallel_tools:
-            return await self._execute_sequential(tool_calls, should_cancel)
+            return await self._execute_sequential(tool_calls, should_cancel, messages)
 
         sync_semaphore = asyncio.Semaphore(self.max_workers)
         results: list[ToolResult | None] = [None] * len(tool_calls)
@@ -76,7 +83,7 @@ class ToolExecutor:
             if should_cancel is not None and should_cancel():
                 results[index] = await self._finish(tool_call, self._cancelled_result(tool_call.name), "cancelled")
                 continue
-            prepared = await self._prepare(index, tool_call)
+            prepared = await self._prepare(index, tool_call, messages, should_cancel)
             if isinstance(prepared, ToolResult):
                 results[index] = prepared
             else:
@@ -133,6 +140,7 @@ class ToolExecutor:
         self,
         tool_calls: list[ToolCall],
         should_cancel: Callable[[], bool] | None,
+        messages: list[Message] | None,
     ) -> list[ToolResult]:
         """No concurrency requested: await each call one at a time, in order."""
         results: list[ToolResult] = []
@@ -140,7 +148,7 @@ class ToolExecutor:
             if should_cancel is not None and should_cancel():
                 results.append(await self._finish(tool_call, self._cancelled_result(tool_call.name), "cancelled"))
                 continue
-            prepared = await self._prepare(index, tool_call)
+            prepared = await self._prepare(index, tool_call, messages, should_cancel)
             if isinstance(prepared, ToolResult):
                 results.append(prepared)
                 continue
@@ -153,7 +161,13 @@ class ToolExecutor:
             results.append(await self._post_and_finish(prepared, result))
         return results
 
-    async def _prepare(self, index: int, tool_call: ToolCall) -> _PreparedCall | ToolResult:
+    async def _prepare(
+        self,
+        index: int,
+        tool_call: ToolCall,
+        messages: list[Message] | None,
+        should_cancel: Callable[[], bool] | None,
+    ) -> _PreparedCall | ToolResult:
         rewritten_call, pre_results = self.hooks.run_pre(tool_call)
         if self.logger:
             await self.logger.write(
@@ -182,6 +196,37 @@ class ToolExecutor:
             tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
         )
         decision = self.permissions.decide(tool, rewritten_call)
+        classifier_verdict: AutoPermissionVerdict | None = None
+        if decision.classify:
+            if self.permission_classifier is None:
+                classifier_verdict = AutoPermissionVerdict(
+                    False,
+                    "auto mode classifier is unavailable",
+                    unavailable=True,
+                )
+            else:
+                try:
+                    classifier_verdict = await self.permission_classifier.classify(
+                        tool,
+                        rewritten_call,
+                        messages or [],
+                        should_cancel,
+                    )
+                except asyncio.CancelledError:
+                    classifier_verdict = AutoPermissionVerdict(
+                        False,
+                        "auto mode classifier was cancelled",
+                        unavailable=True,
+                    )
+            decision = PermissionDecision(
+                classifier_verdict.allowed,
+                reason=(
+                    "auto classifier allowed: "
+                    if classifier_verdict.allowed
+                    else "auto classifier denied: "
+                )
+                + classifier_verdict.reason,
+            )
         # PermissionRequest (R1 programmatic approval): consulted only for ASK decisions
         # — interactive asks (ask_user) and their headless collapse (ask_collapsed) —
         # never for hard denies, so a hook cannot launder a deny rule. A hook allow
@@ -207,6 +252,8 @@ class ToolExecutor:
             payload: dict[str, object] = {"tool": tool.name, "decision": asdict(decision)}
             if hook_verdict is not None:
                 payload["permission_request_hook"] = hook_verdict
+            if classifier_verdict is not None:
+                payload["auto_classifier"] = asdict(classifier_verdict)
             await self.logger.write("permission", payload)
         if not decision.allowed:
             result = ToolResult(tool.name, f"Tool denied: {decision.reason}", ok=False)

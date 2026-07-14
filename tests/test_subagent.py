@@ -5,6 +5,7 @@ import time
 from agent_core.agents.multi import MultiAgentCoordinator
 from agent_core.memory import MemoryConfig
 from agent_core.models import LLMResult, ToolCall, ToolResult, ToolRisk
+from agent_core.permission_classifier import AutoPermissionVerdict
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
@@ -13,6 +14,11 @@ from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.subagent import DispatchAgentTool
+
+
+class _AllowClassifier:
+    async def classify(self, tool, tool_call, messages, should_cancel=None):
+        return AutoPermissionVerdict(True, "test setup")
 
 
 # --- DispatchAgentTool (unit, with a stub factory) ---------------------------
@@ -121,7 +127,12 @@ async def test_dispatch_read_only_calls_can_run_concurrently(tmp_path) -> None:
 
     registry = ToolRegistry()
     registry.register(DispatchAgentTool(SessionContext(workspace=tmp_path, subagent_factory=factory)))
-    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=_AllowClassifier(),
+        max_workers=2,
+    )
 
     start = time.perf_counter()
     results = await executor.execute_many(
@@ -144,7 +155,12 @@ async def test_dispatch_full_conflicts_with_workspace_write(tmp_path) -> None:
     registry = ToolRegistry()
     registry.register(DispatchAgentTool(SessionContext(workspace=tmp_path, subagent_factory=factory)))
     registry.register(WorkspaceWriteSleepTool(tmp_path))
-    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=_AllowClassifier(),
+        max_workers=2,
+    )
 
     start = time.perf_counter()
     await executor.execute_many(
@@ -209,6 +225,7 @@ async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> No
             memory=MemoryConfig(enabled=False),
             max_tool_workers=2,
         ),
+        permission_classifier=_AllowClassifier(),
     )
 
     result = await agent.run("parent task")

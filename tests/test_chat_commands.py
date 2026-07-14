@@ -32,6 +32,16 @@ class PickingUI(NullUI):
         return self.choice
 
 
+class PickingPermissionUI(NullUI):
+    def __init__(self, choice: str | None) -> None:
+        self.choice = choice
+        self.seen: list[str] = []
+
+    async def pick_permission_mode(self, current_mode: str) -> str | None:
+        self.seen.append(current_mode)
+        return self.choice
+
+
 # --- plain text & skills -----------------------------------------------------
 
 
@@ -210,6 +220,42 @@ async def test_model_explicit_openai_switch_preserves_effort(capsys) -> None:
     assert agent.config.model == "custom-openai-model"
     assert agent.config.effort == "max"
     assert "switched" in capsys.readouterr().out.lower()
+
+
+async def test_permissions_direct_switch_updates_live_agent(capsys) -> None:
+    agent = _agent(permission="default")
+    await dispatch("/permissions acceptedits", agent, NullUI(), [])
+    assert agent.config.permission.value == "acceptedits"
+    assert agent.permissions.mode.value == "acceptedits"
+    assert "accept edits on" in capsys.readouterr().out
+
+
+async def test_permissions_bare_command_uses_six_mode_picker(capsys) -> None:
+    agent = _agent(permission="default")
+    ui = PickingPermissionUI("plan")
+    await dispatch("/permissions", agent, ui, [])
+    assert ui.seen == ["default"]
+    assert agent.permissions.mode.value == "plan"
+    assert "plan mode on" in capsys.readouterr().out
+
+
+async def test_permissions_cancel_lists_modes_and_invalid_keeps_state(capsys) -> None:
+    agent = _agent(permission="default")
+    await dispatch("/permissions", agent, NullUI(), [])
+    listed = capsys.readouterr().out
+    assert "manual mode on" in listed and "bypass permissions on" in listed
+
+    await dispatch("/permissions invalid", agent, NullUI(), [])
+    assert agent.permissions.mode.value == "default"
+    assert "Unknown permission mode" in capsys.readouterr().out
+
+
+async def test_misspelled_permission_commands_are_not_registered(capsys) -> None:
+    agent = _agent()
+    await dispatch("/permmision", agent, NullUI(), [])
+    await dispatch("/permission", agent, NullUI(), [])
+    out = capsys.readouterr().out
+    assert out.count("Unknown command") == 2
 
 
 async def test_model_accepts_openai_compat_custom_model(capsys) -> None:

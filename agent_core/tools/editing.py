@@ -109,6 +109,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
         "required": ["path", "edits"],
     }
     risk = ToolRisk.WRITE
+    accept_edits_safe = True
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
@@ -177,6 +178,7 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
         "required": ["patch"],
     }
     risk = ToolRisk.WRITE
+    accept_edits_safe = True
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         try:

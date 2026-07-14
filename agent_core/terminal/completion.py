@@ -61,6 +61,8 @@ class SlashCompleter(Completer):
         arg = arg_match.group("arg")
         if name in {"resume", "continue"}:
             yield from self._complete_sessions(arg)
+        elif name == "permissions":
+            yield from self._complete_permission_modes(arg)
         # `/model` has no inline completion: bare `/model` opens the interactive picker.
 
     # -- name completion ------------------------------------------------------
@@ -115,3 +117,17 @@ class SlashCompleter(Completer):
             yield Completion(
                 info.session_id, start_position=start, display=label[:60], display_meta=meta
             )
+
+    def _complete_permission_modes(self, arg: str) -> "Iterable[Completion]":
+        from agent_core.permissions import PermissionMode, permission_mode_label
+
+        needle = arg.strip().lower()
+        start = -len(arg)
+        for mode in PermissionMode:
+            if mode.value.startswith(needle):
+                yield Completion(
+                    mode.value,
+                    start_position=start,
+                    display=mode.value,
+                    display_meta=permission_mode_label(mode),
+                )

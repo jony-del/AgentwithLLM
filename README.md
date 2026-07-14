@@ -31,6 +31,22 @@ polaris run "Say hello without tools" --provider fake
 安装器只准备沙箱能力，不会擅自修改项目的 `agent.toml`。需要使用沙箱时传入 `--sandbox`，或在
 配置中设置 `[sandbox] enabled = true`。
 
+## 权限模式
+
+交互式 `polaris chat` 中运行 `/permissions` 可从六种策略中选择，或直接运行
+`/permissions <mode>`。Shift+Tab 在 `default → acceptedits → plan → auto` 之间循环，底部状态栏
+始终显示当前模式。
+
+- `default`：读取自动允许，编辑和外部动作需要确认。
+- `acceptedits`：额外自动允许框架原生的工作区文件编辑工具。
+- `plan`：严格只读，只调查、提问和制定计划。
+- `auto`：普通读写走安全快速路径，其他动作由 AI 分类器允许或拒绝。
+- `dontask`：任何本应询问的动作直接拒绝。
+- `bypass`：允许未命中的动作，但 deny/ask 规则和敏感路径保护仍然有效。
+
+`auto`、`dontask`、`bypass` 没有真实沙箱时需要交互式明确确认；无头运行仍默认拒绝。AI 分类器
+超时、报错或返回无法解析的结果时一律拒绝对应动作。
+
 ## 源码开发
 
 先下载/克隆本仓库，然后在仓库根目录执行：

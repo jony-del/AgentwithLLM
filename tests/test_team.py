@@ -10,6 +10,7 @@ import pytest
 
 from agent_core.agents.team import FileLock, TeamPermissionError, TeamStore
 from agent_core.models import LLMResult, ToolCall, ToolRisk
+from agent_core.permission_classifier import AutoPermissionVerdict
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers import FakeProvider
 from agent_core.providers.base import LLMProvider, StreamHandler
@@ -26,6 +27,11 @@ from agent_core.tools.team import (
     TeamMessageSendTool,
     TeammateSpawnTool,
 )
+
+
+class _AllowClassifier:
+    async def classify(self, tool, tool_call, messages, should_cancel=None):
+        return AutoPermissionVerdict(True, "test setup")
 
 
 async def test_team_create_builds_config_tasks_and_leader_inbox(tmp_path: Path) -> None:
@@ -181,7 +187,12 @@ async def test_teammate_spawn_different_tasks_can_run_concurrently(tmp_path: Pat
 
     registry = ToolRegistry()
     registry.register(TeammateSpawnTool(SessionContext(workspace=tmp_path, teammate_factory=factory)))
-    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=_AllowClassifier(),
+        max_workers=2,
+    )
 
     start = time.perf_counter()
     results = await executor.execute_many(
@@ -205,7 +216,12 @@ async def test_teammate_spawn_same_task_is_serial(tmp_path: Path) -> None:
 
     registry = ToolRegistry()
     registry.register(TeammateSpawnTool(SessionContext(workspace=tmp_path, teammate_factory=factory)))
-    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO), max_workers=2)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=_AllowClassifier(),
+        max_workers=2,
+    )
 
     start = time.perf_counter()
     await executor.execute_many(

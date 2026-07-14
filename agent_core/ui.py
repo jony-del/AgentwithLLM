@@ -128,6 +128,10 @@ class AgentUI:
         """
         return None
 
+    async def pick_permission_mode(self, current_mode: str) -> str | None:
+        """Choose one of the six permission modes; silent UIs cannot pick."""
+        return None
+
 
 class NullUI(AgentUI):
     """The default: a silent sink. Present so the loop can always emit events."""
@@ -228,6 +232,12 @@ class ConsoleUI(AgentUI):
             title=spec.title,
             help_text=spec.help_text,
         )
+
+    async def pick_permission_mode(self, current_mode: str) -> str | None:
+        from agent_core.terminal.permission_picker import run_permission_picker
+
+        selected = await run_permission_picker(current_mode)
+        return selected.value if selected is not None else None
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission

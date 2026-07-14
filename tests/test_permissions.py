@@ -1,15 +1,22 @@
 from dataclasses import dataclass
 
-from agent_core.models import ToolCall
+from agent_core.models import ToolCall, ToolRisk
 from agent_core.permission_rules import RuleSet
-from agent_core.permissions import PermissionMode, PermissionPolicy
+from agent_core.permissions import (
+    PermissionMode,
+    PermissionPolicy,
+    next_shift_tab_permission_mode,
+    permission_mode_label,
+)
+from agent_core.tools.base import Tool
 from agent_core.tools.builtin import EchoTool, ReadTextFileTool, RunCommandTool, WriteTextFileTool
 
 
-def test_plan_mode_dry_runs_write_tools() -> None:
+def test_plan_mode_strictly_denies_write_tools() -> None:
     decision = PermissionPolicy(PermissionMode.PLAN).decide(WriteTextFileTool())
-    assert decision.allowed
-    assert decision.dry_run
+    assert not decision.allowed
+    assert not decision.dry_run
+    assert "read-only" in decision.reason
 
 
 def test_default_allows_read_tools() -> None:
@@ -71,10 +78,10 @@ def test_deny_rule_blocks_matching_command() -> None:
     denied = policy.decide(tool, ToolCall("run_command", {"command": "rm -rf /"}))
     assert not denied.allowed
     assert "denied by rule" in denied.reason
-    # A non-matching command is unaffected by the deny rule (auto still denies DANGEROUS).
+    # A non-matching command is delegated to the automated classifier.
     other = policy.decide(tool, ToolCall("run_command", {"command": "ls"}))
     assert not other.allowed
-    assert "auto denies" in other.reason
+    assert other.classify
 
 
 def test_allow_rule_permits_command_under_default() -> None:
@@ -164,11 +171,58 @@ def test_sandbox_coupling_off_when_not_sandboxed() -> None:
     assert not decision.allowed
 
 
-def test_no_rules_preserves_legacy_behavior() -> None:
-    # Empty rule set + no sandbox → identical to the original per-mode matrix.
+def test_no_rules_uses_auto_fast_path_and_classifier_boundary() -> None:
     policy = PermissionPolicy(PermissionMode.AUTO)
     assert policy.decide(EchoTool(), ToolCall("echo", {})).allowed
-    assert not policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"})).allowed
+    action = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"}))
+    assert not action.allowed and action.classify
+
+
+class _GenericWriteTool(Tool):
+    name = "generic_write"
+    description = "A stateful action that is not a native workspace edit."
+    input_schema = {"type": "object", "properties": {}}
+    risk = ToolRisk.WRITE
+
+
+def test_acceptedits_allows_native_edits_but_not_generic_write_actions() -> None:
+    policy = PermissionPolicy(PermissionMode.ACCEPTEDITS, prompter=_prompter("deny"))
+    assert policy.decide(WriteTextFileTool()).allowed
+    generic = policy.decide(_GenericWriteTool())
+    assert generic.ask_user
+    assert not generic.allowed
+
+
+def test_dontask_converts_all_prompts_to_hard_denials() -> None:
+    policy = PermissionPolicy(PermissionMode.DONTASK, prompter=_prompter("once"))
+    generic = policy.decide(_GenericWriteTool())
+    assert not generic.allowed
+    assert not generic.ask_user
+    assert "dontask" in generic.reason
+
+
+def test_plan_mode_cannot_be_bypassed_by_allow_rule() -> None:
+    rules = RuleSet.from_lists(allow=["write_text_file"])
+    decision = PermissionPolicy(PermissionMode.PLAN, rules=rules).decide(WriteTextFileTool())
+    assert not decision.allowed
+    assert "read-only" in decision.reason
+
+
+def test_shift_tab_cycles_only_the_four_interactive_modes() -> None:
+    mode = PermissionMode.DEFAULT
+    seen = []
+    for _ in range(4):
+        mode = next_shift_tab_permission_mode(mode)
+        seen.append(mode)
+    assert seen == [
+        PermissionMode.ACCEPTEDITS,
+        PermissionMode.PLAN,
+        PermissionMode.AUTO,
+        PermissionMode.DEFAULT,
+    ]
+    assert next_shift_tab_permission_mode(PermissionMode.DONTASK) is PermissionMode.DEFAULT
+    assert next_shift_tab_permission_mode(PermissionMode.BYPASS) is PermissionMode.DEFAULT
+    assert permission_mode_label(PermissionMode.DEFAULT) == "manual mode on"
 
 
 # -- secret-path safety net (reads included, bypass-immune) --------------------------

@@ -5,7 +5,9 @@ import pytest
 
 from agent_core.hooks import HookPipeline, HookResult
 from agent_core.models import ToolCall, ToolResult, ToolRisk
+from agent_core.permission_classifier import AutoPermissionVerdict
 from agent_core.permissions import PermissionMode, PermissionPolicy
+from agent_core.storage import JSONLRunLogger, read_events
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.builtin import EchoTool, ReadTextFileTool, WriteTextFileTool
 from agent_core.tools.executor import ToolExecutor
@@ -99,6 +101,16 @@ class StateAppendTool(Tool):
         value = str(arguments["value"])
         self.state.append(value)
         return ToolResult(self.name, value)
+
+
+class _VerdictClassifier:
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.calls: list[str] = []
+
+    async def classify(self, tool, tool_call, messages, should_cancel=None):
+        self.calls.append(tool.name)
+        return AutoPermissionVerdict(self.allowed, "test verdict", model="test")
 
 
 async def test_executor_returns_failed_result_for_unknown_tool() -> None:
@@ -210,7 +222,7 @@ async def test_execute_many_uses_rewritten_call_for_resource_locks() -> None:
     assert elapsed >= 0.28
 
 
-async def test_execute_many_handles_denied_dry_run_and_unknown_without_running() -> None:
+async def test_execute_many_handles_denied_plan_and_unknown_without_running() -> None:
     registry = ToolRegistry()
     dangerous = DangerousCountingTool()
     write = WriteCountingTool()
@@ -224,14 +236,44 @@ async def test_execute_many_handles_denied_dry_run_and_unknown_without_running()
     assert [result.name for result in denied] == ["missing", "dangerous_count", "write_count"]
     assert not denied[0].ok and denied[0].metadata["error_type"] == "UnknownTool"
     assert not denied[1].ok
-    assert denied[2].ok
+    assert not denied[2].ok
     assert dangerous.calls == 0
-    assert write.calls == 1
+    assert write.calls == 0
 
-    dry_run_executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.PLAN))
-    dry_run = await dry_run_executor.execute_many([ToolCall("write_count")])
-    assert dry_run[0].content.startswith("Dry-run:")
-    assert write.calls == 1
+    plan_executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.PLAN))
+    plan_result = await plan_executor.execute_many([ToolCall("write_count")])
+    assert not plan_result[0].ok
+    assert "read-only" in plan_result[0].content
+    assert write.calls == 0
+
+
+async def test_auto_classifier_can_allow_or_block_pending_actions(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    write = WriteCountingTool()
+    registry.register(write)
+
+    allow = _VerdictClassifier(True)
+    logger = JSONLRunLogger(tmp_path, run_id="classifier")
+    allowed = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        logger=logger,
+        permission_classifier=allow,
+    )
+    result = await allowed.execute_many([ToolCall("write_count")])
+    assert result[0].ok and write.calls == 1 and allow.calls == ["write_count"]
+    permission_event = next(event for event in read_events(logger.path) if event["event"] == "permission")
+    assert permission_event["auto_classifier"]["allowed"] is True
+    assert permission_event["auto_classifier"]["model"] == "test"
+
+    block = _VerdictClassifier(False)
+    denied = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=block,
+    )
+    result = await denied.execute_many([ToolCall("write_count")])
+    assert not result[0].ok and write.calls == 1 and block.calls == ["write_count"]
 
 
 async def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:

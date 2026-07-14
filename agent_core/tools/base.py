@@ -78,6 +78,10 @@ class Tool(ABC, ToolDisplayProvider):
     description: str
     input_schema: dict[str, Any]
     risk: ToolRisk = ToolRisk.READ
+    # ``acceptedits`` is a capability mode, not a blanket grant for every tool
+    # labelled WRITE.  Only workspace-native file editors opt in; coordination,
+    # sub-agent, skill, MCP, and other stateful tools keep the fail-safe default.
+    accept_edits_safe: bool = False
 
     def schema_for_llm(self) -> dict[str, Any]:
         return {

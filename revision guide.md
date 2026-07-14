@@ -26,8 +26,9 @@
   分解（allow 须全覆盖、deny 命中任一即拒）；反规避（`SAFE_ENV_VARS` 白名单、
   `BINARY_HIJACK_VARS` 永不剥离、包装器保守剥离）；路径 glob 与 `domain:` 匹配；
   解析失败丢弃规则不崩溃。20 个直接测试（`tests/test_permission_rules.py`）。
-- **模式层**（`permissions.py:45 PermissionPolicy`）：决策管线
-  deny → 敏感路径安全网 → ask → 沙箱自动放行 → bypass → allow → 按 `ToolRisk` 的模式矩阵。
+- **模式层**（`permissions.py PermissionPolicy`）：决策管线
+  deny → plan 严格只读 → 敏感路径安全网 → ask/沙箱/bypass/allow → 能力模式；
+  `acceptedits` 只放行原生编辑能力，`auto` 对其余动作执行有界 AI 安全分类且失败关闭。
 - **OS 沙箱层**（`sandbox/`）：native(bwrap/seatbelt) / container(podman/docker/nerdctl) /
   vm(Kata/Hyper-V/Lima) 分层，显式层级向下降级，`auto` 永不选 vm，
   `fail_if_unavailable` 可硬失败（`sandbox/manager.py:43`）。31 个测试覆盖降级矩阵。

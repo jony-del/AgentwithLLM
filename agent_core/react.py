@@ -46,6 +46,10 @@ from agent_core.hooks import (
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.model_validation import is_model_allowed, unsupported_model_message
+from agent_core.permission_classifier import (
+    AutoPermissionClassifier,
+    ProviderAutoPermissionClassifier,
+)
 from agent_core.permission_rules import RuleSet
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
@@ -86,6 +90,13 @@ logger = logging.getLogger(__name__)
 WRAPUP_TEXT = (
     "You are almost out of time for this task. Stop calling tools now and reply with "
     "your best final answer based on what you have so far, noting anything left undone."
+)
+
+PLAN_MODE_TEXT = (
+    "Plan mode is active. Investigate with read-only tools, ask the user for any "
+    "materially missing decision, and produce a concrete implementation plan. Do not "
+    "edit files, run commands or tests, spawn agents, or perform external side effects. "
+    "The permission layer will reject all write and dangerous tools."
 )
 
 # Bound on the reactive 413 recovery loop: after summarizing once, we peel the oldest
@@ -251,6 +262,7 @@ class ReActAgent:
         session_id: str | None = None,
         transcript: "TranscriptStore | None" = None,
         sandbox: SandboxManager | None = None,
+        permission_classifier: AutoPermissionClassifier | None = None,
     ) -> None:
         self.config = config or ReActConfig()
         # Effective monotonic deadline of the in-flight run(), shared with children
@@ -351,13 +363,16 @@ class ReActAgent:
         # offering the model a tool it can't use).
         if not self.skills.model_invocable():
             self.registry.unregister("skill")
+        # Session-only acknowledgement for explicitly accepted unsandboxed
+        # unattended operation. It is never persisted or inherited by children.
+        self._unsandboxed_permission_ack = False
         # D3: an unattended permission mode with no working sandbox refuses to start
         # (interactive runs get a confirm prompt; the config/env opt-out is explicit).
-        self._enforce_unattended_sandbox_requirement()
+        self._enforce_unattended_sandbox_requirement(self.config.permission)
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
         # The fine-grained rule set + sandbox make the policy argument-aware.
-        permissions = PermissionPolicy(
+        self.permissions = PermissionPolicy(
             self.config.permission,
             prompter=self.ui.confirm_tool if self.ui.is_live else None,
             rules=self.config.permission_rules,
@@ -369,12 +384,17 @@ class ReActAgent:
         # config — the MaxOutput tool hook plus the enabled built-in + external lifecycle
         # hooks. Built after session/logger exist so hooks can close over them.
         self.hooks = hooks or self._build_hook_pipeline()
+        self.permission_classifier = permission_classifier or ProviderAutoPermissionClassifier(
+            self.provider,
+            self._provider_config,
+        )
         self.executor = ToolExecutor(
             self.registry,
-            permissions,
+            self.permissions,
             self.hooks,
             self.logger,
             self.ui,
+            self.permission_classifier,
             parallel_tools=self.config.parallel_tools,
             max_workers=self.config.max_tool_workers,
         )
@@ -448,16 +468,15 @@ class ReActAgent:
             )
             return SkillRegistry()
 
-    def _is_unattended_mode(self) -> bool:
-        """True for the modes that execute without per-call confirmation (auto/dontask/
-        bypass) — the modes where fail-closed defaults (D3, D10) apply."""
+    def _is_unattended_mode(self, mode: PermissionMode | str | None = None) -> bool:
+        """True for modes that can execute without per-call human confirmation."""
         try:
-            mode = PermissionMode(self.config.permission)
+            resolved = PermissionMode(self.config.permission if mode is None else mode)
         except ValueError:
-            return False  # unknown mode string — PermissionPolicy rejects it at construction
-        return mode in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
+            return False
+        return resolved in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
 
-    def _enforce_unattended_sandbox_requirement(self) -> None:
+    def _enforce_unattended_sandbox_requirement(self, mode: PermissionMode | str) -> None:
         """D3: unattended modes (auto/dontask/bypass) must not run with zero isolation.
 
         Those modes execute WRITE (and for bypass, DANGEROUS) tools without per-call
@@ -468,10 +487,10 @@ class ReActAgent:
         read here so embedded/test constructions honor it too) is logged, never silent.
         """
         try:
-            mode = PermissionMode(self.config.permission)
+            resolved = PermissionMode(mode)
         except ValueError:
             return  # unknown mode string — PermissionPolicy will reject it just below
-        if mode not in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}:
+        if not self._is_unattended_mode(resolved):
             return
         if self.sandbox.is_enabled():
             return
@@ -481,19 +500,22 @@ class ReActAgent:
             logger.warning(
                 "permission mode %r runs without per-call confirmation AND without a "
                 "sandbox (explicit allow_unattended_unsandboxed opt-out)",
-                mode.value,
+                resolved.value,
             )
+            return
+        if self._unsandboxed_permission_ack:
             return
         reason = (
             self.sandbox.unavailable_reason()
             or "the sandbox is disabled ([sandbox] enabled = false)"
         )
         message = (
-            f"Permission mode '{mode.value}' executes commands without per-call "
+            f"Permission mode '{resolved.value}' executes commands without per-call "
             f"confirmation, but {reason}."
         )
         if self.ui.is_live and self.ui.confirm_action(message):
-            logger.warning("user confirmed running mode %r without a sandbox", mode.value)
+            self._unsandboxed_permission_ack = True
+            logger.warning("user confirmed running mode %r without a sandbox", resolved.value)
             return
         raise SandboxRequiredError(
             message
@@ -501,6 +523,41 @@ class ReActAgent:
             "attended permission mode, or opt out explicitly with [sandbox] "
             "allow_unattended_unsandboxed = true (env AGENT_SANDBOX_ALLOW_UNATTENDED=1)."
         )
+
+    def set_permission_mode(
+        self,
+        mode: PermissionMode | str,
+        *,
+        source: str = "api",
+    ) -> PermissionMode:
+        """Atomically switch configuration, execution policy, and web egress mode."""
+        target = PermissionMode(mode)
+        previous = PermissionMode(self.config.permission)
+        if target == previous:
+            return target
+
+        self._enforce_unattended_sandbox_requirement(target)
+        self.config.permission = target
+        self.permissions.mode = target
+        for tool in self.registry.list():
+            if isinstance(tool, WebPolicyAwareMixin):
+                tool.bind_web_policy(self.config.web, unattended=self._is_unattended_mode(target))
+        try:
+            self.logger.write_nowait(
+                "permission_mode",
+                {
+                    "from": previous.value,
+                    "to": target.value,
+                    "source": source,
+                    "sandboxed": self.sandbox.is_enabled(),
+                    "unsandboxed_ack": self._unsandboxed_permission_ack,
+                },
+            )
+        except OSError as exc:
+            # Audit is observational: an unwritable run directory must be visible,
+            # but must not leave the already-validated live policy half-switched.
+            logger.warning("could not write permission_mode audit event: %s", exc)
+        return target
 
     async def compact_now(self, messages: list[Message]) -> tuple[list[Message], int]:
         """Force a compaction fold of ``messages`` now, ignoring the token gate.
@@ -575,7 +632,10 @@ class ReActAgent:
         if self.ui.is_live:
             self.ui.bind_event_loop(asyncio.get_running_loop())
         user_message = Message("user", task)
-        messages: list[Message] = [Message("system", self.config.system_prompt), user_message]
+        system_prompt = self.config.system_prompt
+        if PermissionMode(self.config.permission) == PermissionMode.PLAN:
+            system_prompt += "\n\n" + PLAN_MODE_TEXT
+        messages: list[Message] = [Message("system", system_prompt), user_message]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
         # ``_recall``/``_inject_project_context`` position the recall and pinned
         # userContext blocks relative to the trailing user task, so the task must already
@@ -887,7 +947,11 @@ class ReActAgent:
 
             if cancelled():
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
-            tool_results = await self.executor.execute_many(result.tool_calls, should_cancel=cancelled)
+            tool_results = await self.executor.execute_many(
+                result.tool_calls,
+                should_cancel=cancelled,
+                messages=messages,
+            )
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 await self._emit(

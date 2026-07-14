@@ -49,7 +49,7 @@ def _session(**kw) -> SessionInfo:
 def test_slash_lists_commands_and_skills() -> None:
     skill = Skill(name="myskill", description="A skill", body="b")
     displays = {c.display_text for c in _complete(_agent(skills=[skill]), "/")}
-    assert {"/help", "/resume", "/model", "/skills"} <= displays
+    assert {"/help", "/resume", "/model", "/permissions", "/skills"} <= displays
     assert "/myskill" in displays
 
 
@@ -114,6 +114,13 @@ def test_resume_filters_by_typed_partial(monkeypatch) -> None:
 def test_resume_continue_alias_also_completes(monkeypatch) -> None:
     monkeypatch.setattr(completion_mod, "list_sessions", lambda _d: [_session()])
     assert len(_complete(_agent(), "/continue ")) == 1
+
+
+def test_permissions_completes_all_six_modes_and_filters_prefix() -> None:
+    all_modes = {completion.text for completion in _complete(_agent(), "/permissions ")}
+    assert all_modes == {"default", "acceptedits", "plan", "auto", "dontask", "bypass"}
+    filtered = _complete(_agent(), "/permissions a")
+    assert {completion.text for completion in filtered} == {"acceptedits", "auto"}
 
 
 def test_resume_no_session_dir_yields_nothing(monkeypatch) -> None:

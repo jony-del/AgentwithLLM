@@ -53,12 +53,39 @@ class MultiToolProvider:
         return LLMResult("done", stop_reason="end")
 
 
+class _CaptureSystemProvider:
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.messages = list(messages)
+        return LLMResult("plan ready", stop_reason="end")
+
+
 async def test_react_returns_final_answer_without_tools(tmp_path: Path) -> None:
     logger = JSONLRunLogger(tmp_path)
     agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger)
     result = await agent.run("hello")
     assert "Final answer" in result.answer
     assert logger.path.exists()
+
+
+async def test_plan_mode_injects_strict_read_only_guidance(tmp_path: Path) -> None:
+    provider = _CaptureSystemProvider()
+    agent = ReActAgent(
+        provider,
+        ReActConfig(
+            run_dir=str(tmp_path),
+            session_dir="",
+            permission="plan",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False,
+            git_context=False,
+        ),
+    )
+    await agent.run("investigate")
+    assert "Plan mode is active" in provider.messages[0].content
+    assert "Do not edit files" in provider.messages[0].content
 
 
 async def test_react_executes_demo_tool(tmp_path: Path) -> None:

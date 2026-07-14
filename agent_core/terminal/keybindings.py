@@ -8,6 +8,7 @@
 - ``Ctrl+D``                     exit the chat on an empty buffer (EOF); on a non-empty
                                   buffer it deletes the character under the cursor.
 - ``Ctrl+O``                     toggle verbose detail for subsequent turns.
+- ``Shift+Tab``                  cycle default/acceptedits/plan/auto modes.
 
 ``Shift+Enter`` requires a terminal that emits a distinct escape sequence for the
 shifted key.  Two common encodings are supported:
@@ -26,6 +27,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 
@@ -65,7 +67,10 @@ def _patch_ansi_sequences() -> None:
 _patch_ansi_sequences()
 
 
-def create_keybindings(on_toggle_verbose: Callable[[], None] | None = None) -> KeyBindings:
+def create_keybindings(
+    on_toggle_verbose: Callable[[], None] | None = None,
+    on_cycle_permission: Callable[[], None] | None = None,
+) -> KeyBindings:
     kb = KeyBindings()
 
     @kb.add("enter")
@@ -90,6 +95,20 @@ def create_keybindings(on_toggle_verbose: Callable[[], None] | None = None) -> K
             buffer.apply_completion(state.current_completion)
         else:
             buffer.start_completion(select_first=True)
+
+    @kb.add("s-tab")
+    def _(event) -> None:
+        if on_cycle_permission is None:
+            return
+
+        # The callback can show the one-time unsandboxed warning via input(). Suspend
+        # prompt_toolkit while it runs so the confirmation and the current edit buffer
+        # never compete for terminal input, then redraw the live bottom toolbar.
+        async def cycle() -> None:
+            await run_in_terminal(on_cycle_permission)
+            event.app.invalidate()
+
+        event.app.create_background_task(cycle())
 
     @kb.add("right")
     def _(event) -> None:

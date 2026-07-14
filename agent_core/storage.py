@@ -40,8 +40,17 @@ class JSONLRunLogger:
         The actual locked file append runs on a worker thread; the ``threading.Lock``
         keeps concurrent appends (from overlapping ``to_thread`` workers) atomic.
         """
+        await asyncio.to_thread(self.write_nowait, event, payload)
+
+    def write_nowait(self, event: str, payload: dict[str, Any]) -> None:
+        """Append one event synchronously from a synchronous control-path callback.
+
+        Runtime permission-mode changes originate inside prompt_toolkit key handlers,
+        where awaiting is not possible.  They are tiny, infrequent control events; the
+        same lock/flush path keeps them ordered with ordinary asynchronous records.
+        """
         record = {"ts": time.time(), "v": SCHEMA_VERSION, "event": event, **payload}
-        await asyncio.to_thread(self._write_sync, record)
+        self._write_sync(record)
 
     def _write_sync(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"

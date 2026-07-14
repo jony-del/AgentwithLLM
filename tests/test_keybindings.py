@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from prompt_toolkit.keys import Keys
@@ -25,9 +26,17 @@ class _Buffer:
 class _App:
     def __init__(self) -> None:
         self.exit_exception: type[BaseException] | None = None
+        self.tasks = []
+        self.invalidated = 0
 
     def exit(self, *, exception=None) -> None:
         self.exit_exception = exception
+
+    def create_background_task(self, coroutine) -> None:
+        self.tasks.append(asyncio.create_task(coroutine))
+
+    def invalidate(self) -> None:
+        self.invalidated += 1
 
 
 class _Event:
@@ -141,6 +150,25 @@ def test_tab_opens_completion_when_nothing_highlighted() -> None:
     buffer = _CompletionBuffer("/re", current_completion=None)
     handler(_Event(buffer))
     assert buffer.applied == [] and buffer.started == [True]
+
+
+async def test_shift_tab_cycles_permission_without_touching_buffer(monkeypatch) -> None:
+    calls = []
+
+    async def immediate(callback):
+        callback()
+
+    monkeypatch.setattr(keybindings, "run_in_terminal", immediate)
+    handler = _by_key(create_keybindings(on_cycle_permission=lambda: calls.append("cycle")), Keys.BackTab)
+    buffer = _CompletionBuffer("unfinished input", current_completion=None)
+    event = _Event(buffer)
+
+    handler(event)
+    await asyncio.gather(*event.app.tasks)
+
+    assert calls == ["cycle"]
+    assert buffer.text == "unfinished input"
+    assert event.app.invalidated == 1
 
 
 def test_right_accepts_highlighted_without_running() -> None:

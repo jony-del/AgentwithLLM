@@ -61,6 +61,38 @@ class PermissionMode(str, Enum):
     BYPASS = "bypass"
 
 
+PERMISSION_MODE_LABELS: dict[PermissionMode, str] = {
+    PermissionMode.DEFAULT: "manual mode on",
+    PermissionMode.ACCEPTEDITS: "accept edits on",
+    PermissionMode.PLAN: "plan mode on",
+    PermissionMode.AUTO: "auto mode on",
+    PermissionMode.DONTASK: "don't ask mode on",
+    PermissionMode.BYPASS: "bypass permissions on",
+}
+
+SHIFT_TAB_PERMISSION_MODES: tuple[PermissionMode, ...] = (
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPTEDITS,
+    PermissionMode.PLAN,
+    PermissionMode.AUTO,
+)
+
+
+def permission_mode_label(mode: PermissionMode | str) -> str:
+    """Return the exact user-facing status label for a permission mode."""
+    return PERMISSION_MODE_LABELS[PermissionMode(mode)]
+
+
+def next_shift_tab_permission_mode(mode: PermissionMode | str) -> PermissionMode:
+    """Cycle the four interactive modes; hidden modes return to ``default``."""
+    current = PermissionMode(mode)
+    try:
+        index = SHIFT_TAB_PERMISSION_MODES.index(current)
+    except ValueError:
+        return PermissionMode.DEFAULT
+    return SHIFT_TAB_PERMISSION_MODES[(index + 1) % len(SHIFT_TAB_PERMISSION_MODES)]
+
+
 @dataclass(slots=True)
 class PermissionDecision:
     allowed: bool
@@ -71,6 +103,10 @@ class PermissionDecision:
     # distinct from a hard deny (deny rule / mode matrix), which no hook may override.
     # The PermissionRequest hook seam treats ask_user OR ask_collapsed as "askable".
     ask_collapsed: bool = False
+    # Auto mode delegates otherwise-interactive actions to the asynchronous
+    # classifier in ToolExecutor.  This is deliberately distinct from ``ask``:
+    # classifier failures are hard denials and are never turned into a prompt.
+    classify: bool = False
 
 
 class PermissionPolicy:
@@ -115,15 +151,20 @@ class PermissionPolicy:
         if self.rules.deny_matches(name, arguments):
             return PermissionDecision(False, reason="denied by rule")
 
+        # Plan mode is genuinely read-only.  Put this before session/allow grants so
+        # an approval remembered in manual mode cannot leak into planning mode.
+        if self.mode == PermissionMode.PLAN and tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}:
+            return PermissionDecision(False, reason="plan mode is read-only")
+
         # 2. Secret safety net (bypass-immune, ALL risk classes): reading a
         #    secret-bearing path is an exfiltration channel, so even READ tools confirm.
         if _targets_secret_path(arguments):
-            return self._maybe_ask("accessing a secret-bearing path requires confirmation")
+            return self._ask_or_deny("accessing a secret-bearing path requires confirmation")
 
         # 3. Sensitive-path safety net (bypass-immune): writing a protected path
         #    always confirms.
         if tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS} and _targets_sensitive_path(arguments):
-            return self._maybe_ask("writing a protected path requires confirmation")
+            return self._ask_or_deny("writing a protected path requires confirmation")
 
         # 4. Session "always" grants — after deny and the safety nets, so neither
         #    can be washed out by an earlier broad confirmation.
@@ -133,7 +174,7 @@ class PermissionPolicy:
         # 5. Ask rules → confirm, UNLESS the command will run sandboxed (next step).
         sandbox_allows = self._sandbox_auto_allows(name, arguments)
         if self.rules.ask_matches(name, arguments) and not sandbox_allows:
-            return self._maybe_ask("confirmation required by rule")
+            return self._ask_or_deny("confirmation required by rule")
 
         # 6. Sandbox coupling: a command that will actually be sandboxed skips the prompt
         #    (the OS sandbox is the real boundary).
@@ -183,24 +224,30 @@ class PermissionPolicy:
     def _decide_by_mode(self, tool: "Tool") -> PermissionDecision:
         risk = tool.risk
         if self.mode == PermissionMode.PLAN:
-            if risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}:
-                return PermissionDecision(True, dry_run=True, reason="plan mode dry-run")
             return PermissionDecision(True, reason="plan mode read allowed")
         if self.mode == PermissionMode.ACCEPTEDITS:
-            if risk in {ToolRisk.READ, ToolRisk.WRITE}:
-                return PermissionDecision(True, reason="acceptedits allows read/write")
-            return self._maybe_ask("acceptedits requires confirmation for dangerous tools")
+            if risk == ToolRisk.READ:
+                return PermissionDecision(True, reason="acceptedits allows read tools")
+            if tool.accept_edits_safe:
+                return PermissionDecision(True, reason="acceptedits allows workspace file edits")
+            return self._ask_or_deny("acceptedits requires confirmation for non-edit actions")
         if self.mode == PermissionMode.AUTO:
-            if risk == ToolRisk.DANGEROUS:
-                return PermissionDecision(False, reason="auto denies dangerous tools")
-            return PermissionDecision(True, reason="auto allows read/write")
+            if risk == ToolRisk.READ:
+                return PermissionDecision(True, reason="auto allows read tools")
+            if tool.accept_edits_safe:
+                return PermissionDecision(True, reason="auto allows workspace file edits")
+            return PermissionDecision(
+                False,
+                classify=True,
+                reason="auto mode requires an automated safety classification",
+            )
         if self.mode == PermissionMode.DONTASK:
-            if risk == ToolRisk.DANGEROUS:
-                return PermissionDecision(False, reason="dontask denies dangerous tools")
-            return PermissionDecision(True, reason="dontask allows safe tools")
+            if risk == ToolRisk.READ:
+                return PermissionDecision(True, reason="dontask allows read tools")
+            return PermissionDecision(False, reason="dontask denies actions that require confirmation")
         if risk == ToolRisk.READ:
             return PermissionDecision(True, reason="default allows read tools")
-        return self._maybe_ask("default requires confirmation")
+        return self._ask_or_deny("default requires confirmation")
 
     def _sandbox_auto_allows(self, name: str, arguments: dict[str, Any]) -> bool:
         """True when ``name`` is a shell-command tool whose command will be sandboxed."""
@@ -229,6 +276,12 @@ class PermissionPolicy:
         if self.interactive:
             return PermissionDecision(False, ask_user=True, reason=reason)
         return PermissionDecision(False, reason=f"{reason}; non-interactive", ask_collapsed=True)
+
+    def _ask_or_deny(self, reason: str) -> PermissionDecision:
+        """Apply the final Don't Ask transformation to every ask-producing path."""
+        if self.mode == PermissionMode.DONTASK:
+            return PermissionDecision(False, reason=f"{reason}; dontask mode denies prompts")
+        return self._maybe_ask(reason)
 
 
 def _targets_secret_path(arguments: dict[str, Any]) -> bool:

@@ -27,6 +27,11 @@ from agent_core.config import (
     resolve_web_config,
 )
 from agent_core.permission_rules import RuleSet
+from agent_core.permissions import (
+    PermissionMode,
+    next_shift_tab_permission_mode,
+    permission_mode_label,
+)
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
 from agent_core.model_validation import PROVIDERS
@@ -40,6 +45,7 @@ from agent_core.providers import (
 )
 from agent_core.chat_commands import dispatch as dispatch_chat_command
 from agent_core.react import ReActAgent, ReActConfig
+from agent_core.sandbox import SandboxRequiredError
 from agent_core.tools.registry import ToolRegistry
 from agent_core.transcript import (
     build_chain,
@@ -330,6 +336,7 @@ async def _async_input(
     ui: "AgentUI | None" = None,
     completer: "Completer | None" = None,
     bottom_toolbar: "Callable[[], Any] | None" = None,
+    on_cycle_permission: "Callable[[], None] | None" = None,
 ) -> str | None:
     """Read one chat message without blocking the loop; ``None`` on EOF (exit).
 
@@ -353,11 +360,20 @@ async def _async_input(
     from agent_core.terminal.keybindings import create_keybindings
     from agent_core.terminal.theme import completion_menu_style
 
+    # PromptSession is cached for the life of the process. Keep the callback in a
+    # mutable function attribute so a later chat session cannot retain an old agent.
+    _async_input._on_cycle_permission = on_cycle_permission
+
+    def cycle_permission() -> None:
+        callback = getattr(_async_input, "_on_cycle_permission", None)
+        if callback is not None:
+            callback()
+
     session = getattr(_async_input, "_session", None)
     if session is None:
         toggle = getattr(ui, "toggle_verbose", None)
         session = PromptSession(
-            key_bindings=create_keybindings(toggle),
+            key_bindings=create_keybindings(toggle, cycle_permission),
             multiline=True,
             completer=completer,
             complete_while_typing=True,  # menu pops the moment '/' is typed
@@ -485,11 +501,31 @@ def chat_command(args: argparse.Namespace) -> int:
             # Persistent status line: the active model + effort, so the current config
             # (and the effect of the /model picker) is always visible. Read per render.
             effort = agent.config.effort or "—"
-            return f" model: {agent.config.model}  ·  effort: {effort}  ·  /help for commands "
+            mode = permission_mode_label(agent.config.permission)
+            return (
+                f" {mode}  ·  model: {agent.config.model}  ·  effort: {effort}  "
+                "·  /help for commands "
+            )
+
+        def _cycle_permission() -> None:
+            current = PermissionMode(agent.config.permission)
+            target = next_shift_tab_permission_mode(current)
+            try:
+                agent.set_permission_mode(target, source="shift_tab")
+            except SandboxRequiredError as exc:
+                # Most commonly the user declined the no-sandbox confirmation. The
+                # mode remains unchanged; surface the actionable gate message once.
+                print(f"[permission] {exc}")
 
         try:
             while True:
-                task = await _async_input("›", ui, completer, _toolbar)
+                task = await _async_input(
+                    "›",
+                    ui,
+                    completer,
+                    _toolbar,
+                    _cycle_permission,
+                )
                 if task is None:  # EOF
                     break
                 task = task.strip()
