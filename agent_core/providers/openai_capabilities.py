@@ -6,7 +6,7 @@ from typing import Any
 
 OPENAI_REASONING_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
+REASONING_MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
     # GPT-5.6
     "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
     "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
@@ -36,6 +36,20 @@ MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
     "o3": ("low", "medium", "high"),
 }
 
+NON_REASONING_MODELS: tuple[str, ...] = (
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+)
+
+OPENAI_MODEL_EFFORT_OPTIONS: dict[str, tuple[str, ...]] = {
+    **REASONING_MODEL_EFFORTS,
+    **{model: () for model in NON_REASONING_MODELS},
+}
+
+# Backward-compatible alias for callers that need picker-facing effort options.
+MODEL_EFFORTS = OPENAI_MODEL_EFFORT_OPTIONS
+
 
 @dataclass(frozen=True, slots=True)
 class OpenAIResponsesCapabilities:
@@ -61,15 +75,18 @@ def _normalize_model_id(model: str | None) -> str:
 def capabilities_for_responses_model(model: str | None) -> OpenAIResponsesCapabilities:
     """Return the conservative Responses API capability profile for ``model``."""
 
-    efforts = MODEL_EFFORTS.get(_normalize_model_id(model))
-    if efforts is None:
-        return _DEFAULT_RESPONSES_CAPABILITIES
-    return OpenAIResponsesCapabilities(
-        supports_reasoning=True,
-        reasoning_efforts=efforts,
-        include_encrypted_reasoning=True,
-        supports_reasoning_summary=True,
-    )
+    model_id = _normalize_model_id(model)
+    efforts = REASONING_MODEL_EFFORTS.get(model_id)
+    if efforts is not None:
+        return OpenAIResponsesCapabilities(
+            supports_reasoning=True,
+            reasoning_efforts=efforts,
+            include_encrypted_reasoning=True,
+            supports_reasoning_summary=True,
+        )
+    # Known non-reasoning models and unknown models both get the fail-safe shape:
+    # no reasoning-only fields and no encrypted reasoning replay.
+    return _DEFAULT_RESPONSES_CAPABILITIES
 
 
 def reasoning_effort_for_model(model: str | None, level: Any) -> str | None:

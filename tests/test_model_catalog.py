@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent_core.model_catalog import openai_available_efforts, picker_spec_for_provider
 from agent_core.providers.claude import (
     ALL_EFFORT_LEVELS,
     _effort_for_model,
@@ -49,3 +50,20 @@ def test_available_efforts_never_drifts_from_effort_gating() -> None:
             level for level in ALL_EFFORT_LEVELS if _effort_for_model(model, level) == level
         )
         assert available_efforts(model) == expected
+
+
+def test_openai_picker_efforts_use_responses_capabilities() -> None:
+    spec = picker_spec_for_provider("openai")
+
+    assert spec is not None
+    assert spec.efforts_fn is openai_available_efforts
+    assert spec.efforts_fn("gpt-5.6") == ("none", "low", "medium", "high", "xhigh", "max")
+    assert spec.efforts_fn("gpt-4.1-nano") == ()
+    assert spec.efforts_fn("custom-model") == ()
+
+
+def test_picker_specs_are_selected_only_by_explicit_provider() -> None:
+    assert picker_spec_for_provider("claude") is not None
+    assert picker_spec_for_provider("openai") is not None
+    assert picker_spec_for_provider("openai-compat") is None
+    assert picker_spec_for_provider("fake") is None

@@ -4,7 +4,10 @@ import pytest
 
 from agent_core.providers.openai_capabilities import (
     MODEL_EFFORTS,
+    NON_REASONING_MODELS,
+    OPENAI_MODEL_EFFORT_OPTIONS,
     OPENAI_REASONING_EFFORT_LEVELS,
+    REASONING_MODEL_EFFORTS,
     OpenAIResponsesCapabilities,
     capabilities_for_responses_model,
     reasoning_effort_for_model,
@@ -12,7 +15,7 @@ from agent_core.providers.openai_capabilities import (
 )
 
 
-@pytest.mark.parametrize("model,efforts", MODEL_EFFORTS.items())
+@pytest.mark.parametrize("model,efforts", REASONING_MODEL_EFFORTS.items())
 def test_reasoning_models_use_model_specific_reasoning_profile(
     model: str, efforts: tuple[str, ...]
 ) -> None:
@@ -26,6 +29,14 @@ def test_reasoning_models_use_model_specific_reasoning_profile(
     )
     assert supports_reasoning_replay(model) is True
     assert set(efforts).issubset(OPENAI_REASONING_EFFORT_LEVELS)
+
+
+def test_picker_model_effort_options_include_reasoning_and_non_reasoning_models() -> None:
+    assert MODEL_EFFORTS is OPENAI_MODEL_EFFORT_OPTIONS
+    for model, efforts in REASONING_MODEL_EFFORTS.items():
+        assert OPENAI_MODEL_EFFORT_OPTIONS[model] == efforts
+    for model in NON_REASONING_MODELS:
+        assert OPENAI_MODEL_EFFORT_OPTIONS[model] == ()
 
 
 @pytest.mark.parametrize(

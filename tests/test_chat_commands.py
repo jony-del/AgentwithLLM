@@ -22,6 +22,16 @@ def _agent(skills=None, **config_kwargs) -> ReActAgent:
     return agent
 
 
+class PickingUI(NullUI):
+    def __init__(self, choice: tuple[str, str | None] | None) -> None:
+        self.choice = choice
+        self.seen_specs = []
+
+    async def pick_model(self, current_model, current_effort, spec):
+        self.seen_specs.append((current_model, current_effort, spec))
+        return self.choice
+
+
 # --- plain text & skills -----------------------------------------------------
 
 
@@ -133,6 +143,72 @@ async def test_model_accepts_openai_model_without_switching_provider(capsys) -> 
     await dispatch("/model gpt-5.1", agent, NullUI(), [])
     assert agent.config.provider == "openai"
     assert agent.config.model == "gpt-5.1"
+    assert "switched" in capsys.readouterr().out.lower()
+
+
+async def test_model_opens_openai_picker_and_updates_effort(capsys) -> None:
+    agent = _agent(provider="openai", model="gpt-4.1-nano", effort="high")
+    ui = PickingUI(("gpt-5.6", "max"))
+
+    await dispatch("/model", agent, ui, [])
+
+    assert agent.config.provider == "openai"
+    assert agent.config.model == "gpt-5.6"
+    assert agent.config.effort == "max"
+    assert len(ui.seen_specs) == 1
+    current_model, current_effort, spec = ui.seen_specs[0]
+    assert current_model == "gpt-4.1-nano"
+    assert current_effort == "high"
+    assert "OpenAI Responses" in spec.title
+    assert spec.efforts_fn("gpt-5.6") == ("none", "low", "medium", "high", "xhigh", "max")
+    assert "switched" in capsys.readouterr().out.lower()
+
+
+async def test_model_openai_picker_clears_effort_for_no_effort_model(capsys) -> None:
+    agent = _agent(provider="openai", model="gpt-5.6", effort="max")
+    ui = PickingUI(("gpt-4.1-nano", None))
+
+    await dispatch("/model", agent, ui, [])
+
+    assert agent.config.provider == "openai"
+    assert agent.config.model == "gpt-4.1-nano"
+    assert agent.config.effort is None
+    assert "(no effort levels)" in capsys.readouterr().out
+
+
+async def test_model_openai_picker_cancel_leaves_config_unchanged(capsys) -> None:
+    agent = _agent(provider="openai", model="gpt-4.1-nano", effort="high")
+    ui = PickingUI(None)
+
+    await dispatch("/model", agent, ui, [])
+
+    assert agent.config.provider == "openai"
+    assert agent.config.model == "gpt-4.1-nano"
+    assert agent.config.effort == "high"
+    out = capsys.readouterr().out
+    assert "Current provider/model: openai / gpt-4.1-nano" in out
+    assert "Known model families:" in out
+
+
+async def test_model_openai_compat_without_args_stays_non_interactive(capsys) -> None:
+    agent = _agent(provider="openai-compat", model="local-model")
+    ui = PickingUI(("should-not-be-used", "high"))
+
+    await dispatch("/model", agent, ui, [])
+
+    assert agent.config.model == "local-model"
+    assert ui.seen_specs == []
+    assert "Switch with: /model <non-empty model id>" in capsys.readouterr().out
+
+
+async def test_model_explicit_openai_switch_preserves_effort(capsys) -> None:
+    agent = _agent(provider="openai", model="gpt-5.6", effort="max")
+
+    await dispatch("/model custom-openai-model", agent, NullUI(), [])
+
+    assert agent.config.provider == "openai"
+    assert agent.config.model == "custom-openai-model"
+    assert agent.config.effort == "max"
     assert "switched" in capsys.readouterr().out.lower()
 
 

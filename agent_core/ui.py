@@ -118,7 +118,7 @@ class AgentUI:
         return False
 
     async def pick_model(
-        self, current_model: str, current_effort: str | None
+        self, current_model: str, current_effort: str | None, spec: Any
     ) -> tuple[str, str | None] | None:
         """Interactively choose a model + reasoning effort.
 
@@ -214,13 +214,20 @@ class ConsoleUI(AgentUI):
         self._renderer.end_compaction(before_chars, after_chars, detail, reactive)
 
     async def pick_model(
-        self, current_model: str, current_effort: str | None
+        self, current_model: str, current_effort: str | None, spec: Any
     ) -> tuple[str, str | None] | None:
         # Runs on the main event loop (called directly from the chat dispatch), so no
         # thread bridging is needed. Non-TTY is handled inside run_model_picker → None.
         from agent_core.terminal.model_picker import run_model_picker
 
-        return await run_model_picker(current_model, current_effort)
+        return await run_model_picker(
+            current_model,
+            current_effort,
+            models=spec.models,
+            efforts_fn=spec.efforts_fn,
+            title=spec.title,
+            help_text=spec.help_text,
+        )
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission

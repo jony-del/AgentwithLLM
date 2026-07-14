@@ -2,9 +2,8 @@
 
 Split into a pure state machine (:class:`ModelPicker`, fully unit-testable without a
 terminal) and a thin prompt_toolkit ``Application`` runner (:func:`run_model_picker`).
-Each model exposes a different effort set (Haiku has none); the available levels come
-from :func:`agent_core.providers.claude.available_efforts` so the picker can only ever
-offer what the provider will actually send.
+Each provider supplies its own model list and effort function so the picker can only
+ever offer what that provider will actually send.
 """
 from __future__ import annotations
 
@@ -132,6 +131,8 @@ async def run_model_picker(
     *,
     models: Sequence[tuple[str, str]] = SELECTABLE_MODELS,
     efforts_fn: Callable[[str], tuple[str, ...]] = available_efforts,
+    title: str = "Select a model and reasoning effort",
+    help_text: str = "↑/↓ model · ←/→ effort · Enter confirm · Esc cancel",
 ) -> tuple[str, str | None] | None:
     """Drive the picker in a prompt_toolkit ``Application``; ``None`` if cancelled.
 
@@ -152,8 +153,8 @@ async def run_model_picker(
 
     def fragments() -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = [
-            ("bold", "Select a model and reasoning effort\n"),
-            ("fg:#808080", "↑/↓ model · ←/→ effort · Enter confirm · Esc cancel\n\n"),
+            ("bold", f"{title}\n"),
+            ("fg:#808080", f"{help_text}\n\n"),
         ]
         for row in picker.rows():
             marker = "❯ " if row.selected else "  "

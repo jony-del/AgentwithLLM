@@ -353,7 +353,7 @@ preview_chars = 4000          # head kept inline in the pointer (pointer mode on
 # call per tool batch and only helps when a live terminal UI is attached.
 
 # The tool_use_summary for the agent's nth operation appears before the output for the (n+1)th
-# operation, which can confuse users (leading them to mistakenly believe it is the (n+1)th operation),
+# operation, which can confuse users (leading them to mistakenly believe it is the (n+1)th operation), 
 # so set it to false.
 [tool_use_summary]
 enabled = false                       # opt-in; also requires a live UI + a real provider
