@@ -9,9 +9,11 @@ obtain a release bundle.
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hashlib
 import json
+import locale
 import os
 import platform
 import shutil
@@ -41,6 +43,12 @@ EXIT_USAGE = 2
 EXIT_FAILED = 10
 EXIT_RESTART_REQUIRED = 20
 EXIT_UNSUPPORTED = 30
+STATE_SCHEMA = 2
+PACKAGE_NAME = "agent-with-llm"
+
+WINDOWS_UAC_CANCELLED = 1223
+WINDOWS_UAC_CANCELLED_HRESULT = 0x800704C7
+WINDOWS_SUCCESS_OR_REBOOT_CODES = frozenset({0, 1641, 3010})
 
 GITHUB_API = "https://api.github.com"
 NODE_DIST = "https://nodejs.org/dist"
@@ -82,32 +90,70 @@ class StateStore:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_state_path()
-        self.data: dict[str, Any] = {"schema": 1, "completed": {}, "components": {}}
+        self.data: dict[str, Any] = {
+            "schema": STATE_SCHEMA,
+            "completed": {},
+            "components": {},
+        }
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, ValueError):
             return
-        if isinstance(loaded, dict) and loaded.get("schema") == 1:
-            self.data.update(loaded)
+        if not isinstance(loaded, dict) or loaded.get("schema") not in {1, STATE_SCHEMA}:
+            return
+        completed = loaded.get("completed", {})
+        components = loaded.get("components", {})
+        if isinstance(completed, dict):
+            self.data["completed"] = completed
+        if isinstance(components, dict):
+            self.data["components"] = components
+        if loaded.get("schema") == 1:
+            # Old receipts asserted ownership without recording an exact target. Keep
+            # them for diagnostics, but never use them for upgrades or deletion until
+            # the installer/uninstaller can independently prove the target.
+            for item in self.data["components"].values():
+                if isinstance(item, dict) and item.get("installed_by_polaris"):
+                    item["legacy_unverified"] = True
 
     def completed(self, step: str) -> bool:
         return bool(self.data.get("completed", {}).get(step))
 
     def component_owned(self, name: str) -> bool:
         item = self.data.get("components", {}).get(name, {})
-        return bool(item.get("installed_by_polaris"))
+        return bool(
+            item.get("installed_by_polaris") and not item.get("legacy_unverified")
+        )
 
-    def mark(self, step: str, *, component: str | None = None, source: str = "") -> None:
+    def component(self, name: str) -> dict[str, Any]:
+        item = self.data.get("components", {}).get(name, {})
+        return dict(item) if isinstance(item, dict) else {}
+
+    def mark(
+        self,
+        step: str,
+        *,
+        component: str | None = None,
+        source: str = "",
+        installed_by_polaris: bool = True,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.data.setdefault("completed", {})[step] = int(time.time())
         if component:
-            self.data.setdefault("components", {})[component] = {
-                "installed_by_polaris": True,
+            receipt = {
+                "installed_by_polaris": installed_by_polaris,
                 "source": source,
                 "updated_at": int(time.time()),
             }
+            if details:
+                receipt.update(details)
+            components = self.data.setdefault("components", {})
+            if component == "polaris":
+                components.pop("polaris-dev", None)
+            components[component] = receipt
         self.save()
 
     def save(self) -> None:
+        self.data["schema"] = STATE_SCHEMA
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
@@ -133,9 +179,11 @@ class Runner:
         mutates: bool = False,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        display_argv: Sequence[str | os.PathLike[str]] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         rendered = [str(item) for item in argv]
-        print("+", subprocess.list2cmdline(rendered))
+        displayed = [str(item) for item in display_argv] if display_argv else rendered
+        print("+", subprocess.list2cmdline(displayed))
         if self.dry_run and mutates:
             return subprocess.CompletedProcess(rendered, 0, "", "")
         try:
@@ -143,7 +191,6 @@ class Runner:
                 rendered,
                 cwd=str(cwd) if cwd else None,
                 env=env,
-                text=True,
                 capture_output=capture,
                 check=False,
             )
@@ -151,6 +198,13 @@ class Runner:
             if check:
                 raise InstallError(f"could not run {rendered[0]}: {exc}") from exc
             return subprocess.CompletedProcess(rendered, 127, "", str(exc))
+        if capture:
+            proc = subprocess.CompletedProcess(
+                proc.args,
+                proc.returncode,
+                decode_process_output(proc.stdout),
+                decode_process_output(proc.stderr),
+            )
         if check and proc.returncode:
             detail = (proc.stderr or proc.stdout or "").strip()
             raise InstallError(
@@ -256,18 +310,25 @@ class Installer:
         ]
         if not missing and not upgrades:
             return
+        newly_owned: set[str] = set()
         if missing:
-            self._install_packages(missing, upgrade=False)
+            newly_owned = self._install_packages(missing, upgrade=False)
         if upgrades:
             self._install_packages(upgrades, upgrade=True)
         if not self.options.dry_run:
             refresh_windows_path()
-        for name in (*missing, *upgrades):
+        if self.options.dry_run:
+            return
+        for name in missing:
             self.state.mark(
-                f"host:{name}", component=name, source=self.package_family
-            ) if not self.options.dry_run else None
+                f"host:{name}",
+                component=name if name in newly_owned else None,
+                source=self.package_family,
+            )
+        for name in upgrades:
+            self.state.mark(f"host:{name}")
 
-    def _install_packages(self, names: list[str], *, upgrade: bool = False) -> None:
+    def _install_packages(self, names: list[str], *, upgrade: bool = False) -> set[str]:
         package_map = {
             "winget": {"git": "Git.Git", "rg": "BurntSushi.ripgrep.MSVC", "podman": "RedHat.Podman"},
             "brew": {"git": "git", "rg": "ripgrep", "podman": "podman"},
@@ -283,21 +344,17 @@ class Installer:
                     "WinGet is required. Install Microsoft App Installer, then rerun this command."
                 )
             verb = "upgrade" if upgrade else "install"
-            for package in packages:
-                self.runner.run(
-                    [
-                        "winget",
-                        verb,
-                        "--id",
-                        package,
-                        "--exact",
-                        "--accept-package-agreements",
-                        "--accept-source-agreements",
-                    ],
-                    check=True,
-                    mutates=True,
-                )
-            return
+            preexisting = {
+                name: self._winget_package_registered(package)
+                for name, package in zip(names, packages, strict=True)
+            }
+            for name, package in zip(names, packages, strict=True):
+                self._install_winget_package(name, package, verb=verb)
+            return {
+                name
+                for name in names
+                if not upgrade and not preexisting.get(name, False)
+            }
         if self.package_family == "brew":
             self._ensure_homebrew()
             verb = "upgrade" if upgrade else "install"
@@ -305,7 +362,7 @@ class Installer:
                 result = self.runner.run(["brew", verb, package], capture=True, mutates=True)
                 if result.returncode and "already installed" not in (result.stderr or ""):
                     raise InstallError(result.stderr.strip() or f"brew {verb} {package} failed")
-            return
+            return set() if upgrade else set(names)
 
         prefix = self._sudo_prefix()
         if self.package_family == "apt":
@@ -319,6 +376,77 @@ class Installer:
             self.runner.run(
                 [*prefix, "dnf", verb, "-y", *packages], check=True, mutates=True
             )
+        return set() if upgrade else set(names)
+
+    def _winget_package_registered(self, package: str) -> bool:
+        """Probe an exact package id before mutation without parsing localized text."""
+
+        result = self.runner.run(
+            [
+                "winget",
+                "list",
+                "--id",
+                package,
+                "--exact",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+            ],
+            capture=True,
+        )
+        return result.returncode == 0
+
+    def _install_winget_package(self, command: str, package: str, *, verb: str) -> None:
+        """Install one WinGet package and judge success by the usable command.
+
+        ``winget install`` changes to its upgrade flow when its database already has
+        a package record.  A fully up-to-date package then returns a non-zero code,
+        even though the requested command may already be usable.  Conversely, stale
+        portable-package records can say "installed" while the executable and shim
+        are gone.  Neither case can be handled reliably by parsing localized output,
+        so probe the postcondition and use one forced reinstall only when necessary.
+        """
+
+        base = [
+            "winget",
+            verb,
+            "--id",
+            package,
+            "--exact",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]
+        result = self.runner.run(base, mutates=True)
+        if self.options.dry_run:
+            return
+
+        refresh_windows_path()
+        if self.runner.which(command) is not None:
+            if result.returncode:
+                print(
+                    f"WinGet returned {format_windows_exit_code(result.returncode)} for "
+                    f"{package}, but {command} is available; continuing."
+                )
+            return
+
+        # The WinGet registration exists but its portable payload or command shim may
+        # be missing.  --force keeps the command in the install flow and recreates the
+        # current version instead of switching to a no-op upgrade.
+        print(f"WinGet did not expose {command}; repairing {package} with a forced reinstall...")
+        repair_command = ["winget", "install", *base[2:], "--force"]
+        repair = self.runner.run(repair_command, mutates=True)
+        refresh_windows_path()
+        if self.runner.which(command) is not None:
+            return
+
+        codes = (
+            f"initial={format_windows_exit_code(result.returncode)}, "
+            f"repair={format_windows_exit_code(repair.returncode)}"
+        )
+        raise InstallError(
+            f"WinGet could not make {command} available after reinstalling {package} "
+            f"({codes}). The WinGet package record may be damaged. Run "
+            f"'winget uninstall --id {package} --exact', then rerun this installer."
+        )
 
     def _ensure_homebrew(self) -> None:
         if self.runner.which("brew"):
@@ -377,8 +505,19 @@ class Installer:
                 shutil.rmtree(destination)
             shutil.move(str(unpacked), destination)
         node_bin = destination if self.system == "windows" else destination / "bin"
-        expose_node(node_bin, self.system)
-        self.state.mark("runtime:node", component="node", source="nodejs.org")
+        links = expose_node(node_bin, self.system)
+        self.state.mark(
+            "runtime:node",
+            component="node",
+            source="nodejs.org",
+            details={
+                "install_kind": "managed-runtime",
+                "path": str(destination.resolve()),
+                "bin": str(node_bin.resolve()),
+                "links": [str(link.absolute()) for link in links],
+                "path_entry": str(node_bin.resolve()) if self.system == "windows" else "",
+            },
+        )
 
     def _ensure_container_runtime(self) -> str:
         # Reuse any engine that is already *usable* before trying to repair a dormant
@@ -395,17 +534,22 @@ class Installer:
             self._ensure_podman_machine()
             runtime = self._select_usable_runtime()
         if runtime is None:
+            podman_owned = False
             if self.system == "windows":
                 self._ensure_windows_wsl()
             if self.system == "darwin":
                 self._install_macos_podman()
+                podman_owned = True
             else:
-                self._install_packages(["podman"])
+                podman_owned = "podman" in self._install_packages(["podman"])
             if not self.options.dry_run:
                 refresh_windows_path()
-            self.state.mark(
-                "host:podman", component="podman", source=self.package_family
-            ) if not self.options.dry_run else None
+            if not self.options.dry_run:
+                self.state.mark(
+                    "host:podman",
+                    component="podman" if podman_owned else None,
+                    source=self.package_family,
+                )
             if not self.options.dry_run and self.system in {"windows", "darwin"}:
                 self._ensure_podman_machine()
             runtime = (
@@ -454,27 +598,173 @@ class Installer:
                 raise InstallError(start.stderr.strip() or "could not start the Podman machine")
 
     def _ensure_windows_wsl(self) -> None:
-        if self.runner.run(["wsl", "--status"], capture=True).returncode == 0:
+        status = self.runner.run(["wsl", "--status"], capture=True)
+        if status.returncode == 0:
             return
         if self.options.non_interactive:
-            raise InstallError("WSL2 is unavailable; run wsl --install --no-distribution as administrator")
-        self._run_windows_elevated("wsl.exe", ["--update"])
-        self._run_windows_elevated("wsl.exe", ["--install", "--no-distribution"])
-        if not self.options.dry_run:
-            self.state.mark("windows:wsl-enabled", component="wsl2", source="windows")
-            raise RestartRequired("WSL2 was enabled; restart Windows and run the same command again")
+            detail = (status.stderr or status.stdout or "").strip()
+            message = (
+                "WSL2 is unavailable; run wsl --install --no-distribution as administrator"
+            )
+            raise InstallError(message + (f"\n{detail}" if detail else ""))
 
-    def _run_windows_elevated(self, executable: str, arguments: list[str]) -> None:
-        quoted = ",".join("'" + item.replace("'", "''") + "'" for item in arguments)
-        script = (
-            f"$p=Start-Process -FilePath '{executable}' -ArgumentList @({quoted}) "
-            "-Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+        # ``wsl --update`` fails when WSL has not been installed yet.  Use
+        # ``--version`` to distinguish a present-but-unhealthy installation from an
+        # absent one, then perform exactly the applicable elevated action.
+        version = self.runner.run(["wsl", "--version"], capture=True)
+        if version.returncode == 0:
+            arguments = ["--update"]
+            result = self._run_windows_elevated("wsl.exe", arguments)
+            if self.options.dry_run:
+                return
+            self._raise_if_uac_cancelled("wsl.exe", arguments, result)
+            if self.runner.run(["wsl", "--status"], capture=True).returncode == 0:
+                self.state.mark("windows:wsl-updated", component="wsl2", source="windows")
+                return
+            if windows_process_succeeded(result.returncode):
+                self.state.mark("windows:wsl-updated", component="wsl2", source="windows")
+                raise RestartRequired(
+                    "WSL2 was updated but is not available yet; restart Windows and run "
+                    "the same command again"
+                )
+            raise InstallError(
+                "WSL2 is installed but its elevated update failed.\n\n"
+                + format_windows_command_diagnostic("wsl.exe", arguments, result)
+            )
+
+        attempts: list[tuple[list[str], subprocess.CompletedProcess[str]]] = []
+        install_commands = (
+            ["--install", "--no-distribution"],
+            ["--install", "--no-distribution", "--inbox"],
         )
-        self.runner.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-            check=True,
-            mutates=True,
+        for arguments in install_commands:
+            result = self._run_windows_elevated("wsl.exe", arguments)
+            if self.options.dry_run:
+                return
+            self._raise_if_uac_cancelled("wsl.exe", arguments, result)
+            attempts.append((arguments, result))
+
+            # The postcondition wins over the process code. Some Windows servicing
+            # paths return a failure-looking code even though WSL became available.
+            if self.runner.run(["wsl", "--status"], capture=True).returncode == 0:
+                source = "windows-inbox" if "--inbox" in arguments else "windows"
+                self.state.mark("windows:wsl-enabled", component="wsl2", source=source)
+                return
+            if windows_process_succeeded(result.returncode):
+                source = "windows-inbox" if "--inbox" in arguments else "windows"
+                self.state.mark("windows:wsl-enabled", component="wsl2", source=source)
+                raise RestartRequired(
+                    "Windows accepted the WSL2 installation "
+                    f"({format_windows_exit_code(result.returncode)}), but WSL is not "
+                    "available yet; restart Windows and run the same command again"
+                )
+
+        diagnostics = "\n\n".join(
+            format_windows_command_diagnostic("wsl.exe", arguments, result)
+            for arguments, result in attempts
         )
+        raise InstallError(
+            "WSL2 installation failed through both the standard and Windows inbox paths.\n\n"
+            + diagnostics
+        )
+
+    def _raise_if_uac_cancelled(
+        self,
+        executable: str,
+        arguments: list[str],
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if not is_windows_uac_cancelled(result.returncode):
+            return
+        raise InstallError(
+            "Administrator approval was canceled (Windows error 1223 / 0x000004C7). "
+            "No further WSL system changes were attempted. Rerun the installer and "
+            "approve the UAC prompt, or use -SkipSandbox if no container sandbox is needed.\n\n"
+            + format_windows_command_diagnostic(executable, arguments, result)
+        )
+
+    def _run_windows_elevated(
+        self, executable: str, arguments: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one command through UAC while preserving its real output.
+
+        ``Start-Process -Verb RunAs`` cannot directly redirect standard handles. Run a
+        small elevated PowerShell wrapper instead; that wrapper starts the target with
+        separate output files and returns its exit code to the non-elevated parent.
+        """
+
+        target = [executable, *arguments]
+        with tempfile.TemporaryDirectory(prefix="polaris-elevated-") as raw_tmp:
+            capture_dir = Path(raw_tmp)
+            stdout_path = capture_dir / "stdout.bin"
+            stderr_path = capture_dir / "stderr.bin"
+            quoted_arguments = ",".join(
+                powershell_string_literal(item) for item in arguments
+            )
+            argument_clause = (
+                f" -ArgumentList @({quoted_arguments})" if quoted_arguments else ""
+            )
+            exception_code_script = (
+                "$exception=$_.Exception;$code=1;$cursor=$exception;"
+                "while ($null -ne $cursor) {"
+                "if ($cursor -is [System.ComponentModel.Win32Exception] "
+                "-and $cursor.NativeErrorCode -ne 0) {$code=$cursor.NativeErrorCode};"
+                "if (($cursor.HResult -band 0xFFFF) -eq 1223) {$code=1223;break};"
+                "$cursor=$cursor.InnerException};"
+            )
+            inner_script = (
+                "$ErrorActionPreference='Stop';"
+                "try {"
+                f"$p=Start-Process -FilePath {powershell_string_literal(executable)}"
+                f"{argument_clause}"
+                f" -RedirectStandardOutput {powershell_string_literal(str(stdout_path))}"
+                f" -RedirectStandardError {powershell_string_literal(str(stderr_path))}"
+                " -WindowStyle Hidden -Wait -PassThru;exit $p.ExitCode"
+                "} catch {"
+                f"{exception_code_script}"
+                f"[System.IO.File]::WriteAllText({powershell_string_literal(str(stderr_path))},"
+                "$exception.Message + [Environment]::NewLine,[System.Text.Encoding]::Unicode);"
+                "exit $code}"
+            )
+            encoded_script = base64.b64encode(inner_script.encode("utf-16le")).decode("ascii")
+            target_description = subprocess.list2cmdline(target)
+            outer_script = (
+                "$ErrorActionPreference='Stop';"
+                f"$targetDescription={powershell_string_literal(target_description)};"
+                "try {"
+                "$p=Start-Process -FilePath 'powershell.exe' "
+                f"-ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded_script}') "
+                "-Verb RunAs -WindowStyle Hidden -Wait -PassThru;exit $p.ExitCode"
+                "} catch {"
+                f"{exception_code_script}"
+                "[Console]::Error.WriteLine($exception.Message);exit $code}"
+            )
+            launcher = self.runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    outer_script,
+                ],
+                capture=True,
+                mutates=True,
+                display_argv=["[administrator]", *target],
+            )
+
+            capture_errors: list[str] = []
+            stdout = read_captured_process_output(stdout_path, "stdout", capture_errors)
+            stderr = read_captured_process_output(stderr_path, "stderr", capture_errors)
+            stdout = combine_process_output(stdout, decode_process_output(launcher.stdout))
+            stderr = combine_process_output(stderr, decode_process_output(launcher.stderr))
+            if capture_errors:
+                stderr = combine_process_output(stderr, "\n".join(capture_errors))
+            return subprocess.CompletedProcess(
+                target,
+                normalize_uac_cancelled_code(launcher.returncode),
+                stdout,
+                stderr,
+            )
 
     def _install_macos_podman(self) -> None:
         if self.options.dry_run:
@@ -512,35 +802,113 @@ class Installer:
         if not (source / "pyproject.toml").is_file():
             raise InstallError(f"project source is missing pyproject.toml: {source}")
         spec = f"{source}[all,dev]" if self.options.dev else f"{source}[all]"
+        uv = self.runner.which("uv") or "uv"
         if self.options.dev:
             venv = source / ".venv"
             self.runner.run(
-                ["uv", "venv", "--python", PYTHON_SERIES, venv],
+                [uv, "venv", "--python", PYTHON_SERIES, venv],
                 check=True,
                 mutates=True,
             )
             python = venv_python(venv, self.system)
             self.runner.run(
-                ["uv", "pip", "install", "--python", python, "-e", spec],
+                [uv, "pip", "install", "--python", python, "-e", spec],
                 check=True,
                 mutates=True,
             )
             if not self.options.dry_run:
-                self.state.mark("project:dev", component="polaris-dev", source=str(source))
+                executable = python.parent / (
+                    "polaris.exe" if self.system == "windows" else "polaris"
+                )
+                if not venv.is_dir() or not executable.exists():
+                    raise InstallError(
+                        "uv completed the development install but its Polaris command is missing"
+                    )
+                marker = {
+                    "schema": 1,
+                    "package": PACKAGE_NAME,
+                    "source": str(source),
+                }
+                (venv / ".polaris-install.json").write_text(
+                    json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                self.state.mark(
+                    "project:dev",
+                    component="polaris",
+                    source=str(source),
+                    details={
+                        "install_kind": "dev-venv",
+                        "package": PACKAGE_NAME,
+                        "executable": str(executable.resolve()),
+                        "environment": str(venv.resolve()),
+                        "uv": str(Path(uv).resolve()),
+                        "bootstrap_python": str(Path(sys.executable).resolve()),
+                    },
+                )
             return
         existing = self._project_command()
         owned = self.state.component_owned("polaris")
         if existing and (not self.options.upgrade or not owned):
             suffix = " (not installer-owned; left unchanged)" if self.options.upgrade else ""
             print(f"Reusing existing Polaris command: {existing}{suffix}")
+            if not self.options.dry_run:
+                self.state.mark(
+                    "project:external",
+                    component="polaris",
+                    source=str(source),
+                    installed_by_polaris=False,
+                    details={
+                        "install_kind": "external",
+                        "package": PACKAGE_NAME,
+                        "executable": str(Path(existing).resolve()),
+                        "environment": str(Path(sys.prefix).resolve()),
+                    },
+                )
             return
-        args = ["uv", "tool", "install", "--python", PYTHON_SERIES]
+        args = [uv, "tool", "install", "--python", PYTHON_SERIES]
         if self.options.upgrade and owned:
             args.append("--force")
         args.append(spec)
         self.runner.run(args, check=True, mutates=True)
         if not self.options.dry_run:
-            self.state.mark("project:tool", component="polaris", source=str(source))
+            tool_root = self._uv_tool_directory(uv, ["tool", "dir"])
+            bin_dir = self._uv_tool_directory(uv, ["tool", "dir", "--bin"])
+            executable = bin_dir / (
+                "polaris.exe" if self.system == "windows" else "polaris"
+            )
+            environment = tool_root / PACKAGE_NAME
+            if not executable.exists() or not environment.is_dir():
+                raise InstallError(
+                    "uv installed Polaris but its isolated environment or command is missing"
+                )
+            self.state.mark(
+                "project:tool",
+                component="polaris",
+                source=str(source),
+                details={
+                    "install_kind": "uv-tool",
+                    "package": PACKAGE_NAME,
+                    "executable": str(executable.resolve()),
+                    "environment": str(environment.resolve()),
+                    "uv": str(Path(uv).resolve()),
+                    "tool_root": str(tool_root),
+                    "bin_dir": str(bin_dir),
+                    "bootstrap_python": str(Path(sys.executable).resolve()),
+                },
+            )
+
+    def _uv_tool_directory(self, uv: str, arguments: list[str]) -> Path:
+        result = self.runner.run([uv, *arguments], capture=True)
+        lines = (result.stdout or "").strip().splitlines()
+        if result.returncode or not lines:
+            detail = (result.stderr or "").strip()
+            raise InstallError(
+                f"could not locate uv tool directories with "
+                f"{subprocess.list2cmdline([uv, *arguments])}"
+                + (f": {detail}" if detail else "")
+            )
+        return Path(lines[-1]).expanduser().resolve()
 
     def _project_command(self) -> str | None:
         if self.options.dev:
@@ -548,6 +916,10 @@ class Installer:
                 "polaris.exe" if self.system == "windows" else "polaris"
             )
             return str(candidate) if candidate.exists() else None
+        receipt = self.state.component("polaris")
+        recorded = Path(str(receipt.get("executable", "")))
+        if self.state.component_owned("polaris") and recorded.is_file():
+            return str(recorded.resolve())
         direct = self.runner.which("polaris")
         if direct:
             return direct
@@ -625,6 +997,81 @@ def normalize_machine(value: str) -> str:
     return lowered
 
 
+def decode_process_output(data: bytes | str | None) -> str:
+    """Decode captured command output without trusting one Windows code page.
+
+    Most tools emit UTF-8 or the active ANSI/OEM code page, while ``wsl.exe`` emits
+    UTF-16LE even when stdout/stderr are pipes and may omit a byte-order mark.  Python's
+    default ``text=True`` decoding therefore crashes on localized WSL output.  Detect
+    UTF-16 by its NUL-byte layout, then fall back through common text encodings with a
+    replacement-only final path so diagnostics can never kill the installer.
+    """
+
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not data:
+        return ""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+
+    even_nuls = data[0::2].count(0)
+    odd_nuls = data[1::2].count(0)
+    pairs = max(1, len(data) // 2)
+    if max(even_nuls, odd_nuls) >= max(2, pairs // 5):
+        encoding = "utf-16le" if odd_nuls >= even_nuls else "utf-16be"
+        return data.decode(encoding, errors="replace")
+
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    if os.name == "nt":
+        try:
+            encodings.append(f"cp{ctypes.windll.kernel32.GetOEMCP()}")
+        except (AttributeError, OSError):
+            pass
+    tried: set[str] = set()
+    for encoding in encodings:
+        normalized = encoding.lower()
+        if normalized in tried:
+            continue
+        tried.add(normalized)
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode(locale.getpreferredencoding(False), errors="replace")
+
+
+def read_captured_process_output(
+    path: Path, stream_name: str, errors: list[str]
+) -> str:
+    """Read an elevated stream without allowing diagnostics to mask the result."""
+
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        errors.append(f"could not read elevated {stream_name} capture: {exc}")
+        return ""
+    return decode_process_output(data)
+
+
+def combine_process_output(primary: str, secondary: str) -> str:
+    if not primary:
+        return secondary
+    if not secondary:
+        return primary
+    separator = "" if primary.endswith(("\r", "\n")) else "\n"
+    return primary + separator + secondary
+
+
+def powershell_string_literal(value: str) -> str:
+    """Quote an arbitrary value as one PowerShell single-quoted string."""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
 def command_version(runner: Runner, command: str) -> str | None:
     executable = runner.which(command)
     if executable is None:
@@ -641,6 +1088,50 @@ def parse_node_major(version: str) -> int:
         if head.isdigit():
             return int(head)
     return 0
+
+
+def format_windows_exit_code(returncode: int) -> str:
+    """Render signed or unsigned Win32/HRESULT-style process codes consistently."""
+
+    return f"{returncode} (0x{returncode & 0xFFFFFFFF:08X})"
+
+
+def normalize_uac_cancelled_code(returncode: int) -> int:
+    unsigned = returncode & 0xFFFFFFFF
+    if unsigned in {WINDOWS_UAC_CANCELLED, WINDOWS_UAC_CANCELLED_HRESULT}:
+        return WINDOWS_UAC_CANCELLED
+    return returncode
+
+
+def is_windows_uac_cancelled(returncode: int) -> bool:
+    return normalize_uac_cancelled_code(returncode) == WINDOWS_UAC_CANCELLED
+
+
+def windows_process_succeeded(returncode: int) -> bool:
+    return (returncode & 0xFFFFFFFF) in WINDOWS_SUCCESS_OR_REBOOT_CODES
+
+
+def format_windows_command_diagnostic(
+    executable: str,
+    arguments: Sequence[str],
+    result: subprocess.CompletedProcess[str],
+) -> str:
+    """Format one Windows command with both decoded streams for actionable errors."""
+
+    command = subprocess.list2cmdline([executable, *arguments])
+    lines = [
+        f"Command: {command}",
+        f"Exit code: {format_windows_exit_code(result.returncode)}",
+    ]
+    stdout = decode_process_output(result.stdout).strip()
+    stderr = decode_process_output(result.stderr).strip()
+    if stdout:
+        lines.extend(("stdout:", stdout))
+    if stderr:
+        lines.extend(("stderr:", stderr))
+    if not stdout and not stderr:
+        lines.append("Output: (no output captured)")
+    return "\n".join(lines)
 
 
 def node_archive_name(version: str, system: str, machine: str) -> str:
@@ -695,19 +1186,22 @@ def extract_archive(archive: Path, destination: Path) -> None:
         bundle.extractall(destination, filter="data")
 
 
-def expose_node(node_bin: Path, system: str) -> None:
+def expose_node(node_bin: Path, system: str) -> list[Path]:
     if system == "windows":
         prepend_windows_user_path(node_bin)
-        return
+        return []
     bin_dir = Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
+    links: list[Path] = []
     for name in ("node", "npm", "npx"):
         source = node_bin / name
         target = bin_dir / name
         if target.is_symlink() or target.exists():
             target.unlink()
         target.symlink_to(source)
+        links.append(target)
     os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    return links
 
 
 def prepend_windows_user_path(directory: Path) -> None:
@@ -734,7 +1228,7 @@ def refresh_windows_path() -> None:
         return
     import winreg
 
-    values: list[str] = []
+    registry_values: list[str] = []
     locations = (
         (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
         (winreg.HKEY_CURRENT_USER, "Environment"),
@@ -743,11 +1237,34 @@ def refresh_windows_path() -> None:
         try:
             with winreg.OpenKey(hive, path) as key:
                 value, _ = winreg.QueryValueEx(key, "Path")
-                values.append(str(value))
+                registry_values.append(str(value))
         except OSError:
             continue
-    if values:
-        os.environ["PATH"] = ";".join(values)
+    # Keep process-only entries first.  Activated Conda environments, uv bootstrap
+    # paths, and terminal-specific tools do not necessarily exist in the registry;
+    # replacing PATH with only machine/user values can break the installer halfway.
+    values = [os.environ.get("PATH", ""), *registry_values]
+    merged = merge_path_values(*values)
+    if merged:
+        os.environ["PATH"] = merged
+
+
+def merge_path_values(*values: str) -> str:
+    """Merge PATH strings without dropping session entries or adding duplicates."""
+
+    entries: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for raw_entry in value.split(os.pathsep):
+            entry = os.path.expandvars(raw_entry.strip().strip('"'))
+            if not entry:
+                continue
+            key = os.path.normcase(os.path.normpath(entry))
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
+    return os.pathsep.join(entries)
 
 
 def venv_python(venv: Path, system: str) -> Path:

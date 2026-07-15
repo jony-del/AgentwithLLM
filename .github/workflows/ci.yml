@@ -40,6 +40,8 @@ jobs:
         run: python -m pytest -q
       - name: Installer dry-run
         run: python installer/install.py --source . --dry-run --skip-sandbox --non-interactive
+      - name: Validate uninstall recovery core
+        run: python agent_core/uninstall.py --help
       - name: Validate shell entrypoint
         if: runner.os != 'Windows'
         run: bash -n install.sh

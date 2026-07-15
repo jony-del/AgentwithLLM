@@ -6,7 +6,10 @@ param(
     [switch]$Check,
     [switch]$DryRun,
     [switch]$SkipSandbox,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$Uninstall,
+    [switch]$PurgeData,
+    [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,9 +17,25 @@ $UvVersion = "0.11.28"
 $Repository = "https://github.com/jony-del/AgentwithLLM"
 $TemporaryRoot = $null
 
+if ($Uninstall -and ($Dev -or $Upgrade -or $Check -or $SkipSandbox)) {
+    [Console]::Error.WriteLine("[usage] -Uninstall cannot be combined with -Dev, -Upgrade, -Check, or -SkipSandbox")
+    exit 2
+}
+if ((-not $Uninstall) -and ($PurgeData -or $Yes)) {
+    [Console]::Error.WriteLine("[usage] -PurgeData and -Yes require -Uninstall")
+    exit 2
+}
+if ($Uninstall -and $NonInteractive -and (-not $Yes) -and (-not $DryRun)) {
+    [Console]::Error.WriteLine("[usage] non-interactive uninstall requires -Yes (or use -DryRun)")
+    exit 2
+}
+
 function Get-VerifiedSource {
     $localInstaller = Join-Path $PSScriptRoot "installer\install.py"
     if ($PSScriptRoot -and (Test-Path -LiteralPath $localInstaller)) {
+        if ($Uninstall -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot "agent_core\uninstall.py"))) {
+            throw "Source checkout is missing agent_core/uninstall.py"
+        }
         return (Resolve-Path -LiteralPath $PSScriptRoot).Path
     }
 
@@ -44,14 +63,17 @@ function Get-VerifiedSource {
     if (-not (Test-Path -LiteralPath (Join-Path $source "installer\install.py"))) {
         throw "Release archive is missing installer/install.py"
     }
+    if (-not (Test-Path -LiteralPath (Join-Path $source "agent_core\uninstall.py"))) {
+        throw "Release archive is missing agent_core/uninstall.py"
+    }
     return $source
 }
 
 function Get-UvCommand {
     $command = Get-Command uv -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
-    if ($Check -or $DryRun) {
-        throw "uv is missing; check/dry-run mode will not install it"
+    if ($Uninstall -or $Check -or $DryRun) {
+        throw "uv is missing; uninstall/check/dry-run mode will not install it"
     }
     Write-Host "Installing uv $UvVersion..."
     Invoke-RestMethod "https://astral.sh/uv/$UvVersion/install.ps1" | Invoke-Expression
@@ -74,26 +96,38 @@ try {
         throw "-Dev requires a persistent source checkout; run this script from the repository"
     }
     $uv = Get-UvCommand
-    if (-not ($Check -or $DryRun)) {
+    if (-not ($Uninstall -or $Check -or $DryRun)) {
         & $uv python install 3.12
         if ($LASTEXITCODE -ne 0) { throw "uv could not install Python 3.12" }
     } else {
         $env:UV_PYTHON_DOWNLOADS = "never"
     }
-    $python = (& $uv python find 3.12 | Select-Object -Last 1).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $python)) {
-        throw "Python 3.12 is unavailable; check/dry-run mode will not install it"
+    $pythonOutput = & $uv python find 3.12 | Select-Object -Last 1
+    $findExitCode = $LASTEXITCODE
+    $python = if ($pythonOutput) { $pythonOutput.Trim() } else { "" }
+    if ($findExitCode -ne 0 -or -not $python -or -not (Test-Path -LiteralPath $python)) {
+        throw "Python 3.12 is unavailable; uninstall/check/dry-run mode will not install it"
     }
 
-    $arguments = @("--source", $source)
-    if ($Dev) { $arguments += "--dev" }
-    if ($Upgrade) { $arguments += "--upgrade" }
-    if ($Check) { $arguments += "--check" }
-    if ($DryRun) { $arguments += "--dry-run" }
-    if ($SkipSandbox) { $arguments += "--skip-sandbox" }
-    if ($NonInteractive) { $arguments += "--non-interactive" }
-    & $python (Join-Path $source "installer\install.py") @arguments
-    $exitCode = $LASTEXITCODE
+    if ($Uninstall) {
+        $arguments = @()
+        if ($PurgeData) { $arguments += "--purge-data" }
+        if ($Yes) { $arguments += "--yes" }
+        if ($DryRun) { $arguments += "--dry-run" }
+        if ($NonInteractive) { $arguments += "--non-interactive" }
+        & $python (Join-Path $source "agent_core\uninstall.py") @arguments
+        $exitCode = $LASTEXITCODE
+    } else {
+        $arguments = @("--source", $source)
+        if ($Dev) { $arguments += "--dev" }
+        if ($Upgrade) { $arguments += "--upgrade" }
+        if ($Check) { $arguments += "--check" }
+        if ($DryRun) { $arguments += "--dry-run" }
+        if ($SkipSandbox) { $arguments += "--skip-sandbox" }
+        if ($NonInteractive) { $arguments += "--non-interactive" }
+        & $python (Join-Path $source "installer\install.py") @arguments
+        $exitCode = $LASTEXITCODE
+    }
 }
 catch {
     [Console]::Error.WriteLine("[error] " + $_.Exception.Message)

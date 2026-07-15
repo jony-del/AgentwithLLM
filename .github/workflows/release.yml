@@ -30,6 +30,7 @@ jobs:
           PY
           bash -n install.sh
           python installer/install.py --help
+          python agent_core/uninstall.py --help
       - name: Build reproducible source assets
         shell: bash
         run: |
@@ -44,6 +45,8 @@ jobs:
           tar -xzf polaris-source.tar.gz -C smoke-tar
           python smoke-zip/installer/install.py --help
           python smoke-tar/installer/install.py --help
+          python smoke-zip/agent_core/uninstall.py --help
+          python smoke-tar/agent_core/uninstall.py --help
       - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}

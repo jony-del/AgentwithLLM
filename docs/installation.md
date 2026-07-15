@@ -45,13 +45,98 @@ bash install.sh --version v0.1.0
 | `-DryRun` | `--dry-run` | 打印计划执行的命令 |
 | `-SkipSandbox` | `--skip-sandbox` | 明确接受不安装容器运行时 |
 | `-NonInteractive` | `--non-interactive` | 不弹出交互；缺权限或前置条件时失败 |
+| `-Uninstall` | `--uninstall` | 从安装脚本进入恢复卸载流程 |
+| `-PurgeData` | `--purge-data` | 卸载后额外删除用户级 Polaris 数据和安装状态 |
+| `-Yes` | `--yes` | 无提示确认已经显示的卸载计划 |
 
 重复运行默认只补缺失项，不强制升级已有工具。安装状态位于
 `%LOCALAPPDATA%\Polaris\install-state.json`（Windows）或
 `${XDG_STATE_HOME:-~/.local/state}/polaris/install-state.json`，其中只记录步骤、来源和所有权。
 
-退出码：`0` 就绪、`2` 参数错误、`10` 安装/验证失败、`20` 需要重启后重跑、`30` 不支持的
+新安装收据还记录安装类型、CLI/环境根目录、uv 路径和外部 worker Python。记录中不含 API 密钥或
+其他凭据。旧 schema 1 收据不会被直接信任；只有重新探测能精确匹配 uv tool 或源码 `.venv` 时
+才允许卸载，否则按外部安装处理。
+
+Windows 上的成功条件是安装后的命令确实可执行，而不是 WinGet 单独返回成功。若 WinGet 已有
+Git、rg 或 Podman 的记录，但当前终端尚未获得新 PATH，安装器会合并刷新 PATH 后复检；若记录
+存在但可执行文件或 portable 命令链接已经损坏，则自动强制重装一次。恢复后仍不可用时，错误
+信息会给出对应的 `winget uninstall --id ... --exact` 清理命令，不会把未验证的组件写入安装状态。
+
+默认沙箱档可能需要 UAC 来安装 Podman 或启用 WSL2；Windows 首次启用 WSL2 后需要重启，并以
+退出码 `20` 提示重新运行相同命令。只需 Python/Node/主机命令而明确不需要容器沙箱时，可使用
+`-SkipSandbox`；这属于显式选择的降级安装。若用户取消 UAC，安装器会把它明确映射为 Windows
+错误 `1223 (0x000004C7)` 并立即停止，不会继续尝试其他 WSL 系统修改。
+
+安装器会先探测 WSL 状态：尚未安装时先执行 `wsl --install --no-distribution`；命令失败且重新
+探测后 WSL 仍不可用时，再自动尝试一次 `wsl --install --no-distribution --inbox`，使用 Windows
+组件而非 Store 路径。已有 WSL 但状态异常时才执行 `wsl --update`。这些参数适用范围见
+[Microsoft WSL 命令说明](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)。安装器不会
+自动运行 DISM 或系统映像修复。
+
+提权子进程的 stdout/stderr 会分别写入仅本次调用使用的临时文件，读取后始终清理。WSL 在本地化
+Windows 上可能输出无 BOM 的 UTF-16 文本；安装器会按实际字节编码解码，不依赖当前 Conda/Python
+环境的默认代码页。安装器把 `0`、`1641` 和 `3010` 视为成功或需要重启，但每次都会重新运行
+`wsl --status`：即使其他退出码也会以重新探测结果为准。操作已被 Windows 接受但 WSL 尚不可用时，
+安装器写入可恢复步骤并以退出码 `20` 提示重启；两种安装路径都失败时，错误会同时列出两条命令、
+十进制/十六进制退出码以及解码后的 stdout/stderr。诊断内容不会写入安装状态。
+
+退出码：`0` 就绪、`2` 参数错误、`10` 安装/卸载/验证失败、`20` 需要重启后重跑、`30` 不支持的
 平台或架构。
+
+## 卸载与数据保留
+
+首选由 CLI 展示并确认卸载计划：
+
+```console
+polaris uninstall
+polaris uninstall --dry-run
+polaris uninstall --yes
+polaris uninstall --purge-data --yes
+```
+
+`polaris uninstall` 在当前进程退出前把计划复制到权限受限的唯一临时目录，再由目标环境之外的
+uv Python 完成删除。Windows 上不会尝试删除仍被当前进程占用的 `polaris.exe`；成功调度后返回
+`0` 并打印完成日志路径。日志中的 `[uninstalled]` 表示最终完成，`[error]` 会保留可恢复诊断。
+
+若 CLI 命令已损坏，下载/保留与目标版本对应的 release 脚本后使用同步恢复入口：
+
+```powershell
+.\install.ps1 -Uninstall
+.\install.ps1 -Uninstall -DryRun
+.\install.ps1 -Uninstall -PurgeData -Yes
+```
+
+```bash
+bash install.sh --uninstall
+bash install.sh --uninstall --dry-run
+bash install.sh --uninstall --purge-data --yes
+```
+
+卸载模式只查找已经存在的 uv 和 uv Python 3.12，不安装或下载它们，也不会进入 WSL/Podman 准备
+流程。`-Uninstall`/`--uninstall` 不能与安装、升级、检查或沙箱选项组合；非交互卸载必须提供
+`-Yes`/`--yes`，但 dry-run 不需要确认。
+
+默认删除内容：
+
+- 安装器拥有的 `agent-with-llm` uv tool 环境、`polaris` 启动器及环境内专用 Python 依赖；
+- 安装器创建且具有匹配所有权标记的开发 `.venv`，但保留源码 checkout；
+- 安装在 Polaris 私有 runtime 根目录中、路径收据完全匹配的 Node 和对应 PATH/符号链接；
+- Polaris 程序和私有 runtime 的状态收据。
+
+默认保留 `~/.polaris` 配置、信任信息、技能、计划和会话，以及项目内 `.polaris`、`agent.toml`、
+`.env`、`runs`、`memory`。同时始终保留 WSL、Podman/Docker/nerdctl、容器镜像、Git、ripgrep、
+系统 Node、uv、uv Python 和包管理器。`--purge-data` 仅额外删除用户级 `~/.polaris` 与安装状态，
+仍不扫描或删除任何项目目录。
+
+Conda、普通 pip、手工 editable 或仅被安装器复用的 Polaris 没有安装器所有权，自动卸载会以
+退出码 `10` 安全拒绝，并打印绑定当前解释器的命令，例如：
+
+```console
+<当前环境的 python> -m pip uninstall agent-with-llm
+```
+
+路径越界、符号链接逃逸、收据被修改或活动 `polaris` 与收据不一致时同样拒绝，不提供绕过所有权
+检查的强制参数。重复运行恢复卸载且目标已经不存在时返回 `0`。
 
 ## 健康检查
 

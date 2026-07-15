@@ -795,6 +795,14 @@ def health_command(args: argparse.Namespace) -> int:
     return 0 if report.status != "error" else 1
 
 
+def uninstall_command(args: argparse.Namespace) -> int:
+    """Hand self-removal to a stdlib-only worker outside the active environment."""
+
+    from agent_core.uninstall import uninstall_from_cli
+
+    return uninstall_from_cli(args)
+
+
 def mcp_command(args: argparse.Namespace) -> int:
     """List the tools exposed by the configured MCP servers (a verification aid)."""
     mcp_config = resolve_mcp_config(_config_file(args))
@@ -1042,6 +1050,27 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Emit a machine-readable health report."
     )
     health_parser.set_defaults(func=health_command)
+
+    uninstall_parser = subparsers.add_parser(
+        "uninstall",
+        help="Remove an installer-owned Polaris CLI and its private dependencies.",
+    )
+    uninstall_parser.add_argument(
+        "--purge-data",
+        action="store_true",
+        help="Also remove user-level ~/.polaris data and the installer state.",
+    )
+    uninstall_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the exact removal plan without changing files or settings.",
+    )
+    uninstall_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the displayed removal plan without prompting.",
+    )
+    uninstall_parser.set_defaults(func=uninstall_command)
 
     # Default to `chat` when invoked with no subcommand, so a bare `polaris`
     # (like `claude`/`codex`) drops straight into an interactive session. This also

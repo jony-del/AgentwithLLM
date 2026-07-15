@@ -6,6 +6,15 @@ REPOSITORY="https://github.com/jony-del/AgentwithLLM"
 VERSION="latest"
 TEMP_ROOT=""
 FORWARD_ARGS=()
+UNINSTALL=0
+PURGE_DATA=0
+ASSUME_YES=0
+DEV=0
+UPGRADE=0
+CHECK=0
+DRY_RUN=0
+SKIP_SANDBOX=0
+NON_INTERACTIVE=0
 
 while (($#)); do
   case "$1" in
@@ -14,8 +23,46 @@ while (($#)); do
       VERSION="$2"
       shift 2
       ;;
-    --dev|--upgrade|--check|--dry-run|--skip-sandbox|--non-interactive)
+    --dev)
+      DEV=1
       FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --upgrade)
+      UPGRADE=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --check)
+      CHECK=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --skip-sandbox)
+      SKIP_SANDBOX=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --non-interactive)
+      NON_INTERACTIVE=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --uninstall)
+      UNINSTALL=1
+      shift
+      ;;
+    --purge-data)
+      PURGE_DATA=1
+      shift
+      ;;
+    --yes)
+      ASSUME_YES=1
       shift
       ;;
     *)
@@ -24,6 +71,20 @@ while (($#)); do
       ;;
   esac
 done
+
+if ((UNINSTALL)); then
+  if ((DEV || UPGRADE || CHECK || SKIP_SANDBOX)); then
+    echo "[usage] --uninstall cannot be combined with --dev, --upgrade, --check, or --skip-sandbox" >&2
+    exit 2
+  fi
+  if ((NON_INTERACTIVE && !ASSUME_YES && !DRY_RUN)); then
+    echo "[usage] non-interactive uninstall requires --yes (or use --dry-run)" >&2
+    exit 2
+  fi
+elif ((PURGE_DATA || ASSUME_YES)); then
+  echo "[usage] --purge-data and --yes require --uninstall" >&2
+  exit 2
+fi
 
 cleanup() {
   if [[ -n "$TEMP_ROOT" && -d "$TEMP_ROOT" ]]; then
@@ -47,8 +108,12 @@ download() {
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/installer/install.py" ]]; then
   SOURCE_ROOT="$SCRIPT_DIR"
+  if ((UNINSTALL)) && [[ ! -f "$SOURCE_ROOT/agent_core/uninstall.py" ]]; then
+    echo "source checkout is missing agent_core/uninstall.py" >&2
+    exit 10
+  fi
 else
-  if printf '%s\n' "${FORWARD_ARGS[@]}" | grep -qx -- '--dev'; then
+  if ((DEV)); then
     echo "--dev requires a persistent source checkout" >&2
     exit 2
   fi
@@ -75,13 +140,14 @@ else
   mkdir -p "$SOURCE_ROOT"
   tar -xzf "$ARCHIVE" -C "$SOURCE_ROOT"
   [[ -f "$SOURCE_ROOT/installer/install.py" ]] || { echo "release archive is missing installer/install.py" >&2; exit 10; }
+  [[ -f "$SOURCE_ROOT/agent_core/uninstall.py" ]] || { echo "release archive is missing agent_core/uninstall.py" >&2; exit 10; }
 fi
 
 if command -v uv >/dev/null 2>&1; then
   UV="$(command -v uv)"
 else
-  if printf '%s\n' "${FORWARD_ARGS[@]}" | grep -Eqx -- '--check|--dry-run'; then
-    echo "uv is missing; check/dry-run mode will not install it" >&2
+  if ((UNINSTALL || CHECK || DRY_RUN)); then
+    echo "uv is missing; uninstall/check/dry-run mode will not install it" >&2
     exit 10
   fi
   echo "Installing uv $UV_VERSION..."
@@ -95,11 +161,28 @@ else
   [[ -n "$UV" ]] || { echo "uv installation completed but uv was not found" >&2; exit 10; }
 fi
 
-if ! printf '%s\n' "${FORWARD_ARGS[@]}" | grep -Eqx -- '--check|--dry-run'; then
+if ((!UNINSTALL && !CHECK && !DRY_RUN)); then
   "$UV" python install 3.12 || exit 10
 else
   export UV_PYTHON_DOWNLOADS=never
 fi
 PYTHON="$("$UV" python find 3.12 | tail -n 1)"
 [[ -x "$PYTHON" ]] || { echo "uv did not return a Python 3.12 executable" >&2; exit 10; }
-"$PYTHON" "$SOURCE_ROOT/installer/install.py" --source "$SOURCE_ROOT" "${FORWARD_ARGS[@]}"
+if ((UNINSTALL)); then
+  UNINSTALL_ARGS=()
+  if ((PURGE_DATA)); then
+    UNINSTALL_ARGS+=(--purge-data)
+  fi
+  if ((ASSUME_YES)); then
+    UNINSTALL_ARGS+=(--yes)
+  fi
+  if ((DRY_RUN)); then
+    UNINSTALL_ARGS+=(--dry-run)
+  fi
+  if ((NON_INTERACTIVE)); then
+    UNINSTALL_ARGS+=(--non-interactive)
+  fi
+  "$PYTHON" "$SOURCE_ROOT/agent_core/uninstall.py" "${UNINSTALL_ARGS[@]}"
+else
+  "$PYTHON" "$SOURCE_ROOT/installer/install.py" --source "$SOURCE_ROOT" "${FORWARD_ARGS[@]}"
+fi
