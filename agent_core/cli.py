@@ -96,10 +96,13 @@ def _permission_rules(args: argparse.Namespace) -> RuleSet:
     """Fine-grained rules from ``[permissions]`` toml, with CLI ``--allow/--deny/--ask``
     session rules layered on top (they append, deny still wins in the decision pipeline)."""
     rules = resolve_permission_rules(_config_file(args))
+    from agent_core.permission_types import PermissionRuleSource
+
     cli = RuleSet.from_lists(
         allow=getattr(args, "allow", None) or [],
         deny=getattr(args, "deny", None) or [],
         ask=getattr(args, "ask", None) or [],
+        source=PermissionRuleSource.CLI,
     )
     return rules.merge(cli)
 

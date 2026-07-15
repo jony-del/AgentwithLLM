@@ -52,6 +52,8 @@ class Skill:
     when_to_use: str = ""
     argument_hint: str = ""
     allowed_tools: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
+    hooks: tuple[str, ...] = ()
     model: str | None = None
     aliases: tuple[str, ...] = ()
     user_invocable: bool = True

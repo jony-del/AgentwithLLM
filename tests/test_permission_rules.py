@@ -8,6 +8,7 @@ from agent_core.permission_rules import (
     _split_subcommands,
     parse_rule,
 )
+from agent_core.permission_types import PermissionBehavior, PermissionRuleSource
 
 
 # -- rule parsing --------------------------------------------------------------------
@@ -148,3 +149,21 @@ def test_merge_appends_rules() -> None:
     assert merged.allow_matches("run_command", {"command": "git status"})
     # Originals are untouched.
     assert not base.allow
+
+
+def test_rule_provenance_survives_parse_merge_and_match() -> None:
+    project = RuleSet.from_lists(
+        deny=["run_command(rm *)"], source=PermissionRuleSource.PROJECT
+    )
+    cli = RuleSet.from_lists(
+        allow=["run_command(git *)"], source=PermissionRuleSource.CLI
+    )
+    merged = project.merge(cli)
+
+    denied = merged.deny_match("run_command", {"command": "rm x"})
+    allowed = merged.allow_match("run_command", {"command": "git status"})
+
+    assert denied is not None and denied.source is PermissionRuleSource.PROJECT
+    assert denied.behavior is PermissionBehavior.DENY
+    assert allowed is not None and allowed.source is PermissionRuleSource.CLI
+    assert allowed.raw == "run_command(git *)"

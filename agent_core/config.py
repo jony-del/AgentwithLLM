@@ -575,16 +575,34 @@ def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet
     :meth:`RuleSet.merge`. The permission *mode* stays the top-level ``permission`` key.
     """
     from agent_core.permission_rules import RuleSet
+    from agent_core.permission_types import PermissionRuleSource
 
-    table = load_agent_toml(config_file).get("permissions")
-    if not isinstance(table, dict):
-        return RuleSet()
+    def _load(path: str | Path, source: PermissionRuleSource) -> RuleSet:
+        table = load_agent_toml(path).get("permissions")
+        if not isinstance(table, dict):
+            return RuleSet()
 
-    def _rules(key: str) -> list[str]:
-        value = table.get(key)
-        return [str(item) for item in value] if isinstance(value, list) else []
+        def _rules(key: str) -> list[str]:
+            value = table.get(key)
+            return [str(item) for item in value] if isinstance(value, list) else []
 
-    return RuleSet.from_lists(_rules("allow"), _rules("deny"), _rules("ask"))
+        return RuleSet.from_lists(
+            _rules("allow"), _rules("deny"), _rules("ask"), source=source
+        )
+
+    # An explicit config path is user-selected and therefore carries user provenance.
+    if str(config_file) != _REPO_DEFAULT_CONFIG:
+        return _load(config_file, PermissionRuleSource.USER)
+
+    layered = RuleSet()
+    try:
+        user_file = Path.home() / ".polaris" / "agent.toml"
+    except RuntimeError:
+        user_file = Path("__no_user_permission_file__")
+    layered = layered.merge(_load(user_file, PermissionRuleSource.USER))
+    layered = layered.merge(_load(config_file, PermissionRuleSource.PROJECT))
+    layered = layered.merge(_load("agent.local.toml", PermissionRuleSource.LOCAL))
+    return layered
 
 
 def resolve_mcp_config(config_file: str | Path = "agent.toml") -> "MCPConfig":

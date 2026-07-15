@@ -9,11 +9,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
+from agent_core.permission_audit import sanitize_log_payload
+
 
 # Schema version stamped on every event record (the "v" field), so replay/analysis
 # tooling can detect format changes instead of guessing. Bump on breaking changes to
 # the record shape and keep readers tolerant of older versions.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class JSONLRunLogger:
@@ -49,7 +51,12 @@ class JSONLRunLogger:
         where awaiting is not possible.  They are tiny, infrequent control events; the
         same lock/flush path keeps them ordered with ordinary asynchronous records.
         """
-        record = {"ts": time.time(), "v": SCHEMA_VERSION, "event": event, **payload}
+        record = {
+            "ts": time.time(),
+            "v": SCHEMA_VERSION,
+            "event": event,
+            **sanitize_log_payload(payload),
+        }
         self._write_sync(record)
 
     def _write_sync(self, record: dict[str, Any]) -> None:

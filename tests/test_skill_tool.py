@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from agent_core.models import ToolRisk
+from agent_core.models import ToolCall, ToolRisk
+from agent_core.permission_types import PermissionBehavior
+from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.session import SessionContext
@@ -28,6 +30,35 @@ async def test_inline_invocation_returns_rendered_body() -> None:
     assert result.ok
     assert result.content == "Remember the milk"
     assert result.metadata["context"] == "inline"
+
+
+async def test_pure_inline_skill_is_permission_safe() -> None:
+    skill = Skill(name="note", description="d", body="Remember it", context=SkillContext.INLINE)
+    tool = SkillTool(_session([skill]))
+
+    result = await PermissionPolicy(PermissionMode.DEFAULT).evaluate(
+        tool, ToolCall("skill", {"command": "note"})
+    )
+
+    assert result.behavior is PermissionBehavior.ALLOW
+
+
+async def test_skill_with_extra_capability_requires_confirmation_even_in_bypass() -> None:
+    skill = Skill(
+        name="deploy",
+        description="d",
+        body="Deploy it",
+        capabilities=("network",),
+        allowed_tools=("run_command",),
+    )
+    tool = SkillTool(_session([skill]))
+
+    result = await PermissionPolicy(PermissionMode.BYPASS).evaluate(
+        tool, ToolCall("skill", {"command": "deploy"})
+    )
+
+    assert result.behavior is PermissionBehavior.ASK
+    assert result.bypass_immune
 
 
 async def test_fork_invocation_calls_subagent_factory_with_preset_and_model() -> None:

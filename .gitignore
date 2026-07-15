@@ -7,4 +7,5 @@ venv/
 /memory/
 *.egg-info/
 .env
+agent.local.toml
 

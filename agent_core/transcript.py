@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import Message
+from .permission_audit import sanitize_log_payload
 
 # Entry "type" values that are NOT conversation messages.
 _TITLE = "custom-title"
@@ -45,7 +46,7 @@ _RELINK = "relink"
 
 # Schema version stamped on every transcript entry (the "v" field). Bump on breaking
 # changes to the entry shape; loaders stay tolerant of records without it (pre-v1).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Above this file size, the resume load skips everything before the last compaction
 # boundary (reading only post-boundary bytes + a cheap pre-boundary metadata rescue),
@@ -126,10 +127,14 @@ class TranscriptStore:
         self._warned = False
 
     async def append_message(self, message: Message) -> None:
+        message_data = message.to_dict()
+        if message.metadata.get("sensitive"):
+            message_data["content"] = "<redacted-sensitive-tool-output>"
+        message_data = sanitize_log_payload(message_data)
         record = {
             "type": "message",
             "v": SCHEMA_VERSION,
-            **message.to_dict(),
+            **message_data,
             "session_id": self.session_id,
             "cwd": self.workspace,
             "git_branch": self._cwd_branch,

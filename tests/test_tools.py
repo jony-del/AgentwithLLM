@@ -6,6 +6,7 @@ import pytest
 from agent_core.hooks import HookPipeline, HookResult
 from agent_core.models import ToolCall, ToolResult, ToolRisk
 from agent_core.permission_classifier import AutoPermissionVerdict
+from agent_core.permission_types import PermissionContext, PermissionResult
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.storage import JSONLRunLogger, read_events
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
@@ -78,6 +79,11 @@ class WriteCountingTool(Tool):
     def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
         return ConcurrencySpec()
 
+    async def check_permissions(
+        self, arguments: dict, context: PermissionContext
+    ) -> PermissionResult:
+        return PermissionResult.ask("test write needs classification", classifier_approvable=True)
+
     def _invoke(self, arguments: dict) -> ToolResult:
         self.calls += 1
         return ToolResult(self.name, "ran")
@@ -111,6 +117,11 @@ class _VerdictClassifier:
     async def classify(self, tool, tool_call, messages, should_cancel=None):
         self.calls.append(tool.name)
         return AutoPermissionVerdict(self.allowed, "test verdict", model="test")
+
+
+class _BoomClassifier:
+    async def classify(self, tool, tool_call, messages, should_cancel=None):
+        raise RuntimeError("classifier crashed")
 
 
 async def test_executor_returns_failed_result_for_unknown_tool() -> None:
@@ -274,6 +285,46 @@ async def test_auto_classifier_can_allow_or_block_pending_actions(tmp_path: Path
     )
     result = await denied.execute_many([ToolCall("write_count")])
     assert not result[0].ok and write.calls == 1 and block.calls == ["write_count"]
+
+
+async def test_auto_classifier_exception_fails_closed() -> None:
+    registry = ToolRegistry()
+    write = WriteCountingTool()
+    registry.register(write)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        permission_classifier=_BoomClassifier(),
+    )
+
+    (result,) = await executor.execute_many([ToolCall("write_count")])
+
+    assert not result.ok
+    assert "evaluator failed" in result.content
+    assert write.calls == 0
+
+
+async def test_auto_classifier_is_not_called_for_hard_deny() -> None:
+    registry = ToolRegistry()
+    write = WriteCountingTool()
+    registry.register(write)
+    classifier = _VerdictClassifier(True)
+    from agent_core.permission_rules import RuleSet
+
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(
+            PermissionMode.AUTO,
+            rules=RuleSet.from_lists(deny=["write_count"]),
+        ),
+        permission_classifier=classifier,
+    )
+
+    (result,) = await executor.execute_many([ToolCall("write_count")])
+
+    assert not result.ok
+    assert classifier.calls == []
+    assert write.calls == 0
 
 
 async def test_parallel_disabled_prepares_each_call_after_previous_run() -> None:

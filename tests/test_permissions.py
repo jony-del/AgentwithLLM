@@ -15,14 +15,12 @@ from agent_core.tools.builtin import EchoTool, ReadTextFileTool, RunCommandTool,
 def test_plan_mode_strictly_denies_write_tools() -> None:
     decision = PermissionPolicy(PermissionMode.PLAN).decide(WriteTextFileTool())
     assert not decision.allowed
-    assert not decision.dry_run
     assert "read-only" in decision.reason
 
 
 def test_default_allows_read_tools() -> None:
     decision = PermissionPolicy(PermissionMode.DEFAULT).decide(EchoTool())
     assert decision.allowed
-    assert not decision.dry_run
 
 
 def test_default_noninteractive_denies_write_tools() -> None:
@@ -78,8 +76,10 @@ def test_deny_rule_blocks_matching_command() -> None:
     denied = policy.decide(tool, ToolCall("run_command", {"command": "rm -rf /"}))
     assert not denied.allowed
     assert "denied by rule" in denied.reason
-    # A non-matching command is delegated to the automated classifier.
-    other = policy.decide(tool, ToolCall("run_command", {"command": "ls"}))
+    # A safe read command has a fast path; an unresolved development command is
+    # delegated to the automated classifier.
+    assert policy.decide(tool, ToolCall("run_command", {"command": "ls"})).allowed
+    other = policy.decide(tool, ToolCall("run_command", {"command": "pytest -q"}))
     assert not other.allowed
     assert other.classify
 
@@ -138,14 +138,14 @@ class _StubSandbox:
         return self._sandboxes
 
 
-def test_sandbox_coupling_auto_allows_sandboxed_command() -> None:
-    # An ask rule would normally prompt, but a command that will be sandboxed skips it.
+def test_explicit_ask_is_not_overridden_by_sandbox_auto_allow() -> None:
+    # An explicit ask is stronger than sandbox auto-allow.
     rules = RuleSet.from_lists(ask=["run_command"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=_StubSandbox(True))
     tool = RunCommandTool()
     decision = policy.decide(tool, ToolCall("run_command", {"command": "ls"}))
-    assert decision.allowed
-    assert "sandboxed" in decision.reason
+    assert not decision.allowed
+    assert "explicit ask" in decision.reason
 
 
 def test_sandbox_auto_allow_defaults_off() -> None:
@@ -173,8 +173,9 @@ def test_sandbox_coupling_off_when_not_sandboxed() -> None:
 
 def test_no_rules_uses_auto_fast_path_and_classifier_boundary() -> None:
     policy = PermissionPolicy(PermissionMode.AUTO)
-    assert policy.decide(EchoTool(), ToolCall("echo", {})).allowed
-    action = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"}))
+    assert policy.decide(EchoTool(), ToolCall("echo", {"text": "ok"})).allowed
+    assert policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"})).allowed
+    action = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "pytest -q"}))
     assert not action.allowed and action.classify
 
 
@@ -316,4 +317,32 @@ def test_session_always_does_not_override_deny_or_safety_net() -> None:
     denied = policy.decide(run_tool, ToolCall("run_command", {"command": "rm -rf /"}))
     assert not denied.allowed
     assert "denied by rule" in denied.reason
+
+
+def test_explicit_ask_is_not_overridden_by_session_always() -> None:
+    rules = RuleSet.from_lists(ask=["write_text_file"])
+    policy = PermissionPolicy(
+        PermissionMode.DEFAULT,
+        prompter=_prompter("always"),
+        rules=rules,
+    )
+    tool = WriteTextFileTool()
+    call = ToolCall("write_text_file", {"path": "notes.txt", "content": "x"})
+
+    assert policy.confirm(policy.decide(tool, call), tool, call).allowed
+    again = policy.decide(tool, call)
+
+    assert not again.allowed
+    assert again.ask_user
+    assert "explicit ask" in again.reason
+
+
+def test_bypass_does_not_override_explicit_ask() -> None:
+    rules = RuleSet.from_lists(ask=["run_command"])
+    decision = PermissionPolicy(PermissionMode.BYPASS, rules=rules).decide(
+        RunCommandTool(), ToolCall("run_command", {"command": "git status"})
+    )
+
+    assert not decision.allowed
+    assert decision.ask_collapsed
 

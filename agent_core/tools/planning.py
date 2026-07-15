@@ -7,7 +7,10 @@ session-aware (``SessionAwareMixin``) rather than workspace-scoped: nothing touc
 
 from __future__ import annotations
 
+from typing import Any
+
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_types import PermissionContext, PermissionResult
 from agent_core.session import SessionAwareMixin
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
@@ -45,6 +48,11 @@ class UpdateTodosTool(SessionAwareMixin, Tool):
         "required": ["todos"],
     }
     risk = ToolRisk.READ
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return PermissionResult.allow("Todo state is internal session metadata")
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         # This tool notifies the UI from its body, so keep it on the serial path.

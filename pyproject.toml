@@ -14,6 +14,7 @@ requires-python = ">=3.11"
 # needs NO extra Python deps (it shells out to podman/docker/bwrap).
 dependencies = [
     "httpx>=0.27",
+    "jsonschema>=4.23,<5",
     "pyyaml>=6.0",
 ]
 

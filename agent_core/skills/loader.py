@@ -61,6 +61,8 @@ def load_skill_file(path: Path) -> Skill | None:
         when_to_use=str(meta.get("when_to_use") or "").strip(),
         argument_hint=str(meta.get("argument_hint") or "").strip(),
         allowed_tools=_coerce_tuple(meta.get("allowed_tools")),
+        capabilities=_coerce_tuple(meta.get("capabilities")),
+        hooks=_coerce_tuple(meta.get("hooks")),
         model=(str(meta.get("model")).strip() or None) if meta.get("model") else None,
         aliases=_coerce_tuple(meta.get("aliases")),
         user_invocable=meta.get("user_invocable", True) is not False,

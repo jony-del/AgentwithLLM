@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-import fnmatch
+import asyncio
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
+
+from agent_core.managed_policy import ManagedPolicyProvider, NullManagedPolicyProvider
 from agent_core.models import ToolRisk
 from agent_core.permission_rules import (
     _SHELL_COMMAND_TOOLS,
@@ -13,53 +18,32 @@ from agent_core.permission_rules import (
     _normalize_subcommand,
     _split_subcommands,
 )
+from agent_core.permission_safety import (
+    check_web_endpoint,
+    inspect_paths,
+)
+from agent_core.permission_types import (
+    DecisionSource,
+    ManagedPolicySnapshot,
+    PermissionBehavior,
+    PermissionContext,
+    PermissionMode,
+    PermissionResult,
+    PermissionRule,
+    PermissionRuleSource,
+    PlanStateSnapshot,
+    SandboxState,
+    SessionAuthorizationView,
+    ToolCallSource,
+    WebDomainPolicySnapshot,
+)
 
 if TYPE_CHECKING:
     from agent_core.models import ToolCall
     from agent_core.sandbox import SandboxManager
     from agent_core.tools.base import Tool
 
-# Asks the user about a pending tool. Args: tool name, risk value, arguments.
-# Returns "once" (run now), "always" (allow for the rest of the session), or "deny".
 Prompter = Callable[[str, str, dict[str, Any]], str]
-
-# File-write path arguments whose target is checked against the sensitive-path
-# "safety net" (bypass-immune ask).
-_SENSITIVE_PATH_KEYS = ("path", "file_path")
-_SENSITIVE_DIRS = frozenset({".git", ".polaris", ".claude"})
-_SENSITIVE_BASENAMES = frozenset({"agent.toml", "settings.json", "settings.local.json"})
-
-# Secret-bearing paths: reading these is as dangerous as writing them (exfiltration),
-# so the safety net below applies to EVERY risk class, READ included, and is
-# bypass-immune. Directory names match path segments; basename patterns are fnmatch
-# globs against the final component (case-insensitive).
-_SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube"})
-_SECRET_BASENAME_PATTERNS = (
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "*.keystore",
-    "id_rsa*",
-    "id_ed25519*",
-    "id_ecdsa*",
-    "id_dsa*",
-    "credentials",
-    "credentials.json",
-)
-
-
-class PermissionMode(str, Enum):
-    DEFAULT = "default"
-    ACCEPTEDITS = "acceptedits"
-    PLAN = "plan"
-    AUTO = "auto"
-    DONTASK = "dontask"
-    # Allow everything except deny-rules, ask-rules, and the sensitive-path safety net.
-    BYPASS = "bypass"
-
 
 PERMISSION_MODE_LABELS: dict[PermissionMode, str] = {
     PermissionMode.DEFAULT: "manual mode on",
@@ -79,12 +63,10 @@ SHIFT_TAB_PERMISSION_MODES: tuple[PermissionMode, ...] = (
 
 
 def permission_mode_label(mode: PermissionMode | str) -> str:
-    """Return the exact user-facing status label for a permission mode."""
     return PERMISSION_MODE_LABELS[PermissionMode(mode)]
 
 
 def next_shift_tab_permission_mode(mode: PermissionMode | str) -> PermissionMode:
-    """Cycle the four interactive modes; hidden modes return to ``default``."""
     current = PermissionMode(mode)
     try:
         index = SHIFT_TAB_PERMISSION_MODES.index(current)
@@ -95,29 +77,17 @@ def next_shift_tab_permission_mode(mode: PermissionMode | str) -> PermissionMode
 
 @dataclass(slots=True)
 class PermissionDecision:
+    """Deprecated boolean adapter retained for UI and embedded-client compatibility."""
+
     allowed: bool
-    dry_run: bool = False
     ask_user: bool = False
     reason: str = ""
-    # True when this denial IS a collapsed ask (non-interactive run, nobody to ask) —
-    # distinct from a hard deny (deny rule / mode matrix), which no hook may override.
-    # The PermissionRequest hook seam treats ask_user OR ask_collapsed as "askable".
     ask_collapsed: bool = False
-    # Auto mode delegates otherwise-interactive actions to the asynchronous
-    # classifier in ToolExecutor.  This is deliberately distinct from ``ask``:
-    # classifier failures are hard denials and are never turned into a prompt.
     classify: bool = False
 
 
 class PermissionPolicy:
-    """Argument-aware permission gate: fine-grained rules + mode + sandbox coupling.
-
-    The decision pipeline (:meth:`decide`) mirrors Open-ClaudeCode's ordered evaluation:
-    deny rules → sensitive-path safety net → ask rules → sandbox auto-allow → bypass →
-    allow rules → the legacy per-mode ``ToolRisk`` matrix. The first four are
-    *argument-aware* (they inspect the actual command/path/URL); the final matrix is the
-    original coarse gate, preserved so a config with no rules behaves exactly as before.
-    """
+    """Single ordered permission engine combining central and per-tool decisions."""
 
     def __init__(
         self,
@@ -125,141 +95,456 @@ class PermissionPolicy:
         prompter: Prompter | None = None,
         rules: RuleSet | None = None,
         sandbox: "SandboxManager | None" = None,
+        *,
+        workspace: str | Path | None = None,
+        is_subagent: bool = False,
+        parent_mode: PermissionMode | str | None = None,
+        parent_agent_id: str | None = None,
+        tool_source: ToolCallSource = ToolCallSource.MODEL,
+        managed_policy: ManagedPolicySnapshot | None = None,
+        managed_policy_provider: ManagedPolicyProvider | None = None,
+        plan_state: Any | None = None,
+        allow_unsandboxed_unattended: bool | None = None,
     ) -> None:
         self.mode = PermissionMode(mode)
-        # We can only ask the user when a prompter is wired (an interactive UI).
-        # Without one, an "ask" collapses into a denial (matches old non-interactive).
         self.prompter = prompter
         self.interactive = prompter is not None
-        # Fine-grained allow/deny/ask rules (empty by default → pure mode behavior).
-        self.rules = rules or RuleSet()
-        # The active OS sandbox manager, for the "auto-allow if sandboxed" coupling.
+        self.managed_policy_provider = managed_policy_provider or NullManagedPolicyProvider()
+        managed_definition = self.managed_policy_provider.load()
+        self.rules = managed_definition.rules().merge(rules or RuleSet())
         self.sandbox = sandbox
-        # Tools the user chose to "always allow" for the lifetime of this session.
-        # Non-shell tools are remembered by tool name; shell-command tools are
-        # remembered per normalized sub-command (so "always" for `git status` does
-        # NOT silently allow `rm -rf` later — see _session_allowed/_remember_always).
+        self.workspace = Path(workspace).resolve() if workspace is not None else None
+        self.is_subagent = is_subagent
+        self.parent_mode = PermissionMode(parent_mode) if parent_mode is not None else None
+        self.parent_agent_id = parent_agent_id
+        self.tool_source = tool_source
+        self.managed_policy = managed_policy or managed_definition.snapshot()
+        self.plan_state = plan_state
+        if allow_unsandboxed_unattended is None:
+            opt_out = os.getenv("AGENT_SANDBOX_ALLOW_UNATTENDED", "")
+            allow_unsandboxed_unattended = opt_out.strip().casefold() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.allow_unsandboxed_unattended = allow_unsandboxed_unattended
         self._session_allow: set[str] = set()
         self._session_allow_commands: set[str] = set()
+        self._validators: dict[tuple[str, int], Draft202012Validator] = {}
+
+    async def evaluate(
+        self,
+        tool: "Tool",
+        tool_call: "ToolCall | None" = None,
+        *,
+        context: PermissionContext | None = None,
+    ) -> PermissionResult:
+        """Evaluate one call using the documented deterministic permission order."""
+        arguments = dict(tool_call.arguments) if tool_call is not None else {}
+        ctx = context or self.build_context(tool, arguments)
+
+        preflight = await self._preflight(tool, arguments, ctx)
+        if preflight is not None:
+            return self._apply_final_mode(preflight, tool)
+
+        try:
+            tool_result = await tool.check_permissions(arguments, ctx)
+        except Exception as exc:  # tool policy bugs may never fail open
+            return PermissionResult.deny(
+                f"tool permission check failed: {type(exc).__name__}",
+                decision_source=DecisionSource.TOOL,
+                metadata={"error": str(exc)[:200]},
+            )
+
+        if tool_result.updated_arguments is not None:
+            updated = dict(tool_result.updated_arguments)
+            updated_context = self.build_context(tool, updated)
+            updated_preflight = await self._preflight(tool, updated, updated_context)
+            if updated_preflight is not None:
+                return self._apply_final_mode(updated_preflight, tool)
+            arguments = updated
+            ctx = updated_context
+
+        if tool_result.behavior is PermissionBehavior.DENY:
+            return tool_result
+        if tool_result.behavior is PermissionBehavior.ASK:
+            return self._apply_final_mode(tool_result, tool)
+
+        if tool.requires_user_interaction:
+            return self._apply_final_mode(
+                PermissionResult.ask(
+                    "tool requires an explicit interactive approval channel",
+                    decision_source=DecisionSource.CENTRAL_SAFETY,
+                    updated_arguments=tool_result.updated_arguments,
+                    bypass_immune=True,
+                ),
+                tool,
+            )
+
+        if tool_result.behavior is PermissionBehavior.PASSTHROUGH:
+            sandbox_allow = self._sandbox_auto_allows(tool.name, arguments)
+            if sandbox_allow:
+                return PermissionResult.allow(
+                    "allowed because this exact command will run sandboxed",
+                    decision_source=DecisionSource.SANDBOX,
+                    updated_arguments=tool_result.updated_arguments,
+                )
+            if self.mode is PermissionMode.BYPASS:
+                return PermissionResult.allow(
+                    "bypass mode allows the remaining passthrough action",
+                    decision_source=DecisionSource.MODE,
+                    updated_arguments=tool_result.updated_arguments,
+                )
+            if self._session_allowed(tool.name, arguments):
+                return PermissionResult.allow(
+                    "allowed for this session",
+                    decision_source=DecisionSource.RULE,
+                    updated_arguments=tool_result.updated_arguments,
+                    matched_rule=PermissionRule(
+                        PermissionRuleSource.SESSION,
+                        PermissionBehavior.ALLOW,
+                        tool.name,
+                        raw=tool.name,
+                    ),
+                )
+            allow_rule = self.rules.allow_match(tool.name, arguments)
+            if allow_rule is not None:
+                return PermissionResult.allow(
+                    "allowed by rule",
+                    decision_source=DecisionSource.RULE,
+                    updated_arguments=tool_result.updated_arguments,
+                    matched_rule=allow_rule,
+                )
+            return self._apply_final_mode(
+                self._risk_fallback(tool, tool_result.updated_arguments), tool
+            )
+
+        # Session/explicit allow provenance is retained even when the tool independently
+        # classified the operation as safe.  These checks occur after every deny/ask.
+        if self._session_allowed(tool.name, arguments):
+            return PermissionResult.allow(
+                "allowed for this session",
+                decision_source=DecisionSource.RULE,
+                updated_arguments=tool_result.updated_arguments,
+                matched_rule=PermissionRule(
+                    PermissionRuleSource.SESSION,
+                    PermissionBehavior.ALLOW,
+                    tool.name,
+                    raw=tool.name,
+                ),
+            )
+        allow_rule = self.rules.allow_match(tool.name, arguments)
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "allowed by rule",
+                decision_source=DecisionSource.RULE,
+                updated_arguments=tool_result.updated_arguments,
+                matched_rule=allow_rule,
+            )
+
+        # Tool ALLOW is honored only after every central/rule check above succeeded.
+        return tool_result
+
+    async def _preflight(
+        self,
+        tool: "Tool",
+        arguments: dict[str, Any],
+        context: PermissionContext,
+    ) -> PermissionResult | None:
+        schema_result = self._validate_schema(tool, arguments)
+        if schema_result is not None:
+            return schema_result
+
+        if context.mode in context.managed_policy.forbidden_modes:
+            return PermissionResult.deny(
+                f"permission mode {context.mode.value!r} is forbidden by managed policy",
+                decision_source=DecisionSource.MANAGED,
+            )
+        managed_deny = self.rules.deny_match(
+            tool.name, arguments, source=PermissionRuleSource.MANAGED
+        )
+        if managed_deny is not None:
+            return PermissionResult.deny(
+                "denied by managed policy",
+                decision_source=DecisionSource.MANAGED,
+                matched_rule=managed_deny,
+            )
+        deny_rule = self.rules.deny_match(tool.name, arguments)
+        if deny_rule is not None:
+            return PermissionResult.deny(
+                "denied by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=deny_rule,
+            )
+
+        unattended_modes = {
+            PermissionMode.AUTO,
+            PermissionMode.DONTASK,
+            PermissionMode.BYPASS,
+        }
+        if context.mode in unattended_modes and not context.sandbox.enabled:
+            if context.managed_policy.require_sandbox_for_unattended:
+                return PermissionResult.deny(
+                    "managed policy requires a Sandbox for unattended permission modes",
+                    decision_source=DecisionSource.MANAGED,
+                )
+            if not self.allow_unsandboxed_unattended:
+                return PermissionResult.deny(
+                    "unattended permission modes require a Sandbox or an explicit opt-out",
+                    decision_source=DecisionSource.CENTRAL_SAFETY,
+                )
+
+        if context.is_subagent and context.parent_mode is not None:
+            allowed_child_modes = {
+                PermissionMode.DEFAULT: {PermissionMode.DEFAULT},
+                PermissionMode.ACCEPTEDITS: {PermissionMode.DEFAULT, PermissionMode.ACCEPTEDITS},
+                PermissionMode.PLAN: {PermissionMode.PLAN},
+                PermissionMode.AUTO: {
+                    PermissionMode.DEFAULT,
+                    PermissionMode.ACCEPTEDITS,
+                    PermissionMode.AUTO,
+                },
+                PermissionMode.DONTASK: {PermissionMode.DEFAULT, PermissionMode.DONTASK},
+                PermissionMode.BYPASS: {
+                    PermissionMode.DEFAULT,
+                    PermissionMode.ACCEPTEDITS,
+                    PermissionMode.DONTASK,
+                    PermissionMode.BYPASS,
+                },
+            }[context.parent_mode]
+            if context.mode not in allowed_child_modes:
+                return PermissionResult.deny(
+                    "sub-agent permission mode exceeds its parent capability envelope",
+                    decision_source=DecisionSource.CENTRAL_SAFETY,
+                )
+
+        # Plan is centrally constrained so a faulty/custom tool cannot self-declare a
+        # normal mutation safe.  The dedicated plan-artifact capability is added later.
+        plan_capabilities = {
+            "write_plan",
+            "exit_plan",
+            "update_todos",
+            "task_create",
+            "task_update",
+            "team_create",
+            "teammate_spawn",
+            "team_message_send",
+            "dispatch_agent",
+            "skill",
+        }
+        if (
+            context.mode is PermissionMode.PLAN
+            and tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}
+            and tool.name not in plan_capabilities
+        ):
+            return PermissionResult.deny(
+                "plan mode is read-only except for registered planning capabilities",
+                decision_source=DecisionSource.CENTRAL_SAFETY,
+            )
+
+        path_result = inspect_paths(tool.name, arguments, context)
+        if path_result is not None:
+            return path_result
+
+        if tool.name == "web_fetch":
+            web_result = check_web_endpoint(str(arguments.get("url", "")), context)
+            if web_result is not None:
+                return web_result
+
+        ask_rule = self.rules.ask_match(tool.name, arguments)
+        if ask_rule is not None:
+            return PermissionResult.ask(
+                "confirmation required by explicit ask rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=ask_rule,
+                bypass_immune=True,
+            )
+        return None
+
+    def build_context(self, tool: "Tool", arguments: dict[str, Any]) -> PermissionContext:
+        workspace = self.workspace
+        if workspace is None:
+            workspace = Path(getattr(tool, "workspace", Path.cwd())).resolve()
+        web_policy = getattr(tool, "web_policy", None)
+        allowed_domains = tuple(getattr(web_policy, "allowed_domains", ()) or ())
+        blocked_domains = tuple(getattr(web_policy, "blocked_domains", ()) or ())
+        sandbox = self._sandbox_state(tool.name, arguments)
+        return PermissionContext(
+            mode=self.mode,
+            workspace=workspace,
+            interactive=self.interactive,
+            sandbox=sandbox,
+            rules=self.rules,
+            session_authorizations=SessionAuthorizationView(
+                frozenset(self._session_allow),
+                frozenset(self._session_allow_commands),
+            ),
+            is_subagent=self.is_subagent,
+            parent_mode=self.parent_mode,
+            parent_agent_id=self.parent_agent_id,
+            tool_source=self.tool_source,
+            web_policy=WebDomainPolicySnapshot(
+                allowed_domains,
+                blocked_domains,
+                bool(getattr(tool, "unattended", False)),
+            ),
+            managed_policy=self.managed_policy,
+            plan_state=PlanStateSnapshot(
+                active=bool(getattr(self.plan_state, "active", False)),
+                previous_mode=(
+                    PermissionMode(getattr(self.plan_state, "previous_mode"))
+                    if getattr(self.plan_state, "previous_mode", None)
+                    else None
+                ),
+                artifact_path=getattr(self.plan_state, "artifact_path", None),
+            ),
+        )
+
+    def _validate_schema(self, tool: "Tool", arguments: dict[str, Any]) -> PermissionResult | None:
+        schema = tool.input_schema
+        key = (tool.name, id(schema))
+        try:
+            validator = self._validators.get(key)
+            if validator is None:
+                Draft202012Validator.check_schema(schema)
+                validator = Draft202012Validator(schema)
+                self._validators[key] = validator
+            validator.validate(arguments)
+        except (SchemaError, ValidationError) as exc:
+            path = ".".join(str(part) for part in getattr(exc, "absolute_path", ()))
+            location = f" at {path}" if path else ""
+            return PermissionResult.deny(
+                f"tool input schema validation failed{location}: {exc.message}",
+                decision_source=DecisionSource.SCHEMA,
+                metadata={"validation_path": path},
+            )
+        return None
+
+    def _risk_fallback(
+        self,
+        tool: "Tool",
+        updated_arguments: dict[str, Any] | None,
+    ) -> PermissionResult:
+        if tool.risk is ToolRisk.READ:
+            return PermissionResult.allow(
+                "legacy ToolRisk fallback allows read-only tools",
+                decision_source=DecisionSource.RISK_FALLBACK,
+                updated_arguments=updated_arguments,
+            )
+        if self.mode in {PermissionMode.PLAN, PermissionMode.DONTASK}:
+            return PermissionResult.deny(
+                f"{self.mode.value} mode denies an unresolved {tool.risk.value} fallback",
+                decision_source=DecisionSource.RISK_FALLBACK,
+                updated_arguments=updated_arguments,
+            )
+        return PermissionResult.ask(
+            "unmigrated side-effecting tool requires confirmation",
+            decision_source=DecisionSource.RISK_FALLBACK,
+            updated_arguments=updated_arguments,
+            classifier_approvable=self.mode is PermissionMode.AUTO,
+        )
+
+    def _apply_final_mode(self, result: PermissionResult, tool: "Tool") -> PermissionResult:
+        if result.behavior is not PermissionBehavior.ASK:
+            return result
+        if self.mode is PermissionMode.DONTASK:
+            return PermissionResult.deny(
+                f"{result.reason}; dontask mode denies prompts",
+                decision_source=DecisionSource.MODE,
+                updated_arguments=result.updated_arguments,
+                metadata=result.metadata,
+                matched_rule=result.matched_rule,
+            )
+        if self.mode is PermissionMode.AUTO and result.classifier_approvable:
+            if tool.requires_user_interaction:
+                return result
+            metadata = dict(result.metadata or {})
+            metadata["automated_evaluation"] = True
+            return PermissionResult.ask(
+                result.reason,
+                decision_source=result.decision_source,
+                updated_arguments=result.updated_arguments,
+                metadata=metadata,
+                matched_rule=result.matched_rule,
+                classifier_approvable=True,
+                bypass_immune=result.bypass_immune,
+            )
+        return result
 
     def decide(self, tool: "Tool", tool_call: "ToolCall | None" = None) -> PermissionDecision:
-        name = tool.name
-        arguments = tool_call.arguments if tool_call is not None else {}
+        """Synchronous compatibility wrapper; async callers must use ``evaluate``."""
+        if tool_call is None:
+            return self._legacy_without_arguments(tool)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self.as_legacy_decision(asyncio.run(self.evaluate(tool, tool_call)))
+        raise RuntimeError("PermissionPolicy.decide() cannot run inside an event loop; await evaluate()")
 
-        # 1. Deny rules win outright (argument-aware; command decomposition inside).
-        #    Nothing beats a deny — including a prior session "always".
-        if self.rules.deny_matches(name, arguments):
+    def _legacy_without_arguments(self, tool: "Tool") -> PermissionDecision:
+        """Preserve the pre-contract risk-only API when callers provide no arguments.
+
+        Production execution always supplies a ToolCall and therefore always uses the
+        schema/argument-aware pipeline.  This adapter exists for older embedded clients
+        that used ``decide(tool)`` as a coarse capability probe.
+        """
+        if self.rules.deny_matches(tool.name, {}):
             return PermissionDecision(False, reason="denied by rule")
-
-        # Plan mode is genuinely read-only.  Put this before session/allow grants so
-        # an approval remembered in manual mode cannot leak into planning mode.
-        if self.mode == PermissionMode.PLAN and tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}:
+        if self.mode is PermissionMode.PLAN and tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS}:
             return PermissionDecision(False, reason="plan mode is read-only")
-
-        # 2. Secret safety net (bypass-immune, ALL risk classes): reading a
-        #    secret-bearing path is an exfiltration channel, so even READ tools confirm.
-        if _targets_secret_path(arguments):
-            return self._ask_or_deny("accessing a secret-bearing path requires confirmation")
-
-        # 3. Sensitive-path safety net (bypass-immune): writing a protected path
-        #    always confirms.
-        if tool.risk in {ToolRisk.WRITE, ToolRisk.DANGEROUS} and _targets_sensitive_path(arguments):
-            return self._ask_or_deny("writing a protected path requires confirmation")
-
-        # 4. Session "always" grants — after deny and the safety nets, so neither
-        #    can be washed out by an earlier broad confirmation.
-        if self._session_allowed(name, arguments):
+        if self._session_allowed(tool.name, {}):
             return PermissionDecision(True, reason="allowed for this session")
-
-        # 5. Ask rules → confirm, UNLESS the command will run sandboxed (next step).
-        sandbox_allows = self._sandbox_auto_allows(name, arguments)
-        if self.rules.ask_matches(name, arguments) and not sandbox_allows:
-            return self._ask_or_deny("confirmation required by rule")
-
-        # 6. Sandbox coupling: a command that will actually be sandboxed skips the prompt
-        #    (the OS sandbox is the real boundary).
-        if sandbox_allows:
-            return PermissionDecision(True, reason="allowed: command runs sandboxed")
-
-        # 7. Bypass mode allows everything that survived deny/safety/ask above.
-        if self.mode == PermissionMode.BYPASS:
+        if self.rules.ask_matches(tool.name, {}):
+            return self.as_legacy_decision(
+                PermissionResult.ask("confirmation required by explicit ask rule", bypass_immune=True)
+            )
+        if self.mode is PermissionMode.BYPASS:
             return PermissionDecision(True, reason="bypass mode allows")
-
-        # 8. Explicit allow rules.
-        if self.rules.allow_matches(name, arguments):
+        if self.rules.allow_matches(tool.name, {}):
             return PermissionDecision(True, reason="allowed by rule")
+        if tool.risk is ToolRisk.READ:
+            return PermissionDecision(True, reason=f"{self.mode.value} allows read tools")
+        if self.mode is PermissionMode.ACCEPTEDITS and tool.accept_edits_safe:
+            return PermissionDecision(True, reason="acceptedits allows workspace file edits")
+        if self.mode is PermissionMode.AUTO:
+            return PermissionDecision(False, classify=True, reason="auto mode requires classification")
+        if self.mode is PermissionMode.DONTASK:
+            return PermissionDecision(False, reason="dontask mode denies prompts")
+        return self.as_legacy_decision(PermissionResult.ask("default requires confirmation"))
 
-        # 9. Fall back to the original per-mode ToolRisk matrix (unchanged behavior).
-        return self._decide_by_mode(tool)
-
-    # -- session "always" bookkeeping -------------------------------------------------
+    def as_legacy_decision(self, result: PermissionResult) -> PermissionDecision:
+        if result.behavior is PermissionBehavior.ALLOW:
+            return PermissionDecision(True, reason=result.reason)
+        if result.behavior is PermissionBehavior.DENY:
+            return PermissionDecision(False, reason=result.reason)
+        classify = bool((result.metadata or {}).get("automated_evaluation"))
+        if classify:
+            return PermissionDecision(False, reason=result.reason, classify=True)
+        if self.interactive:
+            return PermissionDecision(False, ask_user=True, reason=result.reason)
+        return PermissionDecision(False, reason=f"{result.reason}; non-interactive", ask_collapsed=True)
 
     def _session_allowed(self, name: str, arguments: dict[str, Any]) -> bool:
-        """Whether a prior "always" covers this call.
-
-        Shell-command tools are matched per normalized sub-command: every sub-command
-        of the current line must have been individually always-allowed. Other tools
-        keep the original tool-name grant.
-        """
         command_arg = _SHELL_COMMAND_TOOLS.get(name)
         if command_arg is None:
             return name in self._session_allow
-        subs = [
-            _normalize_subcommand(sub)
-            for sub in _split_subcommands(str(arguments.get(command_arg, "")))
+        normalized = [
+            _normalize_subcommand(part)
+            for part in _split_subcommands(str(arguments.get(command_arg, "")))
         ]
-        subs = [sub for sub in subs if sub]
-        return bool(subs) and all(sub in self._session_allow_commands for sub in subs)
+        normalized = [part for part in normalized if part]
+        return bool(normalized) and all(part in self._session_allow_commands for part in normalized)
 
     def _remember_always(self, tool: "Tool", tool_call: "ToolCall") -> None:
         command_arg = _SHELL_COMMAND_TOOLS.get(tool.name)
         if command_arg is None:
             self._session_allow.add(tool.name)
             return
-        for sub in _split_subcommands(str(tool_call.arguments.get(command_arg, ""))):
-            normalized = _normalize_subcommand(sub)
+        for part in _split_subcommands(str(tool_call.arguments.get(command_arg, ""))):
+            normalized = _normalize_subcommand(part)
             if normalized:
                 self._session_allow_commands.add(normalized)
-
-    def _decide_by_mode(self, tool: "Tool") -> PermissionDecision:
-        risk = tool.risk
-        if self.mode == PermissionMode.PLAN:
-            return PermissionDecision(True, reason="plan mode read allowed")
-        if self.mode == PermissionMode.ACCEPTEDITS:
-            if risk == ToolRisk.READ:
-                return PermissionDecision(True, reason="acceptedits allows read tools")
-            if tool.accept_edits_safe:
-                return PermissionDecision(True, reason="acceptedits allows workspace file edits")
-            return self._ask_or_deny("acceptedits requires confirmation for non-edit actions")
-        if self.mode == PermissionMode.AUTO:
-            if risk == ToolRisk.READ:
-                return PermissionDecision(True, reason="auto allows read tools")
-            if tool.accept_edits_safe:
-                return PermissionDecision(True, reason="auto allows workspace file edits")
-            return PermissionDecision(
-                False,
-                classify=True,
-                reason="auto mode requires an automated safety classification",
-            )
-        if self.mode == PermissionMode.DONTASK:
-            if risk == ToolRisk.READ:
-                return PermissionDecision(True, reason="dontask allows read tools")
-            return PermissionDecision(False, reason="dontask denies actions that require confirmation")
-        if risk == ToolRisk.READ:
-            return PermissionDecision(True, reason="default allows read tools")
-        return self._ask_or_deny("default requires confirmation")
-
-    def _sandbox_auto_allows(self, name: str, arguments: dict[str, Any]) -> bool:
-        """True when ``name`` is a shell-command tool whose command will be sandboxed."""
-        if self.sandbox is None:
-            return False
-        command_arg = _SHELL_COMMAND_TOOLS.get(name)
-        if command_arg is None:
-            return False
-        if not self.sandbox.config.auto_allow_command_if_sandboxed:
-            return False
-        command = str(arguments.get(command_arg, ""))
-        return self.sandbox.should_sandbox(command)
 
     def confirm(self, decision: PermissionDecision, tool: "Tool", tool_call: "ToolCall") -> PermissionDecision:
         if not decision.ask_user or self.prompter is None:
@@ -272,52 +557,31 @@ class PermissionPolicy:
             return PermissionDecision(True, reason="user confirmed")
         return PermissionDecision(False, reason="user rejected")
 
-    def _maybe_ask(self, reason: str) -> PermissionDecision:
-        if self.interactive:
-            return PermissionDecision(False, ask_user=True, reason=reason)
-        return PermissionDecision(False, reason=f"{reason}; non-interactive", ask_collapsed=True)
+    def _sandbox_state(self, name: str, arguments: dict[str, Any]) -> SandboxState:
+        if self.sandbox is None:
+            return SandboxState()
+        command_arg = _SHELL_COMMAND_TOOLS.get(name)
+        command: str | None
+        if command_arg is not None:
+            command = str(arguments.get(command_arg, ""))
+        elif name == "run_tests":
+            command = None
+        else:
+            return SandboxState(
+                enabled=bool(getattr(self.sandbox, "is_enabled", lambda: False)()),
+                backend=str(getattr(self.sandbox, "backend_name", "unknown")),
+            )
+        is_enabled = getattr(self.sandbox, "is_enabled", None)
+        will_sandbox = self.sandbox.should_sandbox(command)
+        enabled = bool(is_enabled()) if callable(is_enabled) else bool(will_sandbox)
+        return SandboxState(
+            enabled=enabled,
+            backend=str(getattr(self.sandbox, "backend_name", "unknown")),
+            will_sandbox=will_sandbox,
+            excluded=enabled and not will_sandbox,
+            auto_allow_enabled=bool(self.sandbox.config.auto_allow_command_if_sandboxed),
+        )
 
-    def _ask_or_deny(self, reason: str) -> PermissionDecision:
-        """Apply the final Don't Ask transformation to every ask-producing path."""
-        if self.mode == PermissionMode.DONTASK:
-            return PermissionDecision(False, reason=f"{reason}; dontask mode denies prompts")
-        return self._maybe_ask(reason)
-
-
-def _targets_secret_path(arguments: dict[str, Any]) -> bool:
-    """Whether a path argument targets secret-bearing material (.env, keys, creds).
-
-    Applies to every risk class: reading a secret is an exfiltration channel, not
-    just writing one. Same deliberate narrowness as ``_targets_sensitive_path`` —
-    shell redirections are the deny-rule/sandbox layer's job.
-    """
-    for key in _SENSITIVE_PATH_KEYS:
-        value = arguments.get(key)
-        if not isinstance(value, str) or not value:
-            continue
-        segments = value.replace("\\", "/").lower().split("/")
-        if any(seg in _SECRET_DIRS for seg in segments):
-            return True
-        basename = segments[-1]
-        if any(fnmatch.fnmatch(basename, pattern) for pattern in _SECRET_BASENAME_PATTERNS):
-            return True
-    return False
-
-
-def _targets_sensitive_path(arguments: dict[str, Any]) -> bool:
-    """Whether a file-write argument targets a protected path (config / .git / .polaris).
-
-    Deliberately narrow (path-bearing tools only): a shell command that redirects into a
-    protected path is not caught here — that surface is covered by deny rules and the OS
-    sandbox instead.
-    """
-    for key in _SENSITIVE_PATH_KEYS:
-        value = arguments.get(key)
-        if not isinstance(value, str) or not value:
-            continue
-        segments = value.replace("\\", "/").lower().split("/")
-        if any(seg in _SENSITIVE_DIRS for seg in segments):
-            return True
-        if segments[-1] in _SENSITIVE_BASENAMES:
-            return True
-    return False
+    def _sandbox_auto_allows(self, name: str, arguments: dict[str, Any]) -> bool:
+        state = self._sandbox_state(name, arguments)
+        return state.auto_allow_enabled and state.will_sandbox and not state.excluded

@@ -502,3 +502,17 @@ Q1–Q5、Q10。产物：新 CLAUDE.md、敏感路径加固、可见降级、sch
   repo 配置中的 `allowed_domains` 属放权键，纳入 `trust.py` 既有 TOFU 门控
   （是把新放权键**纳入门控**，不是扩大 repo 可放权范围）。
   呼应 §9.1"交互可偏松，无头必须偏紧"。
+
+## 10. Permission architecture 演进（2026-07-14）
+
+权限系统已从“`ToolRisk` 统一矩阵”演进为“中央 `PermissionPolicy` + 每工具
+`check_permissions` + `ToolRisk` fallback”。新增 `PermissionBehavior`/`PermissionResult`/
+`PermissionContext` 契约，工具默认 `PASSTHROUGH`；文件、Shell、测试、Web、子 Agent、Team 和 Skill
+均已进行 call-specific 迁移。唯一决策顺序、六种 mode 状态表、安全不变量、plan artifact workflow、
+rule provenance、managed policy 与 JSONL redaction 规范以
+[`docs/permission-system.md`](docs/permission-system.md) 为准。
+
+本轮同时删除 plan fake dry-run，改为 `write_plan`/`exit_plan` 明确 workflow；`auto` 使用可插拔
+`AutomatedPermissionEvaluator` 并 fail-closed；`dontask` 在完整管线后将 ASK 转 DENY；`bypass` 只
+放行通过 managed/deny/ask/中央安全网/交互要求后的 `PASSTHROUGH`。审计事件保留 matched rule 与
+managed/user/project/local/cli/session provenance，不持久化 secret content、token 或完整 credential。

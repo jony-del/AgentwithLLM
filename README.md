@@ -45,7 +45,9 @@ polaris run "Say hello without tools" --provider fake
 - `bypass`：允许未命中的动作，但 deny/ask 规则和敏感路径保护仍然有效。
 
 `auto`、`dontask`、`bypass` 没有真实沙箱时需要交互式明确确认；无头运行仍默认拒绝。AI 分类器
-超时、报错或返回无法解析的结果时一律拒绝对应动作。
+超时、报错或返回无法解析的结果时一律拒绝对应动作。中央安全策略、工具级
+`check_permissions()`、确定性决策顺序、plan artifact 与审计契约见
+[权限系统架构](docs/permission-system.md)。
 
 ## 源码开发
 

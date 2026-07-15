@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_types import PermissionContext, PermissionResult
 
 class ToolDisplayProvider:
     """Optional UI-rendering hints a tool may supply for a nicer live trace.
@@ -82,6 +83,9 @@ class Tool(ABC, ToolDisplayProvider):
     # labelled WRITE.  Only workspace-native file editors opt in; coordination,
     # sub-agent, skill, MCP, and other stateful tools keep the fail-safe default.
     accept_edits_safe: bool = False
+    # These tools must remain an ASK even in bypass/auto; a live user or an
+    # explicitly configured PermissionRequest approval channel must resolve it.
+    requires_user_interaction: bool = False
 
     def schema_for_llm(self) -> dict[str, Any]:
         return {
@@ -97,6 +101,19 @@ class Tool(ABC, ToolDisplayProvider):
         resources run one at a time in original order.
         """
         return ConcurrencySpec(exclusive=True)
+
+    async def check_permissions(
+        self,
+        arguments: dict[str, Any],
+        context: PermissionContext,
+    ) -> PermissionResult:
+        """Return this tool's argument-aware permission recommendation.
+
+        PASSTHROUGH is deliberately the base contract: an un-migrated or third-party
+        tool must still pass through the central policy and conservative ToolRisk
+        fallback instead of accidentally becoming trusted merely by subclassing Tool.
+        """
+        return PermissionResult.passthrough()
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the tool — the single (async) execution entry point.

@@ -172,6 +172,46 @@ def test_redirect_hop_check_covers_domain_policy() -> None:
     assert exc.value.error_type == "BlockedDomain"
 
 
+def test_fetch_rechecks_domain_policy_on_every_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Response:
+        def __init__(self, status: int, url: str, location: str | None = None) -> None:
+            self.status_code = status
+            self.url = url
+            self.headers = {"location": location} if location else {"content-type": "text/plain"}
+            self.text = "body"
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            self.responses = [
+                _Response(302, "https://good.example/start", "https://evil.example/leak"),
+                _Response(200, "https://evil.example/leak"),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url: str):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(web.httpx, "Client", _Client)
+    monkeypatch.setattr(web, "_check_url_safe", lambda url: None)
+    policy = WebPolicyConfig(blocked_domains=["evil.example"])
+    checked: list[str] = []
+
+    def hop_check(url: str) -> None:
+        checked.append(url)
+        _check_domain_policy(url, policy, unattended=False)
+
+    with pytest.raises(WebError) as exc:
+        web._fetch_url("https://good.example/start", hop_check=hop_check)
+
+    assert exc.value.error_type == "BlockedDomain"
+    assert checked == ["https://good.example/start", "https://evil.example/leak"]
+
+
 async def test_web_search_checks_backend_domain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)

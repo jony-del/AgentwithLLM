@@ -18,8 +18,22 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
+from agent_core.command_security import analyze_command
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_safety import (
+    is_secret_path,
+    ordinary_read_permission,
+    ordinary_write_permission,
+)
+from agent_core.permission_types import (
+    DecisionSource,
+    PermissionBehavior,
+    PermissionContext,
+    PermissionMode,
+    PermissionResult,
+)
 from agent_core.sandbox import SandboxAwareMixin
 from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.catalog import builtin_tool
@@ -131,6 +145,11 @@ class ListDirTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_read_permission(self.name, arguments, context)
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
 
@@ -164,6 +183,11 @@ class EditFileTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_write_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))
@@ -217,6 +241,11 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         "required": ["pattern"],
     }
     risk = ToolRisk.READ
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_read_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
@@ -305,6 +334,22 @@ class SearchTextTool(WorkspacePathMixin, Tool):
             cmd.extend(["--glob", str(arguments["glob"])])
         for name in sorted(_IGNORED_DIRS):
             cmd.extend(["--glob", f"!**/{name}/**"])
+        if base.is_dir():
+            for secret_pattern in (
+                ".env",
+                ".env.*",
+                "*.pem",
+                "*.key",
+                "*.p12",
+                "*.pfx",
+                "id_rsa*",
+                "id_ed25519*",
+                "credentials",
+                "credentials.json",
+            ):
+                cmd.extend(["--glob", f"!**/{secret_pattern}"])
+            for name in (".ssh", ".aws", ".gnupg", ".kube"):
+                cmd.extend(["--glob", f"!**/{name}/**"])
         cmd.extend(["--regexp", pattern, "--", str(rel_base) or "."])
         try:
             proc = subprocess.run(
@@ -347,6 +392,8 @@ class SearchTextTool(WorkspacePathMixin, Tool):
                 continue
             if any(part in _IGNORED_DIRS for part in path.relative_to(self.workspace).parts[:-1]):
                 continue
+            if not base.is_file() and is_secret_path(path):
+                continue
             if glob and not fnmatch.fnmatch(path.name, str(glob)):
                 continue
             yield path
@@ -384,6 +431,26 @@ class RunCommandTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
     }
     risk = ToolRisk.DANGEROUS
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        analysis = analyze_command(str(arguments.get("command", "")))
+        metadata = {"category": analysis.category, "segments": len(analysis.segments)}
+        if analysis.behavior is PermissionBehavior.DENY:
+            return PermissionResult.deny(analysis.reason, metadata=metadata)
+        if analysis.behavior is PermissionBehavior.ALLOW:
+            return PermissionResult.allow(analysis.reason, metadata=metadata)
+        if context.mode is PermissionMode.BYPASS and not analysis.bypass_immune:
+            return PermissionResult.passthrough(analysis.reason, metadata=metadata)
+        if analysis.category in {"development", "file_mutation"}:
+            return PermissionResult.passthrough(analysis.reason, metadata=metadata)
+        return PermissionResult.ask(
+            analysis.reason,
+            metadata=metadata,
+            classifier_approvable=analysis.classifier_approvable,
+            bypass_immune=analysis.bypass_immune,
+        )
+
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         command = str(arguments["command"])
         timeout = min(int(arguments.get("timeout", 30)), _MAX_COMMAND_TIMEOUT)
@@ -408,6 +475,11 @@ class GitDiffTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_read_permission(self.name, arguments, context)
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         raw_path = arguments.get("path", ".")
         return ConcurrencySpec((self.workspace_lock(raw_path, "read", subtree=True),))
@@ -419,6 +491,37 @@ class GitDiffTool(WorkspacePathMixin, Tool):
         if arguments.get("path"):
             cmd += ["--", str(self.resolve_workspace_path(arguments["path"]))]
         return _run_subprocess(self.name, cmd, cwd=self.workspace, timeout=30, shell=False)
+
+
+_TEST_SHELL_META = re.compile(r"[;&|`\r\n]|\$\(|%COMSPEC%", re.IGNORECASE)
+_TEST_UNSAFE_OPTIONS = {
+    "-c",
+    "-p",
+    "--rootdir",
+    "--confcutdir",
+    "--basetemp",
+    "--override-ini",
+    "--import-mode",
+}
+
+
+def _unsafe_test_arguments(arguments: dict[str, Any]) -> str | None:
+    target = str(arguments.get("target", ""))
+    if _TEST_SHELL_META.search(target):
+        return "test target contains shell control syntax"
+    extra = arguments.get("args") or []
+    if not isinstance(extra, list):
+        return "test args must be an argv list"
+    for value in extra:
+        arg = str(value)
+        if _TEST_SHELL_META.search(arg):
+            return "test args contain shell control syntax"
+        if arg.startswith("@"):
+            return "pytest response-file arguments are not permitted"
+        option = arg.split("=", 1)[0]
+        if option in _TEST_UNSAFE_OPTIONS:
+            return f"pytest option {option!r} can alter code/config loading and is not permitted"
+    return None
 
 
 @builtin_tool
@@ -438,6 +541,31 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
         "required": [],
     }
     risk = ToolRisk.DANGEROUS
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        invalid = _unsafe_test_arguments(arguments)
+        if invalid is not None:
+            return PermissionResult.deny(invalid, decision_source=DecisionSource.TOOL)
+        allow_rule = context.rules.allow_match(self.name, arguments) if context.rules is not None else None
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "test invocation allowed by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=allow_rule,
+            )
+        if self.name in context.session_authorizations.tool_names:
+            return PermissionResult.allow("tests allowed for this session", decision_source=DecisionSource.RULE)
+        if context.sandbox.auto_allow_enabled and context.sandbox.will_sandbox:
+            return PermissionResult.passthrough("sandbox policy may allow this test invocation")
+        if context.mode is PermissionMode.BYPASS:
+            return PermissionResult.passthrough("test invocation may be resolved by bypass mode")
+        return PermissionResult.ask(
+            "workspace tests execute project code and require review",
+            classifier_approvable=True,
+            metadata={"target": str(arguments.get("target", ""))[:200]},
+        )
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         # pytest is a [dev] extra, not a runtime dependency — probe for it and fail
@@ -556,6 +684,11 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_read_permission(self.name, arguments, context)
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "read"),))
 
@@ -602,6 +735,11 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return ordinary_write_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(arguments["path"], "write"),))

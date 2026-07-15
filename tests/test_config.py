@@ -8,6 +8,7 @@ from agent_core.config import (
     resolve_permission_rules,
     resolve_sandbox_config,
 )
+from agent_core.permission_types import PermissionRuleSource
 
 
 def test_load_dotenv_sets_missing_environment_variables(tmp_path: Path, monkeypatch) -> None:
@@ -181,6 +182,8 @@ def test_resolve_permission_rules_from_toml(tmp_path: Path) -> None:
     assert rules.deny_matches("run_command", {"command": "rm x"})
     # The unparseable "bad(" entry was dropped, not raised.
     assert len(rules.deny) == 1
+    matched = rules.allow_match("run_command", {"command": "git status"})
+    assert matched is not None and matched.source is PermissionRuleSource.USER
 
 
 def test_resolve_permission_rules_absent_table(tmp_path: Path) -> None:

@@ -79,6 +79,18 @@ class AutoPermissionClassifier(Protocol):
     ) -> AutoPermissionVerdict: ...
 
 
+class AutomatedPermissionEvaluator(Protocol):
+    """Stable evaluator contract used by auto mode (allow/deny only)."""
+
+    async def evaluate(
+        self,
+        tool: "Tool",
+        tool_call: ToolCall,
+        messages: list[Message],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AutoPermissionVerdict: ...
+
+
 class ProviderAutoPermissionClassifier:
     """Classify pending actions with the agent's active provider and model."""
 
@@ -90,7 +102,7 @@ class ProviderAutoPermissionClassifier:
         self.provider = provider
         self.base_config = base_config
 
-    async def classify(
+    async def evaluate(
         self,
         tool: "Tool",
         tool_call: ToolCall,
@@ -165,6 +177,35 @@ class ProviderAutoPermissionClassifier:
             duration_ms=duration_ms,
             usage=usage,
         )
+
+    async def classify(
+        self,
+        tool: "Tool",
+        tool_call: ToolCall,
+        messages: list[Message],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AutoPermissionVerdict:
+        """Compatibility alias for callers using the original classifier name."""
+        return await self.evaluate(tool, tool_call, messages, should_cancel)
+
+
+class FakeAutomatedPermissionEvaluator:
+    """Deterministic evaluator for contract tests and embedded offline agents."""
+
+    def __init__(self, allowed: bool, reason: str = "fake evaluator decision") -> None:
+        self.allowed = allowed
+        self.reason = reason
+        self.calls: list[str] = []
+
+    async def evaluate(
+        self,
+        tool: "Tool",
+        tool_call: ToolCall,
+        messages: list[Message],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AutoPermissionVerdict:
+        self.calls.append(tool.name)
+        return AutoPermissionVerdict(self.allowed, self.reason, model="fake")
 
 
 def _action_line(tool: "Tool", tool_call: ToolCall) -> str:

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 # Cap on the recently-read file snapshots kept on a session (Phase 3E). Only the most
@@ -27,6 +29,69 @@ _MAX_READ_FILE_STATE = 20
 # Allowed to-do states, mirroring Claude Code's TodoWrite.
 VALID_TODO_STATUS = frozenset({"pending", "in_progress", "completed"})
 _TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+
+
+@dataclass(slots=True)
+class PlanState:
+    active: bool = False
+    previous_mode: str | None = None
+    artifact_path: Path | None = None
+
+    def enter(self, previous_mode: str, artifact_path: Path) -> None:
+        if not self.active:
+            self.previous_mode = previous_mode
+        self.active = True
+        self.artifact_path = artifact_path
+
+    def clear(self) -> None:
+        self.active = False
+        self.previous_mode = None
+        self.artifact_path = None
+
+
+class PlanArtifactStore:
+    """Agent-owned plan storage; callers never choose an arbitrary output path."""
+
+    def __init__(self, root: str | Path | None = None) -> None:
+        if root is None:
+            try:
+                base = Path.home()
+            except RuntimeError:  # embedded/restricted environments may have no HOME
+                base = Path.cwd()
+            self.root = base / ".polaris" / "plans"
+        else:
+            self.root = Path(root).expanduser()
+
+    def path_for(self, session_id: str, agent_id: str) -> Path:
+        safe_session = _safe_plan_component(session_id or "session")
+        safe_agent = _safe_plan_component(agent_id or "leader")
+        return self.root / f"{safe_session}-{safe_agent}.md"
+
+    def write(self, path: Path, content: str) -> None:
+        encoded = content.encode("utf-8")
+        if len(encoded) > 256 * 1024:
+            raise ValueError("plan artifact exceeds the 256 KiB limit")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_bytes(encoded)
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        temporary.replace(path)
+
+    def read(self, path: Path | None) -> str | None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+
+def _safe_plan_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return cleaned[:80] or "unknown"
 
 
 @dataclass(slots=True)
@@ -85,6 +150,8 @@ class SessionContext:
     # Identifier of the resumable session transcript this run writes to. Threaded through
     # to sub-agents so their sidechain transcripts nest under the parent session dir.
     session_id: str = ""
+    agent_id: str = "leader"
+    parent_agent_id: str | None = None
     todos: TodoStore = field(default_factory=TodoStore)
     # Async factories: children are awaited on the shared event loop so several
     # children's API calls overlap (bounded by the shared provider gate). The trailing
@@ -108,6 +175,9 @@ class SessionContext:
     # read this run's JSONL events. ``run_id`` is the JSONLRunLogger's id.
     run_dir: str = "runs"
     run_id: str = ""
+    plan_state: PlanState = field(default_factory=PlanState)
+    plan_store: PlanArtifactStore = field(default_factory=PlanArtifactStore)
+    permission_mode_setter: Callable[..., object] | None = None
     depth: int = 0
     max_depth: int = 1
     # Recently-read file snapshots, keyed by workspace-resolved path string and

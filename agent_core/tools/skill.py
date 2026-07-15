@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_types import DecisionSource, PermissionContext, PermissionResult
 from agent_core.session import SessionAwareMixin
 from agent_core.skills.dispatch import build_skill_prompt, fork_preset
 from agent_core.skills.models import SkillContext
@@ -43,6 +44,43 @@ class SkillTool(SessionAwareMixin, Tool):
         "required": ["command"],
     }
     risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        registry = getattr(self.session, "skills", None)
+        skill = registry.get(str(arguments.get("command", ""))) if registry else None
+        if skill is None or not skill.model_invocable:
+            return PermissionResult.deny("unknown or unavailable skill", decision_source=DecisionSource.TOOL)
+        pure_prompt = (
+            skill.context is SkillContext.INLINE
+            and not skill.allowed_tools
+            and not skill.capabilities
+            and not skill.hooks
+            and skill.prompt_fn is None
+        )
+        if pure_prompt:
+            return PermissionResult.allow("pure inline prompt skill has no additional capability")
+        allow_rule = context.rules.allow_match(self.name, arguments) if context.rules is not None else None
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "privileged skill allowed by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=allow_rule,
+            )
+        if self.name in context.session_authorizations.tool_names:
+            return PermissionResult.allow("privileged skill allowed for this session", decision_source=DecisionSource.RULE)
+        return PermissionResult.ask(
+            "skill declares a fork, programmatic hook, or additional tool capability",
+            metadata={
+                "skill": skill.name,
+                "context": skill.context.value,
+                "allowed_tools": list(skill.allowed_tools),
+                "capabilities": list(skill.capabilities),
+                "hooks": list(skill.hooks),
+            },
+            bypass_immune=True,
+        )
 
     def _available(self) -> list:
         registry = getattr(self.session, "skills", None)

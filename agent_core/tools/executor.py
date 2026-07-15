@@ -3,16 +3,24 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import PurePath
 
 from agent_core.hooks import HookContext, HookEvent, HookOutcome, HookPipeline
 from agent_core.models import Message, ToolCall, ToolResult
+from agent_core.permission_audit import (
+    build_permission_audit_event,
+    sanitize_log_payload,
+    summarize_arguments,
+    summarize_tool_result,
+)
 from agent_core.permission_classifier import (
     AutoPermissionClassifier,
     AutoPermissionVerdict,
 )
 from agent_core.permissions import PermissionDecision, PermissionPolicy
+from agent_core.permission_safety import is_secret_path
+from agent_core.permission_types import DecisionSource, PermissionBehavior, PermissionResult
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.registry import ToolRegistry
@@ -173,8 +181,14 @@ class ToolExecutor:
             await self.logger.write(
                 "tool_pre",
                 {
-                    "tool_call": asdict(rewritten_call),
-                    "pre_results": [asdict(result) for result in pre_results],
+                    "tool_call": {
+                        "name": rewritten_call.name,
+                        "id": rewritten_call.id,
+                        "arguments_summary": summarize_arguments(
+                            rewritten_call.name, rewritten_call.arguments
+                        ),
+                    },
+                    "pre_results": sanitize_log_payload([asdict(result) for result in pre_results]),
                 },
             )
         if any(not result.allowed for result in pre_results):
@@ -195,7 +209,15 @@ class ToolExecutor:
         self.ui.on_tool_call(
             tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
         )
-        decision = self.permissions.decide(tool, rewritten_call)
+        permission_context = self.permissions.build_context(tool, rewritten_call.arguments)
+        permission_result = await self.permissions.evaluate(
+            tool, rewritten_call, context=permission_context
+        )
+        originating_rule = permission_result.matched_rule
+        if permission_result.updated_arguments is not None:
+            rewritten_call = replace(rewritten_call, arguments=dict(permission_result.updated_arguments))
+            permission_context = self.permissions.build_context(tool, rewritten_call.arguments)
+        decision = self.permissions.as_legacy_decision(permission_result)
         classifier_verdict: AutoPermissionVerdict | None = None
         if decision.classify:
             if self.permission_classifier is None:
@@ -206,16 +228,28 @@ class ToolExecutor:
                 )
             else:
                 try:
-                    classifier_verdict = await self.permission_classifier.classify(
-                        tool,
-                        rewritten_call,
-                        messages or [],
-                        should_cancel,
-                    )
+                    evaluate = getattr(self.permission_classifier, "evaluate", None)
+                    if callable(evaluate):
+                        classifier_verdict = await evaluate(
+                            tool, rewritten_call, messages or [], should_cancel
+                        )
+                    else:
+                        classifier_verdict = await self.permission_classifier.classify(
+                            tool,
+                            rewritten_call,
+                            messages or [],
+                            should_cancel,
+                        )
                 except asyncio.CancelledError:
                     classifier_verdict = AutoPermissionVerdict(
                         False,
                         "auto mode classifier was cancelled",
+                        unavailable=True,
+                    )
+                except Exception as exc:  # fail closed: evaluator failures are hard denials
+                    classifier_verdict = AutoPermissionVerdict(
+                        False,
+                        f"auto mode evaluator failed: {type(exc).__name__}",
                         unavailable=True,
                     )
             decision = PermissionDecision(
@@ -227,6 +261,18 @@ class ToolExecutor:
                 )
                 + classifier_verdict.reason,
             )
+            if classifier_verdict.allowed:
+                permission_result = PermissionResult.allow(
+                    decision.reason,
+                    decision_source=DecisionSource.CLASSIFIER,
+                    metadata={"classifier": asdict(classifier_verdict)},
+                )
+            else:
+                permission_result = PermissionResult.deny(
+                    decision.reason,
+                    decision_source=DecisionSource.CLASSIFIER,
+                    metadata={"classifier": asdict(classifier_verdict)},
+                )
         # PermissionRequest (R1 programmatic approval): consulted only for ASK decisions
         # — interactive asks (ask_user) and their headless collapse (ask_collapsed) —
         # never for hard denies, so a hook cannot launder a deny rule. A hook allow
@@ -245,23 +291,55 @@ class ToolExecutor:
                         + (f": {outcome.reason}" if outcome.reason else "")
                     ),
                 )
+                permission_result = (
+                    PermissionResult.allow(
+                        decision.reason,
+                        decision_source=DecisionSource.HOOK,
+                        matched_rule=originating_rule,
+                    )
+                    if allowed
+                    else PermissionResult.deny(
+                        decision.reason,
+                        decision_source=DecisionSource.HOOK,
+                        matched_rule=originating_rule,
+                    )
+                )
         # The confirm step may block on an interactive prompt (input()); run it on a
         # worker thread so a question to the user doesn't freeze other in-flight work.
+        was_pending_ask = permission_result.behavior is PermissionBehavior.ASK
         decision = await asyncio.to_thread(self.permissions.confirm, decision, tool, rewritten_call)
+        if was_pending_ask:
+            if decision.allowed:
+                permission_result = PermissionResult.allow(
+                    decision.reason,
+                    decision_source=DecisionSource.USER,
+                    matched_rule=originating_rule,
+                )
+            elif not decision.ask_user:
+                source = DecisionSource.USER if self.permissions.interactive else DecisionSource.MODE
+                permission_result = PermissionResult.deny(
+                    decision.reason,
+                    decision_source=source,
+                    matched_rule=originating_rule,
+                )
         if self.logger:
-            payload: dict[str, object] = {"tool": tool.name, "decision": asdict(decision)}
+            classifier_payload = asdict(classifier_verdict) if classifier_verdict is not None else None
+            payload: dict[str, object] = build_permission_audit_event(
+                tool.name,
+                rewritten_call.arguments,
+                permission_context,
+                permission_result,
+                classifier_payload,
+            )
+            payload["decision"] = asdict(decision)  # compatibility for existing replay readers
             if hook_verdict is not None:
                 payload["permission_request_hook"] = hook_verdict
             if classifier_verdict is not None:
-                payload["auto_classifier"] = asdict(classifier_verdict)
+                payload["auto_classifier"] = classifier_payload
             await self.logger.write("permission", payload)
         if not decision.allowed:
             result = ToolResult(tool.name, f"Tool denied: {decision.reason}", ok=False)
             return await self._finish(rewritten_call, result, decision.reason)
-        if decision.dry_run:
-            result = ToolResult(tool.name, f"Dry-run: would execute {tool.name} with {rewritten_call.arguments}")
-            return await self._finish(rewritten_call, result, decision.reason)
-
         try:
             spec = tool.concurrency_spec(rewritten_call.arguments)
         except Exception as exc:
@@ -277,6 +355,10 @@ class ToolExecutor:
         self, tool_call: ToolCall, result: ToolResult, reason: str | None, tool: Tool | None = None
     ) -> ToolResult:
         """Log, surface the observation to the UI, and return one exit for every path."""
+        if tool_call.name == "read_text_file" and is_secret_path(
+            str(tool_call.arguments.get("path", ""))
+        ):
+            result.metadata["sensitive"] = True
         await self._log_result(tool_call, result, reason)
         if not result.ok:
             # Every failed result (denied, unknown tool, tool error) funnels through
@@ -364,7 +446,12 @@ class ToolExecutor:
         if self.logger:
             await self.logger.write(
                 "tool_result",
-                {"tool_call": asdict(tool_call), "result": asdict(result), "reason": reason},
+                {
+                    "tool": tool_call.name,
+                    "arguments_summary": summarize_arguments(tool_call.name, tool_call.arguments),
+                    "result": summarize_tool_result(result.content, result.metadata, result.ok),
+                    "reason": reason,
+                },
             )
 
     def _waves(self, calls: list[_PreparedCall]) -> list[list[_PreparedCall]]:

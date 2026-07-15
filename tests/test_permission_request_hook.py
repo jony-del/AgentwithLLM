@@ -11,6 +11,8 @@ Control-path contract:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent_core.hooks import HookContext, HookEvent, HookOutcome, HookPipeline
 from agent_core.models import ToolCall, ToolResult, ToolRisk
 from agent_core.permission_rules import RuleSet
@@ -18,6 +20,7 @@ from agent_core.permissions import PermissionPolicy
 from agent_core.tools.base import ConcurrencySpec, Tool
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.builtin import WriteTextFileTool
 
 
 class _DangerousTool(Tool):
@@ -147,3 +150,61 @@ async def test_interactive_no_opinion_falls_through_to_prompter() -> None:
     executor = _executor(tool, [_DecidingHook(None)], prompter=prompter)
     (result,) = await executor.execute_many([ToolCall("dangerous_thing", {})])
     assert result.ok and tool.invocations == 1  # user confirmation still works
+
+
+async def test_dontask_converts_ask_before_permission_request_hook() -> None:
+    tool = _DangerousTool()
+    hook = _DecidingHook("allow")
+    registry = ToolRegistry()
+    registry.register(tool)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy("dontask", prompter=lambda name, risk, arguments: "once"),
+        HookPipeline(permission_request_hooks=[hook]),
+    )
+
+    (result,) = await executor.execute_many([ToolCall("dangerous_thing", {})])
+
+    assert not result.ok
+    assert tool.invocations == 0
+    assert hook.contexts == []
+
+
+async def test_safety_ask_can_use_explicit_permission_request_hook(tmp_path: Path) -> None:
+    tool = WriteTextFileTool(tmp_path)
+    hook = _DecidingHook("allow", reason="delegated human approval")
+    registry = ToolRegistry()
+    registry.register(tool)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy("default", workspace=tmp_path),
+        HookPipeline(permission_request_hooks=[hook]),
+    )
+
+    (result,) = await executor.execute_many(
+        [ToolCall("write_text_file", {"path": ".git/config", "content": "x"})]
+    )
+
+    assert result.ok
+    assert (tmp_path / ".git" / "config").read_text(encoding="utf-8") == "x"
+    assert len(hook.contexts) == 1
+
+
+async def test_permission_request_hook_cannot_allow_central_hard_deny(tmp_path: Path) -> None:
+    tool = WriteTextFileTool(tmp_path)
+    hook = _DecidingHook("allow")
+    registry = ToolRegistry()
+    registry.register(tool)
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy("bypass", workspace=tmp_path),
+        HookPipeline(permission_request_hooks=[hook]),
+    )
+
+    (result,) = await executor.execute_many(
+        [ToolCall("write_text_file", {"path": ".git/hooks/pre-commit", "content": "x"})]
+    )
+
+    assert not result.ok
+    assert hook.contexts == []
+    assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()

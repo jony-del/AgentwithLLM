@@ -12,7 +12,15 @@ ceiling on the session is enforced by the factory.
 
 from __future__ import annotations
 
+from typing import Any
+
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_types import (
+    DecisionSource,
+    PermissionContext,
+    PermissionMode,
+    PermissionResult,
+)
 from agent_core.session import SessionAwareMixin
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
@@ -52,6 +60,32 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         "required": ["task"],
     }
     risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        preset = str(arguments.get("tool_preset", "read_only"))
+        if context.mode is PermissionMode.PLAN and preset == "full":
+            return PermissionResult.deny(
+                "plan mode cannot spawn a child with workspace write capability",
+                decision_source=DecisionSource.CENTRAL_SAFETY,
+            )
+        allow_rule = context.rules.allow_match(self.name, arguments) if context.rules is not None else None
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "sub-agent dispatch allowed by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=allow_rule,
+            )
+        if self.name in context.session_authorizations.tool_names:
+            return PermissionResult.allow("sub-agent dispatch allowed for this session", decision_source=DecisionSource.RULE)
+        if context.mode is PermissionMode.BYPASS:
+            return PermissionResult.passthrough("dispatch may be resolved by bypass mode")
+        return PermissionResult.ask(
+            "sub-agent dispatch consumes external model capacity and needs review",
+            classifier_approvable=context.mode is not PermissionMode.PLAN,
+            metadata={"preset": preset},
+        )
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         preset = str(arguments.get("tool_preset", "read_only"))

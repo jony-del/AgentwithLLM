@@ -44,13 +44,15 @@ from agent_core.hooks import (
     OutputLimitConfig,
 )
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
-from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult, ToolRisk
+from agent_core.managed_policy import ManagedPolicyProvider
+from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult
 from agent_core.model_validation import is_model_allowed, unsupported_model_message
 from agent_core.permission_classifier import (
     AutoPermissionClassifier,
     ProviderAutoPermissionClassifier,
 )
 from agent_core.permission_rules import RuleSet
+from agent_core.permission_types import PermissionRuleSource, ToolCallSource
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
 from agent_core.sandbox import (
@@ -93,11 +95,14 @@ WRAPUP_TEXT = (
 )
 
 PLAN_MODE_TEXT = (
-    "Plan mode is active. Investigate with read-only tools, ask the user for any "
-    "materially missing decision, and produce a concrete implementation plan. Do not "
-    "edit files, run commands or tests, spawn agents, or perform external side effects. "
-    "The permission layer will reject all write and dangerous tools."
+    "Plan mode is active. Investigate with dedicated read/search tools, maintain Todo/Task "
+    "state when useful, and produce a decision-complete implementation plan. Do not edit files "
+    "with ordinary file tools. Ordinary "
+    "project edits, shell commands, and tests are prohibited. Save the complete plan with "
+    "write_plan, then call exit_plan to request approval and restore the previous mode."
 )
+_MODE_CONTEXT_START = "\n\n<permission-mode-context>\n"
+_MODE_CONTEXT_END = "\n</permission-mode-context>"
 
 # Bound on the reactive 413 recovery loop: after summarizing once, we peel the oldest
 # whole API rounds and retry ``complete`` at most this many times. This is the guard that
@@ -106,7 +111,7 @@ PLAN_MODE_TEXT = (
 MAX_PTL_RETRIES = 5
 
 
-def _child_permission_mode(preset: str) -> PermissionMode:
+def _child_permission_mode(parent_mode: PermissionMode | str, preset: str) -> PermissionMode:
     """The permission mode a spawned child runs under (decision: no privilege escalation).
 
     Children never inherit ``auto``/``dontask``/``bypass`` — spawning must not launder a
@@ -119,14 +124,43 @@ def _child_permission_mode(preset: str) -> PermissionMode:
     declared capability, nothing more. A ``plan``-mode parent never reaches this point:
     the spawn tool call is dry-run by the parent's own gate.
     """
-    return PermissionMode.ACCEPTEDITS if preset == "full" else PermissionMode.DEFAULT
+    parent = PermissionMode(parent_mode)
+    if parent is PermissionMode.PLAN:
+        return PermissionMode.PLAN
+    if preset != "full":
+        return PermissionMode.DEFAULT
+    if parent in {PermissionMode.ACCEPTEDITS, PermissionMode.AUTO, PermissionMode.BYPASS}:
+        return PermissionMode.ACCEPTEDITS
+    if parent is PermissionMode.DONTASK:
+        return PermissionMode.DONTASK
+    return PermissionMode.DEFAULT
+
+
+_READ_ONLY_CHILD_TOOLS = frozenset(
+    {
+        "list_dir",
+        "search_text",
+        "glob",
+        "git_diff",
+        "read_text_file",
+        "echo",
+        "update_todos",
+    }
+)
+_FULL_CHILD_TOOLS = _READ_ONLY_CHILD_TOOLS | {
+    "edit_file",
+    "multi_edit",
+    "apply_patch",
+    "write_text_file",
+}
 
 
 # Teammates coordinate through the team store (inbox/status/tasks) — those tools write
 # shared team state, not the workspace, so they are allow-ruled in every teammate
 # regardless of the child's mode. Workspace tools still go through the child's own gate.
 _TEAMMATE_COORDINATION_RULES = RuleSet.from_lists(
-    allow=["task_update", "team_inbox_read", "team_message_send"]
+    allow=["task_update", "team_inbox_read", "team_message_send"],
+    source=PermissionRuleSource.SESSION,
 )
 
 
@@ -263,8 +297,10 @@ class ReActAgent:
         transcript: "TranscriptStore | None" = None,
         sandbox: SandboxManager | None = None,
         permission_classifier: AutoPermissionClassifier | None = None,
+        managed_policy_provider: ManagedPolicyProvider | None = None,
     ) -> None:
         self.config = config or ReActConfig()
+        self.managed_policy_provider = managed_policy_provider
         # Effective monotonic deadline of the in-flight run(), shared with children
         # spawned by the sub-agent/teammate factories so the whole fan-out is bounded
         # by one budget. Set at the top of run(); None when no run is active or uncapped.
@@ -330,6 +366,7 @@ class ReActAgent:
         self.session = SessionContext(
             workspace=Path.cwd().resolve(),
             session_id=self.session_id,
+            agent_id=self.logger.run_id,
             subagent_factory=self._spawn_subagent,
             teammate_factory=self._spawn_teammate,
             team_store=self.team_store,
@@ -337,7 +374,13 @@ class ReActAgent:
             skills=self.skills,
             run_dir=self.config.run_dir,
             run_id=self.logger.run_id,
+            permission_mode_setter=self.set_permission_mode,
         )
+        if PermissionMode(self.config.permission) is PermissionMode.PLAN:
+            self.session.plan_state.enter(
+                PermissionMode.DEFAULT.value,
+                self.session.plan_store.path_for(self.session_id, self.session.agent_id),
+            )
         # OS sandbox manager (enforcement layer), built eagerly per the eager-loading
         # invariant. Constructed with fail_if_unavailable honored here (raises before the
         # run starts). An injected manager wins (children receive their parent's, see
@@ -377,7 +420,15 @@ class ReActAgent:
             prompter=self.ui.confirm_tool if self.ui.is_live else None,
             rules=self.config.permission_rules,
             sandbox=self.sandbox,
+            workspace=self.session.workspace,
+            plan_state=self.session.plan_state,
+            managed_policy_provider=self.managed_policy_provider,
+            allow_unsandboxed_unattended=self._unsandboxed_permission_ack,
         )
+        if PermissionMode(self.config.permission) in self.permissions.managed_policy.forbidden_modes:
+            raise ValueError(
+                f"permission mode {PermissionMode(self.config.permission).value!r} is forbidden by managed policy"
+            )
         # One pipeline shared by the executor (pre/post tool hooks) and the run loop
         # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop). An
         # injected pipeline (tests/library use) wins; otherwise assemble the default from
@@ -496,7 +547,15 @@ class ReActAgent:
             return
         env = os.getenv("AGENT_SANDBOX_ALLOW_UNATTENDED")
         env_opt_out = env is not None and env.strip().lower() in {"1", "true", "yes", "on"}
-        if self.config.sandbox.allow_unattended_unsandboxed or env_opt_out:
+        managed_requires_sandbox = False
+        if self.managed_policy_provider is not None:
+            managed_requires_sandbox = (
+                self.managed_policy_provider.load().require_sandbox_for_unattended
+            )
+        if (
+            self.config.sandbox.allow_unattended_unsandboxed or env_opt_out
+        ) and not managed_requires_sandbox:
+            self._unsandboxed_permission_ack = True
             logger.warning(
                 "permission mode %r runs without per-call confirmation AND without a "
                 "sandbox (explicit allow_unattended_unsandboxed opt-out)",
@@ -536,7 +595,16 @@ class ReActAgent:
         if target == previous:
             return target
 
+        if target in self.permissions.managed_policy.forbidden_modes:
+            raise ValueError(f"permission mode {target.value!r} is forbidden by managed policy")
+
         self._enforce_unattended_sandbox_requirement(target)
+        self.permissions.allow_unsandboxed_unattended = self._unsandboxed_permission_ack
+        if target is PermissionMode.PLAN and previous is not PermissionMode.PLAN:
+            self.session.plan_state.enter(
+                previous.value,
+                self.session.plan_store.path_for(self.session_id, self.session.agent_id),
+            )
         self.config.permission = target
         self.permissions.mode = target
         for tool in self.registry.list():
@@ -557,7 +625,22 @@ class ReActAgent:
             # Audit is observational: an unwritable run directory must be visible,
             # but must not leave the already-validated live policy half-switched.
             logger.warning("could not write permission_mode audit event: %s", exc)
+        if previous is PermissionMode.PLAN and target is not PermissionMode.PLAN:
+            self.session.plan_state.clear()
         return target
+
+    def _sync_permission_mode_context(self, messages: list[Message]) -> None:
+        """Refresh the mode system block immediately before every provider call."""
+        system = next((message for message in messages if message.role == "system"), None)
+        if system is None:
+            return
+        base = system.content.split(_MODE_CONTEXT_START, 1)[0]
+        if PermissionMode(self.config.permission) is not PermissionMode.PLAN:
+            system.content = base
+            return
+        artifact = self.session.plan_state.artifact_path
+        detail = PLAN_MODE_TEXT + f"\nPlan artifact: {artifact}"
+        system.content = base + _MODE_CONTEXT_START + detail + _MODE_CONTEXT_END
 
     async def compact_now(self, messages: list[Message]) -> tuple[list[Message], int]:
         """Force a compaction fold of ``messages`` now, ignoring the token gate.
@@ -633,8 +716,6 @@ class ReActAgent:
             self.ui.bind_event_loop(asyncio.get_running_loop())
         user_message = Message("user", task)
         system_prompt = self.config.system_prompt
-        if PermissionMode(self.config.permission) == PermissionMode.PLAN:
-            system_prompt += "\n\n" + PLAN_MODE_TEXT
         messages: list[Message] = [Message("system", system_prompt), user_message]
         await self.logger.write("user", {"content": task, **self._trace_fields()})
         # ``_recall``/``_inject_project_context`` position the recall and pinned
@@ -642,6 +723,7 @@ class ReActAgent:
         # be in place. Final front order: system(+gitStatus) → (recall) → userContext → task.
         await self._recall(task, messages)
         await self._inject_project_context(messages)
+        self._sync_permission_mode_context(messages)
         # Splice prior conversation in just before the new task (after the pinned context),
         # so the order is [system, (recall), userContext, ...history..., task]. System and
         # pinned context are rebuilt fresh above, so any carried in ``history`` are dropped
@@ -743,6 +825,7 @@ class ReActAgent:
             sink = self.ui if (self.ui.is_live and self.config.stream) else None
             self.ui.on_turn_start()
             try:
+                self._sync_permission_mode_context(messages)
                 result = await self.provider.complete(
                     messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
                     should_cancel=cancelled,
@@ -779,6 +862,7 @@ class ReActAgent:
                 for _ in range(MAX_PTL_RETRIES):
                     self.ui.on_turn_start()
                     try:
+                        self._sync_permission_mode_context(messages)
                         result = await self.provider.complete(
                             messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
                             should_cancel=cancelled,
@@ -1681,13 +1765,12 @@ class ReActAgent:
             "team_inbox_read",
             "team_message_send",
         }
+        allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
         for tool in default_tools(workspace=self.session.workspace):
             if getattr(tool, "name", "") in excluded:
                 continue  # prevent recursive fan-out and team orchestration from ordinary sub-agents
-            if preset == "read_only" and tool.risk is not ToolRisk.READ:
+            if getattr(tool, "name", "") not in allowed_tools:
                 continue
-            if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
-                continue  # never hand a child arbitrary command execution implicitly
             sub_registry.register(tool)
         # Disable memory (no independent recall/extract) and skills (the child never gets
         # the ``skill`` tool, so there's nothing to load) in the child. The child's
@@ -1695,7 +1778,7 @@ class ReActAgent:
         # _child_permission_mode (no escalation via spawning).
         child_config = replace(
             self.config,
-            permission=_child_permission_mode(preset),
+            permission=_child_permission_mode(self.config.permission, preset),
             memory=replace(self.config.memory, enabled=False),
             skills=replace(self.config.skills, enabled=False),
         )
@@ -1710,11 +1793,18 @@ class ReActAgent:
             ui=NullUI(),
             session_id=self.session_id,
             transcript=self._child_transcript(agent_id),
+            managed_policy_provider=self.managed_policy_provider,
             sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
         child.session.parent_run_id = self.logger.run_id
+        child.session.agent_id = agent_id
+        child.session.parent_agent_id = self.session.agent_id
+        child.permissions.is_subagent = True
+        child.permissions.parent_mode = PermissionMode(self.config.permission)
+        child.permissions.parent_agent_id = self.session.agent_id
+        child.permissions.tool_source = ToolCallSource.SUBAGENT
         return child
 
     def _child_transcript(self, agent_id: str) -> "TranscriptStore | None":
@@ -1801,16 +1891,12 @@ class ReActAgent:
 
         sub_registry = ToolRegistry()
         excluded = {"dispatch_agent", "skill", "team_create", "task_create", "teammate_spawn", "team_status"}
+        allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
         for tool in default_tools(workspace=self.session.workspace):
             tool_name = getattr(tool, "name", "")
             if tool_name in excluded:
                 continue
-            if tool_name == "task_update":
-                sub_registry.register(tool)
-                continue
-            if preset == "read_only" and tool.risk is not ToolRisk.READ:
-                continue
-            if preset != "full" and tool.risk is ToolRisk.DANGEROUS:
+            if tool_name != "task_update" and tool_name not in allowed_tools:
                 continue
             sub_registry.register(tool)
         sub_registry.register(TeamInboxReadTool())
@@ -1822,7 +1908,7 @@ class ReActAgent:
         # workspace), so a read_only teammate can still claim tasks and report back.
         child_config = replace(
             self.config,
-            permission=_child_permission_mode(preset),
+            permission=_child_permission_mode(self.config.permission, preset),
             permission_rules=self.config.permission_rules.merge(_TEAMMATE_COORDINATION_RULES),
             memory=replace(self.config.memory, enabled=False),
             skills=replace(self.config.skills, enabled=False),
@@ -1837,6 +1923,7 @@ class ReActAgent:
             ui=NullUI(),
             session_id=self.session_id,
             transcript=self._child_transcript(new_session_id()),
+            managed_policy_provider=self.managed_policy_provider,
             sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
         )
         child.session.depth = self.session.depth + 1
@@ -1844,6 +1931,11 @@ class ReActAgent:
         child.session.agent_name = name
         child.session.team_id = team_id
         child.session.parent_run_id = self.logger.run_id
+        child.session.parent_agent_id = self.session.agent_id
+        child.permissions.is_subagent = True
+        child.permissions.parent_mode = PermissionMode(self.config.permission)
+        child.permissions.parent_agent_id = self.session.agent_id
+        child.permissions.tool_source = ToolCallSource.TEAM
         prompt = self._teammate_prompt(team, name, role, focus_task, assigned_tasks)
         return child, prompt
 

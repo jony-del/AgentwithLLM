@@ -258,6 +258,14 @@ def test_child_permission_never_escalates(tmp_path) -> None:
     assert read_only_child.config.permission == PermissionMode.DEFAULT
     assert full_child.config.permission == PermissionMode.ACCEPTEDITS
 
+    default_parent = ReActAgent(
+        provider=FakeProvider(),
+        config=ReActConfig(run_dir=str(tmp_path / "default"), permission="default"),
+    )
+    default_full = default_parent._make_subagent_child("full")
+    assert not isinstance(default_full, str)
+    assert default_full.config.permission == PermissionMode.DEFAULT
+
 
 def test_child_shares_parent_sandbox_manager(tmp_path) -> None:
     # §5.6: a spawned child must reuse the parent's (already prepared) SandboxManager,

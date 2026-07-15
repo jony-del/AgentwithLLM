@@ -13,6 +13,7 @@ to an internal service.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
@@ -26,6 +27,13 @@ import httpx
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_rules import _match_domain
+from agent_core.permission_safety import check_web_endpoint, resolve_and_check_public_host
+from agent_core.permission_types import (
+    DecisionSource,
+    PermissionContext,
+    PermissionMode,
+    PermissionResult,
+)
 from agent_core.tools.base import ConcurrencySpec, Tool
 from agent_core.tools.catalog import builtin_tool
 
@@ -293,6 +301,35 @@ class WebFetchTool(WebPolicyAwareMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        url = str(arguments.get("url", "")).strip()
+        central = check_web_endpoint(url, context)
+        if central is not None:
+            return central
+        try:
+            await asyncio.to_thread(resolve_and_check_public_host, url)
+        except ValueError as exc:
+            return PermissionResult.deny(str(exc), decision_source=DecisionSource.CENTRAL_SAFETY)
+        allow_rule = context.rules.allow_match(self.name, arguments) if context.rules is not None else None
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "web fetch allowed by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=allow_rule,
+            )
+        if self.name in context.session_authorizations.tool_names:
+            return PermissionResult.allow("web fetch allowed for this session", decision_source=DecisionSource.RULE)
+        if context.web_policy.unattended:
+            return PermissionResult.allow("unattended fetch target is allowlisted")
+        if context.mode is PermissionMode.BYPASS:
+            return PermissionResult.passthrough("web fetch may be resolved by bypass mode")
+        return PermissionResult.ask(
+            "network fetch can disclose local intent and requires explicit approval",
+            bypass_immune=True,
+        )
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()
 
@@ -340,6 +377,36 @@ class WebSearchTool(WebPolicyAwareMixin, Tool):
         "required": ["query"],
     }
     risk = ToolRisk.READ
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        host = _SEARCH_BACKEND_DOMAINS[_active_search_backend()]
+        endpoint = f"https://{host}"
+        central = check_web_endpoint(endpoint, context)
+        if central is not None:
+            return central
+        try:
+            await asyncio.to_thread(resolve_and_check_public_host, endpoint)
+        except ValueError as exc:
+            return PermissionResult.deny(str(exc), decision_source=DecisionSource.CENTRAL_SAFETY)
+        allow_rule = context.rules.allow_match(self.name, arguments) if context.rules is not None else None
+        if allow_rule is not None:
+            return PermissionResult.allow(
+                "web search allowed by rule",
+                decision_source=DecisionSource.RULE,
+                matched_rule=allow_rule,
+            )
+        if self.name in context.session_authorizations.tool_names:
+            return PermissionResult.allow("web search allowed for this session", decision_source=DecisionSource.RULE)
+        if context.web_policy.unattended:
+            return PermissionResult.allow("unattended search backend is allowlisted")
+        if context.mode is PermissionMode.BYPASS:
+            return PermissionResult.passthrough("web search may be resolved by bypass mode")
+        return PermissionResult.ask(
+            "web search sends the query to an external service and requires approval",
+            bypass_immune=True,
+        )
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()

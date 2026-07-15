@@ -1,14 +1,48 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from agent_core.agents.team import TeamError, TeamPermissionError, TeamStore
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.permission_types import (
+    DecisionSource,
+    PermissionContext,
+    PermissionMode,
+    PermissionResult,
+)
 from agent_core.session import SessionAwareMixin
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 
 _PRESETS = {"read_only", "full"}
+
+
+def _internal_state_permission(reason: str) -> PermissionResult:
+    return PermissionResult.allow(reason, decision_source=DecisionSource.TOOL)
+
+
+def _team_side_effect_permission(
+    tool_name: str,
+    arguments: dict[str, Any],
+    context: PermissionContext,
+    reason: str,
+) -> PermissionResult:
+    allow_rule = context.rules.allow_match(tool_name, arguments) if context.rules is not None else None
+    if allow_rule is not None:
+        return PermissionResult.allow(
+            "team action allowed by rule",
+            decision_source=DecisionSource.RULE,
+            matched_rule=allow_rule,
+        )
+    if tool_name in context.session_authorizations.tool_names:
+        return PermissionResult.allow("team action allowed for this session", decision_source=DecisionSource.RULE)
+    if context.mode is PermissionMode.BYPASS:
+        return PermissionResult.passthrough(reason)
+    return PermissionResult.ask(
+        reason,
+        classifier_approvable=context.mode is not PermissionMode.PLAN,
+    )
 
 
 def _render(payload: object) -> str:
@@ -63,6 +97,13 @@ class TeamCreateTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.WRITE
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _team_side_effect_permission(
+            self.name, arguments, context, "creating a team changes shared orchestration state"
+        )
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec(
             (
@@ -104,6 +145,11 @@ class TaskCreateTool(SessionAwareMixin, Tool):
         "required": ["team_id", "title", "description"],
     }
     risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _internal_state_permission("Task creation is internal coordination state")
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
@@ -164,6 +210,18 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         "required": ["team_id", "name", "role"],
     }
     risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        if context.mode is PermissionMode.PLAN and str(arguments.get("tool_preset", "read_only")) == "full":
+            return PermissionResult.deny(
+                "plan mode cannot spawn a writable teammate",
+                decision_source=DecisionSource.CENTRAL_SAFETY,
+            )
+        return _team_side_effect_permission(
+            self.name, arguments, context, "spawning a teammate consumes external model capacity"
+        )
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
@@ -240,6 +298,11 @@ class TaskUpdateTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.WRITE
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _internal_state_permission("Task updates are internal coordination state")
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
         task_id = str(arguments.get("task_id", "")).strip()
@@ -292,6 +355,11 @@ class TeamStatusTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _internal_state_permission("Team status is internal read-only state")
+
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
         return ConcurrencySpec((ResourceLock("team_status", team_id or "_", "read"),))
@@ -320,6 +388,11 @@ class TeamInboxReadTool(SessionAwareMixin, Tool):
         "required": [],
     }
     risk = ToolRisk.READ
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _internal_state_permission("Team inbox is internal coordination state")
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
@@ -357,6 +430,13 @@ class TeamMessageSendTool(SessionAwareMixin, Tool):
         "required": ["to", "content"],
     }
     risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return _team_side_effect_permission(
+            self.name, arguments, context, "sending a teammate message changes shared coordination state"
+        )
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)

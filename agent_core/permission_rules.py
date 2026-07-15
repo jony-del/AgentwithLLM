@@ -32,9 +32,14 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
+
+from agent_core.permission_types import (
+    PermissionBehavior,
+    PermissionRule,
+    PermissionRuleSource,
+)
 
 # Tools whose primary argument is a free-form shell command line, so their rule
 # content is matched with shell decomposition + anti-evasion rather than as a plain
@@ -67,12 +72,6 @@ _SHELL_OPERATORS = ("&&", "||", "|", ";", "\n")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-class PermissionBehavior(str, Enum):
-    ALLOW = "allow"
-    DENY = "deny"
-    ASK = "ask"
-
-
 @dataclass(frozen=True, slots=True)
 class ParsedRule:
     """One parsed ``ToolName(content)`` rule.
@@ -83,9 +82,14 @@ class ParsedRule:
 
     tool_name: str
     content: str | None = None
+    source: PermissionRuleSource = PermissionRuleSource.PROJECT
 
 
-def parse_rule(raw: str) -> ParsedRule | None:
+def parse_rule(
+    raw: str,
+    *,
+    source: PermissionRuleSource = PermissionRuleSource.PROJECT,
+) -> ParsedRule | None:
     """Parse ``"ToolName(content)"`` / ``"ToolName"`` → :class:`ParsedRule`, or ``None``.
 
     Returns ``None`` (drop the rule) for anything that isn't a well-formed rule string,
@@ -99,14 +103,14 @@ def parse_rule(raw: str) -> ParsedRule | None:
     open_paren = text.find("(")
     if open_paren == -1:
         # Whole-tool rule, e.g. "WebFetch".
-        return ParsedRule(text)
+        return ParsedRule(text, source=source)
     if not text.endswith(")"):
         return None
     tool = text[:open_paren].strip()
     content = text[open_paren + 1 : -1].strip()
     if not tool:
         return None
-    return ParsedRule(tool, content or None)
+    return ParsedRule(tool, content or None, source)
 
 
 @dataclass(slots=True)
@@ -129,13 +133,15 @@ class RuleSet:
         allow: list[str] | None = None,
         deny: list[str] | None = None,
         ask: list[str] | None = None,
+        *,
+        source: PermissionRuleSource = PermissionRuleSource.PROJECT,
     ) -> "RuleSet":
         """Build from raw rule-string lists, silently dropping unparseable entries."""
 
         def _parse(items: list[str] | None) -> list[ParsedRule]:
             out: list[ParsedRule] = []
             for item in items or []:
-                rule = parse_rule(item)
+                rule = parse_rule(item, source=source)
                 if rule is not None:
                     out.append(rule)
             return out
@@ -157,39 +163,108 @@ class RuleSet:
     # -- behavior queries used by the decision pipeline -------------------------------
 
     def deny_matches(self, tool_name: str, arguments: dict[str, Any]) -> bool:
-        return self._matches(self.deny, tool_name, arguments, behavior=PermissionBehavior.DENY)
+        return self.deny_match(tool_name, arguments) is not None
 
     def ask_matches(self, tool_name: str, arguments: dict[str, Any]) -> bool:
-        return self._matches(self.ask, tool_name, arguments, behavior=PermissionBehavior.ASK)
+        return self.ask_match(tool_name, arguments) is not None
 
     def allow_matches(self, tool_name: str, arguments: dict[str, Any]) -> bool:
-        return self._matches(self.allow, tool_name, arguments, behavior=PermissionBehavior.ALLOW)
+        return self.allow_match(tool_name, arguments) is not None
 
-    def _matches(
+    def deny_match(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        source: PermissionRuleSource | None = None,
+    ) -> PermissionRule | None:
+        return self._match(
+            self.deny, tool_name, arguments, behavior=PermissionBehavior.DENY, source=source
+        )
+
+    def ask_match(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        source: PermissionRuleSource | None = None,
+    ) -> PermissionRule | None:
+        return self._match(
+            self.ask, tool_name, arguments, behavior=PermissionBehavior.ASK, source=source
+        )
+
+    def allow_match(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        source: PermissionRuleSource | None = None,
+    ) -> PermissionRule | None:
+        return self._match(
+            self.allow, tool_name, arguments, behavior=PermissionBehavior.ALLOW, source=source
+        )
+
+    def _match(
         self,
         rules: list[ParsedRule],
         tool_name: str,
         arguments: dict[str, Any],
         *,
         behavior: PermissionBehavior,
-    ) -> bool:
-        scoped = [r for r in rules if r.tool_name == tool_name]
+        source: PermissionRuleSource | None = None,
+    ) -> PermissionRule | None:
+        scoped = [
+            rule
+            for rule in rules
+            if rule.tool_name == tool_name and (source is None or rule.source is source)
+        ]
         if not scoped:
-            return False
+            return None
+        scoped.sort(key=_rule_sort_key, reverse=True)
         # A whole-tool rule (no content) governs every call to that tool.
-        if any(r.content is None for r in scoped):
-            return True
+        whole = next((rule for rule in scoped if rule.content is None), None)
+        if whole is not None:
+            return _public_rule(whole, behavior)
         patterns = [r.content for r in scoped if r.content is not None]
 
         command_arg = _SHELL_COMMAND_TOOLS.get(tool_name)
         if command_arg is not None:
             command = str(arguments.get(command_arg, ""))
-            return _match_shell_command(command, patterns, behavior)
+            if _match_shell_command(command, patterns, behavior):
+                return _public_rule(scoped[0], behavior)
+            return None
 
         candidate = _candidate_string(tool_name, arguments)
         if candidate is None:
-            return False
-        return any(_match_scalar(tool_name, candidate, p) for p in patterns)
+            return None
+        matched = next(
+            (
+                rule
+                for rule in scoped
+                if rule.content is not None and _match_scalar(tool_name, candidate, rule.content)
+            ),
+            None,
+        )
+        return _public_rule(matched, behavior) if matched is not None else None
+
+
+_SOURCE_AUTHORITY = {
+    PermissionRuleSource.USER: 1,
+    PermissionRuleSource.PROJECT: 2,
+    PermissionRuleSource.LOCAL: 3,
+    PermissionRuleSource.SESSION: 4,
+    PermissionRuleSource.CLI: 5,
+    PermissionRuleSource.MANAGED: 6,
+}
+
+
+def _rule_sort_key(rule: ParsedRule) -> tuple[int, int]:
+    return (len(rule.content or ""), _SOURCE_AUTHORITY[rule.source])
+
+
+def _public_rule(rule: ParsedRule, behavior: PermissionBehavior) -> PermissionRule:
+    raw = rule.tool_name if rule.content is None else f"{rule.tool_name}({rule.content})"
+    return PermissionRule(rule.source, behavior, rule.tool_name, rule.content, raw)
 
 
 # -- scalar (path / url / target) matching ------------------------------------------

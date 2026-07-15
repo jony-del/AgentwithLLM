@@ -260,9 +260,9 @@ api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
 # to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official
 # git/fetch/time reference servers are core deps, available by default.
-# Every tool defaults to risk = "dangerous" (confirmed in default/acceptedits,
-# classified in auto, denied in plan/dontask); set risk per server to "read" or
-# "write" only after reviewing what the server can actually do.
+# MCP tools currently use ToolRisk as a conservative fallback unless the server adapter
+# supplies a call-specific check_permissions policy. Dangerous/write calls ask in attended
+# modes, are evaluator candidates in auto, and are denied in plan/dontask.
 # Inspect what a server exposes with:  python -m agent_core mcp list
 #
 # # stdio transport — launch a server as a subprocess:
@@ -388,14 +388,16 @@ blocked_domains = []                   # e.g. ["evil.example"]
 # --- Fine-grained permission rules (policy layer) ---------------------------
 # Argument-aware allow/deny/ask rules plus capability-aware permission modes. Each rule
 # is "ToolName(content)" (or bare "ToolName" for the whole tool). Precedence:
-# deny > strict plan write block > secret/sensitive-path safety nets > session grant >
-# ask > sandbox auto-allow > bypass mode > allow > mode decision/auto classifier.
+# managed/explicit deny > central non-bypassable checks > explicit ask > tool ask >
+# sandbox auto-allow > bypass passthrough > session/explicit allow > tool allow >
+# mode transform > ToolRisk fallback. See docs/permission-system.md for the contract.
 #   - run_command content is matched with shell decomposition + anti-evasion:
 #     a compound command (a && b | c) must have EVERY sub-command covered to allow,
 #     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,
 #     "git * --force" = wildcard, "npm run build" = exact.
 #   - file tools match a path glob ("/src/**"); web tools match "domain:example.com".
-# CLI --allow/--deny/--ask append session rules on top of this table.
+# Rules retain provenance: managed/user/project/local/cli/session. Default resolution reads
+# ~/.polaris/agent.toml, project agent.toml, then ignored agent.local.toml; CLI flags are CLI rules.
 [permissions]
 # allow = ["run_command(git *)", "run_command(npm run test:*)", "read_text_file(/src/**)"]
 # deny  = ["run_command(rm *)", "run_command(curl *)", "web_fetch(domain:evil.example)"]
