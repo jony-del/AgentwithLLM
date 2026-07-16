@@ -14,6 +14,7 @@ pieces (never ``cli``) so there is no import cycle.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -224,6 +225,9 @@ async def _cmd_permissions(
     agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
 ) -> ChatTurn:
     current = PermissionMode(agent.config.permission)
+    if args.strip().casefold().startswith("rules"):
+        await _handle_permission_rules(agent, ui, args.strip()[5:].strip())
+        return ChatTurn()
     raw_target = args.strip().lower()
     if raw_target:
         try:
@@ -233,7 +237,20 @@ async def _cmd_permissions(
             print(f"Unknown permission mode {raw_target!r}. Choose one of: {valid}.")
             return ChatTurn()
     else:
-        selected = await ui.pick_permission_mode(current.value)
+        unavailable = set(agent.permissions.managed_policy.forbidden_modes)
+        if (
+            agent.permissions.managed_policy.require_sandbox_for_unattended
+            and not agent.sandbox.is_enabled()
+        ):
+            unavailable.update(
+                {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
+            )
+        forbidden = tuple(mode.value for mode in unavailable)
+        try:
+            selected = await ui.pick_permission_mode(current.value, forbidden)
+        except TypeError:
+            # Compatibility for embedded UIs implementing the original one-argument hook.
+            selected = await ui.pick_permission_mode(current.value)
         if selected is None:
             _print_permission_modes(current)
             return ChatTurn()
@@ -249,6 +266,69 @@ async def _cmd_permissions(
         return ChatTurn()
     print(f"Permission mode switched to {target.value} ({permission_mode_label(target)}).")
     return ChatTurn()
+
+
+async def _handle_permission_rules(agent: "ReActAgent", ui: AgentUI, args: str) -> None:
+    """Inspect rules or add an explicit least-privilege allow rule."""
+    from agent_core.permission_store import persist_allow_rule
+    from agent_core.permission_types import PermissionDestination
+
+    if not args:
+        rules = agent.permissions.rules
+        deny_keys = {(rule.tool_name, rule.content) for rule in rules.deny}
+        ask_keys = {(rule.tool_name, rule.content) for rule in rules.ask}
+        print("Effective permission rules (DENY > ASK > ALLOW):")
+        for behavior, entries in (("deny", rules.deny), ("ask", rules.ask), ("allow", rules.allow)):
+            for rule in entries:
+                raw = rule.tool_name + (f"({rule.content})" if rule.content is not None else "")
+                shadow = ""
+                if behavior == "allow" and (rule.tool_name, rule.content) in deny_keys | ask_keys:
+                    shadow = " [shadowed]"
+                elif behavior == "ask" and (rule.tool_name, rule.content) in deny_keys:
+                    shadow = " [shadowed]"
+                print(f"  {behavior:<5} {rule.source.value:<8} {raw}{shadow}")
+        if rules.is_empty:
+            print("  (none)")
+        print("Add: /permissions rules add <session|local|project|user> <allow-rule>")
+        return
+    parts = args.split(maxsplit=2)
+    if len(parts) != 3 or parts[0].casefold() != "add":
+        print("Usage: /permissions rules [add <session|local|project|user> <allow-rule>]")
+        return
+    try:
+        destination = PermissionDestination(parts[1].casefold())
+    except ValueError:
+        print(f"Unknown permission destination: {parts[1]!r}.")
+        return
+    if agent.permissions.managed_policy.allow_managed_rules_only:
+        print("Managed policy ignores non-managed allow rules.")
+        return
+    if (
+        destination is not PermissionDestination.SESSION
+        and agent.permissions.managed_policy.disable_persistent_grants
+    ):
+        print("Managed policy disables persistent permission grants.")
+        return
+    rule = parts[2].strip()
+    try:
+        from agent_core.permission_rules import parse_rule
+
+        if parse_rule(rule) is None:
+            raise ValueError("malformed permission rule")
+        if destination is not PermissionDestination.SESSION:
+            confirmed = await asyncio.to_thread(
+                ui.confirm_action,
+                f"Persist allow rule {rule!r} to {destination.value} configuration?",
+            )
+            if not confirmed:
+                print("Persistent permission rule was not confirmed.")
+                return
+            persist_allow_rule(rule, destination, agent.session.workspace)
+        agent.permissions.add_session_rule(rule)
+    except (OSError, ValueError) as exc:
+        print(f"Permission rule was not added: {exc}")
+        return
+    print(f"Added allow rule to {destination.value}: {rule}")
 
 
 async def _cmd_mcp(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:

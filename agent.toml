@@ -17,7 +17,8 @@
 
 # --- Top-level scalars -------------------------------------------------------
 model = "claude-opus-4-8"
-permission = "default"        # default | acceptedits | plan | auto | dontask | bypass
+permission = "default"        # canonical: default | acceptedits | plan | auto | dontask | bypass
+# Compatibility aliases accepted on input: acceptEdits | dontAsk | bypassPermissions
 # Live chat: /permissions opens the six-mode picker; /permissions <mode> switches
 # directly. Shift+Tab cycles default -> acceptedits -> plan -> auto -> default.
 # default=manual confirmation; acceptedits=native workspace edits; plan=strict read-only;

@@ -187,6 +187,9 @@ def resolve_config(
     merged = {**defaults, **scalar_file_values}
     merged.update({key: value for key, value in env_values.items() if value is not None})
     merged.update({key: value for key, value in cli_values.items() if value is not None})
+    from agent_core.permission_types import parse_permission_mode
+
+    merged["permission"] = parse_permission_mode(str(merged["permission"])).value
     return merged
 
 

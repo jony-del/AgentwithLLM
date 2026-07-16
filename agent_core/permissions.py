@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from agent_core.managed_policy import ManagedPolicyProvider, NullManagedPolicyProvider
+from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
 from agent_core.models import ToolRisk
 from agent_core.permission_rules import (
     _SHELL_COMMAND_TOOLS,
@@ -27,23 +27,29 @@ from agent_core.permission_types import (
     ManagedPolicySnapshot,
     PermissionBehavior,
     PermissionContext,
+    PermissionDestination,
     PermissionMode,
+    PermissionRequest,
+    PermissionResponse,
     PermissionResult,
     PermissionRule,
     PermissionRuleSource,
+    PermissionSuggestion,
+    PermissionUpdate,
     PlanStateSnapshot,
     SandboxState,
     SessionAuthorizationView,
     ToolCallSource,
     WebDomainPolicySnapshot,
 )
+from agent_core.permission_store import PermissionPersistenceError, persist_allow_rules
 
 if TYPE_CHECKING:
     from agent_core.models import ToolCall
     from agent_core.sandbox import SandboxManager
     from agent_core.tools.base import Tool
 
-Prompter = Callable[[str, str, dict[str, Any]], str]
+Prompter = Callable[..., str | PermissionResponse]
 
 PERMISSION_MODE_LABELS: dict[PermissionMode, str] = {
     PermissionMode.DEFAULT: "manual mode on",
@@ -109,16 +115,20 @@ class PermissionPolicy:
         self.mode = PermissionMode(mode)
         self.prompter = prompter
         self.interactive = prompter is not None
-        self.managed_policy_provider = managed_policy_provider or NullManagedPolicyProvider()
+        self.managed_policy_provider = managed_policy_provider or FileManagedPolicyProvider()
         managed_definition = self.managed_policy_provider.load()
-        self.rules = managed_definition.rules().merge(rules or RuleSet())
+        self._base_rules = rules or RuleSet()
+        self._session_rules = RuleSet()
+        self.rules = managed_definition.rules().merge(self._base_rules)
         self.sandbox = sandbox
         self.workspace = Path(workspace).resolve() if workspace is not None else None
         self.is_subagent = is_subagent
         self.parent_mode = PermissionMode(parent_mode) if parent_mode is not None else None
         self.parent_agent_id = parent_agent_id
         self.tool_source = tool_source
+        self._managed_snapshot_override = managed_policy
         self.managed_policy = managed_policy or managed_definition.snapshot()
+        self._managed_reload_error: str | None = None
         self.plan_state = plan_state
         if allow_unsandboxed_unattended is None:
             opt_out = os.getenv("AGENT_SANDBOX_ALLOW_UNATTENDED", "")
@@ -132,6 +142,7 @@ class PermissionPolicy:
         self._session_allow: set[str] = set()
         self._session_allow_commands: set[str] = set()
         self._validators: dict[tuple[str, int], Draft202012Validator] = {}
+        self.last_permission_updates: tuple[PermissionUpdate, ...] = ()
 
     async def evaluate(
         self,
@@ -142,7 +153,18 @@ class PermissionPolicy:
     ) -> PermissionResult:
         """Evaluate one call using the documented deterministic permission order."""
         arguments = dict(tool_call.arguments) if tool_call is not None else {}
-        ctx = context or self.build_context(tool, arguments)
+        reload_error = self.refresh_managed_policy()
+        if reload_error is not None:
+            return PermissionResult.deny(
+                f"managed policy reload failed: {reload_error}",
+                decision_source=DecisionSource.MANAGED,
+                metadata={"managed_policy_reload_error": reload_error[:200]},
+            )
+        ctx = (
+            replace(context, mode=self.mode, rules=self.rules, managed_policy=self.managed_policy)
+            if context is not None
+            else self.build_context(tool, arguments)
+        )
 
         preflight = await self._preflight(tool, arguments, ctx)
         if preflight is not None:
@@ -208,7 +230,7 @@ class PermissionPolicy:
                         raw=tool.name,
                     ),
                 )
-            allow_rule = self.rules.allow_match(tool.name, arguments)
+            allow_rule = self._allow_match(tool.name, arguments)
             if allow_rule is not None:
                 return PermissionResult.allow(
                     "allowed by rule",
@@ -234,7 +256,7 @@ class PermissionPolicy:
                     raw=tool.name,
                 ),
             )
-        allow_rule = self.rules.allow_match(tool.name, arguments)
+        allow_rule = self._allow_match(tool.name, arguments)
         if allow_rule is not None:
             return PermissionResult.allow(
                 "allowed by rule",
@@ -355,8 +377,16 @@ class PermissionPolicy:
         ask_rule = self.rules.ask_match(tool.name, arguments)
         if ask_rule is not None:
             return PermissionResult.ask(
-                "confirmation required by explicit ask rule",
-                decision_source=DecisionSource.RULE,
+                (
+                    "confirmation required by managed policy"
+                    if ask_rule.source is PermissionRuleSource.MANAGED
+                    else "confirmation required by explicit ask rule"
+                ),
+                decision_source=(
+                    DecisionSource.MANAGED
+                    if ask_rule.source is PermissionRuleSource.MANAGED
+                    else DecisionSource.RULE
+                ),
                 matched_rule=ask_rule,
                 bypass_immune=True,
             )
@@ -469,8 +499,27 @@ class PermissionPolicy:
                 matched_rule=result.matched_rule,
                 classifier_approvable=True,
                 bypass_immune=result.bypass_immune,
+                suggestions=result.suggestions,
             )
         return result
+
+    def refresh_managed_policy(self) -> str | None:
+        """Refresh the administrator policy at a tool boundary; errors fail closed."""
+        if self._managed_snapshot_override is not None:
+            return None
+        try:
+            definition = self.managed_policy_provider.load()
+        except Exception as exc:  # policy I/O/parser failures may never retain stale grants
+            self._managed_reload_error = f"{type(exc).__name__}: {exc}"
+            return self._managed_reload_error
+        self.managed_policy = definition.snapshot()
+        self.rules = definition.rules().merge(self._base_rules).merge(self._session_rules)
+        self._managed_reload_error = None
+        return None
+
+    def _allow_match(self, tool_name: str, arguments: dict[str, Any]) -> PermissionRule | None:
+        source = PermissionRuleSource.MANAGED if self.managed_policy.allow_managed_rules_only else None
+        return self.rules.allow_match(tool_name, arguments, source=source)
 
     def decide(self, tool: "Tool", tool_call: "ToolCall | None" = None) -> PermissionDecision:
         """Synchronous compatibility wrapper; async callers must use ``evaluate``."""
@@ -501,7 +550,7 @@ class PermissionPolicy:
             )
         if self.mode is PermissionMode.BYPASS:
             return PermissionDecision(True, reason="bypass mode allows")
-        if self.rules.allow_matches(tool.name, {}):
+        if self._allow_match(tool.name, {}) is not None:
             return PermissionDecision(True, reason="allowed by rule")
         if tool.risk is ToolRisk.READ:
             return PermissionDecision(True, reason=f"{self.mode.value} allows read tools")
@@ -526,6 +575,8 @@ class PermissionPolicy:
         return PermissionDecision(False, reason=f"{result.reason}; non-interactive", ask_collapsed=True)
 
     def _session_allowed(self, name: str, arguments: dict[str, Any]) -> bool:
+        if self.managed_policy.allow_managed_rules_only:
+            return False
         command_arg = _SHELL_COMMAND_TOOLS.get(name)
         if command_arg is None:
             return name in self._session_allow
@@ -546,10 +597,97 @@ class PermissionPolicy:
             if normalized:
                 self._session_allow_commands.add(normalized)
 
+    def suggested_rules(self, tool: "Tool", tool_call: "ToolCall") -> tuple[PermissionSuggestion, ...]:
+        """Return least-privilege exact grants suitable for a session or config file."""
+        command_arg = _SHELL_COMMAND_TOOLS.get(tool.name)
+        if command_arg is not None:
+            suggestions = []
+            for part in _split_subcommands(str(tool_call.arguments.get(command_arg, ""))):
+                normalized = _normalize_subcommand(part)
+                if normalized:
+                    suggestions.append(
+                        PermissionSuggestion(
+                            f"{tool.name}({normalized})",
+                            "exact normalized shell subcommand",
+                        )
+                    )
+            return tuple(suggestions)
+        for key in ("path", "file_path", "url", "target", "pattern"):
+            value = tool_call.arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return (
+                    PermissionSuggestion(
+                        f"{tool.name}({value.strip()})",
+                        f"exact {key} for this tool",
+                    ),
+                )
+        return (PermissionSuggestion(tool.name, "whole-tool grant; review scope carefully"),)
+
+    def add_session_rule(self, rule: str) -> None:
+        parsed = RuleSet.from_lists(allow=[rule], source=PermissionRuleSource.SESSION)
+        if not parsed.allow:
+            raise ValueError(f"invalid permission rule: {rule!r}")
+        self._session_rules = self._session_rules.merge(parsed)
+        # Preserve the current managed definition while immediately activating the rule.
+        self.rules = self.rules.merge(parsed)
+
+    def _apply_updates(self, updates: tuple[PermissionUpdate, ...]) -> None:
+        destinations = {update.destination for update in updates}
+        if len({item for item in destinations if item is not PermissionDestination.SESSION}) > 1:
+            raise ValueError("one permission response cannot persist to multiple files")
+        for update in updates:
+            if update.behavior is not PermissionBehavior.ALLOW:
+                raise ValueError("interactive permission updates may only add allow rules")
+            if self.managed_policy.allow_managed_rules_only:
+                raise ValueError("managed policy ignores non-managed allow rules")
+            parsed = RuleSet.from_lists(allow=[update.rule], source=PermissionRuleSource.SESSION)
+            if not parsed.allow:
+                raise ValueError(f"invalid permission rule: {update.rule!r}")
+            if update.destination is not PermissionDestination.SESSION:
+                if self.managed_policy.disable_persistent_grants:
+                    raise ValueError("managed policy disables persistent permission grants")
+        persistent = [item for item in updates if item.destination is not PermissionDestination.SESSION]
+        if persistent:
+            workspace = self.workspace or Path.cwd().resolve()
+            destination = persistent[0].destination
+            persist_allow_rules(tuple(item.rule for item in persistent), destination, workspace)
+        for update in updates:
+            self.add_session_rule(update.rule)
+        self.last_permission_updates = updates
+
     def confirm(self, decision: PermissionDecision, tool: "Tool", tool_call: "ToolCall") -> PermissionDecision:
         if not decision.ask_user or self.prompter is None:
             return decision
-        choice = self.prompter(tool.name, tool.risk.value, tool_call.arguments)
+        self.last_permission_updates = ()
+        request = PermissionRequest(
+            tool.name,
+            tool.risk.value,
+            dict(tool_call.arguments),
+            decision.reason,
+            self.suggested_rules(tool, tool_call),
+            self.managed_policy.disable_persistent_grants
+            or self.managed_policy.allow_managed_rules_only,
+            self.managed_policy.allow_managed_rules_only,
+        )
+        try:
+            import inspect
+
+            inspect.signature(self.prompter).bind(request)
+        except (TypeError, ValueError):
+            # Legacy embedded-client adapter: (tool_name, risk, arguments) -> choice.
+            choice = self.prompter(tool.name, tool.risk.value, tool_call.arguments)
+        else:
+            choice = self.prompter(request)
+        if isinstance(choice, PermissionResponse):
+            if not choice.allow:
+                return PermissionDecision(False, reason=choice.reason or "user rejected")
+            try:
+                self._apply_updates(choice.updates)
+            except (OSError, ValueError, PermissionPersistenceError) as exc:
+                return PermissionDecision(False, reason=f"permission grant was not applied: {exc}")
+            if choice.updated_arguments is not None:
+                tool_call.arguments = dict(choice.updated_arguments)
+            return PermissionDecision(True, reason=choice.reason or "user confirmed")
         if choice == "always":
             self._remember_always(tool, tool_call)
             return PermissionDecision(True, reason="user allowed for this session")

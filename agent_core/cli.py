@@ -857,7 +857,8 @@ def main(argv: list[str] | None = None) -> int:
         subparser.add_argument("--model", default=None)
         subparser.add_argument(
             "--permission",
-            choices=["default", "acceptedits", "plan", "auto", "dontask", "bypass"],
+            type=lambda value: PermissionMode(value).value,
+            metavar="MODE",
             default=None,
         )
         subparser.add_argument(

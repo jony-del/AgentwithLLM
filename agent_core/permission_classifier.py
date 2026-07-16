@@ -67,6 +67,7 @@ class AutoPermissionVerdict:
     duration_ms: int = 0
     usage: dict[str, int] | None = None
     unavailable: bool = False
+    failure_kind: str | None = None
 
 
 class AutoPermissionClassifier(Protocol):

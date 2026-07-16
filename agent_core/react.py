@@ -44,7 +44,7 @@ from agent_core.hooks import (
     OutputLimitConfig,
 )
 from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
-from agent_core.managed_policy import ManagedPolicyProvider
+from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult
 from agent_core.model_validation import is_model_allowed, unsupported_model_message
 from agent_core.permission_classifier import (
@@ -300,7 +300,7 @@ class ReActAgent:
         managed_policy_provider: ManagedPolicyProvider | None = None,
     ) -> None:
         self.config = config or ReActConfig()
-        self.managed_policy_provider = managed_policy_provider
+        self.managed_policy_provider = managed_policy_provider or FileManagedPolicyProvider()
         # Effective monotonic deadline of the in-flight run(), shared with children
         # spawned by the sub-agent/teammate factories so the whole fan-out is bounded
         # by one budget. Set at the top of run(); None when no run is active or uncapped.
@@ -417,7 +417,7 @@ class ReActAgent:
         # The fine-grained rule set + sandbox make the policy argument-aware.
         self.permissions = PermissionPolicy(
             self.config.permission,
-            prompter=self.ui.confirm_tool if self.ui.is_live else None,
+            prompter=self.ui.request_permission if self.ui.is_live else None,
             rules=self.config.permission_rules,
             sandbox=self.sandbox,
             workspace=self.session.workspace,
@@ -425,6 +425,8 @@ class ReActAgent:
             managed_policy_provider=self.managed_policy_provider,
             allow_unsandboxed_unattended=self._unsandboxed_permission_ack,
         )
+        self.session.permission_grant_setter = self.permissions.add_session_rule
+        self.session.registered_tool_names = frozenset(tool.name for tool in self.registry.list())
         if PermissionMode(self.config.permission) in self.permissions.managed_policy.forbidden_modes:
             raise ValueError(
                 f"permission mode {PermissionMode(self.config.permission).value!r} is forbidden by managed policy"
@@ -595,6 +597,9 @@ class ReActAgent:
         if target == previous:
             return target
 
+        reload_error = self.permissions.refresh_managed_policy()
+        if reload_error is not None:
+            raise ValueError(f"managed policy reload failed: {reload_error}")
         if target in self.permissions.managed_policy.forbidden_modes:
             raise ValueError(f"permission mode {target.value!r} is forbidden by managed policy")
 

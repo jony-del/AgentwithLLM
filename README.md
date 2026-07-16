@@ -111,9 +111,14 @@ Polaris。完整安全边界见[安装与卸载指南](docs/installation.md)。
 - `bypass`：允许未命中的动作，但 deny/ask 规则和敏感路径保护仍然有效。
 
 `auto`、`dontask`、`bypass` 没有真实沙箱时需要交互式明确确认；无头运行仍默认拒绝。AI 分类器
-超时、报错或返回无法解析的结果时一律拒绝对应动作。中央安全策略、工具级
+超时、报错或返回无法解析的结果时，顶层交互会话回退人工确认，无头和子 Agent 拒绝。中央安全策略、工具级
 `check_permissions()`、确定性决策顺序、plan artifact 与审计契约见
 [权限系统架构](docs/permission-system.md)。
+
+模式参数同时兼容 `acceptEdits`、`dontAsk`、`bypassPermissions`，日志仍只输出规范名。交互弹窗可把
+精确规则授权到 session、`agent.local.toml`、项目 `agent.toml` 或用户 `~/.polaris/agent.toml`；持久化
+授权需要二次确认。系统管理员可通过平台默认路径或 `POLARIS_MANAGED_POLICY_PATH` 部署只读的
+`[managed.permissions]` 策略。`auto` 分类器故障只在顶层交互会话回退人工确认，无头和子 Agent 拒绝。
 
 ## 源码开发
 

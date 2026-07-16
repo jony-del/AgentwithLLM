@@ -209,6 +209,7 @@ class ToolExecutor:
         self.ui.on_tool_call(
             tool.name, tool.risk.value, rewritten_call.arguments, label=self._render_args(tool, rewritten_call)
         )
+        self.permissions.last_permission_updates = ()
         permission_context = self.permissions.build_context(tool, rewritten_call.arguments)
         permission_result = await self.permissions.evaluate(
             tool, rewritten_call, context=permission_context
@@ -220,11 +221,13 @@ class ToolExecutor:
         decision = self.permissions.as_legacy_decision(permission_result)
         classifier_verdict: AutoPermissionVerdict | None = None
         if decision.classify:
+            pending_auto_ask = permission_result
             if self.permission_classifier is None:
                 classifier_verdict = AutoPermissionVerdict(
                     False,
                     "auto mode classifier is unavailable",
                     unavailable=True,
+                    failure_kind="unavailable",
                 )
             else:
                 try:
@@ -241,37 +244,58 @@ class ToolExecutor:
                             should_cancel,
                         )
                 except asyncio.CancelledError:
-                    classifier_verdict = AutoPermissionVerdict(
-                        False,
-                        "auto mode classifier was cancelled",
-                        unavailable=True,
-                    )
+                    raise
                 except Exception as exc:  # fail closed: evaluator failures are hard denials
                     classifier_verdict = AutoPermissionVerdict(
                         False,
                         f"auto mode evaluator failed: {type(exc).__name__}",
                         unavailable=True,
+                        failure_kind="exception",
                     )
-            decision = PermissionDecision(
-                classifier_verdict.allowed,
-                reason=(
-                    "auto classifier allowed: "
-                    if classifier_verdict.allowed
-                    else "auto classifier denied: "
+            if classifier_verdict.unavailable and self.permissions.interactive and not self.permissions.is_subagent:
+                metadata = dict(pending_auto_ask.metadata or {})
+                metadata.pop("automated_evaluation", None)
+                metadata.update(
+                    {
+                        "original_behavior": "ask",
+                        "auto_fallback": "interactive_prompt",
+                        "failure_kind": classifier_verdict.failure_kind or "unavailable",
+                        "classifier": asdict(classifier_verdict),
+                    }
                 )
-                + classifier_verdict.reason,
-            )
-            if classifier_verdict.allowed:
+                permission_result = PermissionResult.ask(
+                    f"{pending_auto_ask.reason}; auto evaluator unavailable, manual review required",
+                    decision_source=pending_auto_ask.decision_source,
+                    updated_arguments=pending_auto_ask.updated_arguments,
+                    metadata=metadata,
+                    matched_rule=pending_auto_ask.matched_rule,
+                    classifier_approvable=False,
+                    bypass_immune=pending_auto_ask.bypass_immune,
+                    suggestions=pending_auto_ask.suggestions,
+                )
+                decision = self.permissions.as_legacy_decision(permission_result)
+            elif classifier_verdict.allowed:
+                decision = PermissionDecision(
+                    True,
+                    reason="auto classifier allowed: " + classifier_verdict.reason,
+                )
                 permission_result = PermissionResult.allow(
                     decision.reason,
                     decision_source=DecisionSource.CLASSIFIER,
-                    metadata={"classifier": asdict(classifier_verdict)},
+                    metadata={"classifier": asdict(classifier_verdict), "original_behavior": "ask"},
                 )
             else:
+                prefix = "auto classifier unavailable: " if classifier_verdict.unavailable else "auto classifier blocked: "
+                decision = PermissionDecision(False, reason=prefix + classifier_verdict.reason)
                 permission_result = PermissionResult.deny(
                     decision.reason,
                     decision_source=DecisionSource.CLASSIFIER,
-                    metadata={"classifier": asdict(classifier_verdict)},
+                    metadata={
+                        "original_behavior": "ask",
+                        "classifier": asdict(classifier_verdict),
+                        "auto_fallback": "headless_deny" if classifier_verdict.unavailable else "explicit_block",
+                        "failure_kind": classifier_verdict.failure_kind,
+                    },
                 )
         # PermissionRequest (R1 programmatic approval): consulted only for ASK decisions
         # — interactive asks (ask_user) and their headless collapse (ask_collapsed) —
@@ -307,12 +331,20 @@ class ToolExecutor:
         # The confirm step may block on an interactive prompt (input()); run it on a
         # worker thread so a question to the user doesn't freeze other in-flight work.
         was_pending_ask = permission_result.behavior is PermissionBehavior.ASK
+        pending_ask_metadata = permission_result.metadata
         decision = await asyncio.to_thread(self.permissions.confirm, decision, tool, rewritten_call)
+        if tool.name == "exit_plan" and isinstance(pending_ask_metadata, dict):
+            pending_ask_metadata = dict(pending_ask_metadata)
+            requested = rewritten_call.arguments.get("requested_permissions", [])
+            pending_ask_metadata["requested_permission_count"] = (
+                len(requested) if isinstance(requested, list) else 0
+            )
         if was_pending_ask:
             if decision.allowed:
                 permission_result = PermissionResult.allow(
                     decision.reason,
                     decision_source=DecisionSource.USER,
+                    metadata=pending_ask_metadata,
                     matched_rule=originating_rule,
                 )
             elif not decision.ask_user:
@@ -320,6 +352,7 @@ class ToolExecutor:
                 permission_result = PermissionResult.deny(
                     decision.reason,
                     decision_source=source,
+                    metadata=pending_ask_metadata,
                     matched_rule=originating_rule,
                 )
         if self.logger:
@@ -330,6 +363,14 @@ class ToolExecutor:
                 permission_context,
                 permission_result,
                 classifier_payload,
+                [
+                    {
+                        "behavior": update.behavior.value,
+                        "rule": update.rule,
+                        "destination": update.destination.value,
+                    }
+                    for update in self.permissions.last_permission_updates
+                ],
             )
             payload["decision"] = asdict(decision)  # compatibility for existing replay readers
             if hook_verdict is not None:

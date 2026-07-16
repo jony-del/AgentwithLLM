@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 from agent_core.command_security import analyze_command
 from agent_core.permission_types import PermissionContext, PermissionResult
 
-PERMISSION_AUDIT_SCHEMA_VERSION = 1
+PERMISSION_AUDIT_SCHEMA_VERSION = 2
 
 _SENSITIVE_KEY = re.compile(
     r"(?i)(?:password|passwd|token|authorization|cookie|api[_-]?key|private[_-]?key|credential|secret)"
@@ -59,6 +59,7 @@ def build_permission_audit_event(
     context: PermissionContext,
     result: PermissionResult,
     classifier_result: dict[str, Any] | None = None,
+    permission_updates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     matched_rule = None
     rule_source = None
@@ -74,6 +75,12 @@ def build_permission_audit_event(
         "tool": tool_name,
         "arguments_summary": summarize_arguments(tool_name, arguments),
         "mode": context.mode.value,
+        "mode_aliases": {
+            "acceptEdits": "acceptedits",
+            "dontAsk": "dontask",
+            "bypassPermissions": "bypass",
+        },
+        "original_behavior": (result.metadata or {}).get("original_behavior", result.behavior.value),
         "final_behavior": result.behavior.value,
         "reason": redact_secret_material(result.reason),
         "decision_source": result.decision_source.value,
@@ -81,6 +88,18 @@ def build_permission_audit_event(
         "rule_source": rule_source,
         "sandboxed": context.sandbox.will_sandbox,
         "classifier_result": sanitize_log_payload(classifier_result),
+        "auto_fallback": (result.metadata or {}).get("auto_fallback"),
+        "failure_kind": (result.metadata or {}).get("failure_kind"),
+        "permission_updates": sanitize_log_payload(permission_updates or []),
+        "persisted": any(
+            getattr(update.get("destination", "session"), "value", update.get("destination", "session"))
+            != "session"
+            for update in (permission_updates or [])
+        ),
+        "managed_policy_digest": context.managed_policy.policy_digest,
+        "plan_permission_bundle": {
+            "requested": int((result.metadata or {}).get("requested_permission_count", 0)),
+        },
         "parent_agent_id": context.parent_agent_id,
         "tool_source": context.tool_source.value,
     }

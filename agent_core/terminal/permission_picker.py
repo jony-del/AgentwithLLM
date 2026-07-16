@@ -25,9 +25,14 @@ class PermissionPickerRow:
 
 
 class PermissionPicker:
-    def __init__(self, current: PermissionMode | str) -> None:
-        self.modes = list(PermissionMode)
+    def __init__(
+        self, current: PermissionMode | str, forbidden_modes: tuple[PermissionMode | str, ...] = ()
+    ) -> None:
+        forbidden = {PermissionMode(mode) for mode in forbidden_modes}
+        self.modes = [mode for mode in PermissionMode if mode not in forbidden]
         resolved = PermissionMode(current)
+        if resolved not in self.modes:
+            self.modes.insert(0, resolved)
         self.index = self.modes.index(resolved)
 
     def up(self) -> None:
@@ -51,7 +56,9 @@ class PermissionPicker:
         ]
 
 
-async def run_permission_picker(current: PermissionMode | str) -> PermissionMode | None:
+async def run_permission_picker(
+    current: PermissionMode | str, *, forbidden_modes: tuple[PermissionMode | str, ...] = ()
+) -> PermissionMode | None:
     """Return the selected mode, or ``None`` outside a TTY/on cancellation."""
     import sys
 
@@ -63,7 +70,7 @@ async def run_permission_picker(current: PermissionMode | str) -> PermissionMode
     from prompt_toolkit.layout import HSplit, Layout, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
 
-    picker = PermissionPicker(current)
+    picker = PermissionPicker(current, forbidden_modes)
 
     def fragments() -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = [

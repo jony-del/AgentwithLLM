@@ -178,6 +178,8 @@ class SessionContext:
     plan_state: PlanState = field(default_factory=PlanState)
     plan_store: PlanArtifactStore = field(default_factory=PlanArtifactStore)
     permission_mode_setter: Callable[..., object] | None = None
+    permission_grant_setter: Callable[[str], object] | None = None
+    registered_tool_names: frozenset[str] = frozenset()
     depth: int = 0
     max_depth: int = 1
     # Recently-read file snapshots, keyed by workspace-resolved path string and

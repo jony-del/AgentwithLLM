@@ -21,6 +21,31 @@ class PermissionMode(str, Enum):
     DONTASK = "dontask"
     BYPASS = "bypass"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "PermissionMode | None":
+        if isinstance(value, str):
+            canonical = PERMISSION_MODE_ALIASES.get(value.strip().casefold())
+            if canonical is not None:
+                return cls(canonical)
+        return None
+
+
+PERMISSION_MODE_ALIASES: dict[str, str] = {
+    "default": "default",
+    "acceptedits": "acceptedits",
+    "plan": "plan",
+    "auto": "auto",
+    "dontask": "dontask",
+    "bypass": "bypass",
+    # Reference-project / Claude Code spellings.
+    "bypasspermissions": "bypass",
+}
+
+
+def parse_permission_mode(value: PermissionMode | str) -> PermissionMode:
+    """Parse canonical modes and compatibility aliases, returning canonical values."""
+    return value if isinstance(value, PermissionMode) else PermissionMode(value)
+
 
 class PermissionBehavior(str, Enum):
     ALLOW = "allow"
@@ -50,6 +75,46 @@ class PermissionRuleSource(str, Enum):
     LOCAL = "local"
     CLI = "cli"
     SESSION = "session"
+
+
+class PermissionDestination(str, Enum):
+    SESSION = "session"
+    LOCAL = "local"
+    PROJECT = "project"
+    USER = "user"
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionSuggestion:
+    rule: str
+    reason: str
+    destination: PermissionDestination = PermissionDestination.SESSION
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionUpdate:
+    behavior: PermissionBehavior
+    rule: str
+    destination: PermissionDestination
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionRequest:
+    tool_name: str
+    risk: str
+    arguments: Mapping[str, Any]
+    reason: str
+    suggestions: tuple[PermissionSuggestion, ...] = ()
+    persistent_grants_disabled: bool = False
+    session_grants_disabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResponse:
+    allow: bool
+    updates: tuple[PermissionUpdate, ...] = ()
+    reason: str = ""
+    updated_arguments: Mapping[str, Any] | None = None
 
 
 class ToolCallSource(str, Enum):
@@ -97,6 +162,9 @@ class WebDomainPolicySnapshot:
 class ManagedPolicySnapshot:
     forbidden_modes: frozenset[PermissionMode] = frozenset()
     require_sandbox_for_unattended: bool = False
+    allow_managed_rules_only: bool = False
+    disable_persistent_grants: bool = False
+    policy_digest: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -134,6 +202,7 @@ class PermissionResult:
     matched_rule: PermissionRule | None = None
     classifier_approvable: bool = False
     bypass_immune: bool = False
+    suggestions: tuple[PermissionSuggestion, ...] = ()
 
     @classmethod
     def allow(
@@ -165,6 +234,7 @@ class PermissionResult:
         matched_rule: PermissionRule | None = None,
         classifier_approvable: bool = False,
         bypass_immune: bool = False,
+        suggestions: tuple[PermissionSuggestion, ...] = (),
     ) -> "PermissionResult":
         return cls(
             PermissionBehavior.ASK,
@@ -175,6 +245,7 @@ class PermissionResult:
             matched_rule,
             classifier_approvable,
             bypass_immune,
+            suggestions,
         )
 
     @classmethod
@@ -187,6 +258,7 @@ class PermissionResult:
         metadata: Mapping[str, Any] | None = None,
         matched_rule: PermissionRule | None = None,
         bypass_immune: bool = True,
+        suggestions: tuple[PermissionSuggestion, ...] = (),
     ) -> "PermissionResult":
         return cls(
             PermissionBehavior.DENY,
@@ -197,6 +269,7 @@ class PermissionResult:
             matched_rule,
             False,
             bypass_immune,
+            suggestions,
         )
 
     @classmethod

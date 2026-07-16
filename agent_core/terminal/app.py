@@ -15,6 +15,14 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+from agent_core.permission_types import (
+    PermissionBehavior,
+    PermissionDestination,
+    PermissionRequest,
+    PermissionResponse,
+    PermissionUpdate,
+)
+
 from rich.console import Console
 from rich.padding import Padding
 from rich.text import Text
@@ -425,3 +433,130 @@ class TerminalRenderer:
         except (EOFError, KeyboardInterrupt):
             return "deny"
         return answer if answer in ("once", "always", "deny") else "deny"
+
+    async def ask_permission_request_async(self, request: PermissionRequest) -> PermissionResponse:
+        """Prompt for once/session/persistent least-privilege grants."""
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+
+        self._print_permission_panel(request.tool_name, request.risk, dict(request.arguments))
+        if request.tool_name == "exit_plan" and request.arguments.get("requested_permissions"):
+            return await self._ask_plan_permission_bundle_async(request)
+        if request.suggestions:
+            self.emit("Suggested scope: " + ", ".join(item.rule for item in request.suggestions))
+        kb = KeyBindings()
+
+        def bind(key: str, value: str) -> None:
+            @kb.add(key)
+            def _(event) -> None:
+                event.app.exit(result=value)
+
+        bind("y", "once")
+        if not request.session_grants_disabled:
+            bind("s", "session")
+        if not request.persistent_grants_disabled:
+            bind("l", "local")
+            bind("p", "project")
+            bind("u", "user")
+        bind("n", "deny")
+
+        @kb.add("enter")
+        def _(event) -> None:
+            event.app.exit(result="once")
+
+        @kb.add("c-c")
+        @kb.add("c-d")
+        def _(event) -> None:
+            event.app.exit(result="deny")
+
+        suffix = "y/once · n/deny"
+        if not request.session_grants_disabled:
+            suffix += " · s/session"
+        if not request.persistent_grants_disabled:
+            suffix += " · l/local · p/project · u/user"
+        try:
+            choice = await PromptSession(key_bindings=kb).prompt_async(f"Allow? [{suffix}] ")
+        except (EOFError, KeyboardInterrupt):
+            return PermissionResponse(False, reason="permission prompt cancelled")
+        if choice == "deny" or choice not in {"once", "session", "local", "project", "user"}:
+            return PermissionResponse(False, reason="user rejected")
+        if choice == "once":
+            return PermissionResponse(True, reason="user confirmed once")
+        destination = PermissionDestination(choice)
+        if destination is not PermissionDestination.SESSION:
+            confirmed = await self._confirm_persistent_permission_async(destination, len(request.suggestions))
+            if not confirmed:
+                return PermissionResponse(False, reason="persistent grant confirmation rejected")
+        updates = tuple(
+            PermissionUpdate(PermissionBehavior.ALLOW, item.rule, destination)
+            for item in request.suggestions
+        )
+        return PermissionResponse(True, updates, f"user allowed suggested scope in {choice}")
+
+    async def _ask_plan_permission_bundle_async(
+        self, request: PermissionRequest
+    ) -> PermissionResponse:
+        raw_items = request.arguments.get("requested_permissions", [])
+        selected: list[dict[str, Any]] = []
+        self.emit("Review requested session permissions individually:")
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            rule = str(item.get("rule", ""))
+            reason = str(item.get("reason", ""))
+            if await self._confirm_yes_no_async(f"Allow {rule} ({reason})? [y/N] "):
+                selected.append(dict(item))
+        if not await self._confirm_yes_no_async("Approve this plan and leave plan mode? [y/N] "):
+            return PermissionResponse(False, reason="plan approval rejected")
+        updated = dict(request.arguments)
+        updated["requested_permissions"] = selected
+        return PermissionResponse(
+            True,
+            reason=f"plan approved with {len(selected)} scoped session grant(s)",
+            updated_arguments=updated,
+        )
+
+    async def _confirm_yes_no_async(self, prompt: str) -> bool:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+
+        kb = KeyBindings()
+        for key, value in (("y", True), ("n", False)):
+            @kb.add(key)
+            def _(event, resolved=value) -> None:
+                event.app.exit(result=resolved)
+        @kb.add("enter")
+        @kb.add("c-c")
+        @kb.add("c-d")
+        def _(event) -> None:
+            event.app.exit(result=False)
+        try:
+            answer = await PromptSession(key_bindings=kb).prompt_async(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer is True
+
+    async def _confirm_persistent_permission_async(
+        self, destination: PermissionDestination, count: int
+    ) -> bool:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+
+        kb = KeyBindings()
+        for key, value in (("y", True), ("n", False)):
+            @kb.add(key)
+            def _(event, resolved=value) -> None:
+                event.app.exit(result=resolved)
+
+        @kb.add("enter")
+        @kb.add("c-c")
+        @kb.add("c-d")
+        def _(event) -> None:
+            event.app.exit(result=False)
+        try:
+            answer = await PromptSession(key_bindings=kb).prompt_async(
+                f"Persist {count} allow rule(s) to {destination.value}? [y/N] "
+            )
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer is True

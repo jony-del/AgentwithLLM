@@ -4,6 +4,13 @@ import asyncio
 from typing import Any, Literal
 
 from agent_core.models import ToolResult
+from agent_core.permission_types import (
+    PermissionBehavior,
+    PermissionDestination,
+    PermissionRequest,
+    PermissionResponse,
+    PermissionUpdate,
+)
 
 # What confirm_tool may return: run the tool once, allow it for the rest of the
 # session (never ask again for this tool name), or deny it.
@@ -108,6 +115,19 @@ class AgentUI:
         """Ask the user whether to run a tool. Base/non-interactive answer: deny."""
         return "deny"
 
+    def request_permission(self, request: PermissionRequest) -> PermissionResponse:
+        """Structured permission prompt; legacy UIs are adapted through confirm_tool."""
+        choice = self.confirm_tool(request.tool_name, request.risk, dict(request.arguments))
+        if choice == "once":
+            return PermissionResponse(True, reason="user confirmed once")
+        if choice == "always" and request.suggestions:
+            updates = tuple(
+                PermissionUpdate(PermissionBehavior.ALLOW, item.rule, PermissionDestination.SESSION)
+                for item in request.suggestions
+            )
+            return PermissionResponse(True, updates, "user allowed suggested scope for session")
+        return PermissionResponse(False, reason="user rejected")
+
     def confirm_action(self, message: str) -> bool:
         """A one-off yes/no safety confirmation (e.g. "continue without a sandbox?").
 
@@ -128,7 +148,9 @@ class AgentUI:
         """
         return None
 
-    async def pick_permission_mode(self, current_mode: str) -> str | None:
+    async def pick_permission_mode(
+        self, current_mode: str, forbidden_modes: tuple[str, ...] = ()
+    ) -> str | None:
         """Choose one of the six permission modes; silent UIs cannot pick."""
         return None
 
@@ -233,10 +255,12 @@ class ConsoleUI(AgentUI):
             help_text=spec.help_text,
         )
 
-    async def pick_permission_mode(self, current_mode: str) -> str | None:
+    async def pick_permission_mode(
+        self, current_mode: str, forbidden_modes: tuple[str, ...] = ()
+    ) -> str | None:
         from agent_core.terminal.permission_picker import run_permission_picker
 
-        selected = await run_permission_picker(current_mode)
+        selected = await run_permission_picker(current_mode, forbidden_modes=forbidden_modes)
         return selected.value if selected is not None else None
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
@@ -254,6 +278,18 @@ class ConsoleUI(AgentUI):
             return future.result()
         except Exception:
             return "deny"
+
+    def request_permission(self, request: PermissionRequest) -> PermissionResponse:
+        loop = self._loop
+        if loop is None:
+            return PermissionResponse(False, reason="interactive event loop unavailable")
+        future = asyncio.run_coroutine_threadsafe(
+            self._renderer.ask_permission_request_async(request), loop
+        )
+        try:
+            return future.result()
+        except Exception:
+            return PermissionResponse(False, reason="permission prompt failed")
 
     def confirm_action(self, message: str) -> bool:
         # Construction-time confirmation: no event loop is bound yet, so this is a
