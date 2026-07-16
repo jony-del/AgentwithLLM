@@ -45,6 +45,12 @@ async def test_async_input_tty_branch_constructs_session(monkeypatch) -> None:
         assert session.kwargs["multiline"] is True
         assert session.kwargs["complete_while_typing"] is True
         assert session.kwargs["complete_style"] == CompleteStyle.COLUMN
+        toolbar_style = session.kwargs["style"].get_attrs_for_style_str(
+            "class:bottom-toolbar"
+        )
+        assert toolbar_style.bgcolor == "default"
+        assert toolbar_style.color == "ansibrightblack"
+        assert toolbar_style.reverse is False
     finally:
         if hasattr(cli._async_input, "_session"):
             delattr(cli._async_input, "_session")

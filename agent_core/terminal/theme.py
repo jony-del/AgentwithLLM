@@ -20,17 +20,21 @@ claude_theme = Theme({
 
 
 def completion_menu_style():
-    """prompt_toolkit ``Style`` for the slash-command dropdown.
+    """prompt_toolkit ``Style`` for the interactive chat chrome.
 
     White-on-black options with the highlighted command rendered blue+bold so the
     current selection stands out; meta (the grey description) and scrollbar kept low
-    chrome. prompt_toolkit merges this over its default style, so only these classes
-    change. Imported lazily so ``theme`` stays rich-only at module load.
+    chrome. The bottom toolbar uses the terminal palette's subdued grey (matching the
+    dimmed thinking text) on the terminal's own background, instead of prompt_toolkit's
+    default reverse-video style. prompt_toolkit merges this over its default style, so
+    only these classes change. Imported lazily so ``theme`` stays rich-only at module
+    load.
     """
     from prompt_toolkit.styles import Style
 
     return Style.from_dict(
         {
+            "bottom-toolbar": "bg:default ansibrightblack noreverse",
             "completion-menu": "bg:#000000 #ffffff",
             "completion-menu.completion": "bg:#000000 #ffffff",
             "completion-menu.completion.current": "bg:#000000 #5fafff bold",
