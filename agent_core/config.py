@@ -147,7 +147,11 @@ def load_agent_toml(path: str | Path = "agent.toml") -> dict[str, Any]:
     raw = _read_toml(config_path)
     if str(path) == _REPO_DEFAULT_CONFIG and raw:
         raw = _apply_repo_trust(config_path, raw)
-    return _deep_merge(user, raw)
+    # Project-local overrides are intentionally gitignored and outrank the trusted
+    # project file. Environment and CLI layers are applied by the individual
+    # resolvers after this function returns.
+    local = _read_toml(config_path.resolve().parent / "agent.local.toml")
+    return _deep_merge(_deep_merge(user, raw), local)
 
 
 def _apply_repo_trust(config_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
@@ -612,8 +616,7 @@ def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet
     from agent_core.permission_rules import RuleSet
     from agent_core.permission_types import PermissionRuleSource
 
-    def _load(path: str | Path, source: PermissionRuleSource) -> RuleSet:
-        table = load_agent_toml(path).get("permissions")
+    def _from_table(table: object, source: PermissionRuleSource) -> RuleSet:
         if not isinstance(table, dict):
             return RuleSet()
 
@@ -634,16 +637,33 @@ def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet
 
     # An explicit config path is user-selected and therefore carries user provenance.
     if str(config_file) != _REPO_DEFAULT_CONFIG:
-        return _load(config_file, PermissionRuleSource.USER)
+        return _from_table(
+            load_agent_toml(config_file).get("permissions"),
+            PermissionRuleSource.USER,
+        )
 
     layered = RuleSet()
     try:
         user_file = Path.home() / ".polaris" / "agent.toml"
     except RuntimeError:
         user_file = Path("__no_user_permission_file__")
-    layered = layered.merge(_load(user_file, PermissionRuleSource.USER))
-    layered = layered.merge(_load(config_file, PermissionRuleSource.PROJECT))
-    layered = layered.merge(_load("agent.local.toml", PermissionRuleSource.LOCAL))
+    layered = layered.merge(
+        _from_table(_read_toml(user_file).get("permissions"), PermissionRuleSource.USER)
+    )
+    project_raw = _read_toml(Path(config_file))
+    if project_raw:
+        project_raw = _apply_repo_trust(Path(config_file), project_raw)
+    layered = layered.merge(
+        _from_table(project_raw.get("permissions"), PermissionRuleSource.PROJECT)
+    )
+    layered = layered.merge(
+        _from_table(
+            _read_toml(Path(config_file).resolve().parent / "agent.local.toml").get(
+                "permissions"
+            ),
+            PermissionRuleSource.LOCAL,
+        )
+    )
     return layered
 
 

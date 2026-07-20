@@ -196,6 +196,24 @@ def test_no_effort_means_no_output_config() -> None:
     assert "output_config" not in body
 
 
+def test_fast_mode_uses_exact_body_and_beta_header_only_for_opus_46() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    fast = provider._build_body(
+        [Message("user", "hi")],
+        [],
+        ProviderConfig(model="claude-opus-4-6", speed="fast"),
+    )
+    unsupported = provider._build_body(
+        [Message("user", "hi")],
+        [],
+        ProviderConfig(model="claude-opus-4-8", speed="fast"),
+    )
+    assert fast["speed"] == "fast"
+    assert unsupported.get("speed") is None
+    assert provider._headers(fast=True)["anthropic-beta"] == "fast-mode-2026-02-01"
+    assert "anthropic-beta" not in provider._headers()
+
+
 def test_parse_response_collects_thinking_blocks() -> None:
     provider = ClaudeProvider(api_key="test-key")
     payload = {

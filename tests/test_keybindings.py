@@ -74,6 +74,13 @@ def _by_key(kb, key):
     raise AssertionError(f"no binding for {key}")
 
 
+def _by_keys(kb, *keys):
+    for binding in kb.bindings:
+        if binding.keys == keys:
+            return binding.handler
+    raise AssertionError(f"no binding for {keys}")
+
+
 class _CompletionBuffer(_Buffer):
     """Buffer stand-in tracking submit / accept / completion-restart / cursor moves."""
 
@@ -169,6 +176,45 @@ async def test_shift_tab_cycles_permission_without_touching_buffer(monkeypatch) 
     assert calls == ["cycle"]
     assert buffer.text == "unfinished input"
     assert event.app.invalidated == 1
+
+
+async def test_meta_m_is_shift_tab_fallback(monkeypatch) -> None:
+    calls = []
+
+    async def immediate(callback):
+        callback()
+
+    monkeypatch.setattr(keybindings, "run_in_terminal", immediate)
+    handler = _by_keys(
+        create_keybindings(on_cycle_permission=lambda: calls.append("cycle")),
+        Keys.Escape,
+        "m",
+    )
+    event = _Event(_CompletionBuffer("draft"))
+    handler(event)
+    await asyncio.gather(*event.app.tasks)
+    assert calls == ["cycle"]
+    assert event.current_buffer.text == "draft"
+
+
+def test_escape_and_ctrl_b_only_act_while_running() -> None:
+    running = {"value": False}
+    calls: list[str] = []
+    kb = create_keybindings(
+        is_running=lambda: running["value"],
+        on_interrupt=lambda: calls.append("interrupt"),
+        on_background=lambda: calls.append("background"),
+    )
+    event = _Event(_Buffer())
+    escape = _by_key(kb, Keys.Escape)
+    background = _by_key(kb, Keys.ControlB)
+    escape(event)
+    background(event)
+    assert calls == []
+    running["value"] = True
+    escape(event)
+    background(event)
+    assert calls == ["interrupt", "background"]
 
 
 def test_right_accepts_highlighted_without_running() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_core.chat_commands import ChatTurn, dispatch
+from agent_core.chat_commands import ChatTurn, dispatch, is_immediate_command
 from agent_core.memory import MemoryConfig
 from agent_core.models import Message
 from agent_core.providers import FakeProvider
@@ -318,3 +318,61 @@ async def test_compact_now_returns_input_when_nothing_to_fold() -> None:
     compacted, saved = await agent.compact_now(small)
     assert saved == 0
     assert compacted == small
+
+
+def test_command_immediacy_is_explicit() -> None:
+    for command in (
+        "/exit",
+        "/status",
+        "/mcp",
+        "/plugin manage",
+        "/sandbox",
+        "/rename title",
+        "/model claude-opus-4-6",
+        "/fast",
+        "/effort high",
+    ):
+        assert is_immediate_command(command)
+    for command in (
+        "/help",
+        "/clear",
+        "/context",
+        "/compact",
+        "/permissions",
+        "/memory",
+        "/resume",
+        "/reload-plugins",
+        "/unknown",
+    ):
+        assert not is_immediate_command(command)
+
+
+async def test_effort_validates_current_model_capabilities(capsys) -> None:
+    agent = _agent(provider="claude", model="claude-sonnet-4-6", effort="high")
+    await dispatch("/effort xhigh", agent, NullUI(), [])
+    assert agent.config.effort == "high"
+    assert "unsupported" in capsys.readouterr().out
+    await dispatch("/effort max", agent, NullUI(), [])
+    assert agent.config.effort == "max"
+    await dispatch("/effort auto", agent, NullUI(), [])
+    assert agent.config.effort is None
+
+
+async def test_fast_switches_to_exact_supported_model_and_model_disables_it(capsys) -> None:
+    agent = _agent(provider="claude", model="claude-sonnet-4-6")
+    await dispatch("/fast on", agent, NullUI(), [])
+    assert agent.fast_mode is True
+    assert agent.config.model == "claude-opus-4-6"
+    await dispatch("/model claude-sonnet-4-6", agent, NullUI(), [])
+    assert agent.fast_mode is False
+
+
+async def test_rename_persists_custom_title(tmp_path, capsys) -> None:
+    agent = _agent(
+        run_dir=str(tmp_path / "runs"),
+        session_dir=str(tmp_path / "sessions"),
+    )
+    await dispatch("/rename My useful session", agent, NullUI(), [])
+    assert agent.session_title == "My useful session"
+    assert '"type": "custom-title"' in agent.transcript.path.read_text(encoding="utf-8")
+    assert "renamed" in capsys.readouterr().out.lower()

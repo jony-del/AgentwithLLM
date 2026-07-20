@@ -20,7 +20,9 @@ model = "claude-opus-4-8"
 permission = "default"        # canonical: default | acceptedits | plan | auto | dontask | bypass
 # Compatibility aliases accepted on input: acceptEdits | dontAsk | bypassPermissions
 # Live chat: /permissions opens the six-mode picker; /permissions <mode> switches
-# directly. Shift+Tab cycles default -> acceptedits -> plan -> auto -> default.
+# directly. The composer stays mounted while the agent streams, so Shift+Tab
+# (BackTab/ESC[Z or Alt+M fallback) cycles
+# default -> acceptedits -> plan -> auto -> default during an active run too.
 # default=manual confirmation; acceptedits=native workspace edits; plan=strict read-only;
 # auto=AI-classify pending actions; dontask=deny prompts; bypass=allow unmatched actions.
 provider = "claude"           # claude | openai | openai-compat | fake

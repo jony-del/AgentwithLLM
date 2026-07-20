@@ -30,6 +30,14 @@ _RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 # Never sleep longer than this for a server-supplied Retry-After, so a hostile or
 # buggy header can't wedge the agent for minutes.
 _MAX_RETRY_AFTER = 60.0
+_FAST_MODE_BETA = "fast-mode-2026-02-01"
+
+
+class _FastModeFallback(RuntimeError):
+    def __init__(self, reason: str, retry_after: float | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
 
 # Model families that REMOVED the sampling params (``temperature``/``top_p``/``top_k``)
 # and dropped manual extended thinking — on these, sending ``temperature`` or
@@ -154,6 +162,7 @@ class ClaudeProvider(LLMProvider):
         # Test seam: an httpx transport (e.g. MockTransport) injected before the first
         # call. Production leaves this None and uses httpx's default transport.
         self._transport: Any = None
+        self._fast_disabled_reason: str | None = None
 
     async def complete(
         self,
@@ -181,27 +190,60 @@ class ClaudeProvider(LLMProvider):
 
         if not streaming:
             async def send_once() -> dict[str, Any]:
-                response = await client.post(url, json=body, headers=self._headers(), timeout=timeout)
+                response = await client.post(
+                    url,
+                    json=body,
+                    headers=self._headers(fast=body.get("speed") == "fast"),
+                    timeout=timeout,
+                )
                 if response.status_code >= 400:
+                    fallback = (
+                        self._fast_fallback(response)
+                        if body.get("speed") == "fast"
+                        else None
+                    )
+                    if fallback is not None:
+                        raise fallback
                     raise httpx.HTTPStatusError("error", request=response.request, response=response)
                 return response.json()
 
-            payload = await self._request_with_retry(send_once)
+            try:
+                payload = await self._request_with_retry(send_once)
+            except _FastModeFallback as fallback:
+                await self._disable_fast_and_cool_down(body, fallback)
+                payload = await self._request_with_retry(send_once)
             return self._parse_response(payload)
 
         # Streaming: retry only the connection setup (send + status). Once the body is
         # streaming we never retry — a mid-stream break surfaces as LLMTransientError so
         # we never reprint half-streamed output.
         async def open_stream():
-            request = client.build_request("POST", url, json=body, headers=self._headers(), timeout=timeout)
+            request = client.build_request(
+                "POST",
+                url,
+                json=body,
+                headers=self._headers(fast=body.get("speed") == "fast"),
+                timeout=timeout,
+            )
             response = await client.send(request, stream=True)
             if response.status_code >= 400:
                 await response.aread()
+                fallback = (
+                    self._fast_fallback(response)
+                    if body.get("speed") == "fast"
+                    else None
+                )
                 await response.aclose()
+                if fallback is not None:
+                    raise fallback
                 raise httpx.HTTPStatusError("error", request=request, response=response)
             return response
 
-        response = await self._request_with_retry(open_stream)
+        try:
+            response = await self._request_with_retry(open_stream)
+        except _FastModeFallback as fallback:
+            await self._disable_fast_and_cool_down(body, fallback)
+            response = await self._request_with_retry(open_stream)
         assert stream is not None
         try:
             return await self._consume_stream(response, stream, should_cancel)
@@ -279,6 +321,8 @@ class ClaudeProvider(LLMProvider):
         effort = _effort_for_model(model, config.effort)
         if effort is not None:
             body["output_config"] = {"effort": effort}
+        if config.speed == "fast" and "opus-4-6" in model.lower():
+            body["speed"] = "fast"
         if streaming:
             body["stream"] = True
         if system:
@@ -287,14 +331,45 @@ class ClaudeProvider(LLMProvider):
             body["tools"] = tools
         return body
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, fast: bool = False) -> dict[str, str]:
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
-        return {
+        headers = {
             "content-type": "application/json",
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
         }
+        if fast:
+            headers["anthropic-beta"] = _FAST_MODE_BETA
+        return headers
+
+    def _fast_fallback(self, response: httpx.Response) -> _FastModeFallback | None:
+        if response.status_code == 429:
+            return _FastModeFallback(
+                "rate limited",
+                self._parse_retry_after(response.headers.get("Retry-After"))
+                or self.initial_backoff,
+            )
+        if response.status_code not in {400, 403, 404, 422}:
+            return None
+        detail = response.text.lower()
+        if any(word in detail for word in ("fast", "speed", "beta", "entitlement")):
+            return _FastModeFallback("unsupported or not entitled")
+        return None
+
+    async def _disable_fast_and_cool_down(
+        self,
+        body: dict[str, Any],
+        fallback: _FastModeFallback,
+    ) -> None:
+        body.pop("speed", None)
+        self._fast_disabled_reason = fallback.reason
+        if fallback.retry_after is not None:
+            await asyncio.sleep(min(fallback.retry_after, _MAX_RETRY_AFTER))
+
+    def consume_fast_disabled_reason(self) -> str | None:
+        reason, self._fast_disabled_reason = self._fast_disabled_reason, None
+        return reason
 
     @staticmethod
     def _apply_thinking(body: dict[str, Any], thinking_budget: Any) -> None:

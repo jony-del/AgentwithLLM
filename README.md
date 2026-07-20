@@ -101,7 +101,8 @@ Polaris。完整安全边界见[安装与卸载指南](docs/installation.md)。
 
 交互式 `polaris chat` 中运行 `/permissions` 可从六种策略中选择，或直接运行
 `/permissions <mode>`。Shift+Tab 在 `default → acceptedits → plan → auto` 之间循环，底部状态栏
-始终显示当前模式。
+始终显示当前模式。输入框在 Agent 流式输出和工具执行期间保持可用，因此 Shift+Tab 的修改会从
+下一次权限判断/模型请求开始生效；Windows 终端还可使用 BackTab（`ESC[Z`）或 Alt+M。
 
 - `default`：读取自动允许，编辑和外部动作需要确认。
 - `acceptedits`：额外自动允许框架原生的工作区文件编辑工具。
@@ -119,6 +120,33 @@ Polaris。完整安全边界见[安装与卸载指南](docs/installation.md)。
 精确规则授权到 session、`agent.local.toml`、项目 `agent.toml` 或用户 `~/.polaris/agent.toml`；持久化
 授权需要二次确认。系统管理员可通过平台默认路径或 `POLARIS_MANAGED_POLICY_PATH` 部署只读的
 `[managed.permissions]` 策略。`auto` 分类器故障只在顶层交互会话回退人工确认，无头和子 Agent 拒绝。
+
+## 流式交互与队列
+
+Agent 运行时仍可继续输入：Enter 会把消息放入无限内存队列；同优先级按 FIFO 处理。普通消息会在
+完整工具结果批次之后安全注入当前轮，slash command 则留到轮次边界逐条派发。空输入框按 ↑ 可一次
+取回所有可编辑队列项。
+
+- `Esc`：协作式中止当前 Agent run。
+- `Ctrl+B`：把当前前台 Bash/PowerShell 任务转入后台。
+- `Ctrl+O`：查看最近 transcript。
+- `Ctrl+T`：查看 todos 和输入队列。
+- `Ctrl+R`：搜索输入历史；`Ctrl+L`：重绘终端。
+
+常用会话命令包括 `/rename`、`/effort`、`/fast`、`/sandbox`、`/model` 和 `/status`。模型、
+effort 与 fast mode 只在当前会话生效；sandbox 变更原子应用并写入 gitignored
+`agent.local.toml`。
+
+## Claude 兼容插件
+
+`/plugin` 支持 install/manage/uninstall/enable/disable/validate，以及 marketplace 的
+add/remove/update/list。Polaris 不预装 marketplace；安装记录和缓存位于 `~/.polaris/plugins`，
+项目启用状态默认写入 `agent.local.toml`。支持 `.claude-plugin/plugin.json`、skills/commands、
+agents、hooks（含 `${CLAUDE_PLUGIN_ROOT}`）和 `.mcp.json`。可执行 hooks/MCP 启用前需要确认。
+
+安装或启用不会修改正在运行的组件代；在 Agent 空闲时运行 `/reload-plugins` 才会构建并原子切换，
+失败时继续使用旧代。插件组件使用 `plugin:component` 命名空间，安装 ID 使用
+`plugin@marketplace`。
 
 ## 源码开发
 

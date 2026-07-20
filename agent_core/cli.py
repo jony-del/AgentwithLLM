@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +47,10 @@ from agent_core.providers import (
     OpenAIResponsesProvider,
     ProviderConfig,
 )
-from agent_core.chat_commands import dispatch as dispatch_chat_command
+from agent_core.chat_commands import (
+    dispatch as dispatch_chat_command,
+    is_immediate_command,
+)
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.sandbox import SandboxRequiredError
 from agent_core.tools.registry import ToolRegistry
@@ -299,6 +303,10 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         provider=provider, config=config, tools=registry, ui=ui, session_id=session_id,
         mcp_manager=manager,
     )
+    agent._sandbox_cli_locked = (
+        getattr(args, "sandbox", None) is not None
+        or getattr(args, "sandbox_backend", None) is not None
+    )
     return BuiltAgent(agent, ui, manager, history, seed)
 
 
@@ -366,6 +374,15 @@ async def _async_input(
     completer: "Completer | None" = None,
     bottom_toolbar: "Callable[[], Any] | None" = None,
     on_cycle_permission: "Callable[[], None] | None" = None,
+    *,
+    is_running: "Callable[[], bool] | None" = None,
+    on_interrupt: "Callable[[], None] | None" = None,
+    on_background: "Callable[[], None] | None" = None,
+    on_transcript: "Callable[[], None] | None" = None,
+    on_tasks: "Callable[[], None] | None" = None,
+    on_history_search: "Callable[[], None] | None" = None,
+    on_redraw: "Callable[[], None] | None" = None,
+    on_recall_queue: "Callable[[], str] | None" = None,
 ) -> str | None:
     """Read one chat message without blocking the loop; ``None`` on EOF (exit).
 
@@ -393,17 +410,52 @@ async def _async_input(
     # mutable function attribute so a later chat session cannot retain an old agent.
     input_state = cast(Any, _async_input)
     input_state._on_cycle_permission = on_cycle_permission
+    input_state._is_running = is_running
+    input_state._on_interrupt = on_interrupt
+    input_state._on_background = on_background
+    input_state._on_transcript = on_transcript
+    input_state._on_tasks = on_tasks
+    input_state._on_history_search = on_history_search
+    input_state._on_redraw = on_redraw
+    input_state._on_recall_queue = on_recall_queue
 
     def cycle_permission() -> None:
         callback = getattr(_async_input, "_on_cycle_permission", None)
         if callback is not None:
             callback()
 
+    def state_call(name: str, default: Any = None) -> Any:
+        callback = getattr(_async_input, name, None)
+        return callback() if callback is not None else default
+
     session = getattr(input_state, "_session", None)
     if session is None:
         toggle = getattr(ui, "toggle_verbose", None)
         session = PromptSession(
-            key_bindings=create_keybindings(toggle, cycle_permission),
+            key_bindings=create_keybindings(
+                toggle,
+                cycle_permission,
+                is_running=lambda: bool(state_call("_is_running", False)),
+                on_interrupt=lambda: state_call("_on_interrupt"),
+                on_background=lambda: state_call("_on_background"),
+                on_transcript=(
+                    (lambda: state_call("_on_transcript"))
+                    if on_transcript is not None
+                    else None
+                ),
+                on_tasks=(
+                    (lambda: state_call("_on_tasks"))
+                    if on_tasks is not None
+                    else None
+                ),
+                on_history_search=(
+                    (lambda: state_call("_on_history_search"))
+                    if on_history_search is not None
+                    else None
+                ),
+                on_redraw=lambda: state_call("_on_redraw"),
+                on_recall_queue=lambda: str(state_call("_on_recall_queue", "") or ""),
+            ),
             multiline=True,
             completer=completer,
             complete_while_typing=True,  # menu pops the moment '/' is typed
@@ -414,7 +466,8 @@ async def _async_input(
         input_state._session = session
 
     try:
-        line = await session.prompt_async(HTML(f"<ansicyan>{prompt}</ansicyan> "))
+        message = HTML(f"<ansicyan>{prompt}</ansicyan> ")
+        line = await session.prompt_async(message)
         return line
     except EOFError:
         return None  # Ctrl-D / closed stdin → leave the chat loop
@@ -505,7 +558,12 @@ def run_task(args: argparse.Namespace) -> int:
         return 1
     finally:
         agent.sandbox.teardown()
+        for retired in getattr(agent, "_retired_sandboxes", []):
+            retired.teardown()
         agent.logger.close()
+        plugin_mcp = getattr(agent, "_plugin_mcp_manager", None)
+        if plugin_mcp is not None:
+            plugin_mcp.close()
         if mcp is not None:
             mcp.close()
     # A live UI already streamed the answer via on_final; only print it ourselves
@@ -539,6 +597,10 @@ def chat_command(args: argparse.Namespace) -> int:
         history: list[Message] = list(built.history)
         from agent_core.terminal.completion import SlashCompleter
 
+        # A chat owns one persistent PromptSession. Do not retain a toolbar/completer
+        # closure from an earlier embedded chat invocation in the same process.
+        if hasattr(_async_input, "_session"):
+            delattr(_async_input, "_session")
         completer = SlashCompleter(agent)
 
         async def scheduler_heartbeats() -> None:
@@ -558,9 +620,14 @@ def chat_command(args: argparse.Namespace) -> int:
             # (and the effect of the /model picker) is always visible. Read per render.
             effort = agent.config.effort or "—"
             mode = permission_mode_label(agent.config.permission)
+            running = "running" if run_task is not None else "ready"
+            queued = f" · queued: {len(prompt_queue)}" if len(prompt_queue) else ""
+            title = getattr(agent, "session_title", None)
+            titled = f" · {title}" if title else ""
+            fast = " · fast" if getattr(agent, "fast_mode", False) else ""
             return (
-                f" {mode}  ·  model: {agent.config.model}  ·  effort: {effort}  "
-                "·  /help for commands "
+                f" {mode}  ·  {running}{queued}{titled}  ·  model: {agent.config.model}{fast}  "
+                f"·  effort: {effort}  ·  /help for commands "
             )
 
         def _cycle_permission() -> None:
@@ -573,26 +640,63 @@ def chat_command(args: argparse.Namespace) -> int:
                 # mode remains unchanged; surface the actionable gate message once.
                 print(f"[permission] {exc}")
 
-        try:
+        from agent_core.terminal.prompt_queue import PromptQueue
+
+        prompt_queue = PromptQueue()
+        run_task: asyncio.Task[Any] | None = None
+        cancel_requested = threading.Event()
+        background_requested = threading.Event()
+
+        def _consume_background() -> bool:
+            requested = background_requested.is_set()
+            if requested:
+                background_requested.clear()
+            return requested
+
+        def _show_transcript() -> None:
+            visible = getattr(agent, "_active_messages", None) or history
+            print("\nTranscript:")
+            for message in visible[-20:]:
+                label = message.name or message.role
+                text = " ".join(message.content.strip().split())
+                print(f"  {label:<9} {text[:160]}")
+            if not visible:
+                print("  (empty)")
+
+        def _show_tasks() -> None:
+            print("\nTasks:")
+            print(agent.session.todos.render())
+            queued = prompt_queue.snapshot()
+            print(f"Queued input ({len(queued)}):")
+            for item in queued:
+                preview = " ".join(item.content.split())[:120]
+                print(f"  [{item.priority.name.lower()}] {preview}")
+            if not queued:
+                print("  (none)")
+
+        def _input_kwargs() -> dict[str, Any]:
+            return {
+                "is_running": lambda: run_task is not None,
+                "on_interrupt": cancel_requested.set,
+                "on_background": background_requested.set,
+                "on_transcript": _show_transcript,
+                "on_tasks": _show_tasks,
+                "on_redraw": lambda: None,
+                "on_recall_queue": prompt_queue.recall_editable,
+            }
+
+        async def _legacy_loop() -> None:
+            nonlocal history
             while True:
-                task = await _async_input(
-                    "›",
-                    ui,
-                    completer,
-                    _toolbar,
-                    _cycle_permission,
-                )
-                if task is None:  # EOF
-                    break
+                task = await _async_input("›", ui, completer, _toolbar, _cycle_permission)
+                if task is None:
+                    return
                 task = task.strip()
                 if not task:
                     continue
-                # Resolve /commands and skills. A fully-handled command (/help, /clear, a
-                # fork skill, …) yields no prompt; a plain message or inline skill yields the
-                # prompt to run; /clear and /resume replace the loop's history; /exit quits.
                 turn = await dispatch_chat_command(task, agent, ui, history)
                 if turn.quit:
-                    break
+                    return
                 if turn.history is not None:
                     history = turn.history
                 if turn.prompt is None:
@@ -602,17 +706,20 @@ def chat_command(args: argparse.Namespace) -> int:
                         agent.session.should_background = interrupt.consume_background
                         try:
                             result = await agent.run(
-                                turn.prompt, should_cancel=interrupt.is_set, history=history or None
+                                turn.prompt,
+                                should_cancel=interrupt.is_set,
+                                history=history or None,
                             )
                         finally:
                             agent.session.should_background = None
                     history = result.messages
                     history, scheduled = await agent.drain_scheduler_deliveries(history)
                 except LLMTransientError as exc:
-                    # A network hiccup must not tear down the whole session: report it and
-                    # keep the loop (and the accumulated context) alive for a retry.
                     print(f"[network] {exc}", file=sys.stderr)
-                    print("The session is still alive — please send your message again.", file=sys.stderr)
+                    print(
+                        "The session is still alive — please send your message again.",
+                        file=sys.stderr,
+                    )
                     continue
                 except RuntimeError as exc:
                     print(f"[error] {exc}", file=sys.stderr)
@@ -621,6 +728,171 @@ def chat_command(args: argparse.Namespace) -> int:
                     print(result.answer)
                     for scheduled_result in scheduled:
                         print(scheduled_result.answer)
+
+        async def _persistent_loop() -> None:
+            nonlocal history, run_task
+            exit_requested = False
+            input_task: asyncio.Task[str | None] | None = None
+
+            def start_input() -> asyncio.Task[str | None]:
+                return asyncio.create_task(
+                    _async_input(
+                        "›",
+                        ui,
+                        completer,
+                        _toolbar,
+                        _cycle_permission,
+                        **_input_kwargs(),
+                    )
+                )
+
+            def start_prompt(prompt: str) -> None:
+                nonlocal run_task
+                cancel_requested.clear()
+                background_requested.clear()
+                agent.session.should_background = _consume_background
+                run_task = asyncio.create_task(
+                    agent.run(
+                        prompt,
+                        should_cancel=cancel_requested.is_set,
+                        history=history or None,
+                        midturn_drain=prompt_queue.drain_midturn,
+                    )
+                )
+
+            def start_batch(messages: list[Message]) -> None:
+                nonlocal run_task
+                cancel_requested.clear()
+                background_requested.clear()
+                agent.session.should_background = _consume_background
+                run_task = asyncio.create_task(
+                    agent.run_messages(
+                        messages,
+                        should_cancel=cancel_requested.is_set,
+                        history=history or None,
+                        midturn_drain=prompt_queue.drain_midturn,
+                    )
+                )
+
+            async def apply_turn(task: str) -> bool:
+                """Dispatch one idle/immediate command; return True to exit."""
+
+                nonlocal history, exit_requested
+                command_history = (
+                    getattr(agent, "_active_messages", history)
+                    if run_task is not None
+                    else history
+                )
+                turn = await dispatch_chat_command(task, agent, ui, command_history)
+                if turn.quit:
+                    if run_task is not None:
+                        exit_requested = True
+                        cancel_requested.set()
+                    return True
+                if turn.history is not None:
+                    history = turn.history
+                if turn.prompt is not None:
+                    if run_task is None:
+                        start_prompt(turn.prompt)
+                    else:
+                        prompt_queue.enqueue(turn.prompt)
+                        print(f"[queued] {len(prompt_queue)} input(s) waiting")
+                return False
+
+            async def start_next_queued() -> bool:
+                """Dispatch queue units until one starts a run or the queue is empty."""
+
+                while run_task is None and len(prompt_queue):
+                    batch = prompt_queue.pop_between_turn()
+                    if not batch:
+                        return False
+                    first = batch[0]
+                    if first.is_slash_command:
+                        if await apply_turn(first.content):
+                            return True
+                        continue
+                    start_batch([item.to_message(delivery="between_turn") for item in batch])
+                return False
+
+            input_task = start_input()
+            try:
+                while True:
+                    assert input_task is not None
+                    wait_for: set[asyncio.Task[Any]] = {input_task}
+                    if run_task is not None:
+                        wait_for.add(run_task)
+                    done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+
+                    # Treat input completed in the same event-loop tick as the run as
+                    # having been submitted while running, preserving queue ordering.
+                    if input_task in done:
+                        line = await input_task
+                        input_task = None
+                        if line is None:
+                            if run_task is not None:
+                                exit_requested = True
+                                cancel_requested.set()
+                            else:
+                                break
+                        else:
+                            task = line.strip()
+                            if task:
+                                if run_task is not None and not is_immediate_command(task):
+                                    prompt_queue.enqueue(task)
+                                    print(f"[queued] {len(prompt_queue)} input(s) waiting")
+                                else:
+                                    wants_exit = await apply_turn(task)
+                                    if wants_exit and run_task is None:
+                                        break
+
+                    if run_task is not None and run_task in done:
+                        completed = run_task
+                        run_task = None
+                        agent.session.should_background = None
+                        try:
+                            result = await completed
+                            history = result.messages
+                            history, scheduled = await agent.drain_scheduler_deliveries(history)
+                            if not ui.is_live:
+                                print(result.answer)
+                                for scheduled_result in scheduled:
+                                    print(scheduled_result.answer)
+                        except LLMTransientError as exc:
+                            print(f"[network] {exc}", file=sys.stderr)
+                            print(
+                                "The session is still alive — queued input was kept.",
+                                file=sys.stderr,
+                            )
+                        except RuntimeError as exc:
+                            print(f"[error] {exc}", file=sys.stderr)
+                        if exit_requested:
+                            dropped = prompt_queue.clear()
+                            if dropped:
+                                print(f"[exit] dropped {len(dropped)} queued input(s)")
+                            break
+                        if await start_next_queued():
+                            if run_task is None:
+                                break
+
+                    if input_task is None and not exit_requested:
+                        input_task = start_input()
+            finally:
+                if input_task is not None and not input_task.done():
+                    input_task.cancel()
+                    await asyncio.gather(input_task, return_exceptions=True)
+                if run_task is not None and not run_task.done():
+                    cancel_requested.set()
+                    await asyncio.gather(run_task, return_exceptions=True)
+                agent.session.should_background = None
+
+        try:
+            if sys.stdin and sys.stdin.isatty():
+                from prompt_toolkit.patch_stdout import patch_stdout
+
+                with patch_stdout(raw=True):
+                    await _persistent_loop()
+            else:
+                await _legacy_loop()
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -631,7 +903,12 @@ def chat_command(args: argparse.Namespace) -> int:
         asyncio.run(session())
     finally:
         agent.sandbox.teardown()
+        for retired in getattr(agent, "_retired_sandboxes", []):
+            retired.teardown()
         agent.logger.close()
+        plugin_mcp = getattr(agent, "_plugin_mcp_manager", None)
+        if plugin_mcp is not None:
+            plugin_mcp.close()
         if mcp is not None:
             mcp.close()
     return 0

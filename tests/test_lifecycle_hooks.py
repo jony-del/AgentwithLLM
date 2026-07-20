@@ -166,6 +166,40 @@ async def test_user_prompt_context_is_injected(tmp_path: Path) -> None:
     assert "Extra grounding for the model." in injected[0].content
 
 
+async def test_queued_batch_runs_each_hook_and_first_block_controls_query(
+    tmp_path: Path,
+) -> None:
+    class SelectiveHook:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def on_user_prompt(self, ctx: HookContext) -> HookOutcome:
+            prompt = ctx.prompt or ""
+            self.prompts.append(prompt)
+            return HookOutcome(block=prompt.startswith("block"), reason=f"blocked {prompt}")
+
+    fake = FakeProvider()
+    hook = SelectiveHook()
+    agent = ReActAgent(
+        fake,
+        _hermetic_config(tmp_path),
+        hooks=HookPipeline(user_prompt_hooks=[hook]),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    first = Message("user", "block first", metadata={"queued_command": True})
+    second = Message("user", "allowed second", metadata={"queued_command": True})
+
+    result = await agent.run_messages([first, second])
+
+    assert fake.calls == 0
+    assert hook.prompts == ["block first", "allowed second"]
+    warnings = [m for m in result.messages if m.metadata.get("hook_blocked_prompt")]
+    assert len(warnings) == 1
+    assert warnings[0].metadata["original_prompt"] == "block first"
+    allowed = [m for m in result.messages if m.uuid == second.uuid]
+    assert len(allowed) == 1
+
+
 async def test_prompt_validation_neutralizes_task_in_loop(tmp_path: Path) -> None:
     from agent_core.builtin_hooks import PromptValidationHook
 

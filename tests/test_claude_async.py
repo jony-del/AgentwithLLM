@@ -93,6 +93,45 @@ async def test_complete_retries_on_429(monkeypatch) -> None:
     assert len(sleeps) == 1  # one backoff between the two attempts
 
 
+async def test_fast_429_cools_down_then_retries_normally(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    bodies: list[dict] = []
+    beta_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        beta_headers.append(request.headers.get("anthropic-beta"))
+        if len(bodies) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "2"},
+                json={"error": {"message": "rate limited"}},
+            )
+        return httpx.Response(
+            200,
+            json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"},
+        )
+
+    provider = _provider(handler, max_retries=0)
+    result = await provider.complete(
+        [Message("user", "hi")],
+        [],
+        ProviderConfig(model="claude-opus-4-6", speed="fast", stream=False),
+    )
+
+    assert result.content == "ok"
+    assert bodies[0]["speed"] == "fast"
+    assert "speed" not in bodies[1]
+    assert beta_headers == ["fast-mode-2026-02-01", None]
+    assert sleeps == [2.0]
+    assert provider.consume_fast_disabled_reason() == "rate limited"
+
+
 async def test_complete_retries_transient_transport_error_then_succeeds(monkeypatch) -> None:
     async def fake_sleep(delay: float) -> None:
         pass

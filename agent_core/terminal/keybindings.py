@@ -7,7 +7,12 @@
                                   a short window (on an empty buffer) to exit the chat.
 - ``Ctrl+D``                     exit the chat on an empty buffer (EOF); on a non-empty
                                   buffer it deletes the character under the cursor.
-- ``Ctrl+O``                     toggle verbose detail for subsequent turns.
+- ``Esc``                        cooperatively cancel the active agent run.
+- ``Ctrl+B``                     move the foreground shell process to background.
+- ``Ctrl+O``                     show the transcript (verbose fallback outside chat).
+- ``Ctrl+T``                     show tasks and queued input.
+- ``Ctrl+R``                     search input history.
+- ``Ctrl+L``                     redraw the terminal.
 - ``Shift+Tab``                  cycle default/acceptedits/plan/auto modes.
 
 ``Shift+Enter`` requires a terminal that emits a distinct escape sequence for the
@@ -70,6 +75,15 @@ _patch_ansi_sequences()
 def create_keybindings(
     on_toggle_verbose: Callable[[], None] | None = None,
     on_cycle_permission: Callable[[], None] | None = None,
+    *,
+    is_running: Callable[[], bool] | None = None,
+    on_interrupt: Callable[[], None] | None = None,
+    on_background: Callable[[], None] | None = None,
+    on_transcript: Callable[[], None] | None = None,
+    on_tasks: Callable[[], None] | None = None,
+    on_history_search: Callable[[], None] | None = None,
+    on_redraw: Callable[[], None] | None = None,
+    on_recall_queue: Callable[[], str] | None = None,
 ) -> KeyBindings:
     kb = KeyBindings()
 
@@ -97,6 +111,8 @@ def create_keybindings(
             buffer.start_completion(select_first=True)
 
     @kb.add("s-tab")
+    @kb.add("escape", "Z")
+    @kb.add("escape", "m")
     def _(event) -> None:
         if on_cycle_permission is None:
             return
@@ -171,7 +187,51 @@ def create_keybindings(
 
     @kb.add("c-o")
     def _(event) -> None:
-        if on_toggle_verbose is not None:
+        if on_transcript is not None:
+            on_transcript()
+        elif on_toggle_verbose is not None:
             on_toggle_verbose()
+
+    @kb.add("escape")
+    def _(event) -> None:
+        if is_running is not None and is_running() and on_interrupt is not None:
+            on_interrupt()
+
+    @kb.add("c-b")
+    def _(event) -> None:
+        if is_running is not None and is_running() and on_background is not None:
+            on_background()
+
+    @kb.add("c-t")
+    def _(event) -> None:
+        if on_tasks is not None:
+            on_tasks()
+
+    @kb.add("c-r")
+    def _(event) -> None:
+        if on_history_search is not None:
+            on_history_search()
+        else:
+            event.app.current_buffer.start_history_lines_completion()
+
+    @kb.add("c-l")
+    def _(event) -> None:
+        if on_redraw is not None:
+            on_redraw()
+        event.app.renderer.clear()
+        event.app.invalidate()
+
+    if on_recall_queue is not None:
+        @kb.add("up")
+        def _(event) -> None:
+            buffer = event.current_buffer
+            if buffer.text:
+                buffer.history_backward()
+                return
+            recalled = on_recall_queue()
+            if recalled:
+                buffer.insert_text(recalled)
+            else:
+                buffer.history_backward()
 
     return kb

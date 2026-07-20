@@ -67,6 +67,8 @@ class SandboxManager:
         # (backend name, missing deps) for each candidate tried — powers a still-actionable
         # unavailable_reason() after a degrade-to-noop.
         self._selection_diagnostics: list[tuple[str, list[str]]] = []
+        self._reconfigure_lock = threading.RLock()
+        self._retired_backends: list[SandboxBackend] = []
         # prepare() is idempotent (heavyweight readying runs once per manager); teardown
         # resets this so a torn-down manager could be re-readied.
         self._prepared = False
@@ -194,10 +196,32 @@ class SandboxManager:
                 type(exc).__name__, exc,
             )
 
+    def reconfigure(self, config: SandboxConfig) -> None:
+        """Prepare a replacement backend, then atomically publish it.
+
+        Tools that already wrapped/launched a command keep using the retired backend.
+        Retired backend resources are released at session teardown, while all future
+        permission checks and wraps observe the replacement immediately.
+        """
+
+        candidate = SandboxManager(config, workspace=self.workspace)
+        candidate.prepare()
+        with self._reconfigure_lock:
+            self._retired_backends.append(self._backend)
+            self.config = candidate.config
+            self._backend = candidate._backend
+            self._selection_diagnostics = candidate._selection_diagnostics
+            self._prepared = candidate._prepared
+
     def teardown(self) -> None:
         """Release backend resources (stop/remove container, power off VM)."""
         try:
             self._backend.teardown()
+            for backend in self._retired_backends:
+                try:
+                    backend.teardown()
+                except Exception:
+                    pass
         except Exception as exc:  # noqa: BLE001 - teardown must never raise into shutdown
             logger.warning(
                 "sandbox teardown failed (resources may be left behind): %s: %s",
@@ -205,6 +229,7 @@ class SandboxManager:
             )
         finally:
             self._prepared = False
+            self._retired_backends.clear()
 
     # -- the wrap seam called by command tools ---------------------------------------
 

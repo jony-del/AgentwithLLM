@@ -282,7 +282,13 @@ class ConsoleUI(AgentUI):
                 answers.append({"id": item.get("id"), "answer": value})
             return answers
 
-        return await asyncio.to_thread(ask)
+        # The persistent chat composer remains mounted while tools run. Temporarily
+        # suspend that application before a tool asks raw terminal questions, then
+        # restore the untouched draft when the questions finish.
+        from prompt_toolkit.application import in_terminal
+
+        async with in_terminal():
+            return await asyncio.to_thread(ask)
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission
@@ -292,9 +298,15 @@ class ConsoleUI(AgentUI):
         loop = self._loop
         if loop is None:
             return "deny"
-        future = asyncio.run_coroutine_threadsafe(
-            self._renderer.ask_permission_async(tool_name, risk, arguments), loop
-        )
+        async def ask() -> PermissionChoice:
+            from prompt_toolkit.application import in_terminal
+
+            async with in_terminal():
+                return await self._renderer.ask_permission_async(
+                    tool_name, risk, arguments
+                )
+
+        future = asyncio.run_coroutine_threadsafe(ask(), loop)
         try:
             return future.result()
         except Exception:
@@ -304,9 +316,13 @@ class ConsoleUI(AgentUI):
         loop = self._loop
         if loop is None:
             return PermissionResponse(False, reason="interactive event loop unavailable")
-        future = asyncio.run_coroutine_threadsafe(
-            self._renderer.ask_permission_request_async(request), loop
-        )
+        async def ask() -> PermissionResponse:
+            from prompt_toolkit.application import in_terminal
+
+            async with in_terminal():
+                return await self._renderer.ask_permission_request_async(request)
+
+        future = asyncio.run_coroutine_threadsafe(ask(), loop)
         try:
             return future.result()
         except Exception:

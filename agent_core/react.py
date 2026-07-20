@@ -337,6 +337,14 @@ class ReActAgent:
             max_concurrency=self.config.max_api_concurrency,
             rate_limit=self.config.api_rate_limit_per_min,
         )
+        # Interactive /fast is intentionally session-only.
+        self.fast_mode = False
+        self.session_title: str | None = None
+        self._sandbox_cli_locked = False
+        self._retired_sandboxes: list[SandboxManager] = []
+        self._plugin_tool_names: set[str] = set()
+        self._plugin_mcp_manager: Any | None = None
+        self.plugin_agents: dict[str, str] = {}
         self.registry = tools or self.default_registry()
         self.registry.rebind_workspace(str(self._initial_workspace))
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
@@ -568,6 +576,19 @@ class ReActAgent:
         # When this agent was created — a chat session builds one agent, so this doubles
         # as the session start for ``/cost`` duration.
         self._session_started: float = time.monotonic()
+        # Enabled plugins load eagerly at process/session start. A broken generation
+        # never replaces the already-valid built-in registries.
+        try:
+            from agent_core.plugins import PluginManager, reload_plugins
+
+            if PluginManager(self.session.workspace).enabled_ids():
+                reload_plugins(self)
+        except Exception as exc:  # noqa: BLE001 - plugins are optional
+            logging.getLogger(__name__).warning(
+                "enabled plugins failed to load; using built-ins only: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _build_memory(
         self,
@@ -780,6 +801,9 @@ class ReActAgent:
         should_cancel: Callable[[], bool] | None = None,
         deadline: float | None = None,
         history: list[Message] | None = None,
+        midturn_drain: Callable[[], list[Message]] | None = None,
+        *,
+        _user_messages: list[Message] | None = None,
     ) -> AgentRunResult:
         """Drive the ReAct loop to completion and return the final answer.
 
@@ -812,14 +836,28 @@ class ReActAgent:
         # the running loop so it can bridge the prompt back onto the main thread.
         if self.ui.is_live:
             self.ui.bind_event_loop(asyncio.get_running_loop())
-        user_message = Message("user", task)
+        user_messages = list(_user_messages) if _user_messages is not None else [Message("user", task)]
+        if not user_messages:
+            raise ValueError("at least one user message is required")
+        if any(message.role != "user" for message in user_messages):
+            raise ValueError("run user messages must all have role='user'")
+        user_message = user_messages[0]
+        recalled_task = "\n".join(message.content for message in user_messages)
         system_prompt = self.config.system_prompt
-        messages: list[Message] = [Message("system", system_prompt), user_message]
-        await self.logger.write("user", {"content": task, **self._trace_fields()})
+        messages: list[Message] = [Message("system", system_prompt), *user_messages]
+        for submitted in user_messages:
+            await self.logger.write(
+                "user",
+                {
+                    "content": submitted.content,
+                    "uuid": submitted.uuid,
+                    **self._trace_fields(),
+                },
+            )
         # ``_recall``/``_inject_project_context`` position the recall and pinned
         # userContext blocks relative to the trailing user task, so the task must already
         # be in place. Final front order: system(+gitStatus) → (recall) → userContext → task.
-        await self._recall(task, messages)
+        await self._recall(recalled_task, messages)
         await self._inject_project_context(messages)
         self._sync_permission_mode_context(messages)
         # Splice prior conversation in just before the new task (after the pinned context),
@@ -834,6 +872,11 @@ class ReActAgent:
                 messages.insert(insert_at, past)
                 insert_at += 1
                 self._last_message_uuid = past.uuid
+        # The new batch was present while recall/project context found its anchor.
+        # Re-add each message sequentially below so hook-added context and transcript
+        # parent links stay in exact per-command order.
+        for submitted in user_messages:
+            messages.remove(submitted)
         # SessionStart (observational) fires once per agent, on its first run —
         # before UserPromptSubmit so subscribers see the session open first.
         if not self._session_start_fired:
@@ -848,9 +891,33 @@ class ReActAgent:
         # framing (transformed_prompt), or inject extra grounding (additional_context). The new
         # task is chained + persisted inside the helper, *after* the hook, so a rewrite is what
         # gets recorded and sent to the model.
-        blocked = await self._run_user_prompt_hooks(messages, user_message, task)
-        if blocked is not None:
-            return blocked
+        batch_mode = _user_messages is not None
+        first_should_query = True
+        first_block_reason = ""
+        for index, submitted in enumerate(user_messages):
+            messages.append(submitted)
+            blocked, was_blocked = await self._run_user_prompt_hooks(
+                messages,
+                submitted,
+                submitted.content,
+                blocked_as_warning=batch_mode or index > 0,
+            )
+            if index == 0 and was_blocked:
+                first_should_query = False
+                first_block_reason = (
+                    messages[-1].metadata.get("reason", "")
+                    if messages
+                    else ""
+                )
+            if blocked is not None:
+                return blocked
+        if not first_should_query:
+            answer = str(first_block_reason or "First queued prompt was blocked by a hook.")
+            self._emit_recap(messages, 0, "blocked")
+            await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
+            return AgentRunResult(answer, messages, 0, self.logger.run_id)
+        # Exposed read-only to the persistent terminal's Ctrl+O transcript snapshot.
+        self._active_messages = messages
 
         cancelled = should_cancel or (lambda: False)
         start = time.monotonic()
@@ -913,6 +980,7 @@ class ReActAgent:
                     on_stage=self._compaction_reporter(reactive=False),
                     attachments=attachments,
                 )
+                self._active_messages = messages
                 for event in events:
                     await self.logger.write("compression", asdict(event))
                 await self._commit_compaction_boundary(before_compaction, messages)
@@ -951,6 +1019,7 @@ class ReActAgent:
                     on_stage=self._compaction_reporter(reactive=True),
                     attachments=self._build_read_attachments(),
                 )
+                self._active_messages = messages
                 for event in events:
                     await self.logger.write("compression", {**asdict(event), "reactive": True})
                 await self._commit_compaction_boundary(before_compaction, messages)
@@ -979,6 +1048,7 @@ class ReActAgent:
                         )
                         if truncated is not None:
                             messages = truncated
+                            self._active_messages = messages
                             await self.logger.write(
                                 "compression",
                                 {"stage": "ptl_head_truncate", "reactive": True, "kept": len(messages)},
@@ -997,6 +1067,7 @@ class ReActAgent:
                             # left to shrink. Surface the overflow rather than spin.
                             raise
                         messages = shrunk
+                        self._active_messages = messages
                         await self.logger.write(
                             "compression",
                             {"stage": "ptl_shrink", "reactive": True, "kept": len(messages)},
@@ -1004,6 +1075,12 @@ class ReActAgent:
                 if result is None:
                     # Exhausted MAX_PTL_RETRIES without a successful completion.
                     raise exc
+            except Exception:
+                # A fast request may already have transparently fallen back before the
+                # normal-speed retry failed. Reflect that session-state transition even
+                # though this provider call itself did not complete.
+                self._consume_fast_mode_fallback()
+                raise
 
             # Track the running prompt token count from the response usage, when the
             # provider reports it, so the next turn's auto-compact gate thresholds against
@@ -1012,6 +1089,7 @@ class ReActAgent:
             # ``/status`` commands (cheap counters; not part of any contract).
             if result is None:
                 raise RuntimeError("provider returned no result after context recovery")
+            self._consume_fast_mode_fallback()
             if result.usage is not None:
                 # ``total_tokens`` (prompt incl. cache + this turn's output) is the anchor
                 # the gate carries forward — once this turn is in history its output counts
@@ -1153,11 +1231,49 @@ class ReActAgent:
                 self._record_read_result(tool_call, tool_result)
                 await self._notify_lsp_edit(tool_call, tool_result)
 
+            # Interactive input entered while tools were running is inserted only after
+            # the complete tool-result batch, immediately before the next provider call.
+            # These messages have already been classified by the host as ordinary
+            # prompts (slash commands remain queued), and intentionally bypass
+            # UserPromptSubmit hooks because this is a current-turn steering seam.
+            if midturn_drain is not None:
+                for queued_message in midturn_drain():
+                    await self._emit(messages, queued_message)
+                    await self.logger.write(
+                        "queued_prompt",
+                        {
+                            "content": queued_message.content,
+                            "delivery": "midturn",
+                            **self._trace_fields(),
+                        },
+                    )
+
             # Fire (fire-and-forget) the tool-use progress label for this batch. It runs in
             # the background during next turn's model call and is awaited/emitted there.
             self._fire_tool_use_summary(
                 list(zip(result.tool_calls, tool_results, strict=True)), result.content
             )
+
+    async def run_messages(
+        self,
+        user_messages: list[Message],
+        should_cancel: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+        history: list[Message] | None = None,
+        midturn_drain: Callable[[], list[Message]] | None = None,
+    ) -> AgentRunResult:
+        """Run a between-turn batch while preserving each prompt's UUID and hooks."""
+
+        if not user_messages:
+            raise ValueError("at least one user message is required")
+        return await self.run(
+            user_messages[0].content,
+            should_cancel=should_cancel,
+            deadline=deadline,
+            history=history,
+            midturn_drain=midturn_drain,
+            _user_messages=user_messages,
+        )
 
     def _emit_recap(self, messages: list[Message], step: int, reason: str) -> None:
         duration = time.monotonic() - getattr(self, "_run_start_time", time.monotonic())
@@ -1322,8 +1438,13 @@ class ReActAgent:
     # flow. ``self.hooks`` is the same pipeline the executor uses for tool hooks.
 
     async def _run_user_prompt_hooks(
-        self, messages: list[Message], user_message: Message, task: str
-    ) -> "AgentRunResult | None":
+        self,
+        messages: list[Message],
+        user_message: Message,
+        task: str,
+        *,
+        blocked_as_warning: bool = False,
+    ) -> "tuple[AgentRunResult | None, bool]":
         """Fire UserPromptSubmit, then chain + persist the (possibly neutralized) task.
 
         Returns a terminal result if a hook blocked the run, else ``None`` (after persisting
@@ -1342,28 +1463,46 @@ class ReActAgent:
             outcome = await self.hooks.run_user_prompt(ctx)
             if outcome.transformed_prompt is not None:
                 user_message.content = outcome.transformed_prompt
+        if self.hooks.user_prompt_hooks:
+            await self.logger.write(
+                "hook",
+                {
+                    "event": "UserPromptSubmit",
+                    "blocked": outcome.block,
+                    "reason": outcome.reason,
+                    **(outcome.metadata or {}),
+                },
+            )
+        if outcome.block and blocked_as_warning:
+            messages.remove(user_message)
+            reason = outcome.reason or "Request blocked by a UserPromptSubmit hook."
+            await self._emit(
+                messages,
+                Message(
+                    "system",
+                    f"Queued prompt was blocked by UserPromptSubmit: {reason}",
+                    metadata={
+                        "hook_blocked_prompt": True,
+                        "reason": reason,
+                        "original_prompt": task,
+                    },
+                ),
+            )
+            self.ui.on_stopped("blocked_queued_prompt", reason)
+            return None, True
         # Chain + persist the new task (parent = last history message, or None).
         user_message.parent_uuid = self._last_message_uuid
         if self.transcript is not None:
             await self.transcript.append_message(user_message)
         self._last_message_uuid = user_message.uuid
         if not self.hooks.user_prompt_hooks:
-            return None
-        await self.logger.write(
-            "hook",
-            {
-                "event": "UserPromptSubmit",
-                "blocked": outcome.block,
-                "reason": outcome.reason,
-                **(outcome.metadata or {}),
-            },
-        )
+            return None, False
         if outcome.block:
             answer = outcome.reason or "Request blocked by a UserPromptSubmit hook."
             self._emit_recap(messages, 0, "blocked")
             self.ui.on_stopped("blocked", answer)
             await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
-            return AgentRunResult(answer, messages, 0, self.logger.run_id)
+            return AgentRunResult(answer, messages, 0, self.logger.run_id), True
         if outcome.additional_context:
             await self._emit(
                 messages,
@@ -1373,7 +1512,7 @@ class ReActAgent:
                     metadata={"hook": "user_prompt_context"},
                 ),
             )
-        return None
+        return None, False
 
     async def _run_pre_compact_hooks(self, messages: list[Message], trigger: str) -> HookOutcome:
         """Fire PreCompact. The caller honors ``block`` only on the proactive (``auto``)
@@ -1895,8 +2034,23 @@ class ReActAgent:
             max_tokens=self.config.max_tokens,
             thinking_budget=self.config.thinking_budget,
             effort=self.config.effort,
+            speed="fast" if self.fast_mode else None,
             stream=self.config.stream,
         )
+
+    def _consume_fast_mode_fallback(self) -> None:
+        """Reflect a provider's transparent normal-speed retry in session state."""
+
+        provider = self.provider
+        while hasattr(provider, "inner"):
+            provider = provider.inner
+        consume = getattr(provider, "consume_fast_disabled_reason", None)
+        if not callable(consume):
+            return
+        reason = consume()
+        if reason:
+            self.fast_mode = False
+            print(f"[fast] disabled for this session ({reason}); retried at normal speed.")
 
     def _build_hook_pipeline(self) -> HookPipeline:
         """Assemble the default HookPipeline from ``config.hooks``.

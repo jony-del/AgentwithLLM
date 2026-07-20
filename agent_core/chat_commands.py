@@ -15,13 +15,17 @@ pieces (never ``cli``) so there is no import cycle.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import time
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import replace
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from agent_core import tokens
 from agent_core.config import resolve_mcp_config
+from agent_core.local_config import LocalConfigError, update_local_table
 from agent_core.model_catalog import picker_spec_for_provider
 from agent_core.model_validation import CLAUDE_PROVIDER, FAKE_PROVIDER, is_model_allowed
 from agent_core.models import Message
@@ -67,6 +71,16 @@ class ChatTurn:
 
 
 Handler = Callable[["ReActAgent", AgentUI, str, "list[Message]"], "Awaitable[ChatTurn]"]
+
+
+@dataclass(frozen=True, slots=True)
+class CommandSpec:
+    """Execution metadata for an interactive slash command."""
+
+    handler: Handler | None
+    summary: str
+    immediate: bool = False
+    canonical: str | None = None
 
 
 def _estimate_tokens(agent: "ReActAgent", history: list[Message]) -> int:
@@ -125,6 +139,7 @@ async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     print("Status:")
     print(f"  model       {agent.config.model}")
     print(f"  effort      {agent.config.effort or '—'}")
+    print(f"  fast mode   {'on' if getattr(agent, 'fast_mode', False) else 'off'}")
     print(f"  thinking    {thinking_label}")
     mode = PermissionMode(agent.config.permission)
     print(f"  permission  {mode.value} ({permission_mode_label(mode)})")
@@ -201,6 +216,9 @@ async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
         model, effort = chosen
         agent.config.model = model
         agent.config.effort = effort
+        if getattr(agent, "fast_mode", False) and model != "claude-opus-4-6":
+            agent.fast_mode = False
+            print("Fast mode disabled because the selected model is not Claude Opus 4.6.")
         tail = f"  ·  effort: {effort}" if effort is not None else "  ·  (no effort levels)"
         print(f"Model switched to {model}{tail} (takes effect on your next message).")
         return ChatTurn()
@@ -213,7 +231,331 @@ async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
             print(f"Unsupported model {target!r} for provider {agent.config.provider!r}.")
         return ChatTurn()
     agent.config.model = target
+    if getattr(agent, "fast_mode", False) and target != "claude-opus-4-6":
+        agent.fast_mode = False
+        print("Fast mode disabled because the selected model is not Claude Opus 4.6.")
     print(f"Model switched to {target} (takes effect on your next message).")
+    return ChatTurn()
+
+
+async def _cmd_effort(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    spec = picker_spec_for_provider(agent.config.provider)
+    available = spec.efforts_fn(agent.config.model) if spec is not None else ()
+    target = args.strip().casefold()
+    if not target:
+        print(f"Current effort: {agent.config.effort or 'auto'}")
+        print("Available: auto" + (", " + ", ".join(available) if available else ""))
+        return ChatTurn()
+    if target == "auto":
+        agent.config.effort = None
+        print("Effort set to auto for the next provider request.")
+        return ChatTurn()
+    if target not in available:
+        choices = "auto" + (", " + ", ".join(available) if available else "")
+        print(
+            f"Effort {target!r} is unsupported by {agent.config.model}. "
+            f"Choose one of: {choices}."
+        )
+        return ChatTurn()
+    agent.config.effort = target
+    print(f"Effort set to {target} for the next provider request.")
+    return ChatTurn()
+
+
+async def _cmd_fast(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    raw = args.strip().casefold()
+    current = bool(getattr(agent, "fast_mode", False))
+    if raw in {"off", "disable", "disabled"} or (not raw and current):
+        agent.fast_mode = False
+        print("Fast mode off (session only).")
+        return ChatTurn()
+    if raw not in {"", "on", "enable", "enabled"}:
+        print("Usage: /fast [on|off]")
+        return ChatTurn()
+    if agent.config.provider != CLAUDE_PROVIDER:
+        print("Fast mode is available only with the Claude provider.")
+        return ChatTurn()
+    if agent.config.model != "claude-opus-4-6":
+        agent.config.model = "claude-opus-4-6"
+        print("Model switched to claude-opus-4-6 for fast mode.")
+    agent.fast_mode = True
+    print("Fast mode on (session only; takes effect on the next provider request).")
+    return ChatTurn()
+
+
+async def _cmd_rename(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    title = " ".join(args.strip().split())
+    if not title:
+        useful = [message for message in history if message.role in {"user", "assistant"}]
+        if not useful:
+            print("Cannot generate a title before the session has conversation history.")
+            return ChatTurn()
+        prompt = Message(
+            "user",
+            "Create a concise title (at most 8 words) for this conversation. "
+            "Return only the title, without quotes.",
+        )
+        try:
+            result = await agent.provider.complete(
+                [*useful[-12:], prompt],
+                [],
+                replace(
+                    agent._provider_config(),
+                    max_tokens=48,
+                    thinking_budget=None,
+                    stream=False,
+                    speed=None,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - title generation is best effort
+            print(f"Session title unchanged: {type(exc).__name__}: {exc}")
+            return ChatTurn()
+        title = " ".join(result.content.strip().strip("\"'").split())
+        if not title:
+            print("Session title unchanged: the model returned an empty title.")
+            return ChatTurn()
+    title = title[:100]
+    if agent.transcript is None:
+        print("Session title unchanged: transcript persistence is disabled.")
+        return ChatTurn()
+    await agent.transcript.append_meta("custom-title", {"title": title})
+    agent.session_title = title
+    print(f"Session renamed to: {title}")
+    return ChatTurn()
+
+
+async def _cmd_sandbox(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    raw = args.strip()
+    if not raw:
+        config = agent.sandbox.config
+        print("Sandbox:")
+        print(f"  enabled     {config.enabled}")
+        print(f"  backend     {agent.sandbox.backend_name}")
+        print(f"  auto-allow  {config.auto_allow_command_if_sandboxed}")
+        print(f"  excluded    {', '.join(config.excluded_commands) or '(none)'}")
+        print("Change with: /sandbox <auto-allow|regular|disabled|exclude COMMAND>")
+        return ChatTurn()
+    if getattr(agent, "_sandbox_cli_locked", False):
+        print("Sandbox settings are locked by CLI flags for this session.")
+        return ChatTurn()
+
+    action, _, value = raw.partition(" ")
+    action = action.casefold()
+    old_config = deepcopy(agent.sandbox.config)
+    new_config = deepcopy(old_config)
+    if action == "auto-allow":
+        new_config.enabled = True
+        new_config.auto_allow_command_if_sandboxed = True
+    elif action == "regular":
+        new_config.enabled = True
+        new_config.auto_allow_command_if_sandboxed = False
+    elif action == "disabled":
+        if (
+            agent.permissions.managed_policy.require_sandbox_for_unattended
+            and PermissionMode(agent.config.permission)
+            in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
+        ):
+            print("Managed policy requires sandboxing in the current permission mode.")
+            return ChatTurn()
+        new_config.enabled = False
+        new_config.auto_allow_command_if_sandboxed = False
+    elif action == "exclude":
+        command = value.strip()
+        if not command:
+            print("Usage: /sandbox exclude <command-pattern>")
+            return ChatTurn()
+        if command not in new_config.excluded_commands:
+            new_config.excluded_commands.append(command)
+    else:
+        print("Usage: /sandbox <auto-allow|regular|disabled|exclude COMMAND>")
+        return ChatTurn()
+
+    try:
+        from agent_core.sandbox import SandboxManager
+
+        def prepare_replacement() -> SandboxManager:
+            candidate = SandboxManager(new_config, workspace=agent.session.workspace)
+            candidate.prepare()
+            return candidate
+
+        replacement = await asyncio.to_thread(prepare_replacement)
+        await asyncio.to_thread(
+            update_local_table,
+            agent.session.workspace,
+            "sandbox",
+            {
+                "enabled": new_config.enabled,
+                "auto_allow_command_if_sandboxed": (
+                    new_config.auto_allow_command_if_sandboxed
+                ),
+                "excluded_commands": new_config.excluded_commands,
+            },
+        )
+    except (LocalConfigError, OSError, RuntimeError) as exc:
+        replacement_candidate = locals().get("replacement")
+        if replacement_candidate is not None:
+            replacement_candidate.teardown()
+        print(f"Sandbox settings unchanged: {exc}")
+        return ChatTurn()
+    old_sandbox = agent.sandbox
+    agent.sandbox = replacement
+    agent.config.sandbox = new_config
+    agent.permissions.sandbox = replacement
+    agent.registry.bind_runtime(
+        session=agent.session,
+        sandbox=replacement,
+        web_policy=agent.config.web,
+        unattended=agent._is_unattended_mode(),
+    )
+    worktrees = getattr(agent.session, "worktree_manager", None)
+    if worktrees is not None and hasattr(worktrees, "sandbox"):
+        worktrees.sandbox = replacement
+    agent._retired_sandboxes = [
+        *getattr(agent, "_retired_sandboxes", []),
+        old_sandbox,
+    ]
+    print(
+        f"Sandbox updated: enabled={new_config.enabled}, "
+        f"backend={agent.sandbox.backend_name}, "
+        f"auto-allow={new_config.auto_allow_command_if_sandboxed}."
+    )
+    return ChatTurn()
+
+
+async def _cmd_plugin(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    from agent_core.plugins import PluginError, PluginManager, validate_plugin
+
+    try:
+        parts = [part.strip("\"'") for part in shlex.split(args, posix=False)]
+    except ValueError as exc:
+        print(f"Invalid /plugin arguments: {exc}")
+        return ChatTurn()
+    manager = PluginManager(agent.session.workspace)
+    action = parts[0].casefold() if parts else "manage"
+    rest = parts[1:]
+    try:
+        if action in {"manage", "list"}:
+            enabled = set(manager.enabled_ids())
+            records = manager.records()
+            if not records:
+                print("No plugins installed.")
+            else:
+                print("Installed plugins:")
+                for plugin_id, record in sorted(records.items()):
+                    marker = "enabled" if plugin_id in enabled else "disabled"
+                    print(
+                        f"  {plugin_id} [{marker}]"
+                        + (f" v{record.version}" if record.version else "")
+                    )
+            print("Changes take effect after /reload-plugins.")
+        elif action == "install":
+            if not rest:
+                raise PluginError("usage: /plugin install <path|name> [marketplace]")
+            marketplace = rest[1] if len(rest) > 1 else "local"
+            record = await asyncio.to_thread(manager.install, rest[0], marketplace)
+            allow_enable = True
+            if manager.executable_components(record.plugin_id):
+                allow_enable = await asyncio.to_thread(
+                    ui.confirm_action,
+                    f"Enable executable hooks/MCP components from {record.plugin_id}?",
+                )
+            if allow_enable:
+                await asyncio.to_thread(
+                    manager.set_enabled,
+                    record.plugin_id,
+                    True,
+                    scope="project",
+                )
+                state = "enabled for this project"
+            else:
+                state = "installed but disabled"
+            print(f"Plugin {record.plugin_id} {state}; run /reload-plugins to apply.")
+        elif action in {"uninstall", "remove"}:
+            if not rest:
+                raise PluginError("usage: /plugin uninstall <plugin@marketplace>")
+            await asyncio.to_thread(manager.uninstall, rest[0])
+            print(f"Uninstalled {rest[0]}; run /reload-plugins to apply.")
+        elif action in {"enable", "disable"}:
+            if not rest:
+                raise PluginError(f"usage: /plugin {action} <plugin@marketplace> [project|user]")
+            scope = rest[1].casefold() if len(rest) > 1 else "project"
+            if action == "enable" and manager.executable_components(rest[0]):
+                confirmed = await asyncio.to_thread(
+                    ui.confirm_action,
+                    f"Enable executable hooks/MCP components from {rest[0]}?",
+                )
+                if not confirmed:
+                    print("Plugin enable was not confirmed.")
+                    return ChatTurn()
+            await asyncio.to_thread(
+                manager.set_enabled,
+                rest[0],
+                action == "enable",
+                scope=scope,
+            )
+            print(f"{rest[0]} {action}d for {scope}; run /reload-plugins to apply.")
+        elif action == "validate":
+            if not rest:
+                raise PluginError("usage: /plugin validate <path|plugin@marketplace>")
+            installed = manager.records().get(rest[0])
+            target = installed.path if installed is not None else rest[0]
+            manifest = await asyncio.to_thread(validate_plugin, target)
+            print(f"Valid plugin: {manifest['name']} ({target})")
+        elif action == "marketplace":
+            sub = rest[0].casefold() if rest else "list"
+            tail = rest[1:]
+            if sub == "list":
+                markets = manager.marketplaces()
+                if not markets:
+                    print("No marketplaces configured.")
+                for name, source in sorted(markets.items()):
+                    print(f"  {name}  {source}")
+            elif sub == "add" and len(tail) >= 2:
+                await asyncio.to_thread(manager.marketplace_add, tail[0], tail[1])
+                print(f"Marketplace {tail[0]} added.")
+            elif sub == "remove" and tail:
+                await asyncio.to_thread(manager.marketplace_remove, tail[0])
+                print(f"Marketplace {tail[0]} removed.")
+            elif sub == "update" and tail:
+                count = await asyncio.to_thread(manager.marketplace_update, tail[0])
+                print(f"Marketplace {tail[0]} validated ({count} plugins).")
+            else:
+                raise PluginError(
+                    "usage: /plugin marketplace <list|add NAME PATH|remove NAME|update NAME>"
+                )
+        else:
+            raise PluginError(
+                "usage: /plugin <install|manage|uninstall|enable|disable|validate|marketplace>"
+            )
+    except (OSError, PluginError) as exc:
+        print(f"Plugin command failed: {exc}")
+    return ChatTurn()
+
+
+async def _cmd_reload_plugins(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    from agent_core.plugins import PluginError, reload_plugins
+
+    try:
+        skills, hooks, tools = await asyncio.to_thread(reload_plugins, agent)
+    except (OSError, PluginError, RuntimeError) as exc:
+        print(f"Plugin reload failed; the previous generation remains active: {exc}")
+        return ChatTurn()
+    print(
+        f"Plugins reloaded atomically: {skills} skills/commands/agents, "
+        f"{hooks} hooks, {tools} MCP tools."
+    )
     return ChatTurn()
 
 
@@ -400,40 +742,70 @@ async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     return ChatTurn(history=resumed)
 
 
-# (handler, one-line summary) — drives both dispatch and /help. Aliases share a handler.
-_COMMANDS: dict[str, Handler] = {
-    "help": _cmd_help,
-    "skills": _cmd_skills,
-    "clear": _cmd_clear,
-    "reset": _cmd_clear,
-    "new": _cmd_clear,
-    "status": _cmd_status,
-    "context": _cmd_context,
-    "cost": _cmd_cost,
-    "compact": _cmd_compact,
-    "model": _cmd_model,
-    "permissions": _cmd_permissions,
-    "mcp": _cmd_mcp,
-    "memory": _cmd_memory,
-    "resume": _cmd_resume,
-    "continue": _cmd_resume,
+# Command metadata is the sole authority for whether a command may run while the
+# model is streaming. Never infer immediacy from a command being read-only.
+_COMMAND_SPECS: dict[str, CommandSpec] = {
+    "exit": CommandSpec(None, "Leave the chat.", immediate=True),
+    "quit": CommandSpec(None, "Leave the chat.", immediate=True, canonical="exit"),
+    "help": CommandSpec(_cmd_help, "Show this help."),
+    "skills": CommandSpec(_cmd_skills, "List available skills."),
+    "clear": CommandSpec(_cmd_clear, "Clear conversation history (aliases /reset /new)."),
+    "reset": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),
+    "new": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),
+    "status": CommandSpec(_cmd_status, "Show model, session, skill/tool counts.", immediate=True),
+    "context": CommandSpec(_cmd_context, "Show context-window usage."),
+    "cost": CommandSpec(_cmd_cost, "Show session token usage and duration."),
+    "compact": CommandSpec(_cmd_compact, "Compact the conversation now."),
+    "model": CommandSpec(_cmd_model, "Show or switch the model.", immediate=True),
+    "effort": CommandSpec(_cmd_effort, "Show or set reasoning effort.", immediate=True),
+    "fast": CommandSpec(_cmd_fast, "Toggle Claude Opus 4.6 fast mode.", immediate=True),
+    "rename": CommandSpec(_cmd_rename, "Rename this saved session.", immediate=True),
+    "sandbox": CommandSpec(_cmd_sandbox, "Show or change local sandbox settings.", immediate=True),
+    "plugin": CommandSpec(_cmd_plugin, "Install and manage Claude-compatible plugins.", immediate=True),
+    "plugins": CommandSpec(
+        _cmd_plugin,
+        "Manage Claude-compatible plugins.",
+        immediate=True,
+        canonical="plugin",
+    ),
+    "reload-plugins": CommandSpec(
+        _cmd_reload_plugins,
+        "Reload enabled plugins at an idle boundary.",
+    ),
+    "permissions": CommandSpec(_cmd_permissions, "Show or switch the permission mode."),
+    "mcp": CommandSpec(_cmd_mcp, "List configured MCP servers.", immediate=True),
+    "memory": CommandSpec(_cmd_memory, "List stored memories."),
+    "resume": CommandSpec(_cmd_resume, "List or resume a saved session (alias /continue)."),
+    "continue": CommandSpec(_cmd_resume, "List or resume a saved session.", canonical="resume"),
 }
 
-# Canonical commands shown by /help (aliases collapsed).
-_COMMAND_HELP: dict[str, tuple[Handler, str]] = {
-    "help": (_cmd_help, "Show this help."),
-    "skills": (_cmd_skills, "List available skills."),
-    "clear": (_cmd_clear, "Clear conversation history (aliases /reset /new)."),
-    "status": (_cmd_status, "Show model, session, skill/tool counts."),
-    "context": (_cmd_context, "Show context-window usage."),
-    "cost": (_cmd_cost, "Show session token usage and duration."),
-    "compact": (_cmd_compact, "Compact the conversation now."),
-    "model": (_cmd_model, "Show or switch the model."),
-    "permissions": (_cmd_permissions, "Show or switch the permission mode."),
-    "mcp": (_cmd_mcp, "List configured MCP servers."),
-    "memory": (_cmd_memory, "List stored memories."),
-    "resume": (_cmd_resume, "List or resume a saved session (alias /continue)."),
+# Compatibility maps used by completion and integrations.
+_COMMANDS: dict[str, Handler] = {
+    name: cast(Handler, spec.handler)
+    for name, spec in _COMMAND_SPECS.items()
+    if spec.handler is not None
 }
+_COMMAND_HELP: dict[str, tuple[Handler, str]] = {
+    name: (cast(Handler, spec.handler), spec.summary)
+    for name, spec in _COMMAND_SPECS.items()
+    if spec.handler is not None and spec.canonical is None
+}
+
+
+def command_spec(task: str) -> CommandSpec | None:
+    """Return built-in command metadata, or ``None`` for prose/skills/unknowns."""
+
+    if task in {"/exit", "/quit"}:
+        return _COMMAND_SPECS[task[1:]]
+    parsed = parse_slash_command(task)
+    if parsed is None or not looks_like_command(parsed.name):
+        return None
+    return _COMMAND_SPECS.get(parsed.name.lower())
+
+
+def is_immediate_command(task: str) -> bool:
+    spec = command_spec(task)
+    return bool(spec and spec.immediate)
 
 
 async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Message]) -> ChatTurn:
@@ -449,9 +821,9 @@ async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Me
     if parsed is None or not looks_like_command(parsed.name):
         return ChatTurn(prompt=task)  # plain message → send verbatim
 
-    handler = _COMMANDS.get(parsed.name.lower())
-    if handler is not None:
-        return await handler(agent, ui, parsed.args, history)
+    spec = _COMMAND_SPECS.get(parsed.name.lower())
+    if spec is not None and spec.handler is not None:
+        return await spec.handler(agent, ui, parsed.args, history)
 
     skill = agent.skills.get(parsed.name)
     if skill is None or not skill.user_invocable:

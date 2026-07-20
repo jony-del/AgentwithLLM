@@ -34,6 +34,8 @@ class ProviderConfig:
     max_tokens: int = 1024
     thinking_budget: int | None = None
     effort: str | None = None
+    # Provider speed tier. Currently only Claude Opus 4.6 accepts ``"fast"``.
+    speed: str | None = None
     stream: bool = True
     timeout: float = 60.0
 

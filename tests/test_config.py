@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent_core.config import (
+    load_agent_toml,
     load_dotenv,
     resolve_concurrency_config,
     resolve_config,
@@ -39,6 +40,21 @@ def test_load_dotenv_does_not_override_existing_environment(tmp_path: Path, monk
     load_dotenv(env_file)
 
     assert os.environ["AGENT_PROVIDER"] == "fake"
+
+
+def test_agent_local_toml_outranks_project_and_user(tmp_path: Path, monkeypatch) -> None:
+    settings = tmp_path / "settings.toml"
+    project = tmp_path / "agent.toml"
+    local = tmp_path / "agent.local.toml"
+    settings.write_text('model = "user"\n[output]\neffort = "low"\n', encoding="utf-8")
+    project.write_text('model = "project"\n[output]\neffort = "medium"\n', encoding="utf-8")
+    local.write_text('model = "local"\n[output]\neffort = "high"\n', encoding="utf-8")
+    monkeypatch.setenv("POLARIS_SETTINGS_PATH", str(settings))
+
+    loaded = load_agent_toml(project)
+
+    assert loaded["model"] == "local"
+    assert loaded["output"]["effort"] == "high"
 
 
 def test_resolve_config_loads_dotenv_before_reading_environment(tmp_path: Path, monkeypatch) -> None:
