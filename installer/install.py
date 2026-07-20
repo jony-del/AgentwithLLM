@@ -187,7 +187,7 @@ class Runner:
         if self.dry_run and mutates:
             return subprocess.CompletedProcess(rendered, 0, "", "")
         try:
-            proc = subprocess.run(
+            raw_proc = subprocess.run(
                 rendered,
                 cwd=str(cwd) if cwd else None,
                 env=env,
@@ -198,13 +198,12 @@ class Runner:
             if check:
                 raise InstallError(f"could not run {rendered[0]}: {exc}") from exc
             return subprocess.CompletedProcess(rendered, 127, "", str(exc))
-        if capture:
-            proc = subprocess.CompletedProcess(
-                proc.args,
-                proc.returncode,
-                decode_process_output(proc.stdout),
-                decode_process_output(proc.stderr),
-            )
+        proc: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(
+            raw_proc.args,
+            raw_proc.returncode,
+            decode_process_output(raw_proc.stdout) if capture else "",
+            decode_process_output(raw_proc.stderr) if capture else "",
+        )
         if check and proc.returncode:
             detail = (proc.stderr or proc.stdout or "").strip()
             raise InstallError(
@@ -241,14 +240,17 @@ class Installer:
             return before
 
         self._install_host_commands()
+        self._require_trusted_bash()
         self._install_node()
         if not self.options.skip_sandbox:
             self._ensure_container_runtime()
         self._install_project()
+        self._install_scheduler()
         if self.options.dry_run:
             return before
 
         after = self.checks(include_project=True)
+        after.append(self._scheduler_check())
         after.append(self._verify_installed_health())
         self._print_checks("Verification", after)
         return after
@@ -261,6 +263,8 @@ class Installer:
             if command == "node" and ok:
                 ok = parse_node_major(version or "") >= MIN_NODE_MAJOR
             results.append(Check(command, ok, version or "not found"))
+        bash = self._trusted_bash()
+        results.append(Check("git-bash" if self.system == "windows" else "bash", bash is not None, bash or "not found"))
         if not self.options.skip_sandbox:
             runtime = self._select_usable_runtime()
             detail = runtime or "no usable podman/docker/nerdctl runtime"
@@ -271,9 +275,33 @@ class Installer:
                     Check("sandbox-image", present, DEFAULT_IMAGE if present else "image missing")
                 )
         if include_project:
-            command = self._project_command()
-            results.append(Check("polaris", command is not None, command or "not installed"))
+            project_command = self._project_command()
+            results.append(
+                Check("polaris", project_command is not None, project_command or "not installed")
+            )
         return results
+
+    def _trusted_bash(self) -> str | None:
+        configured = os.environ.get("POLARIS_BASH_PATH")
+        if configured and Path(configured).is_file():
+            return str(Path(configured).resolve())
+        if self.system != "windows":
+            return self.runner.which("bash")
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "usr" / "bin" / "bash.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe",
+        ]
+        return next((str(path.resolve()) for path in candidates if path.is_file()), None)
+
+    def _require_trusted_bash(self) -> None:
+        if self._trusted_bash() is None:
+            raise InstallError(
+                "Git for Windows Bash is required; install Git for Windows or set "
+                "POLARIS_BASH_PATH. WindowsApps/WSL bash shims are not accepted."
+                if self.system == "windows" else
+                "Bash is required; install bash before continuing."
+            )
 
     def _validate_host(self) -> None:
         if self.system == "windows":
@@ -852,6 +880,8 @@ class Installer:
         if existing and (not self.options.upgrade or not owned):
             suffix = " (not installer-owned; left unchanged)" if self.options.upgrade else ""
             print(f"Reusing existing Polaris command: {existing}{suffix}")
+            if owned:
+                return
             if not self.options.dry_run:
                 self.state.mark(
                     "project:external",
@@ -897,6 +927,46 @@ class Installer:
                     "bootstrap_python": str(Path(sys.executable).resolve()),
                 },
             )
+
+    def _install_scheduler(self) -> None:
+        command = self._project_command()
+        if command is None:
+            raise InstallError("cannot install the scheduler service before Polaris is available")
+        if not self.options.dry_run and not self.state.component_owned("polaris"):
+            raise InstallError(
+                "refusing to register a scheduler service for a Polaris command that is not "
+                "owned by this installer; use 'polaris scheduler-service install' explicitly"
+            )
+        self.runner.run(
+            [command, "scheduler-service", "install"], check=True, mutates=True,
+            cwd=Path.home(),
+        )
+        if self.options.dry_run:
+            return
+        receipt_path = Path.home() / ".polaris" / "scheduler-service.json"
+        database = Path.home() / ".polaris" / "scheduler.sqlite3"
+        try:
+            service_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise InstallError(f"scheduler service did not write a valid receipt: {exc}") from exc
+        if service_receipt.get("service_id") != "polaris-scheduler":
+            raise InstallError("scheduler service receipt has an unexpected service identifier")
+        self.state.mark(
+            "scheduler:user-service", component="scheduler", source=str(self.options.source),
+            details={
+                "install_kind": "user-service", "service_id": "polaris-scheduler",
+                "executable": str(Path(command).resolve()), "receipt": str(receipt_path),
+                "service_executable": str(service_receipt.get("executable", "")),
+                "database": str(database),
+            },
+        )
+
+    def _scheduler_check(self) -> Check:
+        receipt = Path.home() / ".polaris" / "scheduler-service.json"
+        return Check(
+            "scheduler-service", receipt.is_file(),
+            str(receipt) if receipt.is_file() else "user-service receipt is missing",
+        )
 
     def _uv_tool_directory(self, uv: str, arguments: list[str]) -> Path:
         result = self.runner.run([uv, *arguments], capture=True)

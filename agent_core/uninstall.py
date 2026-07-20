@@ -132,7 +132,7 @@ def _decode(value: bytes | str | None) -> str:
     return value.decode("utf-8", errors="replace")
 
 
-def _run_command(
+def _run_process(
     argv: Sequence[str],
     *,
     env: dict[str, str] | None = None,
@@ -198,7 +198,7 @@ class Uninstaller:
         data_path: Path | None = None,
         runtime_root: Path | None = None,
         current_executable: Path | None = None,
-        runner: CommandRunner = _run_command,
+        runner: CommandRunner = _run_process,
     ) -> None:
         self.state_path = _resolved(state_path or default_state_path())
         self.data_path = _resolved(data_path or default_data_path())
@@ -660,7 +660,7 @@ def apply_plan(plan: UninstallPlan) -> None:
     state_path = Path(plan.state_path)
     if plan.kind == "uv-tool" and not plan.already_absent:
         command = [plan.uv, "tool", "uninstall", plan.package]
-        result = _run_command(command)
+        result = _run_process(command)
         if result.returncode and (
             Path(plan.executable).exists() or Path(plan.environment).exists()
         ):
@@ -803,6 +803,7 @@ def run_uninstall(
     if plan.kind == "none" and not purge_data:
         print("[uninstalled] Polaris is already absent.")
         return EXIT_OK
+    _remove_scheduler_service(plan)
     if detach and plan.kind != "none":
         try:
             log_path = _stage_worker(plan)
@@ -819,6 +820,42 @@ def run_uninstall(
         raise UninstallError(f"could not remove an installer-owned path: {exc}") from exc
     print("[uninstalled] Polaris removal completed successfully.")
     return EXIT_OK
+
+
+def _remove_scheduler_service(plan: UninstallPlan) -> None:
+    """Remove only a scheduler service proven by both installer and service receipts."""
+    state_path = Path(plan.state_path)
+    try:
+        state = _read_state(state_path)
+        component = state.get("components", {}).get("scheduler", {})
+    except UninstallError:
+        return
+    if not isinstance(component, dict) or not component.get("installed_by_polaris"):
+        return
+    receipt_path = Path(str(component.get("receipt", ""))).expanduser()
+    if not receipt_path.is_file() or component.get("service_id") != "polaris-scheduler":
+        return
+    try:
+        service_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UninstallError(f"scheduler service receipt is invalid; refusing unsafe cleanup: {exc}") from exc
+    recorded_executable = Path(str(service_receipt.get("executable", ""))).expanduser()
+    if (
+        service_receipt.get("service_id") != "polaris-scheduler"
+        or not recorded_executable.is_absolute()
+        or _resolved(str(component.get("service_executable", ""))) != recorded_executable.resolve()
+    ):
+        raise UninstallError("scheduler service receipt does not match the installer receipt")
+    from agent_core.scheduler_service import uninstall_user_service
+
+    try:
+        uninstall_user_service(
+            expected_executable=recorded_executable, receipt_path=receipt_path,
+            purge_data=plan.purge_data,
+        )
+    except RuntimeError as exc:
+        raise UninstallError(f"could not safely remove scheduler user service: {exc}") from exc
+    _remove_component_receipts(state_path, {"scheduler"})
 
 
 def cli_executable() -> Path | None:

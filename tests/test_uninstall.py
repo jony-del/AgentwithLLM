@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -84,7 +85,7 @@ def _uninstaller(paths: dict[str, Path], **kwargs) -> Uninstaller:
         data_path=paths["data"],
         runtime_root=paths["runtime"],
         current_executable=kwargs.get("current_executable", paths["executable"]),
-        runner=kwargs.get("runner", uninstall._run_command),
+        runner=kwargs.get("runner", uninstall._run_process),
     )
 
 
@@ -107,7 +108,7 @@ def test_uv_tool_uninstall_removes_private_environment_but_preserves_host_and_da
 ) -> None:
     paths = _make_uv_install(tmp_path)
     plan = _uninstaller(paths).build_plan()
-    monkeypatch.setattr(uninstall, "_run_command", _fake_uv_uninstall(paths))
+    monkeypatch.setattr(uninstall, "_run_process", _fake_uv_uninstall(paths))
 
     apply_plan(plan)
 
@@ -127,7 +128,7 @@ def test_purge_data_removes_only_user_level_data_and_state(tmp_path, monkeypatch
     (project / ".polaris").mkdir(parents=True)
     (project / "runs").mkdir()
     plan = _uninstaller(paths).build_plan(purge_data=True)
-    monkeypatch.setattr(uninstall, "_run_command", _fake_uv_uninstall(paths))
+    monkeypatch.setattr(uninstall, "_run_process", _fake_uv_uninstall(paths))
     monkeypatch.setattr(uninstall, "default_data_path", lambda: paths["data"])
 
     apply_plan(plan)
@@ -318,17 +319,17 @@ def test_tampered_dev_receipt_outside_source_is_rejected(tmp_path) -> None:
         _uninstaller(paths).build_plan()
 
 
-def test_symlinked_dev_environment_is_never_followed(tmp_path) -> None:
+def test_redirected_dev_environment_is_never_followed(
+    tmp_path: Path,
+    directory_redirect: Callable[[Path, Path], str],
+) -> None:
     source = tmp_path / "source"
     source.mkdir()
     target = tmp_path / "valuable-environment"
     target.mkdir()
     (target / "keep.txt").write_text("keep", encoding="utf-8")
     link = source / ".venv"
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        pytest.skip("creating directory symlinks is not permitted on this host")
+    directory_redirect(link, target)
     executable = link / ("Scripts/polaris.exe" if os.name == "nt" else "bin/polaris")
     python = tmp_path / ("python.exe" if os.name == "nt" else "python")
     python.write_text("python", encoding="utf-8")
@@ -355,7 +356,7 @@ def test_symlinked_dev_environment_is_never_followed(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(OwnershipError, match="symlinked development"):
+    with pytest.raises(OwnershipError, match=r"symlinked development|source/\.venv"):
         Uninstaller(
             state_path=state,
             data_path=tmp_path / "data",
@@ -386,7 +387,7 @@ def test_private_node_receipt_is_removed_but_host_receipts_remain(
     state["completed"]["runtime:node"] = 1
     paths["state"].write_text(json.dumps(state), encoding="utf-8")
     plan = _uninstaller(paths).build_plan()
-    monkeypatch.setattr(uninstall, "_run_command", _fake_uv_uninstall(paths))
+    monkeypatch.setattr(uninstall, "_run_process", _fake_uv_uninstall(paths))
     monkeypatch.setattr(uninstall, "_remove_windows_user_path", lambda path: None)
 
     apply_plan(plan)

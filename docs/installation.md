@@ -4,7 +4,8 @@
 
 完整运行档包含：uv 管理的 Python 3.12、项目的 `[all]` Python extras、Git、ripgrep、
 Node.js 24 LTS、npm/npx、一个可用的 Podman/Docker/nerdctl 运行时，以及
-`docker.io/library/debian:stable-slim` 沙箱镜像。
+`docker.io/library/debian:stable-slim` 沙箱镜像。安装器还会注册最小权限的当前用户 Scheduler
+服务；不支持或不可用的用户服务管理器会使安装明确失败，不会留下孤儿后台进程。
 
 Node 使用 nodejs.org 官方二进制和 `SHASUMS256.txt` 校验，安装在用户目录；不会覆盖系统
 Python。Git、rg 和 Podman 使用 WinGet、Homebrew/官方 macOS 包、apt 或 dnf 安装。脚本只在
@@ -18,6 +19,8 @@ Python。Git、rg 和 Podman 使用 WinGet、Homebrew/官方 macOS 包、apt 或
 
 Windows 需要可用的 WinGet（Microsoft App Installer）。企业代理环境可使用标准的
 `HTTPS_PROXY`、证书和 uv 索引环境变量。
+Windows 的 agent 命令还强制要求可信的 Git for Windows Bash；WindowsApps `bash.exe` 和 WSL
+不会作为回退。非标准路径可通过 `POLARIS_BASH_PATH` 指定。
 
 ## 可审阅与固定版本安装
 
@@ -97,6 +100,8 @@ polaris uninstall --purge-data --yes
 `polaris uninstall` 在当前进程退出前把计划复制到权限受限的唯一临时目录，再由目标环境之外的
 uv Python 完成删除。Windows 上不会尝试删除仍被当前进程占用的 `polaris.exe`；成功调度后返回
 `0` 并打印完成日志路径。日志中的 `[uninstalled]` 表示最终完成，`[error]` 会保留可恢复诊断。
+Scheduler 服务仅在安装状态和独立服务收据同时精确匹配时删除；默认保留调度历史，只有
+`--purge-data` 才删除 Scheduler SQLite 数据库。
 
 若 CLI 命令已损坏，下载/保留与目标版本对应的 release 脚本后使用同步恢复入口：
 

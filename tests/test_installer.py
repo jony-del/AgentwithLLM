@@ -159,7 +159,7 @@ def test_schema_one_ownership_is_migrated_as_unverified(tmp_path) -> None:
 
 def test_check_mode_is_non_mutating_when_runtime_is_ready(tmp_path) -> None:
     runner = FakeRunner(
-        {"git", "rg", "node", "npm", "npx", "podman", "polaris"},
+        {"git", "rg", "node", "npm", "npx", "bash", "podman", "polaris"},
         versions={"node": "v24.4.1"},
     )
     installer = Installer(

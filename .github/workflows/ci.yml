@@ -1,7 +1,6 @@
 # CI (revision guide Q7/D6): full pytest on Windows, Linux, and macOS (Windows is the
-# primary dev environment, so it is a required lane), plus the stage-1
-# lint/type gates — ruff E/F and mypy over the contract modules. Widen incrementally;
-# never loosen back.
+# primary dev environment, so it is a required lane), plus ruff E/F and mypy over
+# every production module.
 name: CI
 
 on:
@@ -30,7 +29,7 @@ jobs:
         run: pip install -e .[all,dev]
       - name: Lint (ruff E/F)
         run: python -m ruff check agent_core tests installer
-      - name: Type-check contract modules (mypy)
+      - name: Type-check production modules (mypy)
         run: python -m mypy
       - name: Tests
         env:

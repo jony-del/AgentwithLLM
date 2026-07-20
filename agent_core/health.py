@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterable
 
 from agent_core.sandbox.config import SandboxContainerConfig
@@ -67,7 +68,12 @@ class HealthReport:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
 
-def collect_dependency_checks(profile: str = "runtime") -> list[HealthCheck]:
+def collect_dependency_checks(
+    profile: str = "runtime",
+    *,
+    bash_executable: str | None = None,
+    powershell_executable: str | None = None,
+) -> list[HealthCheck]:
     if profile not in {"runtime", "dev"}:
         raise ValueError(f"unknown health profile: {profile}")
     checks = [
@@ -84,6 +90,42 @@ def collect_dependency_checks(profile: str = "runtime") -> list[HealthCheck]:
         distributions = (*_RUNTIME_DISTRIBUTIONS, *_DEV_DISTRIBUTIONS)
     checks.extend(_distribution_check(name) for name in distributions)
     checks.extend(_command_check(name) for name in _HOST_COMMANDS)
+    from agent_core.process_supervisor import (
+        ShellUnavailableError,
+        resolve_bash_executable,
+        resolve_powershell_executable,
+    )
+
+    for name, required, resolver, configured in (
+        (
+            "git-bash" if sys.platform == "win32" else "bash",
+            True,
+            resolve_bash_executable,
+            bash_executable,
+        ),
+        ("powershell", False, resolve_powershell_executable, powershell_executable),
+    ):
+        try:
+            executable = resolver(configured)
+        except ShellUnavailableError as exc:
+            checks.append(HealthCheck(name, required, "error" if required else "missing", detail=str(exc)))
+        else:
+            checks.append(HealthCheck(name, required, "ok", version=_command_version(executable), detail=executable))
+    from agent_core.scheduler_service import SERVICE_ID, default_receipt_path
+
+    scheduler_receipt = default_receipt_path()
+    try:
+        receipt = json.loads(scheduler_receipt.read_text(encoding="utf-8"))
+        service_executable = Path(str(receipt.get("executable", "")))
+        scheduler_ok = receipt.get("service_id") == SERVICE_ID and service_executable.is_file()
+    except (OSError, ValueError):
+        scheduler_ok = False
+    checks.append(
+        HealthCheck(
+            "scheduler-service", False, "ok" if scheduler_ok else "missing",
+            detail=str(scheduler_receipt) if scheduler_ok else "current-user service is not installed",
+        )
+    )
     runtime = _usable_container_runtime()
     checks.append(
         HealthCheck(
