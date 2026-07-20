@@ -32,7 +32,7 @@ def test_read_text_file_is_exempt_from_spill(tmp_path: Path) -> None:
     assert not read.metadata.get("spilled")
     assert not (tmp_path / "outputs").exists()  # nothing written for the exempt tool
 
-    other = hook.after_tool(ToolCall(name="run_command"), _result(content))
+    other = hook.after_tool(ToolCall(name="bash"), _result(content))
     assert other.metadata.get("spilled") is True  # non-exempt tool still spills
 
 

@@ -5,9 +5,10 @@ import logging
 import os
 import time
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from agent_core.agents.team import TeamStore
 from agent_core.compression import (
@@ -62,6 +63,7 @@ from agent_core.sandbox import (
     SandboxRequiredError,
     get_shared_manager,
 )
+from agent_core.scheduler import SchedulerStore
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.skills import (
     SkillRegistry,
@@ -71,6 +73,14 @@ from agent_core.skills import (
     load_skills,
 )
 from agent_core.storage import JSONLRunLogger
+from agent_core.process_supervisor import (
+    ProcessSupervisor,
+    ShellUnavailableError,
+    resolve_bash_executable,
+    resolve_powershell_executable,
+)
+from agent_core.tool_config import ToolSuiteConfig
+from agent_core.worktree import WorktreeManager
 from agent_core import tokens
 from agent_core.tool_use_summary import (
     ToolUseSummaryConfig,
@@ -78,7 +88,7 @@ from agent_core.tool_use_summary import (
     build_tool_use_summarizer,
 )
 from agent_core.transcript import TranscriptStore, new_session_id
-from agent_core.tools.catalog import default_tools
+from agent_core.tools.catalog import default_tools, populate_registry
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
@@ -93,7 +103,6 @@ WRAPUP_TEXT = (
     "You are almost out of time for this task. Stop calling tools now and reply with "
     "your best final answer based on what you have so far, noting anything left undone."
 )
-
 PLAN_MODE_TEXT = (
     "Plan mode is active. Investigate with dedicated read/search tools, maintain Todo/Task "
     "state when useful, and produce a decision-complete implementation plan. Do not edit files "
@@ -145,6 +154,10 @@ _READ_ONLY_CHILD_TOOLS = frozenset(
         "read_text_file",
         "echo",
         "update_todos",
+        "sleep",
+        "cron_create",
+        "cron_list",
+        "cron_delete",
     }
 )
 _FULL_CHILD_TOOLS = _READ_ONLY_CHILD_TOOLS | {
@@ -236,7 +249,11 @@ class ReActConfig:
         "moving on. For self-contained sub-investigations, consider dispatch_agent to run "
         "them in a fresh context. For work that needs a team of cooperating agents, use "
         "the team tools explicitly: team_create, task_create, teammate_spawn, task_update, "
-        "and team_status. Multiple tool calls in the same turn may run concurrently when "
+        "and team_status. Use bash or powershell for commands; long-running commands may "
+        "continue in the background and can be inspected or stopped with task_output and "
+        "task_stop. Use tool_search to discover deferred capabilities such as LSP, notebook, "
+        "worktree, configuration, MCP resources, and scheduling tools. Multiple tool calls "
+        "in the same turn may run concurrently when "
         "their resources are independent; if an action needs the output from a previous "
         "tool call, wait until the next turn to request it."
     )
@@ -270,6 +287,7 @@ class ReActConfig:
     # blocked_domains always refuse; in unattended modes (auto/dontask/bypass) a
     # domain not in allowed_domains is refused too (fail-closed exfiltration guard).
     web: WebPolicyConfig = field(default_factory=WebPolicyConfig)
+    tools: ToolSuiteConfig = field(default_factory=ToolSuiteConfig)
 
 
 @dataclass(slots=True)
@@ -298,13 +316,18 @@ class ReActAgent:
         sandbox: SandboxManager | None = None,
         permission_classifier: AutoPermissionClassifier | None = None,
         managed_policy_provider: ManagedPolicyProvider | None = None,
+        mcp_manager: object | None = None,
+        workspace: str | Path | None = None,
+        ask_user: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]] | None = None,
     ) -> None:
         self.config = config or ReActConfig()
+        self._initial_workspace = Path(workspace or Path.cwd()).resolve()
         self.managed_policy_provider = managed_policy_provider or FileManagedPolicyProvider()
         # Effective monotonic deadline of the in-flight run(), shared with children
         # spawned by the sub-agent/teammate factories so the whole fan-out is bounded
         # by one budget. Set at the top of run(); None when no run is active or uncapped.
         self._active_deadline: float | None = None
+        self._reported_missed_jobs: set[str] = set()
         # Wrap the provider in a shared, bounded concurrency gate (idempotent): the
         # top-level agent creates it from config, and children spawned with
         # ``provider=self.provider`` reuse the same gate, so the whole fan-out shares
@@ -315,6 +338,7 @@ class ReActAgent:
             rate_limit=self.config.api_rate_limit_per_min,
         )
         self.registry = tools or self.default_registry()
+        self.registry.rebind_workspace(str(self._initial_workspace))
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         # Resumable session transcript (distinct from the event logger above). An injected
         # store wins; otherwise build one from config unless ``session_dir`` is disabled
@@ -323,8 +347,9 @@ class ReActAgent:
         if transcript is not None:
             self.transcript: TranscriptStore | None = transcript
         elif self.config.session_dir:
-            workspace = Path.cwd().resolve()
-            self.transcript = TranscriptStore(self.config.session_dir, workspace, self.session_id)
+            self.transcript = TranscriptStore(
+                self.config.session_dir, self._initial_workspace, self.session_id
+            )
         else:
             self.transcript = None
         # uuid of the last message appended to the transcript, so each new message links
@@ -364,7 +389,7 @@ class ReActAgent:
         # registry may have been built before this agent existed (the CLI path), so we
         # rebind every session-aware tool to *this* session below.
         self.session = SessionContext(
-            workspace=Path.cwd().resolve(),
+            workspace=self._initial_workspace,
             session_id=self.session_id,
             agent_id=self.logger.run_id,
             subagent_factory=self._spawn_subagent,
@@ -375,7 +400,18 @@ class ReActAgent:
             run_dir=self.config.run_dir,
             run_id=self.logger.run_id,
             permission_mode_setter=self.set_permission_mode,
+            tool_suite=self.config.tools,
+            logger=self.logger,
+            audit_event=self._audit_event,
+            mcp_manager=mcp_manager,
+            registry=self.registry,
         )
+        self.process_supervisor = ProcessSupervisor(
+            self.config.tools.shell,
+            Path(self.config.run_dir) / "tasks" / self.session_id,
+            event_sink=self._audit_event,
+        )
+        self.session.process_supervisor = self.process_supervisor
         if PermissionMode(self.config.permission) is PermissionMode.PLAN:
             self.session.plan_state.enter(
                 PermissionMode.DEFAULT.value,
@@ -394,6 +430,9 @@ class ReActAgent:
         # base snapshot). Idempotent — a shared, already-prepared manager returns
         # immediately. Degrades to passthrough on failure unless fail_if_unavailable.
         self.sandbox.prepare()
+        self.session.worktree_manager = WorktreeManager(
+            self.session, self.registry, self.sandbox, self.config.tools.worktree
+        )
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(self.session)
@@ -401,6 +440,59 @@ class ReActAgent:
                 tool.bind_sandbox(self.sandbox)
             if isinstance(tool, WebPolicyAwareMixin):
                 tool.bind_web_policy(self.config.web, unattended=self._is_unattended_mode())
+        self.registry.bind_runtime(
+            session=self.session,
+            sandbox=self.sandbox,
+            web_policy=self.config.web,
+            unattended=self._is_unattended_mode(),
+        )
+        shell_config = self.config.tools.shell
+        available_shells = 0
+        for name, enabled, resolver, configured in (
+            ("bash", shell_config.enabled and shell_config.bash.enabled,
+             resolve_bash_executable, shell_config.bash.executable or os.getenv("POLARIS_BASH_PATH")),
+            ("powershell", shell_config.enabled and shell_config.powershell.enabled,
+             resolve_powershell_executable, shell_config.powershell.executable),
+        ):
+            if enabled:
+                try:
+                    resolver(configured)
+                except ShellUnavailableError:
+                    self.registry.unregister(name)
+                else:
+                    available_shells += 1
+            else:
+                self.registry.unregister(name)
+        if not available_shells:
+            self.registry.unregister("task_output")
+            self.registry.unregister("task_stop")
+        if ask_user is not None:
+            self.session.ask_user = ask_user
+        elif self.ui.is_live:
+            self.session.ask_user = self.ui.ask_questions
+        else:
+            self.registry.unregister("ask_user_question")
+        if mcp_manager is None:
+            self.registry.unregister("list_mcp_resources")
+            self.registry.unregister("read_mcp_resource")
+        if not self.config.tools.lsp.servers:
+            self.registry.unregister("lsp")
+        if not self.config.tools.scheduler.enabled:
+            for name in ("cron_create", "cron_list", "cron_delete"):
+                self.registry.unregister(name)
+        blanket_denied = {
+            rule.tool_name for rule in self.config.permission_rules.deny if rule.content is None
+        }
+        try:
+            managed_rules = self.managed_policy_provider.load().rules()
+            blanket_denied.update(
+                rule.tool_name for rule in managed_rules.deny if rule.content is None
+            )
+        except Exception:
+            pass
+        for name in blanket_denied:
+            if any(item.name == name for item in self.registry.deferred()):
+                self.registry.unregister(name)
         # The model-facing ``skill`` tool is dead weight when no skill is model-invocable,
         # so drop it from the advertised tool set in that case (saves tokens, avoids
         # offering the model a tool it can't use).
@@ -426,6 +518,9 @@ class ReActAgent:
             allow_unsandboxed_unattended=self._unsandboxed_permission_ack,
         )
         self.session.permission_grant_setter = self.permissions.add_session_rule
+        self.session.permission_workspace_setter = lambda path: setattr(
+            self.permissions, "workspace", path
+        )
         self.session.registered_tool_names = frozenset(tool.name for tool in self.registry.list())
         if PermissionMode(self.config.permission) in self.permissions.managed_policy.forbidden_modes:
             raise ValueError(
@@ -505,8 +600,7 @@ class ReActAgent:
         if not self.config.skills.enabled:
             return SkillRegistry()
         try:
-            workspace = Path.cwd().resolve()
-            dirs = discover_skill_dirs(workspace, self.config.skills)
+            dirs = discover_skill_dirs(self._initial_workspace, self.config.skills)
             markdown = load_skills(dirs, disabled=self.config.skills.disabled)
             # Programmatic (Python) skills register themselves via @programmatic_skill and
             # are merged in alongside markdown ones (same name → markdown wins, since it's
@@ -677,8 +771,7 @@ class ReActAgent:
         # The tool set lives in the tools package (self-registered via @builtin_tool
         # and auto-discovered) — adding a tool there needs no change here.
         registry = ToolRegistry()
-        for tool in default_tools():
-            registry.register(tool)
+        populate_registry(registry)
         return registry
 
     async def run(
@@ -917,6 +1010,8 @@ class ReActAgent:
             # real usage (parity with the reference) rather than only a char estimate.
             # Also accumulate session-wide input/output totals for the chat ``/cost`` and
             # ``/status`` commands (cheap counters; not part of any contract).
+            if result is None:
+                raise RuntimeError("provider returned no result after context recovery")
             if result.usage is not None:
                 # ``total_tokens`` (prompt incl. cache + this turn's output) is the anchor
                 # the gate carries forward — once this turn is in history its output counts
@@ -1056,6 +1151,7 @@ class ReActAgent:
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
                 # post-compaction fold. Defensive: odd/missing args just skip.
                 self._record_read_result(tool_call, tool_result)
+                await self._notify_lsp_edit(tool_call, tool_result)
 
             # Fire (fire-and-forget) the tool-use progress label for this batch. It runs in
             # the background during next turn's model call and is awaited/emitted there.
@@ -1065,7 +1161,7 @@ class ReActAgent:
 
     def _emit_recap(self, messages: list[Message], step: int, reason: str) -> None:
         duration = time.monotonic() - getattr(self, "_run_start_time", time.monotonic())
-        tool_counts = {}
+        tool_counts: dict[str, int] = {}
         for msg in messages:
             if msg.role == "tool" and msg.name:
                 tool_counts[msg.name] = tool_counts.get(msg.name, 0) + 1
@@ -1176,9 +1272,12 @@ class ReActAgent:
         if self.session.depth != 0 and not self.config.tool_use_summary.include_subagents:
             return
         self._pending_tool_use_names = [call.name for call, _ in batch]
-        self._pending_tool_use_summary = asyncio.create_task(
-            self._tool_use_summarizer(batch, last_assistant_text)
-        )
+
+        async def summarize() -> str | None:
+            assert self._tool_use_summarizer is not None
+            return await self._tool_use_summarizer(batch, last_assistant_text)
+
+        self._pending_tool_use_summary = asyncio.create_task(summarize())
 
     async def _flush_pending_tool_use_summary(self) -> None:
         """Await the pending label task and emit it to the UI + event log (never the API).
@@ -1403,6 +1502,20 @@ class ReActAgent:
         """Fire SessionEnd (observational). The HOST owns the session boundary:
         the CLI calls this after a one-shot run and at chat exit; library embedders
         call it when their session concept closes. No-op before the first run()."""
+        await self.process_supervisor.shutdown()
+        if self.session.scheduler_store is not None:
+            await asyncio.to_thread(
+                self.session.scheduler_store.delete_session_jobs,
+                self.session.session_id,
+                self.session.agent_id,
+            )
+        lsp_manager = self.session.lsp_manager
+        if lsp_manager is not None:
+            close = getattr(lsp_manager, "close", None)
+            if close is not None:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
         if not self._session_start_fired:
             return
         self._session_start_fired = False
@@ -1411,6 +1524,98 @@ class ReActAgent:
             {"run_id": self.logger.run_id, "reason": reason, **self._trace_fields()},
             [],
         )
+
+    def _scheduler_store(self) -> SchedulerStore | None:
+        if not self.config.tools.scheduler.enabled:
+            return None
+        if self.session.scheduler_store is None:
+            config = self.config.tools.scheduler
+            self.session.scheduler_store = SchedulerStore(
+                config.database_path(), max_jobs=config.max_jobs,
+                max_prompt_chars=config.max_prompt_chars,
+            )
+        return self.session.scheduler_store
+
+    async def scheduler_heartbeat(self, *, ttl: float = 120) -> None:
+        """Publish session liveness and make one missed recurring delivery eligible."""
+        try:
+            store = self._scheduler_store()
+        except Exception as exc:  # noqa: BLE001 - scheduling is observational to an agent run
+            await self._audit_event(
+                "scheduler_delivery", {"state": "store_unavailable", "error": str(exc)}
+            )
+            return
+        if store is None:
+            return
+        try:
+            catchups = await asyncio.to_thread(
+                store.heartbeat, self.session.session_id, self.session.agent_id, ttl=ttl
+            )
+            missed_one_shots = await asyncio.to_thread(
+                store.missed_one_shots, self.session.session_id, self.session.agent_id
+            )
+        except Exception as exc:  # noqa: BLE001 - scheduling cannot sink the foreground turn
+            await self._audit_event(
+                "scheduler_delivery", {"state": "heartbeat_error", "error": str(exc)}
+            )
+            return
+        for delivery in catchups:
+            await self._audit_event("scheduler_missed", delivery)
+        for job in missed_one_shots:
+            job_id = str(job["id"])
+            if self.session.ask_user is None:
+                if job_id not in self._reported_missed_jobs:
+                    await self._audit_event(
+                        "scheduler_missed",
+                        {"job_id": job_id, "one_shot": True, "state": "confirmation_required"},
+                    )
+                    self._reported_missed_jobs.add(job_id)
+                continue
+            answers = await self.session.ask_user([{
+                "id": f"missed-{job_id}",
+                "question": f"One-shot job {job_id} was missed. Run it now?",
+                "options": [
+                    {"label": "Run now", "description": "Queue the missed prompt once."},
+                    {"label": "Discard", "description": "Delete it without running."},
+                ],
+            }])
+            answer = str(answers[0].get("answer", "")) if answers else ""
+            deliver = answer.strip().casefold() in {"run now", "run", "yes", "y"}
+            await asyncio.to_thread(
+                store.resolve_missed_one_shot, job_id, deliver=deliver
+            )
+            await self._audit_event(
+                "scheduler_missed",
+                {"job_id": job_id, "one_shot": True,
+                 "state": "queued" if deliver else "discarded"},
+            )
+
+    async def drain_scheduler_deliveries(
+        self, history: list[Message] | None,
+    ) -> tuple[list[Message], list[AgentRunResult]]:
+        """Run queued prompts serially after the current complete agent turn."""
+        store = self.session.scheduler_store
+        current = list(history or [])
+        results: list[AgentRunResult] = []
+        if store is None:
+            return current, results
+        pending = await asyncio.to_thread(
+            store.pending, self.session.session_id, self.session.agent_id
+        )
+        for delivery in pending[:10]:
+            await self._audit_event(
+                "scheduler_delivery",
+                {"delivery_id": delivery["id"], "job_id": delivery["job_id"], "state": "started"},
+            )
+            result = await self.run(str(delivery["prompt"]), history=current or None)
+            current = result.messages
+            results.append(result)
+            await asyncio.to_thread(store.complete_delivery, int(str(delivery["id"])))
+            await self._audit_event(
+                "scheduler_delivery",
+                {"delivery_id": delivery["id"], "job_id": delivery["job_id"], "state": "completed"},
+            )
+        return current, results
 
     async def _reap_background_hooks(self) -> None:
         """Await any in-flight PostSampling tasks at a terminal return (best-effort)."""
@@ -1520,7 +1725,7 @@ class ReActAgent:
         ``auto_compact``). Accumulates the overall before/after size and the
         non-empty stage details, emitting start → progress* → end. ``NullUI`` makes
         all three hooks no-ops, so non-interactive runs stay silent."""
-        state: dict[str, object] = {"started": False, "before": 0, "after": 0, "details": []}
+        state: dict[str, Any] = {"started": False, "before": 0, "after": 0, "details": []}
 
         def on_stage(done: int, total: int, event: CompressionEvent) -> None:
             if not state["started"]:
@@ -1529,11 +1734,11 @@ class ReActAgent:
                 state["before"] = event.before_chars
             state["after"] = event.after_chars
             if event.detail:
-                state["details"].append(event.detail)  # type: ignore[union-attr]
+                state["details"].append(event.detail)
             self.ui.on_compaction_progress(done / total, event.stage)
             if done == total:
                 self.ui.on_compaction_end(
-                    state["before"], state["after"], ", ".join(state["details"]), reactive  # type: ignore[arg-type]
+                    state["before"], state["after"], ", ".join(state["details"]), reactive
                 )
 
         return on_stage
@@ -1562,8 +1767,32 @@ class ReActAgent:
                 return
             key = str((self.session.workspace / raw_path).resolve())
             self.session.record_read(key, tool_result.content)
+            if tool_result.metadata.get("notebook"):
+                self.session.notebook_reads[key] = {
+                    "sha256": tool_result.metadata.get("fingerprint"),
+                    "mtime_ns": tool_result.metadata.get("mtime_ns"),
+                    "size": tool_result.metadata.get("size"),
+                }
         except Exception:  # noqa: BLE001 - read-state recording is best-effort, never fatal
             return
+
+    async def _notify_lsp_edit(self, tool_call: ToolCall, tool_result: ToolResult) -> None:
+        if not tool_result.ok or self.session.lsp_manager is None:
+            return
+        path_keys = {
+            "edit_file": "path", "multi_edit": "path", "write_text_file": "path",
+            "apply_patch": "path", "notebook_edit": "notebook_path",
+        }
+        key = path_keys.get(tool_call.name)
+        if key is None:
+            return
+        raw = tool_call.arguments.get(key)
+        if not isinstance(raw, str) or not raw:
+            return
+        try:
+            await self.session.lsp_manager.notify_saved(raw)
+        except Exception as exc:  # observational integration: edits already succeeded
+            await self.logger.write("lsp_server_state", {"state": "notify_failed", "error": str(exc)})
 
     def _build_read_attachments(self) -> list[Message]:
         """Build the post-compact file re-injection message from session read-state.
@@ -1739,7 +1968,55 @@ class ReActAgent:
             "parent_run_id": self.session.parent_run_id,
         }
 
-    def _make_subagent_child(self, preset: str, model: str | None = None) -> "ReActAgent | str":
+    async def _audit_event(self, kind: str, payload: dict[str, object]) -> None:
+        await self.logger.write(kind, {**payload, **self._trace_fields()})
+
+    async def _git_capture(self, cwd: Path, *args: str) -> str:
+        process = await asyncio.create_subprocess_exec(
+            "git", *args, cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        output, error = await asyncio.wait_for(process.communicate(), 30)
+        text = output.decode("utf-8", errors="replace").strip()
+        if process.returncode:
+            detail = error.decode("utf-8", errors="replace").strip() or text
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail[:2000]}")
+        return text
+
+    async def _create_agent_worktree(self, prefix: str) -> dict[str, Any]:
+        workspace = self.session.workspace.resolve()
+        repo = Path(await self._git_capture(workspace, "rev-parse", "--show-toplevel")).resolve()
+        base_sha = await self._git_capture(workspace, "rev-parse", "HEAD")
+        slug = f"{prefix}-{new_session_id()[:12]}"
+        root = (repo / self.config.tools.worktree.root).resolve()
+        path = (root / slug).resolve()
+        if path.parent != root or path.exists():
+            raise RuntimeError(f"unsafe agent worktree path: {path}")
+        branch = f"polaris/ephemeral/{slug}"
+        root.mkdir(parents=True, exist_ok=True)
+        await self._git_capture(repo, "worktree", "add", "-b", branch, str(path), base_sha)
+        return {"path": path, "branch": branch, "base_sha": base_sha, "repo": repo}
+
+    async def _finalize_agent_worktree(self, state: dict[str, Any]) -> dict[str, object]:
+        path = Path(state["path"])
+        repo = Path(state["repo"])
+        base_sha = str(state["base_sha"])
+        status = await self._git_capture(path, "status", "--porcelain=v1")
+        commits = int(await self._git_capture(path, "rev-list", "--count", f"{base_sha}..HEAD") or "0")
+        diff = await self._git_capture(path, "diff", "--stat", base_sha)
+        retained = bool(status) or commits > 0
+        if not retained:
+            await self._git_capture(repo, "worktree", "remove", str(path))
+            await self._git_capture(repo, "branch", "-D", str(state["branch"]))
+        return {
+            "path": str(path), "branch": state["branch"], "base_sha": base_sha,
+            "dirty": bool(status), "new_commits": commits, "diff_summary": diff[:8000],
+            "retained": retained,
+        }
+
+    def _make_subagent_child(
+        self, preset: str, model: str | None = None, workspace: Path | None = None
+    ) -> "ReActAgent | str":
         """Build the ``dispatch_agent`` child (or a refusal string at the depth ceiling).
 
         The child reuses this agent's gated provider and scalar config but gets a
@@ -1771,7 +2048,8 @@ class ReActAgent:
             "team_message_send",
         }
         allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
-        for tool in default_tools(workspace=self.session.workspace):
+        child_workspace = (workspace or self.session.workspace).resolve()
+        for tool in default_tools(workspace=child_workspace):
             if getattr(tool, "name", "") in excluded:
                 continue  # prevent recursive fan-out and team orchestration from ordinary sub-agents
             if getattr(tool, "name", "") not in allowed_tools:
@@ -1799,7 +2077,8 @@ class ReActAgent:
             session_id=self.session_id,
             transcript=self._child_transcript(agent_id),
             managed_policy_provider=self.managed_policy_provider,
-            sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
+            sandbox=self.sandbox if child_workspace == self.session.workspace else None,
+            workspace=child_workspace,
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -1810,6 +2089,9 @@ class ReActAgent:
         child.permissions.parent_mode = PermissionMode(self.config.permission)
         child.permissions.parent_agent_id = self.session.agent_id
         child.permissions.tool_source = ToolCallSource.SUBAGENT
+        child.permissions.inherit_scoped_session_grants(
+            self.permissions, frozenset(tool.name for tool in child.registry.list())
+        )
         return child
 
     def _child_transcript(self, agent_id: str) -> "TranscriptStore | None":
@@ -1826,7 +2108,8 @@ class ReActAgent:
         )
 
     async def _spawn_subagent(
-        self, task: str, preset: str = "read_only", model: str | None = None
+        self, task: str, preset: str = "read_only", model: str | None = None,
+        isolation: str = "shared",
     ) -> str:
         """``dispatch_agent`` factory — awaits the child on the shared event loop.
 
@@ -1834,8 +2117,14 @@ class ReActAgent:
         cancellation skips the Stop event (best-effort — never await new work while
         being torn down).
         """
-        child = self._make_subagent_child(preset, model)
+        isolated = await self._create_agent_worktree("agent") if isolation == "worktree" else None
+        child = (
+            self._make_subagent_child(preset, model, isolated["path"])
+            if isolated is not None else self._make_subagent_child(preset, model)
+        )
         if isinstance(child, str):
+            if isolated is not None:
+                await self._finalize_agent_worktree(isolated)
             return child
         # getattr-guarded: the factory seam may be stubbed (tests/embedding) and an
         # observational payload must never be the thing that breaks spawning.
@@ -1845,24 +2134,50 @@ class ReActAgent:
             "model": model or self.config.model,
             "depth": getattr(getattr(child, "session", None), "depth", None),
             "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
+            "isolation": isolation,
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
         try:
             result = await child.run(task, deadline=self._active_deadline)
+            drain = getattr(child, "drain_scheduler_deliveries", None)
+            _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
+            if scheduled:
+                result.answer += "\n\n" + "\n\n".join(item.answer for item in scheduled)
         except Exception:
+            end = getattr(child, "fire_session_end", None)
+            if end is not None:
+                await end("subagent_error")
             await self._fire_observational(
                 HookEvent.SUBAGENT_STOP,
                 {**detail, "ok": False, "duration_s": round(time.monotonic() - started, 3)},
                 [],
             )
+            if isolated is not None:
+                try:
+                    await self._finalize_agent_worktree(isolated)
+                except Exception as cleanup_exc:  # noqa: BLE001 - retain unknown state fail-closed
+                    logger.warning("sub-agent worktree finalization failed: %s", cleanup_exc)
             raise
+        finally:
+            end = getattr(child, "fire_session_end", None)
+            if end is not None:
+                await end("subagent_exit")
+            child_sandbox = getattr(child, "sandbox", self.sandbox)
+            if child_sandbox is not self.sandbox:
+                child_sandbox.teardown()
+            child_logger = getattr(child, "logger", None)
+            if child_logger is not None:
+                child_logger.close()
         await self._fire_observational(
             HookEvent.SUBAGENT_STOP,
             {**detail, "ok": True, "duration_s": round(time.monotonic() - started, 3)},
             [],
         )
-        return result.answer
+        if isolated is None:
+            return result.answer
+        summary = await self._finalize_agent_worktree(isolated)
+        return result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
 
     async def _make_teammate_child(
         self,
@@ -1872,6 +2187,7 @@ class ReActAgent:
         task_id: str | None,
         preset: str,
         model: str | None = None,
+        workspace: Path | None = None,
     ) -> "tuple[ReActAgent, str] | str":
         """Build a teammate child and its prompt (or a refusal string at the ceiling).
 
@@ -1897,7 +2213,8 @@ class ReActAgent:
         sub_registry = ToolRegistry()
         excluded = {"dispatch_agent", "skill", "team_create", "task_create", "teammate_spawn", "team_status"}
         allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
-        for tool in default_tools(workspace=self.session.workspace):
+        child_workspace = (workspace or self.session.workspace).resolve()
+        for tool in default_tools(workspace=child_workspace):
             tool_name = getattr(tool, "name", "")
             if tool_name in excluded:
                 continue
@@ -1929,7 +2246,8 @@ class ReActAgent:
             session_id=self.session_id,
             transcript=self._child_transcript(new_session_id()),
             managed_policy_provider=self.managed_policy_provider,
-            sandbox=self.sandbox,  # share the prepared manager — never re-prepare per child
+            sandbox=self.sandbox if child_workspace == self.session.workspace else None,
+            workspace=child_workspace,
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -1941,6 +2259,9 @@ class ReActAgent:
         child.permissions.parent_mode = PermissionMode(self.config.permission)
         child.permissions.parent_agent_id = self.session.agent_id
         child.permissions.tool_source = ToolCallSource.TEAM
+        child.permissions.inherit_scoped_session_grants(
+            self.permissions, frozenset(tool.name for tool in child.registry.list())
+        )
         prompt = self._teammate_prompt(team, name, role, focus_task, assigned_tasks)
         return child, prompt
 
@@ -1952,13 +2273,19 @@ class ReActAgent:
         task_id: str | None = None,
         preset: str = "read_only",
         model: str | None = None,
+        isolation: str = "shared",
     ) -> str:
         """Teammate factory — awaits the teammate turn on the shared event loop.
 
         Fires SubagentStart/SubagentStop (observational, ``kind="teammate"``) around
         the child run; a cancellation skips the Stop event (best-effort)."""
-        built = await self._make_teammate_child(team_id, name, role, task_id, preset, model)
+        isolated = await self._create_agent_worktree("teammate") if isolation == "worktree" else None
+        built = await self._make_teammate_child(
+            team_id, name, role, task_id, preset, model, isolated["path"] if isolated else None
+        )
         if isinstance(built, str):
+            if isolated is not None:
+                await self._finalize_agent_worktree(isolated)
             return built
         child, prompt = built
         detail: dict[str, object] = {
@@ -1969,24 +2296,50 @@ class ReActAgent:
             "model": model or self.config.model,
             "depth": getattr(getattr(child, "session", None), "depth", None),
             "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
+            "isolation": isolation,
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
         try:
             result = await child.run(prompt, deadline=self._active_deadline)
+            drain = getattr(child, "drain_scheduler_deliveries", None)
+            _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
+            if scheduled:
+                result.answer += "\n\n" + "\n\n".join(item.answer for item in scheduled)
         except Exception:
+            end = getattr(child, "fire_session_end", None)
+            if end is not None:
+                await end("teammate_error")
             await self._fire_observational(
                 HookEvent.SUBAGENT_STOP,
                 {**detail, "ok": False, "duration_s": round(time.monotonic() - started, 3)},
                 [],
             )
+            if isolated is not None:
+                try:
+                    await self._finalize_agent_worktree(isolated)
+                except Exception as cleanup_exc:  # noqa: BLE001 - retain unknown state fail-closed
+                    logger.warning("teammate worktree finalization failed: %s", cleanup_exc)
             raise
+        finally:
+            end = getattr(child, "fire_session_end", None)
+            if end is not None:
+                await end("teammate_exit")
+            child_sandbox = getattr(child, "sandbox", self.sandbox)
+            if child_sandbox is not self.sandbox:
+                child_sandbox.teardown()
+            child_logger = getattr(child, "logger", None)
+            if child_logger is not None:
+                child_logger.close()
         await self._fire_observational(
             HookEvent.SUBAGENT_STOP,
             {**detail, "ok": True, "duration_s": round(time.monotonic() - started, 3)},
             [],
         )
-        return result.answer
+        if isolated is None:
+            return result.answer
+        summary = await self._finalize_agent_worktree(isolated)
+        return result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _teammate_prompt(

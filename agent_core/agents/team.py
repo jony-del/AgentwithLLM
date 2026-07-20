@@ -6,8 +6,9 @@ import os
 import re
 import time
 import uuid
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 TASK_STATUSES = frozenset({"pending", "assigned", "in_progress", "blocked", "completed"})
@@ -32,17 +33,18 @@ class FileLock:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._file = None
+        self._file: BinaryIO | None = None
 
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("a+b")
-        if self._file.seek(0, os.SEEK_END) == 0:
-            self._file.write(b"\0")
-            self._file.flush()
-        self._file.seek(0)
+        file = self.path.open("a+b")
+        self._file = file
+        if file.seek(0, os.SEEK_END) == 0:
+            file.write(b"\0")
+            file.flush()
+        file.seek(0)
         if os.name == "nt":
-            import msvcrt  # type: ignore[import-not-found]
+            import msvcrt
 
             # LK_LOCK retries once per second and gives up after ~10s with EDEADLK
             # ("Resource deadlock avoided") — under many concurrent workers that's
@@ -50,14 +52,15 @@ class FileLock:
             # short interval instead, waiting indefinitely like fcntl.flock.
             while True:
                 try:
-                    msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
                     time.sleep(0.005)
         else:
-            import fcntl  # type: ignore[import-not-found]
+            import importlib
 
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+            fcntl = importlib.import_module("fcntl")
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -65,12 +68,13 @@ class FileLock:
             return
         self._file.seek(0)
         if os.name == "nt":
-            import msvcrt  # type: ignore[import-not-found]
+            import msvcrt
 
             msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
         else:
-            import fcntl  # type: ignore[import-not-found]
+            import importlib
 
+            fcntl = importlib.import_module("fcntl")
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
         self._file.close()
         self._file = None
@@ -154,6 +158,9 @@ class TeamStore:
 
     async def read_events(self, team_id: str, limit: int = 20) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._read_events_sync, team_id, limit)
+
+    async def delete_team(self, team_id: str) -> None:
+        await asyncio.to_thread(self._delete_team_sync, team_id)
 
     # --- blocking implementations (worker-thread internals) ------------------
 
@@ -247,7 +254,7 @@ class TeamStore:
 
         path = self._tasks_file(team_id)
         now = time.time()
-        task = {
+        task: dict[str, Any] = {
             "id": f"task_{uuid.uuid4().hex[:10]}",
             "title": title,
             "description": description,
@@ -403,6 +410,14 @@ class TeamStore:
         with FileLock(self._lock_file(path)):
             events = self._read_jsonl(path)
         return events[-limit:]
+
+    def _delete_team_sync(self, team_id: str) -> None:
+        directory = self._team_dir(team_id).resolve()
+        root = self.root.resolve()
+        if directory.parent != root or not directory.is_dir():
+            raise TeamError(f"unknown team: {team_id}")
+        with FileLock(root / f".{team_id}.delete.lock"):
+            shutil.rmtree(directory)
 
     # --- path helpers ------------------------------------------------------
 

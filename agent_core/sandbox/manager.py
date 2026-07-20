@@ -21,6 +21,7 @@ hard gate for deployments that must never run commands unsandboxed).
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 import sys
 import threading
 from pathlib import Path
@@ -207,7 +208,7 @@ class SandboxManager:
 
     # -- the wrap seam called by command tools ---------------------------------------
 
-    def wrap(self, spec, shell: bool, *, command: str | None = None) -> tuple[object, bool]:
+    def wrap(self, spec, shell: bool, *, command: str | None = None, scope=None) -> tuple[object, bool]:
         """Return ``(spec, shell)`` wrapped for isolation, or unchanged if not sandboxing.
 
         ``command`` is the raw shell command line (for the exclusion check); pass ``None``
@@ -218,7 +219,29 @@ class SandboxManager:
                 return spec, shell
         elif not self.is_enabled():
             return spec, shell
-        return self._backend.wrap(spec, shell, config=self.config, workspace=self.workspace)
+        workspace = getattr(scope, "workspace", self.workspace)
+        config = self.config
+        if scope is not None:
+            config = deepcopy(self.config)
+            writable = [str(path) for path in getattr(scope, "writable_roots", ())]
+            private_temp = getattr(scope, "private_temp", None)
+            if private_temp is not None:
+                writable.append(str(private_temp))
+            config.filesystem.allow_write.extend(writable)
+            read_only = [str(path) for path in getattr(scope, "read_only_roots", ())]
+            git_common = getattr(scope, "git_common_dir", None)
+            if git_common is not None:
+                read_only.append(str(git_common))
+            if not getattr(scope, "workspace_writable", True):
+                read_only.append(str(workspace))
+            config.filesystem.deny_write.extend(read_only)
+            config.filesystem.allow_read.extend(read_only)
+            if getattr(scope, "network", "deny") == "deny":
+                config.network.allowed_domains.clear()
+                config.network.allow_local_binding = False
+            else:
+                config.network.allow_local_binding = True
+        return self._backend.wrap(spec, shell, config=config, workspace=workspace)
 
     # -- diagnostics -----------------------------------------------------------------
 

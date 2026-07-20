@@ -12,13 +12,13 @@ from agent_core.tools.builtin import (
     GitDiffTool,
     ListDirTool,
     ReadTextFileTool,
-    RunCommandTool,
     RunTestsTool,
     SearchTextTool,
     _DEFAULT_READ_LINES,
     _run_subprocess,
     _shell_invocation,
 )
+from agent_core.tools.shell import BashTool, PowerShellTool
 
 
 # --- list_dir ----------------------------------------------------------------
@@ -204,13 +204,9 @@ def test_run_subprocess_timeout(tmp_path: Path) -> None:
     assert result.metadata["error_type"] == "Timeout"
 
 
-async def test_run_command_shell_echo(tmp_path: Path) -> None:
-    result = await RunCommandTool(tmp_path).run({"command": "echo hello"})
-    assert "hello" in result.content
-
-
-def test_run_command_is_dangerous() -> None:
-    assert RunCommandTool().risk is ToolRisk.DANGEROUS
+def test_dialect_shell_tools_are_dangerous() -> None:
+    assert BashTool().risk is ToolRisk.DANGEROUS
+    assert PowerShellTool().risk is ToolRisk.DANGEROUS
 
 
 def test_shell_invocation_per_platform() -> None:
@@ -221,25 +217,6 @@ def test_shell_invocation_per_platform() -> None:
     else:
         assert shell is True
         assert spec == "Get-Content x"
-
-
-async def test_run_command_child_python_emits_utf8(tmp_path: Path) -> None:
-    # The GBK regression: a child printing non-ASCII must not crash and must
-    # round-trip as UTF-8 (PYTHONUTF8/PYTHONIOENCODING are forced for the child).
-    code = "print('\\u2705 完成')"
-    result = await RunCommandTool(tmp_path).run({"command": f'{sys.executable} -c "{code}"'})
-    assert result.ok
-    assert "完成" in result.content
-
-
-@pytest.mark.skipif(not sys.platform.startswith("win"), reason="PowerShell cmdlet test is Windows-only")
-async def test_run_command_powershell_cmdlet_reads_utf8(tmp_path: Path) -> None:
-    # Get-Content (a PowerShell cmdlet, absent in cmd.exe) must resolve AND read a
-    # UTF-8 file's CJK correctly under Windows PowerShell 5.1.
-    (tmp_path / "u.txt").write_text("你好世界\n", encoding="utf-8")
-    result = await RunCommandTool(tmp_path).run({"command": "Get-Content u.txt"})
-    assert result.ok
-    assert "你好世界" in result.content
 
 
 # --- read_text_file ----------------------------------------------------------

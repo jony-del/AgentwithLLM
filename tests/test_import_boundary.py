@@ -78,7 +78,7 @@ agent = ReActAgent(
 )
 names = {{tool.name for tool in default_tools()}}
 assert "web_fetch" not in names and "web_search" not in names, names  # [web] skipped
-assert "read_text_file" in names and "run_command" in names  # core tools intact
+assert "read_text_file" in names and "bash" in names  # core tools intact
 print("construct-ok")
 """,
         tmp_path,

@@ -20,7 +20,12 @@ from agent_core.permission_classifier import (
 )
 from agent_core.permissions import PermissionDecision, PermissionPolicy
 from agent_core.permission_safety import is_secret_path
-from agent_core.permission_types import DecisionSource, PermissionBehavior, PermissionResult
+from agent_core.permission_types import (
+    DecisionSource,
+    PermissionBehavior,
+    PermissionResult,
+    PermissionUpdate,
+)
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.registry import ToolRegistry
@@ -107,14 +112,14 @@ class ToolExecutor:
             wave_results = await asyncio.gather(
                 *(self._run_tool(prepared, sync_semaphore) for prepared in wave)
             )
-            for prepared, result in zip(wave, wave_results, strict=True):
-                results[prepared.index] = result
+            for prepared, wave_result in zip(wave, wave_results, strict=True):
+                results[prepared.index] = wave_result
 
         completed: list[ToolResult] = []
-        for index, result in enumerate(results):
-            if result is None:
+        for index, maybe_result in enumerate(results):
+            if maybe_result is None:
                 raise RuntimeError(f"missing tool result at index {index}")
-            completed.append(result)
+            completed.append(maybe_result)
         return completed
 
     async def _run_tool(self, prepared: _PreparedCall, sync_semaphore: asyncio.Semaphore) -> ToolResult:
@@ -357,20 +362,23 @@ class ToolExecutor:
                 )
         if self.logger:
             classifier_payload = asdict(classifier_verdict) if classifier_verdict is not None else None
+            permission_updates: list[dict[str, str]] = []
+            permission_update: PermissionUpdate
+            for permission_update in self.permissions.last_permission_updates:
+                permission_updates.append(
+                    {
+                        "behavior": permission_update.behavior.value,
+                        "rule": permission_update.rule,
+                        "destination": permission_update.destination.value,
+                    }
+                )
             payload: dict[str, object] = build_permission_audit_event(
                 tool.name,
                 rewritten_call.arguments,
                 permission_context,
                 permission_result,
                 classifier_payload,
-                [
-                    {
-                        "behavior": update.behavior.value,
-                        "rule": update.rule,
-                        "destination": update.destination.value,
-                    }
-                    for update in self.permissions.last_permission_updates
-                ],
+                permission_updates,
             )
             payload["decision"] = asdict(decision)  # compatibility for existing replay readers
             if hook_verdict is not None:

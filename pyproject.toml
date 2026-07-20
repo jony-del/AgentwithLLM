@@ -69,10 +69,10 @@ include = ["agent_core*"]
 [tool.setuptools.package-data]
 "agent_core.skills" = ["bundled/*.md"]
 
-# Lint/type-check are introduced incrementally (revision guide D6). Stage 1: ruff
-# E (pycodestyle errors) + F (pyflakes) with E501 excluded (long lines are pervasive
-# and cosmetic); mypy covers only the cross-layer contract modules. Widen both as
-# the codebase is brought along — never loosen back.
+# Lint/type-check were introduced incrementally (revision guide D6). Ruff checks
+# E (pycodestyle errors) + F (pyflakes), with E501 excluded because long lines are
+# pervasive and cosmetic. Mypy now covers every production module; tests remain
+# protected by pytest and Ruff.
 [tool.ruff]
 line-length = 110
 
@@ -82,10 +82,8 @@ ignore = ["E501"]
 
 [tool.mypy]
 files = [
-    "agent_core/models.py",
-    "agent_core/providers/base.py",
-    "agent_core/permissions.py",
-    "agent_core/permission_rules.py",
+    "agent_core",
+    "installer",
 ]
 follow_imports = "silent"
 ignore_missing_imports = true

@@ -39,6 +39,14 @@ def test_empty_confirmation_does_not_set_interrupt() -> None:
     assert not interrupt.is_set()
 
 
+def test_ctrl_b_background_request_is_consumed_once() -> None:
+    interrupt = KeyInterrupt()
+    interrupt._background.set()
+
+    assert interrupt.consume_background()
+    assert not interrupt.consume_background()
+
+
 def test_windows_watcher_ignores_non_interrupt_key(monkeypatch) -> None:
     interrupt = KeyInterrupt(confirm=True, input_func=lambda prompt: "y")
     keys = ["q"]

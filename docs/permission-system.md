@@ -65,7 +65,7 @@ Windows 大小写差异。秘密读取安全网覆盖 `.env*`、`*.pem`、`*.key
 `.git`、`.polaris`、`.claude`、`agent.toml`、`settings.json` 和 `settings.local.json`；写入
 `.git/hooks` hard-deny。
 
-`run_command` 在 rule/mode 放行前分解复合命令，并递归分析 `bash -c`、PowerShell 和 `cmd /c`
+`bash` 与 `powershell` 在 rule/mode 放行前分解复合命令，并递归分析 shell wrapper
 wrapper；任一危险子命令使整体 DENY。allow rule 必须覆盖全部子命令。`PATH`、`LD_*`、`DYLD_*`、
 dynamic evaluation、download-to-shell、persistence、秘密路径和受保护路径不能借 wrapper 或 environment
 assignment 获得 fast allow。
@@ -112,7 +112,7 @@ material 会统一 redaction。transcript 和通用 run logger 使用同一 sani
 - `~/.polaris/agent.toml`（当前用户）。
 
 Shell 建议按规范化后的每条子命令分别授权，复合命令必须全部被覆盖；不会生成无边界的
-`run_command` grant。持久化操作需要二次确认，使用进程间 lock、临时文件、`fsync` 和原子替换；
+shell grant。持久化操作需要二次确认，使用进程间 lock、临时文件、`fsync` 和原子替换；
 失败时既不执行工具，也不遗留内存 grant。安装依赖可用时由 `tomlkit` 保留原文件注释和格式。
 
 `auto` 分类器明确返回 block 时仍为 hard deny。只有分类器不可用、超时、异常或输出无效时，顶层
@@ -131,8 +131,8 @@ fail closed。取消信号不会被转换成授权拒绝，而是继续向上传
 
 ```toml
 [managed.permissions]
-allow = ["run_command(git status)"]
-deny = ["run_command(rm *)"]
+allow = ["bash(git status)"]
+deny = ["bash(rm *)"]
 ask = ["web_fetch(domain:github.com)"]
 forbidden_modes = ["bypassPermissions"]
 require_sandbox_for_unattended = true

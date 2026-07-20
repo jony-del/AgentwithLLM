@@ -13,7 +13,7 @@ Design rules:
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from agent_core.permission_types import (
     PermissionBehavior,
@@ -414,7 +414,12 @@ class TerminalRenderer:
                 event.app.exit(result=value)
             return handler
 
-        for keys, value in (("yY", "once"), ("aA", "always"), ("nN", "deny")):
+        choices: tuple[tuple[str, PermissionChoice], ...] = (
+            ("yY", "once"),
+            ("aA", "always"),
+            ("nN", "deny"),
+        )
+        for keys, value in choices:
             for key in keys:
                 kb.add(key)(_resolve(value))
 
@@ -429,10 +434,17 @@ class TerminalRenderer:
 
         session: PromptSession = PromptSession(key_bindings=kb)
         try:
-            answer = await session.prompt_async("Allow? [y/once · a/always · n/deny] ")
+            answer = cast(
+                str,
+                await session.prompt_async("Allow? [y/once · a/always · n/deny] "),
+            )
         except (EOFError, KeyboardInterrupt):
             return "deny"
-        return answer if answer in ("once", "always", "deny") else "deny"
+        return (
+            cast(PermissionChoice, answer)
+            if answer in ("once", "always", "deny")
+            else "deny"
+        )
 
     async def ask_permission_request_async(self, request: PermissionRequest) -> PermissionResponse:
         """Prompt for once/session/persistent least-privilege grants."""
@@ -475,7 +487,12 @@ class TerminalRenderer:
         if not request.persistent_grants_disabled:
             suffix += " · l/local · p/project · u/user"
         try:
-            choice = await PromptSession(key_bindings=kb).prompt_async(f"Allow? [{suffix}] ")
+            choice = cast(
+                str,
+                await PromptSession(key_bindings=kb).prompt_async(
+                    f"Allow? [{suffix}] "
+                ),
+            )
         except (EOFError, KeyboardInterrupt):
             return PermissionResponse(False, reason="permission prompt cancelled")
         if choice == "deny" or choice not in {"once", "session", "local", "project", "user"}:
@@ -531,7 +548,9 @@ class TerminalRenderer:
         def _(event) -> None:
             event.app.exit(result=False)
         try:
-            answer = await PromptSession(key_bindings=kb).prompt_async(prompt)
+            answer = cast(
+                bool, await PromptSession(key_bindings=kb).prompt_async(prompt)
+            )
         except (EOFError, KeyboardInterrupt):
             return False
         return answer is True
@@ -554,8 +573,11 @@ class TerminalRenderer:
         def _(event) -> None:
             event.app.exit(result=False)
         try:
-            answer = await PromptSession(key_bindings=kb).prompt_async(
-                f"Persist {count} allow rule(s) to {destination.value}? [y/N] "
+            answer = cast(
+                bool,
+                await PromptSession(key_bindings=kb).prompt_async(
+                    f"Persist {count} allow rule(s) to {destination.value}? [y/N] "
+                ),
             )
         except (EOFError, KeyboardInterrupt):
             return False

@@ -33,7 +33,7 @@ blocked_domains = []
 deny = ["web_fetch", "web_search"]
 # Commands always require an explicit yes — even ones an allow rule or the
 # sandbox auto-allow would otherwise wave through.
-ask = ["run_command", "run_tests"]
+ask = ["bash", "powershell", "run_tests"]
 
 # --- OS sandbox: mandatory --------------------------------------------------
 [sandbox]

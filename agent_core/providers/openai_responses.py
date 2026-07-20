@@ -268,7 +268,8 @@ class OpenAIResponsesProvider(LLMProvider):
 
     @staticmethod
     def _parse_response(payload: dict[str, Any]) -> LLMResult:
-        output = payload.get("output") if isinstance(payload.get("output"), list) else []
+        raw_output = payload.get("output")
+        output: list[Any] = raw_output if isinstance(raw_output, list) else []
         text_parts = OpenAIResponsesProvider._parse_text_parts(output)
         tool_calls = OpenAIResponsesProvider._parse_function_calls(output)
         return LLMResult(
@@ -313,32 +314,32 @@ class OpenAIResponsesProvider(LLMProvider):
         if isinstance(value, str):
             return [value]
         if isinstance(value, list):
-            parts: list[str] = []
+            nested_parts: list[str] = []
             for item in value:
-                parts.extend(cls._extract_reasoning_display_parts(item))
-            return parts
+                nested_parts.extend(cls._extract_reasoning_display_parts(item))
+            return nested_parts
         if not isinstance(value, dict):
             return []
 
         kind = str(value.get("type") or "").lower()
         is_reasoning = "reasoning" in kind or kind in {"summary_text", "summary"}
-        parts: list[str] = []
+        reasoning_parts: list[str] = []
         if is_reasoning:
             if "encrypted" in kind:
                 return []
             for key in ("summary", "content"):
-                parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
+                reasoning_parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
             for key in ("text", "delta"):
                 text = value.get(key)
                 if isinstance(text, str) and text:
-                    parts.append(text)
+                    reasoning_parts.append(text)
         else:
             # Some streaming events carry a top-level summary even when their event
             # type, not the nested block, names the reasoning summary shape.
             for key in ("summary", "reasoning", "reasoning_summary"):
                 if key in value:
-                    parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
-        return parts
+                    reasoning_parts.extend(cls._extract_reasoning_display_parts(value.get(key)))
+        return reasoning_parts
 
     @staticmethod
     def _parse_function_calls(output: list[Any]) -> list[ToolCall]:

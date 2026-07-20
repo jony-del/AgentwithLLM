@@ -19,11 +19,11 @@ def test_parse_whole_tool_rule() -> None:
 
 
 def test_parse_rule_with_content() -> None:
-    assert parse_rule("run_command(git *)") == ParsedRule("run_command", "git *")
+    assert parse_rule("bash(git *)") == ParsedRule("bash", "git *")
 
 
 def test_parse_bad_rule_degrades_to_none() -> None:
-    assert parse_rule("run_command(unterminated") is None
+    assert parse_rule("bash(unterminated") is None
     assert parse_rule("") is None
     assert parse_rule("()") is None
 
@@ -38,40 +38,40 @@ def test_from_lists_drops_unparseable_entries() -> None:
 
 
 def test_exact_match() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(npm run build)"])
-    assert rules.allow_matches("run_command", {"command": "npm run build"})
-    assert not rules.allow_matches("run_command", {"command": "npm run test"})
+    rules = RuleSet.from_lists(allow=["bash(npm run build)"])
+    assert rules.allow_matches("bash", {"command": "npm run build"})
+    assert not rules.allow_matches("bash", {"command": "npm run test"})
 
 
 def test_prefix_match() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(npm:*)"])
-    assert rules.allow_matches("run_command", {"command": "npm run build"})
-    assert rules.allow_matches("run_command", {"command": "npm"})
-    assert not rules.allow_matches("run_command", {"command": "npmx evil"})
+    rules = RuleSet.from_lists(allow=["bash(npm:*)"])
+    assert rules.allow_matches("bash", {"command": "npm run build"})
+    assert rules.allow_matches("bash", {"command": "npm"})
+    assert not rules.allow_matches("bash", {"command": "npmx evil"})
 
 
 def test_wildcard_match_and_bare_trailing() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(git * --force)"])
-    assert rules.deny_matches("run_command", {"command": "git push --force"})
-    rules2 = RuleSet.from_lists(allow=["run_command(git *)"])
-    assert rules2.allow_matches("run_command", {"command": "git"})  # bare command matches "git *"
-    assert rules2.allow_matches("run_command", {"command": "git status"})
+    rules = RuleSet.from_lists(deny=["bash(git * --force)"])
+    assert rules.deny_matches("bash", {"command": "git push --force"})
+    rules2 = RuleSet.from_lists(allow=["bash(git *)"])
+    assert rules2.allow_matches("bash", {"command": "git"})  # bare command matches "git *"
+    assert rules2.allow_matches("bash", {"command": "git status"})
 
 
 # -- compound command semantics: allow needs ALL, deny needs ANY ---------------------
 
 
 def test_compound_allow_requires_every_subcommand() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(git *)"])
-    assert rules.allow_matches("run_command", {"command": "git status && git diff"})
+    rules = RuleSet.from_lists(allow=["bash(git *)"])
+    assert rules.allow_matches("bash", {"command": "git status && git diff"})
     # One sub-command not covered → not allowed.
-    assert not rules.allow_matches("run_command", {"command": "git status && rm x"})
+    assert not rules.allow_matches("bash", {"command": "git status && rm x"})
 
 
 def test_compound_deny_triggers_on_any_subcommand() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
-    assert rules.deny_matches("run_command", {"command": "git status && rm -rf /"})
-    assert rules.deny_matches("run_command", {"command": "rm x | cat"})
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
+    assert rules.deny_matches("bash", {"command": "git status && rm -rf /"})
+    assert rules.deny_matches("bash", {"command": "rm x | cat"})
 
 
 def test_split_respects_quotes() -> None:
@@ -84,22 +84,22 @@ def test_split_respects_quotes() -> None:
 
 
 def test_safe_env_var_prefix_is_stripped_for_allow() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(npm run test)"])
-    assert rules.allow_matches("run_command", {"command": "LANG=C npm run test"})
+    rules = RuleSet.from_lists(allow=["bash(npm run test)"])
+    assert rules.allow_matches("bash", {"command": "LANG=C npm run test"})
 
 
 def test_binary_hijack_var_is_never_stripped() -> None:
     # PATH= must NOT be stripped, so the command no longer matches a naive allow.
     assert BINARY_HIJACK_VARS.match("PATH")
-    rules = RuleSet.from_lists(allow=["run_command(npm run test)"])
-    assert not rules.allow_matches("run_command", {"command": "PATH=/tmp npm run test"})
-    assert not rules.allow_matches("run_command", {"command": "LD_PRELOAD=x npm run test"})
+    rules = RuleSet.from_lists(allow=["bash(npm run test)"])
+    assert not rules.allow_matches("bash", {"command": "PATH=/tmp npm run test"})
+    assert not rules.allow_matches("bash", {"command": "LD_PRELOAD=x npm run test"})
 
 
 def test_safe_wrapper_stripping() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(npm run test)"])
-    assert rules.allow_matches("run_command", {"command": "timeout 300 npm run test"})
-    assert rules.allow_matches("run_command", {"command": "nohup npm run test"})
+    rules = RuleSet.from_lists(allow=["bash(npm run test)"])
+    assert rules.allow_matches("bash", {"command": "timeout 300 npm run test"})
+    assert rules.allow_matches("bash", {"command": "nohup npm run test"})
 
 
 def test_unsafe_wrapper_flag_halts_stripping() -> None:
@@ -110,8 +110,8 @@ def test_unsafe_wrapper_flag_halts_stripping() -> None:
 
 def test_deny_matches_despite_wrapper_evasion() -> None:
     # Deny is checked against the raw form too, so wrapping can't dodge it.
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
-    assert rules.deny_matches("run_command", {"command": "timeout 5 rm -rf /"})
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
+    assert rules.deny_matches("bash", {"command": "timeout 5 rm -rf /"})
 
 
 # -- scalar matching: paths and domains ----------------------------------------------
@@ -136,34 +136,34 @@ def test_whole_tool_rule_matches_any_call() -> None:
 
 
 def test_rule_scoped_to_its_tool() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
     # A different tool with the same-looking arg is unaffected.
     assert not rules.deny_matches("read_text_file", {"path": "rm x"})
 
 
 def test_merge_appends_rules() -> None:
-    base = RuleSet.from_lists(deny=["run_command(rm *)"])
-    extra = RuleSet.from_lists(allow=["run_command(git *)"])
+    base = RuleSet.from_lists(deny=["bash(rm *)"])
+    extra = RuleSet.from_lists(allow=["bash(git *)"])
     merged = base.merge(extra)
-    assert merged.deny_matches("run_command", {"command": "rm x"})
-    assert merged.allow_matches("run_command", {"command": "git status"})
+    assert merged.deny_matches("bash", {"command": "rm x"})
+    assert merged.allow_matches("bash", {"command": "git status"})
     # Originals are untouched.
     assert not base.allow
 
 
 def test_rule_provenance_survives_parse_merge_and_match() -> None:
     project = RuleSet.from_lists(
-        deny=["run_command(rm *)"], source=PermissionRuleSource.PROJECT
+        deny=["bash(rm *)"], source=PermissionRuleSource.PROJECT
     )
     cli = RuleSet.from_lists(
-        allow=["run_command(git *)"], source=PermissionRuleSource.CLI
+        allow=["bash(git *)"], source=PermissionRuleSource.CLI
     )
     merged = project.merge(cli)
 
-    denied = merged.deny_match("run_command", {"command": "rm x"})
-    allowed = merged.allow_match("run_command", {"command": "git status"})
+    denied = merged.deny_match("bash", {"command": "rm x"})
+    allowed = merged.allow_match("bash", {"command": "git status"})
 
     assert denied is not None and denied.source is PermissionRuleSource.PROJECT
     assert denied.behavior is PermissionBehavior.DENY
     assert allowed is not None and allowed.source is PermissionRuleSource.CLI
-    assert allowed.raw == "run_command(git *)"
+    assert allowed.raw == "bash(git *)"

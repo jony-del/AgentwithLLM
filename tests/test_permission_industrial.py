@@ -76,7 +76,7 @@ async def test_managed_policy_file_loads_and_hot_reload_failure_denies(tmp_path:
 def test_atomic_permission_persistence_is_idempotent_and_preserves_other_tables(tmp_path: Path) -> None:
     path = tmp_path / "agent.local.toml"
     path.write_text(
-        "# keep me\n[permissions]\nallow = [\n    'echo',\n]\ndeny = ['run_command(rm *)']\n\n[web]\nblocked_domains = ['x.test']\n",
+        "# keep me\n[permissions]\nallow = [\n    'echo',\n]\ndeny = ['bash(rm *)']\n\n[web]\nblocked_domains = ['x.test']\n",
         encoding="utf-8",
     )
     for _ in range(2):
@@ -185,12 +185,12 @@ async def test_plan_exit_installs_only_valid_scoped_session_bundle(tmp_path: Pat
         plan_store=store,
         permission_mode_setter=lambda mode, **kwargs: mode,
         permission_grant_setter=grants.append,
-        registered_tool_names=frozenset({"exit_plan", "run_command"}),
+        registered_tool_names=frozenset({"exit_plan", "bash"}),
     )
     tool = ExitPlanTool(session)
     args = {
         "requested_permissions": [
-            {"rule": "run_command(python -m pytest -q)", "reason": "verify implementation"}
+            {"rule": "bash(python -m pytest -q)", "reason": "verify implementation"}
         ]
     }
     context = PermissionContext(
@@ -203,11 +203,11 @@ async def test_plan_exit_installs_only_valid_scoped_session_bundle(tmp_path: Pat
     assert checked.behavior is PermissionBehavior.ASK
     invoked = tool._invoke(args)
     assert invoked.ok
-    assert grants == ["run_command(python -m pytest -q)"]
+    assert grants == ["bash(python -m pytest -q)"]
 
     bad = {
         "requested_permissions": [
-            {"rule": "run_command(rm -rf /)", "reason": "unsafe"}
+            {"rule": "bash(rm -rf /)", "reason": "unsafe"}
         ]
     }
     state.active = True

@@ -163,3 +163,35 @@ class MCPClientManager:
             session.call_tool(tool, arguments or {}), self._loop
         )
         return future.result(timeout if timeout is not None else self._call_timeout)
+
+    def list_resources(self, server: str | None = None, timeout: float | None = None) -> list[dict[str, Any]]:
+        if self._loop is None or self._closed:
+            raise RuntimeError("MCP manager is not running")
+
+        async def collect() -> list[dict[str, Any]]:
+            records: list[dict[str, Any]] = []
+            for name, session in self._sessions.items():
+                if server is not None and name != server:
+                    continue
+                response = await session.list_resources()
+                for item in response.resources:
+                    records.append({
+                        "server": name,
+                        "uri": str(item.uri),
+                        "name": getattr(item, "name", None),
+                        "description": getattr(item, "description", None),
+                        "mime_type": getattr(item, "mimeType", None),
+                    })
+            return records
+
+        future = asyncio.run_coroutine_threadsafe(collect(), self._loop)
+        return future.result(timeout if timeout is not None else self._call_timeout)
+
+    def read_resource(self, server: str, uri: str, timeout: float | None = None) -> Any:
+        if self._loop is None or self._closed:
+            raise RuntimeError("MCP manager is not running")
+        session = self._sessions.get(server)
+        if session is None:
+            raise KeyError(f"Unknown MCP server: {server}")
+        future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
+        return future.result(timeout if timeout is not None else self._call_timeout)

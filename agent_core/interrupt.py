@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import threading
 from collections.abc import Callable
+from typing import Any
 
 
 class KeyInterrupt:
@@ -20,6 +21,7 @@ class KeyInterrupt:
     """
 
     ESC = "\x1b"
+    BACKGROUND = "\x02"  # Ctrl+B
     _WINDOWS_EXTENDED_PREFIXES = {"\x00", "\xe0"}
 
     def __init__(
@@ -35,6 +37,7 @@ class KeyInterrupt:
         self._confirm_prompt = confirm_prompt
         self._input = input_func or input
         self._event = threading.Event()
+        self._background = threading.Event()
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._confirm_lock = threading.Lock()
@@ -46,6 +49,13 @@ class KeyInterrupt:
         if self._confirm and self._pending.is_set():
             self._confirm_pending()
         return self._event.is_set()
+
+    def consume_background(self) -> bool:
+        """Return one Ctrl+B request and clear it so later commands stay foreground."""
+        requested = self._background.is_set()
+        if requested:
+            self._background.clear()
+        return requested
 
     def __enter__(self) -> "KeyInterrupt":
         if not self._stdin_is_tty():
@@ -80,7 +90,7 @@ class KeyInterrupt:
             pass
 
     def _watch_windows(self) -> None:
-        import msvcrt  # type: ignore[import-not-found]
+        import msvcrt
 
         while not self._stop.is_set() and not self._event.is_set():
             if self._pending.is_set():
@@ -95,6 +105,8 @@ class KeyInterrupt:
                     self._request_interrupt()
                     if not self._confirm:
                         return
+                elif key == self.BACKGROUND:
+                    self._background.set()
             else:
                 self._stop.wait(0.05)
 
@@ -104,20 +116,26 @@ class KeyInterrupt:
         import tty
 
         fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        termios_api: Any = termios
+        tty_api: Any = tty
+        old = termios_api.tcgetattr(fd)
         try:
-            tty.setcbreak(fd)
+            tty_api.setcbreak(fd)
             while not self._stop.is_set() and not self._event.is_set():
                 if self._pending.is_set():
                     self._stop.wait(0.05)
                     continue
                 ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if ready and self._read_posix_key(select.select) == self._key:
-                    self._request_interrupt()
-                    if not self._confirm:
-                        return
+                if ready:
+                    key = self._read_posix_key(select.select)
+                    if key == self._key:
+                        self._request_interrupt()
+                        if not self._confirm:
+                            return
+                    elif key == self.BACKGROUND:
+                        self._background.set()
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            termios_api.tcsetattr(fd, termios_api.TCSADRAIN, old)
 
     def _read_posix_key(self, select_func: Callable) -> str:
         key = sys.stdin.read(1)

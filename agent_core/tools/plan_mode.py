@@ -144,7 +144,7 @@ class ExitPlanTool(SessionAwareMixin, Tool):
             content = parsed.content
             if "*" in content or "?" in content or "$(" in content or "`" in content:
                 raise ValueError(f"wildcard/dynamic scope is not allowed: {rule_text!r}")
-            if parsed.tool_name == "run_command":
+            if parsed.tool_name in {"bash", "powershell"}:
                 analysis = analyze_command(content)
                 if analysis.behavior is PermissionBehavior.DENY or analysis.category in {
                     "destructive", "dynamic", "environment", "persistence", "protected", "secret"

@@ -15,7 +15,7 @@ _EXPECTED = {
     "git_diff",
     "write_text_file",
     "edit_file",
-    "run_command",
+    "bash",
     "run_tests",
 }
 

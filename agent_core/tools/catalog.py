@@ -16,9 +16,13 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.tools.base import Tool, WorkspacePathMixin
+
+if TYPE_CHECKING:
+    from agent_core.tools.registry import ToolRegistry
 
 # Populated by the @builtin_tool decorator as tool modules are imported.
 _BUILTIN: list[type[Tool]] = []
@@ -65,10 +69,37 @@ def default_tools(
     """
     tools: list[Tool] = []
     for cls in builtin_tool_classes():
+        constructor = cast(Any, cls)
         if issubclass(cls, SessionAwareMixin):
-            tools.append(cls(session) if session is not None else cls())  # type: ignore[call-arg]
+            tools.append(constructor(session) if session is not None else constructor())
         elif workspace is not None and issubclass(cls, WorkspacePathMixin):
-            tools.append(cls(workspace))  # type: ignore[call-arg]
+            tools.append(constructor(workspace))
         else:
-            tools.append(cls())
+            tools.append(constructor())
     return tools
+
+
+def populate_registry(
+    registry: "ToolRegistry",
+    workspace: str | Path | None = None,
+    session: SessionContext | None = None,
+) -> None:
+    """Populate active tools and retain heavyweight/rare tools as deferred."""
+    from agent_core.tools.registry import ToolRegistry
+
+    if not isinstance(registry, ToolRegistry):
+        raise TypeError("registry must be a ToolRegistry")
+    for cls in builtin_tool_classes():
+        constructor = cast(Any, cls)
+
+        def factory(cls=cls, constructor=constructor):
+            if issubclass(cls, SessionAwareMixin):
+                return constructor(session) if session is not None else constructor()
+            if workspace is not None and issubclass(cls, WorkspacePathMixin):
+                return constructor(workspace)
+            return constructor()
+
+        if bool(getattr(cls, "deferred", False)):
+            registry.register_deferred(cls.name, cls.description, factory)
+        else:
+            registry.register(factory())

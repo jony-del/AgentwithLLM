@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import json
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 from agent_core.agents.team import TeamError, TeamPermissionError, TeamStore
 from agent_core.models import ToolRisk, ToolResult
@@ -12,7 +14,13 @@ from agent_core.permission_types import (
     PermissionResult,
 )
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
+from agent_core.tools.base import (
+    ConcurrencySpec,
+    LockMode,
+    ResourceLock,
+    Tool,
+    coerce_int,
+)
 from agent_core.tools.catalog import builtin_tool
 
 _PRESETS = {"read_only", "full"}
@@ -206,6 +214,10 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
                     "model, so a team can mix models by role."
                 ),
             },
+            "isolation": {
+                "type": "string", "enum": ["shared", "worktree"],
+                "description": "shared uses the parent workspace; worktree creates an isolated Git worktree.",
+            },
         },
         "required": ["team_id", "name", "role"],
     }
@@ -230,7 +242,7 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
-        fs_mode = "write" if preset == "full" else "read"
+        fs_mode: LockMode = "write" if preset == "full" else "read"
         locks = [
             ResourceLock("member", _resource_id(team_id, name), "write"),
             ResourceLock("fs", str(self.session.workspace.resolve()), fs_mode, subtree=True),
@@ -257,8 +269,17 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         if preset not in _PRESETS:
             preset = "read_only"
         model = str(arguments.get("model", "")).strip() or None
+        isolation = str(arguments.get("isolation", "shared"))
+        if isolation not in {"shared", "worktree"}:
+            isolation = "shared"
         try:
-            answer = await factory(team_id, name, role, task_id, preset, model)
+            parameters = inspect.signature(factory).parameters
+            factory_call = cast(Callable[..., Awaitable[str]], factory)
+            answer = (
+                await factory_call(team_id, name, role, task_id, preset, model, isolation)
+                if len(parameters) >= 7
+                else await factory_call(team_id, name, role, task_id, preset, model)
+            )
         except Exception as exc:  # noqa: BLE001
             return _team_error(self.name, exc)
         return ToolResult(
@@ -270,6 +291,7 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
                 "task_id": task_id,
                 "preset": preset,
                 "model": model,
+                "isolation": isolation,
             },
         )
 
@@ -370,7 +392,9 @@ class TeamStatusTool(SessionAwareMixin, Tool):
             return store
         team_id = _team_id(arguments, self.session.team_id)
         try:
-            status = await store.status(team_id, int(arguments.get("recent_events", 20)))
+            status = await store.status(
+                team_id, coerce_int(arguments.get("recent_events", 20))
+            )
         except Exception as exc:  # noqa: BLE001
             return _team_error(self.name, exc)
         return ToolResult(self.name, _render(status), metadata={"team_id": team_id})
@@ -396,7 +420,7 @@ class TeamInboxReadTool(SessionAwareMixin, Tool):
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         team_id = _team_id(arguments, self.session.team_id)
-        mode = "write" if bool(arguments.get("unread_only", True)) else "read"
+        mode: LockMode = "write" if bool(arguments.get("unread_only", True)) else "read"
         return ConcurrencySpec((ResourceLock("member", _resource_id(team_id, self.session.agent_name), mode),))
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:

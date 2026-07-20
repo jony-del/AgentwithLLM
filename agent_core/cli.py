@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from agent_core.config import (
     resolve_compression_config,
@@ -24,6 +26,7 @@ from agent_core.config import (
     resolve_session_dir,
     resolve_skills_config,
     resolve_tool_use_summary_config,
+    resolve_tool_suite_config,
     resolve_web_config,
 )
 from agent_core.permission_rules import RuleSet
@@ -61,6 +64,7 @@ from agent_core.transcript import (
 from agent_core.ui import AgentUI, ConsoleUI, NullUI
 
 if TYPE_CHECKING:
+    from agent_core.mcp import MCPClientManager
     from prompt_toolkit.completion import Completer
 
 
@@ -98,10 +102,21 @@ def _permission_rules(args: argparse.Namespace) -> RuleSet:
     rules = resolve_permission_rules(_config_file(args))
     from agent_core.permission_types import PermissionRuleSource
 
+    cli_values = {
+        "allow": getattr(args, "allow", None) or [],
+        "deny": getattr(args, "deny", None) or [],
+        "ask": getattr(args, "ask", None) or [],
+    }
+    legacy = [value for values in cli_values.values() for value in values if "run_command" in value]
+    if legacy:
+        raise ValueError(
+            f"legacy run_command CLI rules are unsupported: {legacy!r}. "
+            "Split each rule into bash(...) and/or powershell(...)."
+        )
     cli = RuleSet.from_lists(
-        allow=getattr(args, "allow", None) or [],
-        deny=getattr(args, "deny", None) or [],
-        ask=getattr(args, "ask", None) or [],
+        allow=cli_values["allow"],
+        deny=cli_values["deny"],
+        ask=cli_values["ask"],
         source=PermissionRuleSource.CLI,
     )
     return rules.merge(cli)
@@ -193,7 +208,9 @@ def _connect_mcp(mcp_config):
     return manager
 
 
-def _start_mcp(registry: ToolRegistry, config_file: str = "agent.toml"):
+def _start_mcp(
+    registry: ToolRegistry, config_file: str = "agent.toml"
+) -> "MCPClientManager | None":
     """Connect any configured MCP servers and register their tools, or return ``None``.
 
     Only connects when ``[mcp.servers.*]`` is non-empty. The caller owns the returned
@@ -212,6 +229,13 @@ def _start_mcp(registry: ToolRegistry, config_file: str = "agent.toml"):
 def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     values = _resolve(args)
     config_file = _config_file(args)
+    tool_suite = resolve_tool_suite_config(config_file)
+    if tool_suite.shell.enabled and tool_suite.shell.bash.enabled:
+        from agent_core.process_supervisor import resolve_bash_executable
+
+        resolve_bash_executable(
+            tool_suite.shell.bash.executable or os.getenv("POLARIS_BASH_PATH")
+        )
     provider = _make_provider(values)
     ui = _make_ui(args)
     concurrency = resolve_concurrency_config(config_file)
@@ -262,6 +286,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         sandbox=_sandbox_config(args),
         permission_rules=_permission_rules(args),
         web=resolve_web_config(config_file),
+        tools=tool_suite,
     )
     registry = ReActAgent.default_registry()
     manager = _start_mcp(registry, config_file)
@@ -271,7 +296,8 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     # empty because the history already lives on disk.
     session_id, history, seed = _resolve_session(args, config.session_dir)
     agent = ReActAgent(
-        provider=provider, config=config, tools=registry, ui=ui, session_id=session_id
+        provider=provider, config=config, tools=registry, ui=ui, session_id=session_id,
+        mcp_manager=manager,
     )
     return BuiltAgent(agent, ui, manager, history, seed)
 
@@ -280,7 +306,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
 class BuiltAgent:
     agent: ReActAgent
     ui: AgentUI
-    mcp: object | None
+    mcp: "MCPClientManager | None"
     history: list[Message]
     seed: list[Message]
 
@@ -365,14 +391,15 @@ async def _async_input(
 
     # PromptSession is cached for the life of the process. Keep the callback in a
     # mutable function attribute so a later chat session cannot retain an old agent.
-    _async_input._on_cycle_permission = on_cycle_permission
+    input_state = cast(Any, _async_input)
+    input_state._on_cycle_permission = on_cycle_permission
 
     def cycle_permission() -> None:
         callback = getattr(_async_input, "_on_cycle_permission", None)
         if callback is not None:
             callback()
 
-    session = getattr(_async_input, "_session", None)
+    session = getattr(input_state, "_session", None)
     if session is None:
         toggle = getattr(ui, "toggle_verbose", None)
         session = PromptSession(
@@ -384,7 +411,7 @@ async def _async_input(
             style=completion_menu_style(),
             bottom_toolbar=bottom_toolbar,
         )
-        _async_input._session = session
+        input_state._session = session
 
     try:
         line = await session.prompt_async(HTML(f"<ansicyan>{prompt}</ansicyan> "))
@@ -422,8 +449,13 @@ async def _threaded_input(prompt: str) -> str | None:
             line: str | None = _clean_surrogates(input(prompt))
         except EOFError:
             line = None
+
+        def resolve_future() -> None:
+            if not future.done():
+                future.set_result(line)
+
         try:
-            loop.call_soon_threadsafe(lambda: future.done() or future.set_result(line))
+            loop.call_soon_threadsafe(resolve_future)
         except RuntimeError:
             pass  # loop already closed (e.g. Ctrl-C tore the session down)
 
@@ -438,10 +470,10 @@ async def _seed_transcript(built: "BuiltAgent") -> None:
             await built.agent.transcript.append_message(message)
 
 
-def run_command(args: argparse.Namespace) -> int:
+def run_task(args: argparse.Namespace) -> int:
     try:
         built = build_agent(args)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         # E.g. an MCP server failed to connect, or a bad --resume id.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
@@ -450,16 +482,23 @@ def run_command(args: argparse.Namespace) -> int:
     async def run_once():
         await _seed_transcript(built)
         try:
+            await agent.scheduler_heartbeat()
             with KeyInterrupt(confirm=True) as interrupt:
-                return await agent.run(
-                    args.task, should_cancel=interrupt.is_set, history=built.history or None
-                )
+                agent.session.should_background = interrupt.consume_background
+                try:
+                    result = await agent.run(
+                        args.task, should_cancel=interrupt.is_set, history=built.history or None
+                    )
+                finally:
+                    agent.session.should_background = None
+            _history, scheduled = await agent.drain_scheduler_deliveries(result.messages)
+            return result, scheduled
         finally:
             # SessionEnd is host-driven: a one-shot run IS the whole session.
             await agent.fire_session_end("run_exit")
 
     try:
-        result = asyncio.run(run_once())
+        result, scheduled = asyncio.run(run_once())
     except RuntimeError as exc:
         # Covers LLMTransientError (network exhausted retries) and API errors.
         print(f"[error] {exc}", file=sys.stderr)
@@ -473,6 +512,8 @@ def run_command(args: argparse.Namespace) -> int:
     # when the run was silent (piped/--quiet) so we don't echo it twice.
     if not ui.is_live:
         print(result.answer)
+        for scheduled_result in scheduled:
+            print(scheduled_result.answer)
     print(f"\nRun log: runs/{result.run_id}.jsonl")
     if agent.transcript is not None:
         print(f"Session: {agent.session_id}  (resume with --resume {agent.session_id})")
@@ -482,7 +523,7 @@ def run_command(args: argparse.Namespace) -> int:
 def chat_command(args: argparse.Namespace) -> int:
     try:
         built = build_agent(args)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
     agent, ui, mcp = built.agent, built.ui, built.mcp
@@ -499,6 +540,18 @@ def chat_command(args: argparse.Namespace) -> int:
         from agent_core.terminal.completion import SlashCompleter
 
         completer = SlashCompleter(agent)
+
+        async def scheduler_heartbeats() -> None:
+            while True:
+                try:
+                    await agent.scheduler_heartbeat()
+                except Exception as exc:  # noqa: BLE001 - scheduler health is observational
+                    await agent.logger.write(
+                        "scheduler_delivery", {"state": "heartbeat_error", "error": str(exc)}
+                    )
+                await asyncio.sleep(45)
+
+        heartbeat_task = asyncio.create_task(scheduler_heartbeats())
 
         def _toolbar() -> str:
             # Persistent status line: the active model + effort, so the current config
@@ -546,10 +599,15 @@ def chat_command(args: argparse.Namespace) -> int:
                     continue
                 try:
                     with KeyInterrupt(confirm=True) as interrupt:
-                        result = await agent.run(
-                            turn.prompt, should_cancel=interrupt.is_set, history=history or None
-                        )
+                        agent.session.should_background = interrupt.consume_background
+                        try:
+                            result = await agent.run(
+                                turn.prompt, should_cancel=interrupt.is_set, history=history or None
+                            )
+                        finally:
+                            agent.session.should_background = None
                     history = result.messages
+                    history, scheduled = await agent.drain_scheduler_deliveries(history)
                 except LLMTransientError as exc:
                     # A network hiccup must not tear down the whole session: report it and
                     # keep the loop (and the accumulated context) alive for a retry.
@@ -561,7 +619,11 @@ def chat_command(args: argparse.Namespace) -> int:
                     continue
                 if not ui.is_live:
                     print(result.answer)
+                    for scheduled_result in scheduled:
+                        print(scheduled_result.answer)
         finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
             # SessionEnd is host-driven: leaving the chat loop closes the session.
             await agent.fire_session_end("chat_exit")
 
@@ -752,8 +814,10 @@ def health_command(args: argparse.Namespace) -> int:
     from agent_core.health import HealthCheck, HealthReport, collect_dependency_checks, render_human
 
     checks: list[HealthCheck] = []
+    tool_suite = None
     try:
         resolve_config({}, config_file=_config_file(args))
+        tool_suite = resolve_tool_suite_config(_config_file(args))
         checks.append(HealthCheck("configuration", True, "ok", detail="loaded successfully"))
     except Exception as e:
         checks.append(HealthCheck("configuration", True, "error", detail=str(e)))
@@ -789,7 +853,18 @@ def health_command(args: argparse.Namespace) -> int:
     except Exception as e:
         checks.append(HealthCheck("memory", True, "error", detail=str(e)))
 
-    checks.extend(collect_dependency_checks(args.profile))
+    bash_executable = os.getenv("POLARIS_BASH_PATH")
+    powershell_executable = None
+    if tool_suite is not None:
+        bash_executable = tool_suite.shell.bash.executable or bash_executable
+        powershell_executable = tool_suite.shell.powershell.executable
+    checks.extend(
+        collect_dependency_checks(
+            args.profile,
+            bash_executable=bash_executable,
+            powershell_executable=powershell_executable,
+        )
+    )
     report = HealthReport(args.profile, tuple(checks))
     print(report.to_json() if args.json else render_human(report))
     return 0 if report.status != "error" else 1
@@ -801,6 +876,39 @@ def uninstall_command(args: argparse.Namespace) -> int:
     from agent_core.uninstall import uninstall_from_cli
 
     return uninstall_from_cli(args)
+
+
+def scheduler_service_command(args: argparse.Namespace) -> int:
+    """Install, inspect, or remove the least-privilege scheduler user service."""
+    from agent_core.scheduler_service import (
+        default_receipt_path,
+        install_user_service,
+        uninstall_user_service,
+    )
+
+    receipt_path = default_receipt_path()
+    try:
+        if args.action == "install":
+            config = resolve_tool_suite_config(_config_file(args)).scheduler
+            receipt = install_user_service(
+                executable=sys.executable, database=config.database_path(),
+                receipt_path=receipt_path,
+            )
+            print(json.dumps(receipt, ensure_ascii=False, indent=2))
+            return 0
+        if args.action == "uninstall":
+            uninstall_user_service(
+                expected_executable=sys.executable, receipt_path=receipt_path,
+                purge_data=bool(args.purge_data),
+            )
+            print("Scheduler user service removed.")
+            return 0
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        print(json.dumps(receipt, ensure_ascii=False, indent=2))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
 
 
 def mcp_command(args: argparse.Namespace) -> int:
@@ -879,19 +987,19 @@ def main(argv: list[str] | None = None) -> int:
             "--allow",
             action="append",
             metavar="RULE",
-            help="Add an allow rule, e.g. --allow 'run_command(git *)'. Repeatable.",
+            help="Add an allow rule, e.g. --allow 'bash(git *)'. Repeatable.",
         )
         subparser.add_argument(
             "--deny",
             action="append",
             metavar="RULE",
-            help="Add a deny rule, e.g. --deny 'run_command(rm *)'. Repeatable; deny wins.",
+            help="Add a deny rule, e.g. --deny 'bash(rm *)'. Repeatable; deny wins.",
         )
         subparser.add_argument(
             "--ask",
             action="append",
             metavar="RULE",
-            help="Add an ask rule (force confirmation), e.g. --ask 'run_command'. Repeatable.",
+            help="Add an ask rule (force confirmation), e.g. --ask 'bash'. Repeatable.",
         )
         subparser.add_argument("--provider", choices=list(PROVIDERS), default=None)
         subparser.add_argument(
@@ -993,7 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("task")
     add_common(run_parser)
     add_session_flags(run_parser)
-    run_parser.set_defaults(func=run_command)
+    run_parser.set_defaults(func=run_task)
 
     chat_parser = subparsers.add_parser("chat")
     add_common(chat_parser)
@@ -1051,6 +1159,16 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Emit a machine-readable health report."
     )
     health_parser.set_defaults(func=health_command)
+
+    scheduler_parser = subparsers.add_parser(
+        "scheduler-service", help="Manage the scheduler's current-user service."
+    )
+    scheduler_parser.add_argument("action", choices=["install", "status", "uninstall"])
+    scheduler_parser.add_argument(
+        "--purge-data", action="store_true", help="Delete the scheduler database on uninstall."
+    )
+    add_config_flag(scheduler_parser)
+    scheduler_parser.set_defaults(func=scheduler_service_command)
 
     uninstall_parser = subparsers.add_parser(
         "uninstall",

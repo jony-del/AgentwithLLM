@@ -12,7 +12,9 @@ ceiling on the session is enforced by the factory.
 
 from __future__ import annotations
 
-from typing import Any
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_types import (
@@ -22,7 +24,7 @@ from agent_core.permission_types import (
     PermissionResult,
 )
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
+from agent_core.tools.base import ConcurrencySpec, LockMode, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 
 _PRESETS = {"read_only", "full"}
@@ -55,6 +57,10 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
                     "model. Each dispatch chooses independently, so cheaper sub-tasks can "
                     "run a smaller model."
                 ),
+            },
+            "isolation": {
+                "type": "string", "enum": ["shared", "worktree"],
+                "description": "shared uses the current workspace; worktree creates an isolated Git worktree.",
             },
         },
         "required": ["task"],
@@ -91,7 +97,7 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
-        mode = "write" if preset == "full" else "read"
+        mode: LockMode = "write" if preset == "full" else "read"
         return ConcurrencySpec((ResourceLock("fs", str(self.session.workspace.resolve()), mode, subtree=True),))
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
@@ -103,6 +109,9 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         if preset not in _PRESETS:
             preset = "read_only"
         model = str(arguments.get("model", "")).strip() or None
+        isolation = str(arguments.get("isolation", "shared"))
+        if isolation not in {"shared", "worktree"}:
+            isolation = "shared"
 
         factory = self.session.subagent_factory
         if factory is None:
@@ -113,7 +122,13 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
                 metadata={"error_type": "Unavailable"},
             )
         try:
-            answer = await factory(task, preset, model)
+            parameters = inspect.signature(factory).parameters
+            factory_call = cast(Callable[..., Awaitable[str]], factory)
+            answer = (
+                await factory_call(task, preset, model, isolation)
+                if len(parameters) >= 4
+                else await factory_call(task, preset, model)
+            )
         except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
             return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
-        return ToolResult(self.name, answer, metadata={"preset": preset, "model": model})
+        return ToolResult(self.name, answer, metadata={"preset": preset, "model": model, "isolation": isolation})

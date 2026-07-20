@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from agent_core.config import (
     load_dotenv,
     resolve_concurrency_config,
@@ -172,18 +174,27 @@ def test_resolve_permission_rules_from_toml(tmp_path: Path) -> None:
     config_file.write_text(
         """
         [permissions]
-        allow = ["run_command(git *)"]
-        deny = ["run_command(rm *)", "bad("]
+        allow = ["bash(git *)"]
+        deny = ["bash(rm *)", "bad("]
         """,
         encoding="utf-8",
     )
     rules = resolve_permission_rules(config_file)
-    assert rules.allow_matches("run_command", {"command": "git status"})
-    assert rules.deny_matches("run_command", {"command": "rm x"})
+    assert rules.allow_matches("bash", {"command": "git status"})
+    assert rules.deny_matches("bash", {"command": "rm x"})
     # The unparseable "bad(" entry was dropped, not raised.
     assert len(rules.deny) == 1
-    matched = rules.allow_match("run_command", {"command": "git status"})
+    matched = rules.allow_match("bash", {"command": "git status"})
     assert matched is not None and matched.source is PermissionRuleSource.USER
+
+
+def test_legacy_run_command_permission_rule_fails_with_migration_help(tmp_path: Path) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        '[permissions]\nallow = ["run_command(git *)"]\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="bash.*powershell"):
+        resolve_permission_rules(config_file)
 
 
 def test_resolve_permission_rules_absent_table(tmp_path: Path) -> None:

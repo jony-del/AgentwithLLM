@@ -158,8 +158,8 @@ class SessionContext:
     # ``str | None`` is an optional per-spawn model override (None → inherit the parent's
     # model); each spawn call chooses independently, so one leader can fan out a mix of
     # Haiku/Sonnet/Opus children.
-    subagent_factory: Callable[[str, str, str | None], Awaitable[str]] | None = None
-    teammate_factory: Callable[[str, str, str, str | None, str, str | None], Awaitable[str]] | None = None
+    subagent_factory: Callable[[str, str, str | None, str], Awaitable[str]] | None = None
+    teammate_factory: Callable[[str, str, str, str | None, str, str | None, str], Awaitable[str]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None
@@ -179,7 +179,19 @@ class SessionContext:
     plan_store: PlanArtifactStore = field(default_factory=PlanArtifactStore)
     permission_mode_setter: Callable[..., object] | None = None
     permission_grant_setter: Callable[[str], object] | None = None
+    permission_workspace_setter: Callable[[Path], None] | None = None
     registered_tool_names: frozenset[str] = frozenset()
+    process_supervisor: Any | None = None
+    lsp_manager: Any | None = None
+    worktree_manager: Any | None = None
+    mcp_manager: Any | None = None
+    tool_suite: Any | None = None
+    registry: Any | None = None
+    ask_user: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]] | None = None
+    logger: Any | None = None
+    audit_event: Callable[[str, dict[str, object]], Awaitable[None]] | None = None
+    scheduler_store: Any | None = None
+    should_background: Callable[[], bool] | None = None
     depth: int = 0
     max_depth: int = 1
     # Recently-read file snapshots, keyed by workspace-resolved path string and
@@ -187,6 +199,7 @@ class SessionContext:
     # newest-last so post-compaction re-injection can take the most-recent few. Capped
     # so a long run that reads many files can't grow this unbounded.
     read_file_state: dict[str, str] = field(default_factory=dict)
+    notebook_reads: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def notify_todos(self) -> None:
         if self.ui_notify is not None:

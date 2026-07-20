@@ -29,6 +29,13 @@ class ToolDisplayProvider:
 LockMode = Literal["read", "write"]
 
 
+def coerce_int(value: object) -> int:
+    """Convert a JSON-compatible scalar without accepting arbitrary objects."""
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        return int(value)
+    raise TypeError(f"expected an integer-compatible value, got {type(value).__name__}")
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceLock:
     """A logical resource a tool call reads or writes.
@@ -52,6 +59,47 @@ class ConcurrencySpec:
     exclusive: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionScope:
+    """Per-call filesystem/network boundaries passed to execution providers.
+
+    A scope is immutable so concurrent tools cannot accidentally mutate global
+    sandbox state while another command is being prepared.  Backends that do not
+    yet understand the extra roots still receive the active workspace through the
+    existing wrap seam and therefore fail no less safely than before.
+    """
+
+    workspace: Path
+    git_common_dir: Path | None = None
+    read_only_roots: tuple[Path, ...] = ()
+    writable_roots: tuple[Path, ...] = ()
+    private_temp: Path | None = None
+    network: Literal["deny", "allow"] = "deny"
+    workspace_writable: bool = True
+
+    @classmethod
+    def for_workspace(
+        cls,
+        workspace: str | Path,
+        *,
+        git_common_dir: str | Path | None = None,
+        read_only_roots: tuple[str | Path, ...] = (),
+        writable_roots: tuple[str | Path, ...] = (),
+        private_temp: str | Path | None = None,
+        network: Literal["deny", "allow"] = "deny",
+        workspace_writable: bool = True,
+    ) -> "ExecutionScope":
+        return cls(
+            Path(workspace).resolve(),
+            Path(git_common_dir).resolve() if git_common_dir is not None else None,
+            tuple(Path(item).resolve() for item in read_only_roots),
+            tuple(Path(item).resolve() for item in writable_roots),
+            Path(private_temp).resolve() if private_temp is not None else None,
+            network,
+            workspace_writable,
+        )
+
+
 class WorkspacePathMixin:
     """Confine file/command access to a workspace root.
 
@@ -62,6 +110,10 @@ class WorkspacePathMixin:
 
     def __init__(self, workspace: str | Path | None = None) -> None:
         self.workspace = Path(workspace or Path.cwd()).resolve()
+
+    def bind_workspace(self, workspace: str | Path) -> None:
+        """Atomically repoint a workspace-scoped tool at a new project root."""
+        self.workspace = Path(workspace).resolve()
 
     def resolve_workspace_path(self, raw_path: object) -> Path:
         path = Path(str(raw_path))

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from prompt_toolkit.document import Document
 
     from agent_core.react import ReActAgent
+    from agent_core.skills import Skill
 
 # ``/name`` with no space yet → still completing the command/skill name.
 _FIRST_TOKEN = re.compile(r"^/(?P<name>\S*)$")
@@ -78,7 +79,9 @@ class SlashCompleter(Completer):
                 )
 
         try:
-            skills = sorted(self._agent.skills.user_invocable(), key=lambda s: s.name)
+            skills: list[Skill] = sorted(
+                self._agent.skills.user_invocable(), key=lambda s: s.name
+            )
         except Exception:  # noqa: BLE001 - completion must never break input
             return
         for skill in skills:

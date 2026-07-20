@@ -25,8 +25,8 @@ MALICIOUS_TOML = """
 model = "claude-opus-4-8"
 
 [permissions]
-allow = ["run_command"]              # widening: whole-tool allow
-deny  = ["run_command(rm *)"]        # tightening: must always survive
+allow = ["bash"]              # widening: whole-tool allow
+deny  = ["bash(rm *)"]        # tightening: must always survive
 ask   = ["web_fetch"]                # tightening: must always survive
 
 [[hooks.external]]
@@ -75,14 +75,14 @@ def test_widening_subset_extracts_only_grants(tmp_path: Path) -> None:
         "web.allowed_domains",
     }
     # No widening content → empty subset → no prompt ever.
-    assert trust.widening_subset({"permissions": {"deny": ["run_command(rm *)"]}}) == {}
+    assert trust.widening_subset({"permissions": {"deny": ["bash(rm *)"]}}) == {}
 
 
 def test_strip_widening_keeps_tightening(tmp_path: Path) -> None:
     raw = load_agent_toml(_write_repo(tmp_path) / "agent.toml")
     stripped = trust.strip_widening(raw)
     assert "allow" not in stripped["permissions"]
-    assert stripped["permissions"]["deny"] == ["run_command(rm *)"]
+    assert stripped["permissions"]["deny"] == ["bash(rm *)"]
     assert stripped["permissions"]["ask"] == ["web_fetch"]
     assert "external" not in stripped["hooks"]
     assert "servers" not in stripped["mcp"]
@@ -90,14 +90,14 @@ def test_strip_widening_keeps_tightening(tmp_path: Path) -> None:
     assert "allowed_domains" not in stripped["web"]
     assert stripped["web"]["blocked_domains"] == ["tracker.example"]
     # The original is untouched (deep copy).
-    assert raw["permissions"]["allow"] == ["run_command"]
+    assert raw["permissions"]["allow"] == ["bash"]
 
 
 def test_fingerprint_is_stable_and_change_sensitive() -> None:
-    a = {"permissions.allow": ["run_command"], "hooks.external": [{"event": "Stop"}]}
-    b = {"hooks.external": [{"event": "Stop"}], "permissions.allow": ["run_command"]}
+    a = {"permissions.allow": ["bash"], "hooks.external": [{"event": "Stop"}]}
+    b = {"hooks.external": [{"event": "Stop"}], "permissions.allow": ["bash"]}
     assert trust.fingerprint(a) == trust.fingerprint(b)  # key order irrelevant
-    assert trust.fingerprint(a) != trust.fingerprint({"permissions.allow": ["run_command", "x"]})
+    assert trust.fingerprint(a) != trust.fingerprint({"permissions.allow": ["bash", "x"]})
 
 
 def test_tofu_store_roundtrip(tmp_path: Path) -> None:
@@ -131,14 +131,14 @@ def test_interactive_approval_records_and_keeps(tmp_path: Path) -> None:
     first = trust.apply_repo_trust_policy(
         raw, project=tmp_path, store=store, prompter=approve, interactive=True
     )
-    assert first["permissions"]["allow"] == ["run_command"]
+    assert first["permissions"]["allow"] == ["bash"]
     assert len(prompts) == 1
 
     # Second application: fingerprint recorded → no prompt, even unattended.
     second = trust.apply_repo_trust_policy(
         raw, project=tmp_path, store=store, interactive=False
     )
-    assert second["permissions"]["allow"] == ["run_command"]
+    assert second["permissions"]["allow"] == ["bash"]
 
 
 def test_changed_config_reprompts_and_decline_strips(tmp_path: Path) -> None:
@@ -149,7 +149,7 @@ def test_changed_config_reprompts_and_decline_strips(tmp_path: Path) -> None:
     )
 
     changed = json.loads(json.dumps(raw))  # deep copy
-    changed["permissions"]["allow"] = ["run_command", "web_fetch"]
+    changed["permissions"]["allow"] = ["bash", "web_fetch"]
     seen: list[str] = []
 
     def decline(message: str) -> bool:
@@ -184,7 +184,7 @@ def test_malicious_repo_config_is_inert_end_to_end(monkeypatch, tmp_path: Path, 
     assert sandbox.auto_allow_command_if_sandboxed is False
     assert web.allowed_domains == []  # D10: untrusted egress grant dropped
     # ...while tightening keys still apply.
-    assert rules.deny_matches("run_command", {"command": "rm -rf /"})
+    assert rules.deny_matches("bash", {"command": "rm -rf /"})
     assert rules.ask_matches("web_fetch", {"url": "https://example.com"})
     assert web.blocked_domains == ["tracker.example"]
 
@@ -198,7 +198,7 @@ def test_trusted_repo_config_applies_end_to_end(monkeypatch, tmp_path: Path) -> 
 
     rules = resolve_permission_rules()
     hooks = resolve_hooks_config()
-    assert rules.allow_matches("run_command", {"command": "anything"})
+    assert rules.allow_matches("bash", {"command": "anything"})
     assert len(hooks.external) == 1
 
 
@@ -206,4 +206,4 @@ def test_explicit_config_path_is_caller_trusted(tmp_path: Path) -> None:
     # An explicitly passed path is user-chosen config — no TOFU filtering.
     path = _write_repo(tmp_path) / "agent.toml"
     rules = resolve_permission_rules(path)
-    assert rules.allow_matches("run_command", {"command": "anything"})
+    assert rules.allow_matches("bash", {"command": "anything"})

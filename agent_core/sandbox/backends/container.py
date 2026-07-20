@@ -113,7 +113,11 @@ class ContainerBackend(SandboxBackend):
         ws_guest = _map_workspace_path(workspace, cfg.windows_isolation)
 
         prefix: list[str] = [self._runtime, "run", "--rm", "--init"]
-        prefix += ["-v", f"{ws_host}:{ws_guest}", "-w", ws_guest]
+        workspace_read_only = str(workspace) in expand_paths(
+            config.filesystem.deny_write, workspace
+        )
+        suffix = ":ro" if workspace_read_only else ""
+        prefix += ["-v", f"{ws_host}:{ws_guest}{suffix}", "-w", ws_guest]
 
         # Extra writable mounts (same-path where possible).
         for path in expand_paths(config.filesystem.allow_write, workspace):

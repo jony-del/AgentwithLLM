@@ -49,7 +49,7 @@ async def test_skill_with_extra_capability_requires_confirmation_even_in_bypass(
         description="d",
         body="Deploy it",
         capabilities=("network",),
-        allowed_tools=("run_command",),
+        allowed_tools=("bash",),
     )
     tool = SkillTool(_session([skill]))
 

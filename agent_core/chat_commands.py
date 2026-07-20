@@ -18,7 +18,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from agent_core import tokens
 from agent_core.config import resolve_mcp_config
@@ -28,6 +28,7 @@ from agent_core.models import Message
 from agent_core.permissions import PermissionMode, permission_mode_label
 from agent_core.sandbox import SandboxRequiredError
 from agent_core.skills import (
+    Skill,
     SkillContext,
     SkillPromptContext,
     build_skill_prompt,
@@ -85,7 +86,9 @@ async def _cmd_help(agent: "ReActAgent", ui: AgentUI, args: str, history: list[M
     for name, (_, summary) in sorted(_COMMAND_HELP.items()):
         print(f"  /{name:<10} {summary}")
     print("  /exit, /quit  Leave the chat.")
-    skills = sorted(agent.skills.user_invocable(), key=lambda skill: skill.name)
+    skills: list[Skill] = sorted(
+        agent.skills.user_invocable(), key=lambda skill: skill.name
+    )
     if skills:
         print("\nSkills (run as /<name> [args]):")
         for skill in skills:
@@ -97,7 +100,9 @@ async def _cmd_help(agent: "ReActAgent", ui: AgentUI, args: str, history: list[M
 
 
 async def _cmd_skills(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
-    skills = sorted(agent.skills.user_invocable(), key=lambda skill: skill.name)
+    skills: list[Skill] = sorted(
+        agent.skills.user_invocable(), key=lambda skill: skill.name
+    )
     if not skills:
         print("No skills available. Drop a SKILL.md under ./.polaris/skills or ~/.polaris/skills.")
         return ChatTurn()
@@ -309,26 +314,26 @@ async def _handle_permission_rules(agent: "ReActAgent", ui: AgentUI, args: str) 
     ):
         print("Managed policy disables persistent permission grants.")
         return
-    rule = parts[2].strip()
+    rule_text = parts[2].strip()
     try:
         from agent_core.permission_rules import parse_rule
 
-        if parse_rule(rule) is None:
+        if parse_rule(rule_text) is None:
             raise ValueError("malformed permission rule")
         if destination is not PermissionDestination.SESSION:
             confirmed = await asyncio.to_thread(
                 ui.confirm_action,
-                f"Persist allow rule {rule!r} to {destination.value} configuration?",
+                f"Persist allow rule {rule_text!r} to {destination.value} configuration?",
             )
             if not confirmed:
                 print("Persistent permission rule was not confirmed.")
                 return
-            persist_allow_rule(rule, destination, agent.session.workspace)
-        agent.permissions.add_session_rule(rule)
+            persist_allow_rule(rule_text, destination, agent.session.workspace)
+        agent.permissions.add_session_rule(rule_text)
     except (OSError, ValueError) as exc:
         print(f"Permission rule was not added: {exc}")
         return
-    print(f"Added allow rule to {destination.value}: {rule}")
+    print(f"Added allow rule to {destination.value}: {rule_text}")
 
 
 async def _cmd_mcp(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
@@ -463,7 +468,8 @@ async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Me
         print("[error] fork skills need sub-agents, which are unavailable here.")
         return ChatTurn()
     try:
-        answer = await factory(prompt, fork_preset(skill.allowed_tools), skill.model)
+        factory_call = cast(Callable[..., Awaitable[str]], factory)
+        answer = await factory_call(prompt, fork_preset(skill.allowed_tools), skill.model)
     except Exception as exc:  # noqa: BLE001 - a skill failure must not tear down the chat
         print(f"[error] skill /{skill.name} failed: {type(exc).__name__}: {exc}")
         return ChatTurn()

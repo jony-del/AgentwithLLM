@@ -8,7 +8,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from agent_core.permission_types import PermissionDestination
 
@@ -96,25 +96,32 @@ def _exclusive_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
 
 
 def _update_permissions_allow(text: str, rule: str) -> str:
+    tomlkit_module: Any = None
     try:
         import tomlkit
     except ModuleNotFoundError:
-        tomlkit = None  # type: ignore[assignment]
-    if tomlkit is not None:
+        pass
+    else:
+        tomlkit_module = tomlkit
+    if tomlkit_module is not None:
         try:
-            document = tomlkit.parse(text) if text.strip() else tomlkit.document()
+            document = (
+                tomlkit_module.parse(text)
+                if text.strip()
+                else tomlkit_module.document()
+            )
             permissions = document.get("permissions")
             if permissions is None:
-                permissions = tomlkit.table()
+                permissions = tomlkit_module.table()
                 document["permissions"] = permissions
             allow = permissions.get("allow")
             if allow is None:
-                allow = tomlkit.array().multiline(True)
+                allow = tomlkit_module.array().multiline(True)
                 permissions["allow"] = allow
             existing = [str(item) for item in allow]
             if rule not in existing:
                 allow.append(rule)
-            return tomlkit.dumps(document)
+            return tomlkit_module.dumps(document)
         except Exception as exc:
             raise PermissionPersistenceError(f"cannot update TOML: {exc}") from exc
     try:

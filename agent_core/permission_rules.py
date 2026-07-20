@@ -8,7 +8,7 @@ should be asked about, based on rules written as ``ToolName(content)`` strings.
 
 The static per-tool ``ToolRisk`` gate in :mod:`agent_core.permissions` only sees the
 tool *class*; these rules see the *arguments* (the shell command, the path, the URL),
-so a user can say ``run_command(git *)`` allow but ``run_command(rm *)`` deny.
+so a user can say ``bash(git *)`` allow but ``bash(rm *)`` deny.
 
 Design invariants (mirroring the reference + the project's security-provenance stance):
 
@@ -44,7 +44,7 @@ from agent_core.permission_types import (
 # Tools whose primary argument is a free-form shell command line, so their rule
 # content is matched with shell decomposition + anti-evasion rather than as a plain
 # string. Keyed by the argument that holds the command.
-_SHELL_COMMAND_TOOLS = {"run_command": "command"}
+_SHELL_COMMAND_TOOLS = {"bash": "command", "powershell": "command"}
 
 # Argument keys tried (in order) to extract the single string a non-shell rule matches
 # against — a path for file tools, a URL for web tools, a target for the test runner.

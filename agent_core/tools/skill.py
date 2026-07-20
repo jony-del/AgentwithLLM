@@ -12,7 +12,8 @@ schema lists the *model-invocable* skills, so the model knows what it can call.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_types import DecisionSource, PermissionContext, PermissionResult
@@ -146,7 +147,8 @@ class SkillTool(SessionAwareMixin, Tool):
                 )
             preset = fork_preset(skill.allowed_tools)
             try:
-                answer = await factory(prompt, preset, skill.model)
+                factory_call = cast(Callable[..., Awaitable[str]], factory)
+                answer = await factory_call(prompt, preset, skill.model)
             except Exception as exc:  # noqa: BLE001 - a skill failure must not crash the parent run
                 return ToolResult(self.name, f"Skill error: {type(exc).__name__}: {exc}", ok=False)
             return ToolResult(

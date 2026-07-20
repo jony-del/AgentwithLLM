@@ -12,7 +12,10 @@ Two process-wide arrangements:
 """
 
 import os
+import subprocess
 import tempfile
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +23,44 @@ os.environ.setdefault("AGENT_SANDBOX_ALLOW_UNATTENDED", "1")
 os.environ.setdefault(
     "AGENT_TRUST_STORE", os.path.join(tempfile.mkdtemp(prefix="polaris-test-trust-"), "trusted.json")
 )
+
+
+def _create_directory_redirect(link: Path, target: Path) -> str:
+    """Create a directory symlink, falling back to a Windows junction without elevation."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            pytest.fail(f"could not create directory redirect: {exc}")
+        process = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(link),
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if process.returncode:
+            detail = (process.stdout or process.stderr).strip()
+            pytest.fail(f"could not create directory junction: {detail}")
+        kind = "junction"
+    else:
+        kind = "symlink"
+    if link.resolve() != target.resolve():
+        pytest.fail(f"{kind} did not resolve to its target")
+    return kind
+
+
+@pytest.fixture
+def directory_redirect() -> Callable[[Path, Path], str]:
+    return _create_directory_redirect
 
 
 @pytest.fixture(autouse=True)

@@ -212,7 +212,7 @@ class OpenAICompatProvider(LLMProvider):
             elif message.role == "assistant":
                 entry: dict[str, Any] = {"role": "assistant", "content": message.content or None}
                 tool_calls = message.metadata.get("tool_calls", [])
-                calls = []
+                calls: list[dict[str, Any]] = []
                 if isinstance(tool_calls, list):
                     for tool_call in tool_calls:
                         if not isinstance(tool_call, dict) or not tool_call.get("name"):

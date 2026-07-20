@@ -9,7 +9,8 @@ from agent_core.permissions import (
     permission_mode_label,
 )
 from agent_core.tools.base import Tool
-from agent_core.tools.builtin import EchoTool, ReadTextFileTool, RunCommandTool, WriteTextFileTool
+from agent_core.tools.builtin import EchoTool, ReadTextFileTool, WriteTextFileTool
+from agent_core.tools.shell import BashTool
 
 
 def test_plan_mode_strictly_denies_write_tools() -> None:
@@ -70,45 +71,45 @@ def test_confirm_deny_rejects() -> None:
 
 
 def test_deny_rule_blocks_matching_command() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
     policy = PermissionPolicy(PermissionMode.AUTO, rules=rules)
-    tool = RunCommandTool()
-    denied = policy.decide(tool, ToolCall("run_command", {"command": "rm -rf /"}))
+    tool = BashTool()
+    denied = policy.decide(tool, ToolCall("bash", {"command": "rm -rf /"}))
     assert not denied.allowed
     assert "denied by rule" in denied.reason
     # A safe read command has a fast path; an unresolved development command is
     # delegated to the automated classifier.
-    assert policy.decide(tool, ToolCall("run_command", {"command": "ls"})).allowed
-    other = policy.decide(tool, ToolCall("run_command", {"command": "pytest -q"}))
+    assert policy.decide(tool, ToolCall("bash", {"command": "ls"})).allowed
+    other = policy.decide(tool, ToolCall("bash", {"command": "pytest -q"}))
     assert not other.allowed
     assert other.classify
 
 
 def test_allow_rule_permits_command_under_default() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(git *)"])
+    rules = RuleSet.from_lists(allow=["bash(git *)"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules)
-    tool = RunCommandTool()
-    decision = policy.decide(tool, ToolCall("run_command", {"command": "git status"}))
+    tool = BashTool()
+    decision = policy.decide(tool, ToolCall("bash", {"command": "git status"}))
     assert decision.allowed
     assert "allowed by rule" in decision.reason
 
 
 def test_deny_beats_allow() -> None:
-    rules = RuleSet.from_lists(allow=["run_command(git *)"], deny=["run_command(git push *)"])
+    rules = RuleSet.from_lists(allow=["bash(git *)"], deny=["bash(git push *)"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules)
-    tool = RunCommandTool()
-    assert not policy.decide(tool, ToolCall("run_command", {"command": "git push --force"})).allowed
-    assert policy.decide(tool, ToolCall("run_command", {"command": "git status"})).allowed
+    tool = BashTool()
+    assert not policy.decide(tool, ToolCall("bash", {"command": "git push --force"})).allowed
+    assert policy.decide(tool, ToolCall("bash", {"command": "git status"})).allowed
 
 
 def test_bypass_mode_allows_unmatched_but_deny_still_wins() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
     policy = PermissionPolicy(PermissionMode.BYPASS, rules=rules)
-    tool = RunCommandTool()
+    tool = BashTool()
     # bypass allows a dangerous command the plain matrix would block...
-    assert policy.decide(tool, ToolCall("run_command", {"command": "curl x"})).allowed
+    assert policy.decide(tool, ToolCall("bash", {"command": "curl x"})).allowed
     # ...but a deny rule is bypass-immune.
-    assert not policy.decide(tool, ToolCall("run_command", {"command": "rm x"})).allowed
+    assert not policy.decide(tool, ToolCall("bash", {"command": "rm x"})).allowed
 
 
 def test_sensitive_path_safety_net_is_bypass_immune() -> None:
@@ -140,10 +141,10 @@ class _StubSandbox:
 
 def test_explicit_ask_is_not_overridden_by_sandbox_auto_allow() -> None:
     # An explicit ask is stronger than sandbox auto-allow.
-    rules = RuleSet.from_lists(ask=["run_command"])
+    rules = RuleSet.from_lists(ask=["bash"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=_StubSandbox(True))
-    tool = RunCommandTool()
-    decision = policy.decide(tool, ToolCall("run_command", {"command": "ls"}))
+    tool = BashTool()
+    decision = policy.decide(tool, ToolCall("bash", {"command": "ls"}))
     assert not decision.allowed
     assert "explicit ask" in decision.reason
 
@@ -154,19 +155,19 @@ def test_sandbox_auto_allow_defaults_off() -> None:
 
     assert SandboxConfig().auto_allow_command_if_sandboxed is False
 
-    rules = RuleSet.from_lists(ask=["run_command"])
+    rules = RuleSet.from_lists(ask=["bash"])
     sandbox = _StubSandbox(True)
     sandbox.config.auto_allow_command_if_sandboxed = False
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=sandbox)
-    decision = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"}))
+    decision = policy.decide(BashTool(), ToolCall("bash", {"command": "ls"}))
     assert not decision.allowed  # ask rule stands; non-interactive → deny
 
 
 def test_sandbox_coupling_off_when_not_sandboxed() -> None:
-    rules = RuleSet.from_lists(ask=["run_command"])
+    rules = RuleSet.from_lists(ask=["bash"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, rules=rules, sandbox=_StubSandbox(False))
-    tool = RunCommandTool()
-    decision = policy.decide(tool, ToolCall("run_command", {"command": "ls"}))
+    tool = BashTool()
+    decision = policy.decide(tool, ToolCall("bash", {"command": "ls"}))
     # not sandboxed → the ask rule stands (non-interactive → deny)
     assert not decision.allowed
 
@@ -174,8 +175,8 @@ def test_sandbox_coupling_off_when_not_sandboxed() -> None:
 def test_no_rules_uses_auto_fast_path_and_classifier_boundary() -> None:
     policy = PermissionPolicy(PermissionMode.AUTO)
     assert policy.decide(EchoTool(), ToolCall("echo", {"text": "ok"})).allowed
-    assert policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "ls"})).allowed
-    action = policy.decide(RunCommandTool(), ToolCall("run_command", {"command": "pytest -q"}))
+    assert policy.decide(BashTool(), ToolCall("bash", {"command": "ls"})).allowed
+    action = policy.decide(BashTool(), ToolCall("bash", {"command": "pytest -q"}))
     assert not action.allowed and action.classify
 
 
@@ -272,34 +273,34 @@ def test_secret_deny_rule_still_beats_the_ask() -> None:
 
 def test_always_for_shell_command_is_per_subcommand() -> None:
     policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"))
-    tool = RunCommandTool()
-    call = ToolCall("run_command", {"command": "git status"})
+    tool = BashTool()
+    call = ToolCall("bash", {"command": "git status"})
 
     first = policy.confirm(policy.decide(tool, call), tool, call)
     assert first.allowed
 
     # The same normalized command is now session-allowed...
-    again = policy.decide(tool, ToolCall("run_command", {"command": "git status"}))
+    again = policy.decide(tool, ToolCall("bash", {"command": "git status"}))
     assert again.allowed and not again.ask_user
     # ...but a DIFFERENT command still asks — "always" must not be a whole-tool grant.
-    other = policy.decide(tool, ToolCall("run_command", {"command": "rm -rf build"}))
+    other = policy.decide(tool, ToolCall("bash", {"command": "rm -rf build"}))
     assert not other.allowed
     assert other.ask_user
 
 
 def test_always_compound_command_requires_every_subcommand_granted() -> None:
     policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"))
-    tool = RunCommandTool()
-    call = ToolCall("run_command", {"command": "git status"})
+    tool = BashTool()
+    call = ToolCall("bash", {"command": "git status"})
     policy.confirm(policy.decide(tool, call), tool, call)
 
     # A compound line is covered only when every sub-command was granted.
-    partial = policy.decide(tool, ToolCall("run_command", {"command": "git status && rm x"}))
+    partial = policy.decide(tool, ToolCall("bash", {"command": "git status && rm x"}))
     assert not partial.allowed
 
 
 def test_session_always_does_not_override_deny_or_safety_net() -> None:
-    rules = RuleSet.from_lists(deny=["run_command(rm *)"])
+    rules = RuleSet.from_lists(deny=["bash(rm *)"])
     policy = PermissionPolicy(PermissionMode.DEFAULT, prompter=_prompter("always"), rules=rules)
 
     write_tool = WriteTextFileTool()
@@ -310,11 +311,11 @@ def test_session_always_does_not_override_deny_or_safety_net() -> None:
     assert not guarded.allowed
     assert guarded.ask_user
 
-    run_tool = RunCommandTool()
-    ls_call = ToolCall("run_command", {"command": "ls"})
+    run_tool = BashTool()
+    ls_call = ToolCall("bash", {"command": "ls"})
     policy.confirm(policy.decide(run_tool, ls_call), run_tool, ls_call)
     # A deny rule is immune to any prior "always".
-    denied = policy.decide(run_tool, ToolCall("run_command", {"command": "rm -rf /"}))
+    denied = policy.decide(run_tool, ToolCall("bash", {"command": "rm -rf /"}))
     assert not denied.allowed
     assert "denied by rule" in denied.reason
 
@@ -338,9 +339,9 @@ def test_explicit_ask_is_not_overridden_by_session_always() -> None:
 
 
 def test_bypass_does_not_override_explicit_ask() -> None:
-    rules = RuleSet.from_lists(ask=["run_command"])
+    rules = RuleSet.from_lists(ask=["bash"])
     decision = PermissionPolicy(PermissionMode.BYPASS, rules=rules).decide(
-        RunCommandTool(), ToolCall("run_command", {"command": "git status"})
+        BashTool(), ToolCall("bash", {"command": "git status"})
     )
 
     assert not decision.allowed

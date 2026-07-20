@@ -136,10 +136,11 @@ class Dreamer:
 
     async def _synthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
         request = self._build_insight_request(survivors)
-        if request is None:
+        provider = self.provider
+        if request is None or provider is None:
             return []
         try:
-            result = await self.provider.complete(request, [], self.provider_config)
+            result = await provider.complete(request, [], self.provider_config)
         except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
             report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
             return []

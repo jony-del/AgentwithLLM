@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
+
+import pytest
 
 from agent_core.cli import build_agent
 from agent_core.config import resolve_limits_config
@@ -175,6 +178,9 @@ def _cli_args(**overrides) -> argparse.Namespace:
 
 def test_build_agent_cli_limits_win(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)  # no agent.toml here -> defaults, then CLI override
+    bash = tmp_path / "bash.exe"
+    bash.write_bytes(b"")
+    monkeypatch.setenv("POLARIS_BASH_PATH", str(bash))
     built = build_agent(_cli_args(max_wall_seconds=42.0, max_steps=7))
     agent, mcp = built.agent, built.mcp
     try:
@@ -187,6 +193,9 @@ def test_build_agent_cli_limits_win(tmp_path: Path, monkeypatch) -> None:
 
 def test_build_agent_cli_zero_disables(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    bash = tmp_path / "bash.exe"
+    bash.write_bytes(b"")
+    monkeypatch.setenv("POLARIS_BASH_PATH", str(bash))
     built = build_agent(_cli_args(max_wall_seconds=0, max_steps=0))
     agent, mcp = built.agent, built.mcp
     try:
@@ -195,3 +204,18 @@ def test_build_agent_cli_zero_disables(tmp_path: Path, monkeypatch) -> None:
     finally:
         if mcp is not None:
             mcp.close()
+
+
+def test_build_agent_fails_before_provider_when_git_bash_is_missing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-specific Git Bash preflight")
+    from agent_core.process_supervisor import ShellUnavailableError
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("POLARIS_BASH_PATH", raising=False)
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "missing-program-files"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "missing-local"))
+    with pytest.raises(ShellUnavailableError, match="POLARIS_BASH_PATH"):
+        build_agent(_cli_args())

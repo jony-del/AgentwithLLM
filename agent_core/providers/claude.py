@@ -202,6 +202,7 @@ class ClaudeProvider(LLMProvider):
             return response
 
         response = await self._request_with_retry(open_stream)
+        assert stream is not None
         try:
             return await self._consume_stream(response, stream, should_cancel)
         except (httpx.TransportError, httpx.TimeoutException) as exc:
@@ -287,6 +288,8 @@ class ClaudeProvider(LLMProvider):
         return body
 
     def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
         return {
             "content-type": "application/json",
             "x-api-key": self.api_key,
@@ -561,17 +564,23 @@ class ClaudeProvider(LLMProvider):
                 usage.output_tokens = acc.usage.output_tokens or usage.output_tokens
                 acc.usage = usage
         elif etype == "content_block_start":
-            acc.blocks[event.get("index")] = self._start_block(event.get("content_block", {}))
+            index = event.get("index")
+            if isinstance(index, int):
+                acc.blocks[index] = self._start_block(event.get("content_block", {}))
         elif etype == "content_block_delta":
-            self._apply_delta(acc.blocks.get(event.get("index")), event.get("delta", {}), stream)
+            index = event.get("index")
+            if isinstance(index, int):
+                self._apply_delta(acc.blocks.get(index), event.get("delta", {}), stream)
         elif etype == "content_block_stop":
-            self._finalize_block(
-                acc.blocks.get(event.get("index")),
-                acc.text_parts,
-                acc.thinking_parts,
-                acc.thinking_blocks,
-                acc.tool_calls,
-            )
+            index = event.get("index")
+            if isinstance(index, int):
+                self._finalize_block(
+                    acc.blocks.get(index),
+                    acc.text_parts,
+                    acc.thinking_parts,
+                    acc.thinking_blocks,
+                    acc.tool_calls,
+                )
         elif etype == "message_delta":
             acc.stop_reason = event.get("delta", {}).get("stop_reason") or acc.stop_reason
             # message_delta carries the running output token total at top level.

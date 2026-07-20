@@ -71,6 +71,18 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(mcp, dict) and mcp.get("servers"):
         subset["mcp.servers"] = mcp["servers"]
 
+    tools = raw.get("tools")
+    if isinstance(tools, dict):
+        shell = tools.get("shell")
+        if isinstance(shell, dict):
+            for dialect in ("bash", "powershell"):
+                table = shell.get(dialect)
+                if isinstance(table, dict) and table.get("executable"):
+                    subset[f"tools.shell.{dialect}.executable"] = table["executable"]
+        lsp = tools.get("lsp")
+        if isinstance(lsp, dict) and lsp.get("servers"):
+            subset["tools.lsp.servers"] = lsp["servers"]
+
     # [web].allowed_domains widens egress in unattended modes (D10). blocked_domains
     # only tightens and passes through freely.
     web = raw.get("web")
@@ -101,6 +113,17 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
     mcp = out.get("mcp")
     if isinstance(mcp, dict):
         mcp.pop("servers", None)
+    tools = out.get("tools")
+    if isinstance(tools, dict):
+        shell = tools.get("shell")
+        if isinstance(shell, dict):
+            for dialect in ("bash", "powershell"):
+                table = shell.get(dialect)
+                if isinstance(table, dict):
+                    table.pop("executable", None)
+        lsp = tools.get("lsp")
+        if isinstance(lsp, dict):
+            lsp.pop("servers", None)
     web = out.get("web")
     if isinstance(web, dict):
         web.pop("allowed_domains", None)

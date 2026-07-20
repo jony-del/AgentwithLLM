@@ -15,6 +15,7 @@ if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-
     from agent_core.skills import SkillsConfig
     from agent_core.tool_use_summary import ToolUseSummaryConfig
     from agent_core.tools.web import WebPolicyConfig
+    from agent_core.tool_config import ToolSuiteConfig
 
 _T = TypeVar("_T")
 
@@ -111,19 +112,42 @@ _REPO_DEFAULT_CONFIG = "agent.toml"
 _TRUST_CACHE: dict[tuple[str, int, str], dict[str, Any]] = {}
 
 
-def load_agent_toml(path: str | Path = "agent.toml") -> dict[str, Any]:
-    config_path = Path(path)
-    if not config_path.exists():
+def user_settings_path() -> Path:
+    override = os.getenv("POLARIS_SETTINGS_PATH")
+    return Path(override).expanduser() if override else Path.home() / ".polaris" / "settings.toml"
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    if not path.exists():
         return {}
     try:
         import tomllib
     except ModuleNotFoundError:
         return {}
-    with config_path.open("rb") as file:
-        raw = tomllib.load(file)
-    if str(path) != _REPO_DEFAULT_CONFIG:
-        return raw
-    return _apply_repo_trust(config_path, raw)
+    with path.open("rb") as file:
+        return tomllib.load(file)
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_agent_toml(path: str | Path = "agent.toml") -> dict[str, Any]:
+    config_path = Path(path)
+    try:
+        user = _read_toml(user_settings_path())
+    except RuntimeError:
+        user = {}
+    raw = _read_toml(config_path)
+    if str(path) == _REPO_DEFAULT_CONFIG and raw:
+        raw = _apply_repo_trust(config_path, raw)
+    return _deep_merge(user, raw)
 
 
 def _apply_repo_trust(config_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
@@ -223,6 +247,14 @@ def resolve_web_config(config_file: str | Path = "agent.toml") -> "WebPolicyConf
 
     table = load_agent_toml(config_file).get("web")
     return WebPolicyConfig.from_dict(table if isinstance(table, dict) else None)
+
+
+def resolve_tool_suite_config(config_file: str | Path = "agent.toml") -> "ToolSuiteConfig":
+    """Resolve the nested ``[tools]`` lifecycle/capability configuration."""
+    from agent_core.tool_config import ToolSuiteConfig
+
+    table = load_agent_toml(config_file).get("tools")
+    return ToolSuiteConfig.from_dict(table if isinstance(table, dict) else None)
 
 
 def resolve_output_config(config_file: str | Path = "agent.toml") -> "OutputLimitConfig":
@@ -569,9 +601,9 @@ def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet
     Shape::
 
         [permissions]
-        allow = ["run_command(git *)", "read_text_file(/src/**)"]
-        deny  = ["run_command(rm *)", "web_fetch(domain:evil.example)"]
-        ask   = ["run_command"]
+        allow = ["bash(git *)", "read_text_file(/src/**)"]
+        deny  = ["bash(rm *)", "web_fetch(domain:evil.example)"]
+        ask   = ["bash", "powershell"]
 
     Unparseable rule strings are dropped (not raised), so a sloppy table degrades to
     fewer rules. CLI ``--allow/--deny/--ask`` rules are layered on by the caller via
@@ -587,7 +619,14 @@ def resolve_permission_rules(config_file: str | Path = "agent.toml") -> "RuleSet
 
         def _rules(key: str) -> list[str]:
             value = table.get(key)
-            return [str(item) for item in value] if isinstance(value, list) else []
+            rules = [str(item) for item in value] if isinstance(value, list) else []
+            legacy = [item for item in rules if "run_command" in item]
+            if legacy:
+                raise ValueError(
+                    f"legacy run_command rules are unsupported: {legacy!r}. Split by dialect, "
+                    "for example bash(git *) and powershell(Get-ChildItem *)."
+                )
+            return rules
 
         return RuleSet.from_lists(
             _rules("allow"), _rules("deny"), _rules("ask"), source=source

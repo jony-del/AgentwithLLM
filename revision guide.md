@@ -93,7 +93,7 @@
 | S5 | **子代理权限放大**：teammate 强制 `permission="auto"`（`react.py:1560`）；`dispatch_agent` 本身 risk=WRITE（`tools/subagent.py:54`），auto/dontask 模式自动放行 | 同左 | 父代理的 ask 交互被子代理绕过；`preset="full"` 子代理拿到 WRITE 工具无需确认 |
 | S6 | **沙箱与权限的耦合默认放松**：`auto_allow_command_if_sandboxed=true` 默认 | `sandbox/config.py`；对照参考 strict 配置 `autoAllowBashIfSandboxed: false` | 沙箱一开、命令提示全跳过；而容器逃逸/挂载写穿是真实风险面 |
 | S7 | **外部 hook 一律 fail-open**："degrades to allow + log on any failure — never sink a run" | `hook_adapters.py` 全部适配器；CLAUDE.md 明文 | 对观测 hook 正确；但用户想用 hook 做安全 gate（如命令审计器）时，hook 崩溃 = 门自动打开，无 per-hook fail-closed 选项 |
-| S8 | **session "always allow" 以工具名为粒度** | `permissions.py:148 self._session_allow.add(tool.name)` | 对 `run_command` 答一次 "always" = 本会话放行一切后续任意命令。参考项目按命令前缀规则记忆 |
+| S8 | **session "always allow" 以工具名为粒度** | `permissions.py:148 self._session_allow.add(tool.name)` | 对 `bash/powershell` 答一次 "always" = 本会话放行一切后续任意命令。参考项目按命令前缀规则记忆 |
 | S9 | **`bypass` 模式无部署护栏** | `permissions.py:33` | 参考项目 `--dangerously-skip-permissions` 要求 "sandbox only"，且有 `disableBypassPermissionsMode` 策略开关；本项目 bypass 与沙箱可用性无联动 |
 
 **S 项落地状态（2026-07-03，详见 §6.5）**：
@@ -146,7 +146,7 @@
   剩余部分：`search_text` 为纯 Python 逐文件扫（`tools/builtin.py:192`），
   大仓库上明显慢于 ripgrep。**[推测：性能量级，未基准]**
 - **C2** 无向用户提问的工具（参考 AskUserQuestionTool）——交互模式下模型只能猜。
-- **C3** 无后台/长任务管理（参考 Task* 工具族）：`run_command` 超时即杀，
+- **C3** 无后台/长任务管理（参考 Task* 工具族）：`bash/powershell` 超时即杀，
   无法启动 dev server 再观察。
 - **C4** 无 LSP/诊断集成；无 notebook 编辑。（长期项，非近期必需）
 - **C5** ~~hook 事件面缺口：无 SessionStart/SessionEnd、SubagentStart/SubagentStop、
@@ -278,7 +278,7 @@
 | Q2 | 敏感路径清单扩展：`.env`、`*.pem`、`id_rsa*`、`.ssh/`、`.aws/`、`credentials*`；并对 READ 工具启用安全网 | `permissions.py` | 低（多几次确认提示） | `test_permissions.py`：读 .env 触发 ask | ✅ |
 | Q3 | JSONL/transcript 记录加 `schema_version` | `storage.py`、`transcript.py` | 极低 | `test_storage_schema.py` | ✅ |
 | Q4 | 静默 `except` 补事件/日志（react.py、sandbox 已补） | ~5 个点 | 极低 | 灰盒 | ✅ 全部（skills prompt builder 已补，2026-07-03） |
-| Q5 | `_session_allow` 改为按规范化命令前缀记忆（run_command 特例） | `permissions.py` | 低 | 用例：always 后不同命令仍提示 | ✅ |
+| Q5 | `_session_allow` 改为按规范化命令前缀记忆（bash/powershell 特例） | `permissions.py` | 低 | 用例：always 后不同命令仍提示 | ✅ |
 | Q6 | pytest 移入 `[dev]` extra；`run_tests` 探测 + actionable error | `pyproject.toml`、`tools/builtin.py` | 中低（本地需 `pip install -e .[dev]`） | 无 pytest 环境冒烟 | ✅ |
 | Q7 | GitHub Actions：windows+ubuntu × pytest；ruff E/F + mypy 契约模块 | `.github/workflows/ci.yml` | 低 | CI 绿 | ✅ |
 | Q8 | `auto_allow_command_if_sandboxed` 默认改 `false` | `sandbox/config.py` | 低（行为更保守） | `test_permissions.py` 用例反转 | ✅ |
@@ -434,7 +434,7 @@ Q1–Q5、Q10。产物：新 CLAUDE.md、敏感路径加固、可见降级、sch
 - ~~Glob 工具~~（已完成，`tools/editing.py:31 GlobTool`）；`search_text` 探测 ripgrep
   （有则用，无则回退纯 Python）。
 - AskUserQuestion 工具（仅交互模式注册；依赖 `terminal/` 栈，优先级按 D8）。
-- 后台任务族（启动/查询/停止长进程，配 run_command 超时联动）。
+- 后台任务族（启动/查询/停止长进程，配 bash/powershell 超时联动）。
 - ~~hook 事件补齐：SessionStart/End、SubagentStart/Stop、PostToolUseFailure。~~
   （已完成，见 §6.6 W9，2026-07-04）
 - LSP / worktree 隔离 / notebook：观察需求再排。
@@ -485,6 +485,8 @@ Q1–Q5、Q10。产物：新 CLAUDE.md、敏感路径加固、可见降级、sch
   Anthropic 协议锁死，其次才是覆盖面。优先级上调（见 R2 调整）。
 - **D6 lint/type-check 渐进引入。** 第一步：ruff 开 E、F；mypy 只检查核心契约模块
   （`models.py`、`providers/base.py`、`permissions.py`、`permission_rules.py`）。
+  **2026-07-20 已完成第二步**：mypy 扩展到 `agent_core` 与 `installer` 的全部
+  生产模块；测试代码继续由 pytest 与 Ruff 覆盖。
   后续逐级收紧：ruff 扩圈 → mypy strict → 覆盖率门槛 → 所有 PR 必须通过 CI。
 - **D7 CLAUDE.md 注入降级：确认执行。** repo 文件是项目输入，不得凌驾权限、
   安全策略与 sandbox。preamble 从 "OVERRIDE any default behavior" 改为

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 from agent_core.sandbox.backends.base import SandboxBackend, SandboxTier, to_argv
 from agent_core.sandbox.backends.container import ContainerBackend, _map_workspace_path
@@ -124,7 +125,9 @@ class KataStrategy(VmStrategy):
         # Force the container to run under the Kata OCI runtime for microVM isolation.
         forced = _with_oci_runtime(config, self._kata_runtime)
         wrapped, _ = self._container.wrap(argv, False, config=forced, workspace=workspace)
-        return list(wrapped)  # type: ignore[arg-type]
+        if not isinstance(wrapped, list):
+            raise TypeError("container backend returned a non-argv command")
+        return cast(list[str], wrapped)
 
 
 class HyperVStrategy(VmStrategy):

@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_core.command_security import analyze_command
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_safety import (
     is_secret_path,
@@ -29,13 +28,12 @@ from agent_core.permission_safety import (
 )
 from agent_core.permission_types import (
     DecisionSource,
-    PermissionBehavior,
     PermissionContext,
     PermissionMode,
     PermissionResult,
 )
 from agent_core.sandbox import SandboxAwareMixin
-from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
+from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin, coerce_int
 from agent_core.tools.catalog import builtin_tool
 
 
@@ -254,7 +252,7 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         pattern = str(arguments["pattern"])
         base = self.resolve_workspace_path(arguments.get("path", "."))
         glob = arguments.get("glob")
-        max_results = int(arguments.get("max_results", 100))
+        max_results = coerce_int(arguments.get("max_results", 100))
         flags = re.IGNORECASE if arguments.get("ignore_case") else 0
         try:
             matcher = re.compile(pattern if arguments.get("regex") else re.escape(pattern), flags)
@@ -415,53 +413,6 @@ class SearchTextTool(WorkspacePathMixin, Tool):
 
 
 @builtin_tool
-class RunCommandTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
-    name = "run_command"
-    description = (
-        "Run a shell command in the workspace and return its combined stdout/stderr and exit code. "
-        "DANGEROUS: executes arbitrary commands; requires permission."
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The shell command line to execute."},
-            "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 30)."},
-        },
-        "required": ["command"],
-    }
-    risk = ToolRisk.DANGEROUS
-
-    async def check_permissions(
-        self, arguments: dict[str, Any], context: PermissionContext
-    ) -> PermissionResult:
-        analysis = analyze_command(str(arguments.get("command", "")))
-        metadata = {"category": analysis.category, "segments": len(analysis.segments)}
-        if analysis.behavior is PermissionBehavior.DENY:
-            return PermissionResult.deny(analysis.reason, metadata=metadata)
-        if analysis.behavior is PermissionBehavior.ALLOW:
-            return PermissionResult.allow(analysis.reason, metadata=metadata)
-        if context.mode is PermissionMode.BYPASS and not analysis.bypass_immune:
-            return PermissionResult.passthrough(analysis.reason, metadata=metadata)
-        if analysis.category in {"development", "file_mutation"}:
-            return PermissionResult.passthrough(analysis.reason, metadata=metadata)
-        return PermissionResult.ask(
-            analysis.reason,
-            metadata=metadata,
-            classifier_approvable=analysis.classifier_approvable,
-            bypass_immune=analysis.bypass_immune,
-        )
-
-    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
-        command = str(arguments["command"])
-        timeout = min(int(arguments.get("timeout", 30)), _MAX_COMMAND_TIMEOUT)
-        spec, shell = _shell_invocation(command)
-        # Wrap under the OS sandbox when active (no-op on Windows/unsupported). Pass the
-        # raw command so excluded_commands can opt specific commands out of isolation.
-        spec, shell = self.sandbox.wrap(spec, shell, command=command)
-        return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
-
-
-@builtin_tool
 class GitDiffTool(WorkspacePathMixin, Tool):
     name = "git_diff"
     description = "Show the git diff for the workspace. Set staged=true for the index; pass path to scope it."
@@ -584,7 +535,7 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
         extra = arguments.get("args") or []
         if isinstance(extra, list):
             cmd += [str(a) for a in extra]
-        timeout = min(int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT)
+        timeout = min(coerce_int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT)
         # Sandbox the (argv) test invocation when active; no command string to exclude on.
         spec, shell = self.sandbox.wrap(cmd, False, command=None)
         return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
@@ -694,6 +645,11 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
+        if path.suffix.lower() == ".ipynb":
+            from agent_core.notebook import format_notebook
+
+            content, metadata = format_notebook(path)
+            return ToolResult(name=self.name, content=content, metadata=metadata)
         text = path.read_text(encoding="utf-8")
         offset = arguments.get("offset")
         limit = arguments.get("limit")
@@ -716,8 +672,8 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
             )
         # Explicit paging: honor offset/limit verbatim.
         lines = text.splitlines()
-        start = max(int(offset) - 1, 0) if offset is not None else 0
-        end = start + int(limit) if limit is not None else len(lines)
+        start = max(coerce_int(offset) - 1, 0) if offset is not None else 0
+        end = start + coerce_int(limit) if limit is not None else len(lines)
         return ToolResult(name=self.name, content="\n".join(lines[start:end]))
 
 

@@ -631,6 +631,21 @@ class PermissionPolicy:
         # Preserve the current managed definition while immediately activating the rule.
         self.rules = self.rules.merge(parsed)
 
+    def inherit_scoped_session_grants(
+        self, parent: "PermissionPolicy", allowed_tools: frozenset[str]
+    ) -> None:
+        """Copy only parent grants that remain inside an already-narrowed child registry."""
+        if self.managed_policy.allow_managed_rules_only:
+            return
+        self._session_allow.update(parent._session_allow & allowed_tools)
+        if allowed_tools & _SHELL_COMMAND_TOOLS.keys():
+            self._session_allow_commands.update(parent._session_allow_commands)
+        inherited = RuleSet(
+            allow=[rule for rule in parent._session_rules.allow if rule.tool_name in allowed_tools]
+        )
+        self._session_rules = self._session_rules.merge(inherited)
+        self.rules = self.rules.merge(inherited)
+
     def _apply_updates(self, updates: tuple[PermissionUpdate, ...]) -> None:
         destinations = {update.destination for update in updates}
         if len({item for item in destinations if item is not PermissionDestination.SESSION}) > 1:

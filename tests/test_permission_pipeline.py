@@ -1,4 +1,4 @@
-import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -56,14 +56,14 @@ async def test_git_hook_write_is_hard_denied(tmp_path: Path) -> None:
     assert result.behavior is PermissionBehavior.DENY
 
 
-async def test_symlink_cannot_escape_workspace(tmp_path: Path) -> None:
+async def test_directory_redirect_cannot_escape_workspace(
+    tmp_path: Path,
+    directory_redirect: Callable[[Path, Path], str],
+) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir(exist_ok=True)
     link = tmp_path / "escape"
-    try:
-        os.symlink(outside, link, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"symlinks unavailable: {exc}")
+    directory_redirect(link, outside)
 
     result = await PermissionPolicy(PermissionMode.BYPASS, workspace=tmp_path).evaluate(
         ReadTextFileTool(tmp_path), ToolCall("read_text_file", {"path": "escape/secret.txt"})
@@ -154,15 +154,15 @@ async def test_acceptedits_does_not_auto_allow_tests(tmp_path: Path) -> None:
 async def test_bypass_cannot_skip_sensitive_shell_path_checks(
     tmp_path: Path, command: str, expected_category: str
 ) -> None:
-    from agent_core.tools.builtin import RunCommandTool
+    from agent_core.tools.shell import BashTool
 
     result = await PermissionPolicy(PermissionMode.BYPASS, workspace=tmp_path).evaluate(
-        RunCommandTool(tmp_path), ToolCall("run_command", {"command": command})
+        BashTool(tmp_path), ToolCall("bash", {"command": command})
     )
 
     assert result.behavior is PermissionBehavior.ASK
     assert result.bypass_immune
-    assert result.metadata == {"category": expected_category, "segments": 1}
+    assert result.metadata == {"category": expected_category, "segments": 1, "dialect": "bash"}
 
 
 class _ExcludedSandboxConfig:

@@ -357,7 +357,7 @@ class AgentHookAdapter(_ExternalHookAdapter):
         self,
         spec: ExternalHookSpec,
         logger: "JSONLRunLogger",
-        subagent_factory: Callable[[str, str, str | None], Awaitable[str]],
+        subagent_factory: Callable[..., Awaitable[str]],
     ) -> None:
         super().__init__(spec, logger)
         self.subagent_factory = subagent_factory
@@ -380,7 +380,7 @@ def build_external_adapter(
     logger: "JSONLRunLogger",
     provider: "LLMProvider | None" = None,
     base_config: "ProviderConfig | None" = None,
-    subagent_factory: Callable[[str, str, str | None], Awaitable[str]] | None = None,
+    subagent_factory: Callable[..., Awaitable[str]] | None = None,
 ) -> _ExternalHookAdapter | None:
     """Build the adapter for one spec, or ``None`` when its dependencies are unavailable.
 

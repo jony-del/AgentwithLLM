@@ -7,6 +7,8 @@ both the chat ``/command`` dispatcher and the model-facing ``skill`` tool read i
 
 from __future__ import annotations
 
+import builtins
+
 from agent_core.skills.models import Skill
 
 
@@ -37,13 +39,13 @@ class SkillRegistry:
         target = self._aliases.get(lowered)
         return self._by_name.get(target) if target else None
 
-    def list(self) -> list[Skill]:
-        return list(self._by_name.values())
+    def list(self) -> builtins.list[Skill]:
+        return builtins.list(self._by_name.values())
 
-    def user_invocable(self) -> list[Skill]:
+    def user_invocable(self) -> builtins.list[Skill]:
         return [skill for skill in self._by_name.values() if skill.user_invocable]
 
-    def model_invocable(self) -> list[Skill]:
+    def model_invocable(self) -> builtins.list[Skill]:
         return [skill for skill in self._by_name.values() if skill.model_invocable]
 
     def __len__(self) -> int:

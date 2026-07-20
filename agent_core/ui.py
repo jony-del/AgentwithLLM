@@ -154,6 +154,10 @@ class AgentUI:
         """Choose one of the six permission modes; silent UIs cannot pick."""
         return None
 
+    async def ask_questions(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Ask up to three structured questions; silent UIs cannot answer."""
+        return []
+
 
 class NullUI(AgentUI):
     """The default: a silent sink. Present so the loop can always emit events."""
@@ -262,6 +266,23 @@ class ConsoleUI(AgentUI):
 
         selected = await run_permission_picker(current_mode, forbidden_modes=forbidden_modes)
         return selected.value if selected is not None else None
+
+    async def ask_questions(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def ask() -> list[dict[str, Any]]:
+            answers: list[dict[str, Any]] = []
+            for item in questions[:3]:
+                prompt = str(item.get("question", "Question"))
+                options = item.get("options", [])
+                labels = [str(option.get("label", "")) for option in options if isinstance(option, dict)]
+                suffix = f" [{' / '.join(labels)}]" if labels else ""
+                try:
+                    value = input(prompt + suffix + ": ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    value = ""
+                answers.append({"id": item.get("id"), "answer": value})
+            return answers
+
+        return await asyncio.to_thread(ask)
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission

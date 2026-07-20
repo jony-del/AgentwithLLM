@@ -276,6 +276,20 @@ def test_child_shares_parent_sandbox_manager(tmp_path) -> None:
     assert child.sandbox is agent.sandbox
 
 
+def test_child_inherits_only_scoped_session_grants(tmp_path) -> None:
+    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(run_dir=str(tmp_path)))
+    agent.permissions.add_session_rule("edit_file(src/app.py)")
+    agent.permissions.add_session_rule("web_fetch(domain:example.com)")
+
+    child = agent._make_subagent_child("full")
+
+    assert not isinstance(child, str)
+    assert child.permissions.rules.allow_matches("edit_file", {"path": "src/app.py"})
+    assert not child.permissions.rules.allow_matches(
+        "web_fetch", {"url": "https://example.com"}
+    )
+
+
 def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
     agent = ReActAgent(provider=FakeProvider())
     # Re-derive what the read_only child would receive by replicating the filter the
@@ -288,7 +302,7 @@ def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
         if t.name != "dispatch_agent" and t.risk is ToolRisk.READ
     }
     assert "dispatch_agent" not in names_read_only  # no recursion
-    assert "run_command" not in names_read_only  # no arbitrary exec
+    assert "bash" not in names_read_only  # no arbitrary exec
     assert "glob" in names_read_only and "search_text" in names_read_only
 
 

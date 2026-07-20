@@ -3,7 +3,7 @@ from __future__ import annotations
 from agent_core.models import LLMResult, Message, ToolCall, TokenUsage
 from agent_core.permission_classifier import ProviderAutoPermissionClassifier
 from agent_core.providers.base import LLMProvider, ProviderConfig
-from agent_core.tools.builtin import RunCommandTool
+from agent_core.tools.shell import BashTool
 
 
 class _ClassifierProvider(LLMProvider):
@@ -33,8 +33,8 @@ async def test_provider_classifier_accepts_structured_tool_verdict() -> None:
     )
     provider = _ClassifierProvider(result)
     verdict = await _classifier(provider).classify(
-        RunCommandTool(),
-        ToolCall("run_command", {"command": "git status"}),
+        BashTool(),
+        ToolCall("bash", {"command": "git status"}),
         [Message("user", "Inspect the repository")],
     )
 
@@ -49,7 +49,7 @@ async def test_provider_classifier_accepts_structured_tool_verdict() -> None:
 async def test_provider_classifier_fails_closed_on_invalid_output() -> None:
     provider = _ClassifierProvider(LLMResult(content="not a decision"))
     verdict = await _classifier(provider).classify(
-        RunCommandTool(), ToolCall("run_command", {"command": "rm -rf build"}), []
+        BashTool(), ToolCall("bash", {"command": "rm -rf build"}), []
     )
     assert not verdict.allowed
     assert verdict.unavailable
@@ -71,7 +71,7 @@ async def test_classifier_projection_excludes_untrusted_non_user_context() -> No
         Message("tool", "TOOL_OUTPUT_INJECTION"),
     ]
     await _classifier(provider).classify(
-        RunCommandTool(), ToolCall("run_command", {"command": "git status"}), messages
+        BashTool(), ToolCall("bash", {"command": "git status"}), messages
     )
 
     sent = provider.calls[0][0][-1].content
@@ -91,8 +91,8 @@ async def test_classifier_rejects_oversized_current_action_without_api_call() ->
         )
     )
     verdict = await _classifier(provider).classify(
-        RunCommandTool(),
-        ToolCall("run_command", {"command": "x" * 20_000}),
+        BashTool(),
+        ToolCall("bash", {"command": "x" * 20_000}),
         [Message("user", "run it")],
     )
     assert not verdict.allowed and verdict.unavailable

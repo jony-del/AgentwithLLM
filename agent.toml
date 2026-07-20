@@ -386,24 +386,59 @@ include_subagents = false             # default: only the leader narrates (not s
 allowed_domains = []                   # e.g. ["docs.python.org", "github.com"]
 blocked_domains = []                   # e.g. ["evil.example"]
 
+[tools.shell]
+enabled = true
+timeout = 30
+max_timeout = 600
+auto_background_seconds = 15
+max_tasks = 16
+preview_bytes = 262144
+log_bytes = 33554432
+shutdown_grace_seconds = 3
+[tools.shell.bash]
+enabled = true
+executable = "D:/Git/bin/bash.exe"
+[tools.shell.powershell]
+enabled = true
+[tools.notebook]
+max_bytes = 16777216
+max_output_chars = 8000
+[tools.worktree]
+root = ".polaris/worktrees"
+stale_days = 30
+[tools.scheduler]
+enabled = true
+max_jobs = 50
+max_prompt_chars = 16000
+database = "~/.polaris/scheduler.sqlite3"
+[tools.lsp]
+autodetect = false
+max_restarts = 3
+# [[tools.lsp.servers]]
+# name = "pyright"
+# command = "pyright-langserver"
+# args = ["--stdio"]
+# extensions = { ".py" = "python" }
+# timeout = 15
+
 # --- Fine-grained permission rules (policy layer) ---------------------------
 # Argument-aware allow/deny/ask rules plus capability-aware permission modes. Each rule
 # is "ToolName(content)" (or bare "ToolName" for the whole tool). Precedence:
 # deny > strict plan write block > secret/sensitive-path safety nets > session grant >
 # ask > sandbox auto-allow > bypass mode > allow > mode decision/auto classifier.
-#   - run_command content is matched with shell decomposition + anti-evasion:
+#   - bash/powershell content is matched with shell decomposition + anti-evasion:
 #     a compound command (a && b | c) must have EVERY sub-command covered to allow,
 #     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,
 #     "git * --force" = wildcard, "npm run build" = exact.
 #   - file tools match a path glob ("/src/**"); web tools match "domain:example.com".
 # CLI --allow/--deny/--ask append session rules on top of this table.
 [permissions]
-# allow = ["run_command(git *)", "run_command(npm run test:*)", "read_text_file(/src/**)"]
-# deny  = ["run_command(rm *)", "run_command(curl *)", "web_fetch(domain:evil.example)"]
-# ask   = ["run_command"]
+# allow = ["bash(git *)", "bash(npm run test:*)", "read_text_file(/src/**)"]
+# deny  = ["bash(rm *)", "bash(curl *)", "web_fetch(domain:evil.example)"]
+# ask   = ["bash", "powershell"]
 
 # --- OS sandbox (enforcement layer) -----------------------------------------
-# Wraps dangerous command execution (run_command / run_tests) in an OS sandbox:
+# Wraps dangerous command execution (bash / powershell / run_tests) in an OS sandbox:
 # bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
 # environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
 # the permission rules above are the boundary. Disabled by default.

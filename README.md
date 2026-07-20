@@ -193,3 +193,6 @@ pip install -e .
 pip install -e ".[all]"
 pip install -e ".[all,dev]"
 ```
+工业级 tool lifecycle、Bash/PowerShell 后台任务、LSP、Notebook、Git Worktree 与 Scheduler
+的配置和安全语义见 [Tool platform](docs/tool-platform.md)。从旧 shell 规则升级时见
+[Shell permission migration](docs/shell-migration.md)。

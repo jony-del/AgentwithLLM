@@ -34,11 +34,14 @@ from agent_core.permission_types import (
     PermissionMode,
     PermissionResult,
 )
-from agent_core.tools.base import ConcurrencySpec, Tool
+from agent_core.tools.base import ConcurrencySpec, Tool, coerce_int
 from agent_core.tools.catalog import builtin_tool
 
 logger = logging.getLogger(__name__)
 
+_BeautifulSoup: Any = None
+_DDGS: Any = None
+_markdownify: Any = None
 try:
     from bs4 import BeautifulSoup
     from ddgs import DDGS
@@ -46,12 +49,15 @@ try:
 
     _MISSING_WEB_DEP: str | None = None
 except ModuleNotFoundError as _exc:  # the [web] extra is not installed
-    BeautifulSoup = DDGS = markdownify = None  # type: ignore[assignment]
     _MISSING_WEB_DEP = _exc.name or str(_exc)
     logger.warning(
         "web tools disabled: missing dependency %r — pip install 'agent-with-llm[web]' (or [all])",
         _MISSING_WEB_DEP,
     )
+else:
+    _BeautifulSoup = BeautifulSoup
+    _DDGS = DDGS
+    _markdownify = markdownify
 
 
 def _web_tool(cls: type[Tool]) -> type[Tool]:
@@ -208,15 +214,17 @@ def _fetch_url(
 
 def _html_to_markdown(html: str) -> str:
     """Strip scripts/styles and convert HTML to markdown."""
-    soup = BeautifulSoup(html, "html.parser")
+    assert _BeautifulSoup is not None and _markdownify is not None
+    soup = _BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
-    return markdownify(str(soup)).strip()
+    return _markdownify(str(soup)).strip()
 
 
 def _search_ddgs(query: str, max_results: int) -> list[dict]:
     """Keyless DuckDuckGo search."""
-    rows = DDGS().text(query, max_results=max_results)
+    assert _DDGS is not None
+    rows = _DDGS().text(query, max_results=max_results)
     return [
         {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")}
         for r in rows
@@ -335,7 +343,7 @@ class WebFetchTool(WebPolicyAwareMixin, Tool):
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         url = str(arguments.get("url", "")).strip()
-        max_chars = int(arguments.get("max_chars", _DEFAULT_MAX_CHARS))
+        max_chars = coerce_int(arguments.get("max_chars", _DEFAULT_MAX_CHARS))
         if not url:
             return ToolResult(self.name, "url must not be empty", ok=False, metadata={"error_type": "BadArgs"})
         # Pre-check before any network/dep work so an unsafe URL is rejected cheaply.
@@ -413,7 +421,7 @@ class WebSearchTool(WebPolicyAwareMixin, Tool):
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         query = str(arguments.get("query", "")).strip()
-        max_results = int(arguments.get("max_results", 5))
+        max_results = coerce_int(arguments.get("max_results", 5))
         if not query:
             return ToolResult(self.name, "query must not be empty", ok=False, metadata={"error_type": "BadArgs"})
         # The query itself leaves the machine, so the policy is checked against the

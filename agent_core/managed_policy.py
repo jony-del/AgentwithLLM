@@ -118,6 +118,12 @@ class FileManagedPolicyProvider:
                 raise ManagedPolicyError(f"managed.permissions.{key} must be an array of strings")
             items = tuple(item.strip() for item in value if item.strip())
             if key in {"allow", "deny", "ask"}:
+                legacy = [item for item in items if "run_command" in item]
+                if legacy:
+                    raise ManagedPolicyError(
+                        f"managed.permissions.{key} contains legacy run_command rules {legacy!r}; "
+                        "replace them with separate bash(...) and powershell(...) rules"
+                    )
                 invalid = next((item for item in items if parse_rule(item) is None), None)
                 if invalid is not None:
                     raise ManagedPolicyError(

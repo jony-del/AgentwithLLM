@@ -18,7 +18,7 @@ from typing import Any
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_safety import ordinary_read_permission, ordinary_write_permission
 from agent_core.permission_types import PermissionContext, PermissionResult
-from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
+from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin, coerce_int
 from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
@@ -60,7 +60,7 @@ class GlobTool(WorkspacePathMixin, Tool):
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
         base = self.resolve_workspace_path(arguments.get("path", "."))
-        max_results = int(arguments.get("max_results", _MAX_GLOB_RESULTS))
+        max_results = coerce_int(arguments.get("max_results", _MAX_GLOB_RESULTS))
         if not base.exists():
             return ToolResult(self.name, f"No such path: {base}", ok=False, metadata={"error_type": "NotFound"})
 
