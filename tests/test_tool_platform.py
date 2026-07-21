@@ -17,7 +17,9 @@ from agent_core.scheduler import CronError, CronExpression, SchedulerStore
 from agent_core import scheduler_service
 from agent_core.tool_config import LSPServerConfig, LSPToolConfig, ShellToolConfig, WorktreeToolConfig
 from agent_core.tools.base import Tool
+from agent_core.tools.local import AskUserQuestionTool
 from agent_core.tools.registry import ToolRegistry
+from agent_core.session import SessionContext
 from agent_core.worktree import WorktreeManager
 from agent_core.lsp import LSPManager
 
@@ -26,6 +28,67 @@ class _Deferred(Tool):
     name = "deferred_demo"
     description = "diagnostic demo capability"
     input_schema = {"type": "object", "properties": {}}
+
+
+def _questions(*, multi_select: object = False) -> list[dict[str, object]]:
+    return [
+        {
+            "id": "scope",
+            "question": "Which scope?",
+            "multi_select": multi_select,
+            "options": [
+                {"label": "API", "description": "Public API"},
+                {"label": "CLI", "description": "Terminal UI"},
+            ],
+        }
+    ]
+
+
+async def test_ask_user_question_preserves_legacy_callback_answers() -> None:
+    seen: list[list[dict[str, object]]] = []
+
+    async def ask(questions):
+        seen.append(questions)
+        return [{"id": "scope", "answer": "API"}]
+
+    result = await AskUserQuestionTool(SessionContext(ask_user=ask)).run(
+        {"questions": _questions()}
+    )
+    assert result.ok
+    assert result.metadata == {"count": 1, "completed_count": 1, "outcome": "answered"}
+    assert seen[0][0]["multi_select"] is False
+    assert json.loads(result.content) == [{"id": "scope", "answer": "API"}]
+
+
+async def test_ask_user_question_reports_discussion_batch_outcome() -> None:
+    async def ask(_questions):
+        return [
+            {"id": "first", "kind": "answer", "answer": "A"},
+            {"id": "second", "kind": "discussion", "answer": "Compare them first"},
+        ]
+
+    result = await AskUserQuestionTool(SessionContext(ask_user=ask)).run(
+        {"questions": _questions()}
+    )
+    assert result.ok
+    assert result.metadata["outcome"] == "discussion"
+    assert result.metadata["completed_count"] == 1
+
+
+async def test_ask_user_question_rejects_invalid_batch_before_callback() -> None:
+    called = False
+
+    async def ask(_questions):
+        nonlocal called
+        called = True
+        return []
+
+    result = await AskUserQuestionTool(SessionContext(ask_user=ask)).run(
+        {"questions": _questions(multi_select="yes")}
+    )
+    assert not result.ok
+    assert result.metadata["error_type"] == "BadArgs"
+    assert called is False
 
 
 def test_deferred_registry_activates_search_match() -> None:

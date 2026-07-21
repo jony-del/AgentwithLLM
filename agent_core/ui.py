@@ -268,27 +268,20 @@ class ConsoleUI(AgentUI):
         return selected.value if selected is not None else None
 
     async def ask_questions(self, questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        def ask() -> list[dict[str, Any]]:
-            answers: list[dict[str, Any]] = []
-            for item in questions[:3]:
-                prompt = str(item.get("question", "Question"))
-                options = item.get("options", [])
-                labels = [str(option.get("label", "")) for option in options if isinstance(option, dict)]
-                suffix = f" [{' / '.join(labels)}]" if labels else ""
-                try:
-                    value = input(prompt + suffix + ": ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    value = ""
-                answers.append({"id": item.get("id"), "answer": value})
-            return answers
-
         # The persistent chat composer remains mounted while tools run. Temporarily
-        # suspend that application before a tool asks raw terminal questions, then
-        # restore the untouched draft when the questions finish.
+        # suspend that application while the structured picker owns terminal input,
+        # then restore the untouched draft when the question batch finishes.
         from prompt_toolkit.application import in_terminal
+        from agent_core.terminal.question_picker import QuestionSpec, run_question_picker
 
         async with in_terminal():
-            return await asyncio.to_thread(ask)
+            answers: list[dict[str, Any]] = []
+            for item in questions[:3]:
+                response = await run_question_picker(QuestionSpec.from_mapping(item))
+                answers.append(response.as_dict())
+                if response.kind in {"discussion", "cancelled"}:
+                    break
+            return answers
 
     def confirm_tool(self, tool_name: str, risk: str, arguments: dict[str, Any]) -> PermissionChoice:
         # confirm_tool is invoked on the executor's worker thread (the permission

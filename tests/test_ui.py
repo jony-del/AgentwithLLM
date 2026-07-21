@@ -105,6 +105,43 @@ async def test_always_allow_via_ui_grants_write_permission(tmp_path: Path) -> No
     assert "observation" in result.answer.lower()
 
 
+async def test_console_questions_stop_batch_on_discussion(monkeypatch) -> None:
+    from agent_core.terminal import question_picker
+
+    seen: list[str] = []
+
+    async def fake_picker(question):
+        seen.append(question.id)
+        if question.id == "first":
+            return question_picker.QuestionResponse(
+                "first", "answer", answer="A", selected_options=("A",)
+            )
+        return question_picker.QuestionResponse(
+            "second",
+            "discussion",
+            answer="Compare these first",
+            discussion="Compare these first",
+        )
+
+    monkeypatch.setattr(question_picker, "run_question_picker", fake_picker)
+    questions = [
+        {
+            "id": question_id,
+            "question": f"Question {question_id}?",
+            "options": [
+                {"label": "A", "description": "First"},
+                {"label": "B", "description": "Second"},
+            ],
+        }
+        for question_id in ("first", "second", "third")
+    ]
+
+    answers = await ConsoleUI(color=False).ask_questions(questions)
+
+    assert seen == ["first", "second"]
+    assert [answer["kind"] for answer in answers] == ["answer", "discussion"]
+
+
 # --- permission prompt: see tests/test_terminal_permission.py ----------------
 # confirm_tool now bridges to TerminalRenderer.ask_permission_async (prompt_toolkit),
 # so the interactive prompt is covered there with a headless pipe input.

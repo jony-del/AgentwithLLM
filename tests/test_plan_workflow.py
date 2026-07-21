@@ -98,3 +98,44 @@ async def test_every_model_call_receives_plan_mode_system_context(tmp_path: Path
     assert len(provider.system_messages) >= 2
     assert all("<permission-mode-context>" in message for message in provider.system_messages)
     assert all("write_plan" in message and "exit_plan" in message for message in provider.system_messages)
+
+
+async def test_question_discussion_keeps_plan_mode_active(tmp_path: Path) -> None:
+    async def discuss(_questions):
+        return [
+            {
+                "id": "scope",
+                "kind": "discussion",
+                "answer": "Explain the compatibility tradeoff first",
+                "discussion": "Explain the compatibility tradeoff first",
+            }
+        ]
+
+    agent = ReActAgent(
+        _FinalProvider(),
+        ReActConfig(run_dir=str(tmp_path), session_dir="", permission="plan"),
+        ask_user=discuss,
+    )
+    result = await agent.executor.execute_many(
+        [
+            ToolCall(
+                "ask_user_question",
+                {
+                    "questions": [
+                        {
+                            "id": "scope",
+                            "question": "Which scope?",
+                            "options": [
+                                {"label": "API", "description": "Public API"},
+                                {"label": "CLI", "description": "Terminal UI"},
+                            ],
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    assert result[0].ok
+    assert result[0].metadata["outcome"] == "discussion"
+    assert PermissionMode(agent.config.permission) is PermissionMode.PLAN
+    assert agent.session.plan_state.active

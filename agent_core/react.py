@@ -105,7 +105,10 @@ WRAPUP_TEXT = (
 )
 PLAN_MODE_TEXT = (
     "Plan mode is active. Investigate with dedicated read/search tools, maintain Todo/Task "
-    "state when useful, and produce a decision-complete implementation plan. Do not edit files "
+    "state when useful, and produce a decision-complete implementation plan. Use "
+    "ask_user_question for material unresolved choices. Its discussion outcome is not a "
+    "decision: address it and revise or re-ask the omitted questions without leaving plan mode. "
+    "Do not edit files "
     "with ordinary file tools. Ordinary "
     "project edits, shell commands, and tests are prohibited. Save the complete plan with "
     "write_plan, then call exit_plan to request approval and restore the previous mode."

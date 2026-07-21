@@ -51,7 +51,12 @@ class ToolSearchTool(RegistryAwareMixin, Tool):
 @builtin_tool
 class AskUserQuestionTool(SessionAwareMixin, Tool):
     name = "ask_user_question"
-    description = "Ask the live user up to three structured questions and return their answers."
+    description = (
+        "Ask the live user up to three structured questions and return their answers. "
+        "Set multi_select=true only when several business options may be combined. The UI "
+        "automatically adds custom-answer and discuss-first actions; do not include those in "
+        "options. A discussion result stops the remaining batch and is not a decision."
+    )
     input_schema = {
         "type": "object",
         "properties": {
@@ -60,33 +65,117 @@ class AskUserQuestionTool(SessionAwareMixin, Tool):
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
-                        "question": {"type": "string"},
+                        "id": {"type": "string", "minLength": 1},
+                        "question": {"type": "string", "minLength": 1},
+                        "multi_select": {
+                            "type": "boolean",
+                            "description": "Allow combining several preset options; defaults to false.",
+                        },
                         "options": {
                             "type": "array", "minItems": 2, "maxItems": 3,
                             "items": {
                                 "type": "object",
-                                "properties": {"label": {"type": "string"}, "description": {"type": "string"}},
+                                "properties": {
+                                    "label": {"type": "string", "minLength": 1},
+                                    "description": {"type": "string", "minLength": 1},
+                                },
                                 "required": ["label", "description"],
+                                "additionalProperties": False,
                             },
                         },
                     },
                     "required": ["id", "question", "options"],
+                    "additionalProperties": False,
                 },
             }
         },
         "required": ["questions"],
+        "additionalProperties": False,
     }
     risk = ToolRisk.READ
-    requires_user_interaction = True
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return PermissionResult.allow(
+            "structured questions only collect live user input",
+            decision_source=DecisionSource.TOOL,
+        )
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         raw = arguments.get("questions")
-        if not isinstance(raw, list) or not 1 <= len(raw) <= 3 or self.session.ask_user is None:
+        if self.session.ask_user is None:
             return ToolResult(self.name, "A live question callback is unavailable.", ok=False)
-        questions = [dict(item) for item in raw if isinstance(item, dict)]
+        try:
+            questions = self._validated_questions(raw)
+        except ValueError as exc:
+            return ToolResult(
+                self.name,
+                f"Invalid structured questions: {exc}",
+                ok=False,
+                metadata={"error_type": "BadArgs"},
+            )
         answers = await self.session.ask_user(questions)
-        return ToolResult(self.name, json.dumps(answers, ensure_ascii=False, indent=2), metadata={"count": len(answers)})
+        if not isinstance(answers, list):
+            return ToolResult(
+                self.name,
+                "Question callback returned an invalid response.",
+                ok=False,
+                metadata={"error_type": "CallbackError"},
+            )
+        kinds = [str(item.get("kind", "answer")) for item in answers if isinstance(item, dict)]
+        outcome = "discussion" if "discussion" in kinds else "cancelled" if "cancelled" in kinds else "answered"
+        completed = sum(kind not in {"discussion", "cancelled"} for kind in kinds)
+        return ToolResult(
+            self.name,
+            json.dumps(answers, ensure_ascii=False, indent=2),
+            metadata={"count": len(answers), "completed_count": completed, "outcome": outcome},
+        )
+
+    @staticmethod
+    def _validated_questions(raw: object) -> list[dict[str, Any]]:
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 3:
+            raise ValueError("questions must contain one to three items")
+        questions: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        for position, item in enumerate(raw, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"question {position} must be an object")
+            question_id = str(item.get("id", "")).strip()
+            prompt = str(item.get("question", "")).strip()
+            if not question_id or not prompt:
+                raise ValueError(f"question {position} needs a non-empty id and question")
+            if question_id in ids:
+                raise ValueError(f"duplicate question id: {question_id}")
+            ids.add(question_id)
+            multi_select = item.get("multi_select", False)
+            if not isinstance(multi_select, bool):
+                raise ValueError(f"question {question_id} has a non-boolean multi_select")
+            raw_options = item.get("options")
+            if not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 3:
+                raise ValueError(f"question {question_id} needs two or three options")
+            options: list[dict[str, str]] = []
+            labels: set[str] = set()
+            for raw_option in raw_options:
+                if not isinstance(raw_option, dict):
+                    raise ValueError(f"question {question_id} contains a non-object option")
+                label = str(raw_option.get("label", "")).strip()
+                description = str(raw_option.get("description", "")).strip()
+                if not label or not description:
+                    raise ValueError(f"question {question_id} contains a blank option")
+                if label in labels:
+                    raise ValueError(f"question {question_id} contains duplicate option {label!r}")
+                labels.add(label)
+                options.append({"label": label, "description": description})
+            questions.append(
+                {
+                    "id": question_id,
+                    "question": prompt,
+                    "multi_select": multi_select,
+                    "options": options,
+                }
+            )
+        return questions
 
 
 @builtin_tool
