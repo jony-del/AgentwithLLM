@@ -418,18 +418,12 @@ database = "~/.polaris/scheduler.sqlite3"
 [tools.lsp]
 autodetect = false
 max_restarts = 3
-# [[tools.lsp.servers]]
-# name = "pyright"
-# command = "pyright-langserver"
-# args = ["--stdio"]
-# extensions = { ".py" = "python" }
-# timeout = 15
-# [[tools.lsp.servers]]
-# name = "pyright"
-# command = "pyright-langserver"
-# args = ["--stdio"]
-# extensions = { ".py" = "python" }
-# timeout = 15
+[[tools.lsp.servers]]
+name = "pyright"
+command = "pyright-langserver"
+args = ["--stdio"]
+extensions = { ".py" = "python" }
+timeout = 15
 
 # --- Fine-grained permission rules (policy layer) ---------------------------
 # Argument-aware allow/deny/ask rules plus capability-aware permission modes. Each rule
@@ -445,18 +439,19 @@ max_restarts = 3
 # Rules retain provenance: managed/user/project/local/cli/session. Default resolution reads
 # ~/.polaris/agent.toml, project agent.toml, then ignored agent.local.toml; CLI flags are CLI rules.
 [permissions]
-# allow = ["bash(git *)", "bash(npm run test:*)", "read_text_file(/src/**)"]
-# deny  = ["bash(rm *)", "bash(curl *)", "web_fetch(domain:evil.example)"]
-# ask   = ["bash", "powershell"]
+allow = ["bash(git *)", "bash(npm run test:*)", "read_text_file(/src/**)"]
+deny  = ["bash(rm *)", "bash(curl *)", "web_fetch(domain:evil.example)"]
+ask   = ["bash", "powershell"]
 
 # --- OS sandbox (enforcement layer) -----------------------------------------
 # Wraps dangerous command execution (bash / powershell / run_tests) in an OS sandbox:
 # bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
 # environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
-# the permission rules above are the boundary. Disabled by default.
+# the permission rules above are the boundary. The built-in default is disabled;
+# this shipped example enables it explicitly.
 # Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
 [sandbox]
-enabled = false                        # master switch
+enabled = true                        # master switch
 backend = "auto"                       # isolation tier: "auto" (container→native→noop),
                                        #   "native" (bwrap/sandbox-exec), "container"
                                        #   (podman/docker), or "vm" (Hyper-V/Kata/Lima).
@@ -491,7 +486,7 @@ allow_local_binding = false            # permit binding local ports (servers/tes
 # workspace is bind-mounted (drive path E:\proj → /mnt/e/proj inside the container).
 runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
 image = "docker.io/library/debian:stable-slim"   # image the command runs inside
-auto_pull = false                      # pull the image at startup if missing
+auto_pull = true                      # pull the image at startup if missing
 oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
 read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
 drop_all_capabilities = true           # --cap-drop ALL
