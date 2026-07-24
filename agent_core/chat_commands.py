@@ -696,14 +696,72 @@ async def _cmd_memory(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     if store is None:
         print("Memory is disabled (enable it in [memory] or with --memory).")
         return ChatTurn()
-    records = store.all()
-    if not records:
-        print("No memories stored yet.")
+    repository = getattr(store, "repository", None)
+    if repository is None:
+        records = store.all()
+        if not records:
+            print("No memories stored yet.")
+            return ChatTurn()
+        print(f"Stored memories ({len(records)}):")
+        for record in records[-10:]:
+            summary = record.content.strip().splitlines()[0] if record.content.strip() else "(empty)"
+            print(f"  [{record.kind}] {summary[:100]}")
         return ChatTurn()
-    print(f"Stored memories ({len(records)}):")
-    for record in records[-10:]:
-        summary = record.content.strip().splitlines()[0] if record.content.strip() else "(empty)"
-        print(f"  [{record.kind}] {summary[:100]}")
+    try:
+        parts = shlex.split(args)
+    except ValueError as exc:
+        print(f"Invalid memory command: {exc}")
+        return ChatTurn()
+    action = parts.pop(0).lower() if parts else "list"
+    if action == "list":
+        documents = repository.list()
+        if not documents:
+            print("No memories stored yet.")
+            return ChatTurn()
+        print(f"Stored memories ({len(documents)}):")
+        for document in documents[-10:]:
+            print(
+                f"  {document.id} [{document.type}] {document.name} "
+                f"(updated {document.updated_at})"
+            )
+    elif action == "show" and parts:
+        document = repository.get(parts[0])
+        print(document.content if document is not None else f"No memory {parts[0]}")
+    elif action == "search" and parts:
+        for document in repository.search(" ".join(parts)):
+            print(f"  {document.id} [{document.type}] {document.name}: {document.description}")
+    elif action == "add" and parts:
+        content = " ".join(parts)
+        document = await asyncio.to_thread(
+            repository.write,
+            name=content[:60],
+            description=content[:160],
+            type="project",
+            content=content,
+            explicit=True,
+            sources=[f"run:{agent.logger.run_id}"],
+        )
+        if agent.extractor is not None:
+            agent.extractor.mark_direct_write()
+        print(f"Added {document.id}")
+    elif action == "edit" and len(parts) >= 2:
+        document = await asyncio.to_thread(
+            repository.update,
+            parts[0],
+            content=" ".join(parts[1:]),
+            explicit=True,
+        )
+        print(f"Updated {document.id}")
+    elif action == "forget" and parts:
+        forgotten = await asyncio.to_thread(repository.forget, parts[0])
+        print(f"Forgot {parts[0]}" if forgotten else f"No memory {parts[0]}")
+    elif action == "validate":
+        report = await asyncio.to_thread(repository.validate, repair="--repair" in parts)
+        print(f"scanned={report.scanned} valid={report.valid}")
+        for error in report.errors:
+            print(f"  error: {error}")
+    else:
+        print("Usage: /memory [list|show ID|search QUERY|add TEXT|edit ID TEXT|forget ID|validate]")
     return ChatTurn()
 
 
@@ -774,7 +832,7 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "permissions": CommandSpec(_cmd_permissions, "Show or switch the permission mode."),
     "mcp": CommandSpec(_cmd_mcp, "List configured MCP servers.", immediate=True),
-    "memory": CommandSpec(_cmd_memory, "List stored memories."),
+    "memory": CommandSpec(_cmd_memory, "Inspect or curate long-term memory."),
     "resume": CommandSpec(_cmd_resume, "List or resume a saved session (alias /continue)."),
     "continue": CommandSpec(_cmd_resume, "List or resume a saved session.", canonical="resume"),
 }
@@ -841,7 +899,17 @@ async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Me
         return ChatTurn()
     try:
         factory_call = cast(Callable[..., Awaitable[str]], factory)
-        answer = await factory_call(prompt, fork_preset(skill.allowed_tools), skill.model)
+        if skill.memory != "none":
+            answer = await factory_call(
+                prompt,
+                fork_preset(skill.allowed_tools),
+                skill.model,
+                "shared",
+                skill.agent_key or skill.name,
+                skill.memory,
+            )
+        else:
+            answer = await factory_call(prompt, fork_preset(skill.allowed_tools), skill.model)
     except Exception as exc:  # noqa: BLE001 - a skill failure must not tear down the chat
         print(f"[error] skill /{skill.name} failed: {type(exc).__name__}: {exc}")
         return ChatTurn()

@@ -56,3 +56,14 @@ def test_resolve_without_table_is_defaults(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("AGENT_MEMORY", raising=False)
     toml = _write_toml(tmp_path, "model = \"x\"\n")  # no [memory] table
     assert resolve_memory_config(None, toml) == MemoryConfig()
+
+
+def test_repository_config_cannot_trust_private_memory_redirect(tmp_path: Path) -> None:
+    external = tmp_path.parent / "sensitive"
+    toml = _write_toml(
+        tmp_path,
+        f'[memory]\nenabled = true\ndir = "{external.as_posix()}"\n',
+    )
+    config = resolve_memory_config(None, toml)
+    assert config.dir == external.as_posix()
+    assert config.dir_trusted is False

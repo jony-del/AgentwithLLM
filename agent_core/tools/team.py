@@ -218,6 +218,11 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
                 "type": "string", "enum": ["shared", "worktree"],
                 "description": "shared uses the parent workspace; worktree creates an isolated Git worktree.",
             },
+            "memory": {
+                "type": "string",
+                "enum": ["none", "user", "project", "local"],
+                "description": "Optional stable memory for this named teammate; defaults to none.",
+            },
         },
         "required": ["team_id", "name", "role"],
     }
@@ -272,11 +277,16 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         isolation = str(arguments.get("isolation", "shared"))
         if isolation not in {"shared", "worktree"}:
             isolation = "shared"
+        memory = str(arguments.get("memory", "none"))
+        if memory not in {"none", "user", "project", "local"}:
+            memory = "none"
         try:
             parameters = inspect.signature(factory).parameters
             factory_call = cast(Callable[..., Awaitable[str]], factory)
             answer = (
-                await factory_call(team_id, name, role, task_id, preset, model, isolation)
+                await factory_call(team_id, name, role, task_id, preset, model, isolation, memory)
+                if len(parameters) >= 8
+                else await factory_call(team_id, name, role, task_id, preset, model, isolation)
                 if len(parameters) >= 7
                 else await factory_call(team_id, name, role, task_id, preset, model)
             )
@@ -292,6 +302,7 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
                 "preset": preset,
                 "model": model,
                 "isolation": isolation,
+                "memory": memory,
             },
         )
 

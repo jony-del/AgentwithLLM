@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, Protocol
 
 from agent_core.memory.config import MemoryConfig
 from agent_core.memory.extraction import MEMORY_EXTRACTION_MARKER, parse_memory_items
 from agent_core.memory.models import MemoryRecord, DreamReport
-from agent_core.memory.store import MemoryStore
 from agent_core.memory.text import lexical_relevance, tokenize
 from agent_core.models import Message
 from agent_core.providers.base import LLMProvider, ProviderConfig
@@ -24,6 +23,12 @@ Respond with ONLY a JSON array (no prose). Each item:
 Return [] if no genuinely new insight emerges."""
 
 
+class DreamStore(Protocol):
+    def all(self) -> list[MemoryRecord]: ...
+    def __len__(self) -> int: ...
+    async def replace_all(self, records: list[MemoryRecord], *, flush: bool = True) -> None: ...
+
+
 class Dreamer:
     """Offline memory consolidation: decay/forget, merge duplicates, synthesise insight.
 
@@ -34,7 +39,7 @@ class Dreamer:
 
     def __init__(
         self,
-        store: MemoryStore,
+        store: DreamStore,
         config: MemoryConfig | None = None,
         provider: LLMProvider | None = None,
         provider_config: ProviderConfig | None = None,

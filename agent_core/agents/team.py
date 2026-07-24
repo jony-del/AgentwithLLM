@@ -10,6 +10,8 @@ import shutil
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from agent_core.file_lock import FileLock as CommonFileLock
+
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 TASK_STATUSES = frozenset({"pending", "assigned", "in_progress", "blocked", "completed"})
 
@@ -22,7 +24,7 @@ class TeamPermissionError(PermissionError):
     """The current agent is not allowed to make the requested team change."""
 
 
-class FileLock:
+class _LegacyFileLock:
     """Small cross-platform exclusive file lock.
 
     The lock is taken on a sidecar ``*.lock`` file, so writers can atomically replace
@@ -35,7 +37,7 @@ class FileLock:
         self.path = Path(path)
         self._file: BinaryIO | None = None
 
-    def __enter__(self) -> "FileLock":
+    def __enter__(self) -> "_LegacyFileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         file = self.path.open("a+b")
         self._file = file
@@ -78,6 +80,11 @@ class FileLock:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
         self._file.close()
         self._file = None
+
+
+# Compatibility re-export: existing imports keep working while every subsystem uses
+# the common infrastructure implementation.
+FileLock = CommonFileLock
 
 
 class TeamStore:

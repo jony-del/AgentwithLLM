@@ -27,7 +27,8 @@
       "PowerShell(pytest *)",
       "PowerShell(Get-Command *)",
       "Bash(grep -E '^src/[^/]+$')",
-      "Bash(python -m pytest tests/test_sandbox.py tests/test_config.py tests/test_react.py tests/test_terminal_renderer.py -q)"
+      "Bash(python -m pytest tests/test_sandbox.py tests/test_config.py tests/test_react.py tests/test_terminal_renderer.py -q)",
+      "Skill(claude-api)"
     ]
   }
 }

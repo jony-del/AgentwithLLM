@@ -158,8 +158,8 @@ class SessionContext:
     # ``str | None`` is an optional per-spawn model override (None → inherit the parent's
     # model); each spawn call chooses independently, so one leader can fan out a mix of
     # Haiku/Sonnet/Opus children.
-    subagent_factory: Callable[[str, str, str | None, str], Awaitable[str]] | None = None
-    teammate_factory: Callable[[str, str, str, str | None, str, str | None, str], Awaitable[str]] | None = None
+    subagent_factory: Callable[..., Awaitable[str]] | None = None
+    teammate_factory: Callable[..., Awaitable[str]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None
@@ -191,6 +191,8 @@ class SessionContext:
     logger: Any | None = None
     audit_event: Callable[[str, dict[str, object]], Awaitable[None]] | None = None
     scheduler_store: Any | None = None
+    memory_repository: Any | None = None
+    memory_direct_write: Callable[[], None] | None = None
     should_background: Callable[[], bool] | None = None
     depth: int = 0
     max_depth: int = 1

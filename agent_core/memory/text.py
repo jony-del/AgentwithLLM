@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import re
 
-# Small, deliberately generic stopword set. The goal is only to stop the most common
-# function words from dominating the lexical overlap; this is not meant to be a
-# linguistically complete list (zero-dependency project — no NLTK).
 _STOPWORDS = frozenset(
     {
         "the", "a", "an", "and", "or", "but", "if", "then", "else", "of", "to", "in",
@@ -16,29 +13,29 @@ _STOPWORDS = frozenset(
     }
 )
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 
 
 def tokenize(text: str) -> set[str]:
-    """Lowercase, split on non-alphanumeric runs, drop stopwords and 1-char tokens.
-
-    Returns a *set* — recall here cares about which concepts overlap, not how many
-    times each appears, so set overlap is the right primitive.
-    """
-    return {
+    """Produce Unicode word tokens plus CJK character bi/tri-grams."""
+    lowered = text.casefold()
+    tokens = {
         token
-        for token in _TOKEN_RE.findall(text.lower())
-        if len(token) > 1 and token not in _STOPWORDS
+        for token in _WORD_RE.findall(lowered)
+        if len(token) > 1 and token not in _STOPWORDS and not _CJK_RE.fullmatch(token)
     }
+    for match in _CJK_RE.finditer(lowered):
+        run = match.group(0)
+        if len(run) == 1:
+            tokens.add(run)
+        for width in (2, 3):
+            tokens.update(run[index : index + width] for index in range(len(run) - width + 1))
+    return tokens
 
 
 def lexical_relevance(a: set[str], b: set[str]) -> float:
-    """Overlap coefficient ``|a∩b| / min(|a|,|b|)`` in [0,1].
-
-    Overlap coefficient (rather than Jaccard) is chosen so that a short, specific
-    memory still scores highly against a long query that contains it — we don't want
-    to penalise a memory just because the query has many other unrelated words.
-    """
+    """Return overlap coefficient ``|a∩b| / min(|a|,|b|)`` in [0, 1]."""
     if not a or not b:
         return 0.0
     intersection = len(a & b)

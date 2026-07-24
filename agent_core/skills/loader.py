@@ -35,6 +35,11 @@ def _coerce_tuple(value: object) -> tuple[str, ...]:
     return ()
 
 
+def _coerce_memory(value: object) -> str:
+    memory = str(value or "none").strip().lower()
+    return memory if memory in {"none", "user", "project", "local"} else "none"
+
+
 def load_skill_file(path: Path) -> Skill | None:
     """Parse one skill file into a :class:`Skill`, or ``None`` if unusable.
 
@@ -68,6 +73,8 @@ def load_skill_file(path: Path) -> Skill | None:
         user_invocable=meta.get("user_invocable", True) is not False,
         disable_model_invocation=meta.get("disable_model_invocation", False) is True,
         context=_coerce_context(meta.get("context")),
+        memory=_coerce_memory(meta.get("memory")),
+        agent_key=name,
         source_path=path,
     )
 

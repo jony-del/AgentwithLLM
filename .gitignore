@@ -8,4 +8,5 @@ venv/
 *.egg-info/
 .env
 agent.local.toml
+/.claude/worktrees/
 

@@ -137,6 +137,14 @@ Agent 运行时仍可继续输入：Enter 会把消息放入无限内存队列�
 effort 与 fast mode 只在当前会话生效；sandbox 变更原子应用并写入 gitignored
 `agent.local.toml`。
 
+## 长期记忆
+
+长期记忆以独立主题 Markdown 为权威数据源，主代理私有记忆保存在用户目录，
+团队记忆保存在当前 checkout 的 `.polaris/memory/team/`。系统支持中文检索、
+跨进程原子写入、秘密扫描、可恢复遗忘和旧 JSONL 无损迁移；召回内容始终按
+不可信历史数据处理，涉及当前代码或配置的说法需要重新验证。命令、目录结构、
+迁移和隐私边界见 [长期记忆文档](docs/long-term-memory.md)。
+
 ## Claude 兼容插件
 
 `/plugin` 支持 install/manage/uninstall/enable/disable/validate，以及 marketplace 的

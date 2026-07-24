@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from agent_core.memory.models import MemoryRecord
+from agent_core.memory.repository import MemoryRepository
 
 
 class MemoryStore:
@@ -131,3 +132,112 @@ class MemoryStore:
             for line in lines:
                 file.write(line + "\n")
         os.replace(tmp, self.path)
+
+
+class RepositoryMemoryStore:
+    """One-release adapter exposing the old store API over a Markdown repository."""
+
+    def __init__(self, repository: MemoryRepository) -> None:
+        self.repository = repository
+
+    def _record(self, document: object) -> MemoryRecord:
+        from datetime import datetime
+
+        from agent_core.memory.models import MemoryDocument
+
+        assert isinstance(document, MemoryDocument)
+        legacy = document.legacy
+        try:
+            created = datetime.fromisoformat(document.created_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            created = time.time()
+        return MemoryRecord(
+            id=document.id,
+            content=document.content,
+            kind=str(legacy.get("kind") or document.type),
+            importance=float(legacy.get("importance", document.confidence)),
+            created_at=created,
+            last_accessed_at=float(legacy.get("last_accessed_at") or created),
+            access_count=max(
+                int(legacy.get("access_count", 0)),
+                1 if document.explicit or document.verified_at or self.repository.scope == "team" else 0,
+            ),
+            source_run_id=(document.sources[0] if document.sources else None),
+            tags=list(document.tags),
+        )
+
+    def all(self) -> list[MemoryRecord]:
+        return [self._record(document) for document in self.repository.list()]
+
+    def get(self, record_id: str) -> MemoryRecord | None:
+        document = self.repository.get(record_id)
+        return self._record(document) if document is not None else None
+
+    def __len__(self) -> int:
+        return len(self.repository.list(headers_only=True))
+
+    async def add(
+        self,
+        content: str,
+        *,
+        kind: str = "fact",
+        importance: float = 0.5,
+        tags: list[str] | None = None,
+        source_run_id: str | None = None,
+        flush: bool = True,
+    ) -> MemoryRecord:
+        del flush
+        memory_type = {
+            "preference": "user",
+            "fact": "project",
+            "episode": "project",
+            "insight": "reference",
+            "summary": "reference",
+        }.get(kind, "project")
+        description = " ".join(content.split())[:160]
+        document = await asyncio.to_thread(
+            self.repository.write,
+            name=description[:60] or "memory",
+            description=description or "Long-term memory",
+            type=memory_type,
+            content=content.strip(),
+            confidence=max(0.0, min(1.0, importance)),
+            tags=list(tags or []),
+            sources=[source_run_id] if source_run_id else [],
+        )
+        record = self._record(document)
+        record.kind = kind
+        return record
+
+    async def update(self, record: MemoryRecord, *, flush: bool = True) -> None:
+        del flush
+        await asyncio.to_thread(
+            self.repository.update,
+            record.id,
+            content=record.content,
+            confidence=record.importance,
+            tags=list(record.tags),
+            sources=[record.source_run_id] if record.source_run_id else [],
+            legacy={
+                "kind": record.kind,
+                "importance": record.importance,
+                "last_accessed_at": record.last_accessed_at,
+                "access_count": record.access_count,
+                "source_run_id": record.source_run_id,
+            },
+        )
+
+    async def delete(self, record_id: str, *, flush: bool = True) -> bool:
+        del flush
+        return await asyncio.to_thread(self.repository.forget, record_id)
+
+    async def touch(self, record_id: str, *, flush: bool = True) -> None:
+        # Recall is session-local: a possibly mistaken hit must not rewrite durable memory.
+        del record_id, flush
+
+    async def replace_all(self, records: list[MemoryRecord], *, flush: bool = True) -> None:
+        del flush
+        await asyncio.to_thread(self.repository.replace_records, records)
+
+    async def flush(self) -> None:
+        return

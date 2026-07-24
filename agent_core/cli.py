@@ -37,7 +37,13 @@ from agent_core.permissions import (
     permission_mode_label,
 )
 from agent_core.interrupt import KeyInterrupt
-from agent_core.memory import Dreamer, MemoryConfig, MemoryStore
+from agent_core.memory import (
+    Dreamer,
+    MemoryConfig,
+    MemoryPathResolver,
+    MemoryRepository,
+    RepositoryMemoryStore,
+)
 from agent_core.model_validation import PROVIDERS
 from agent_core.models import LLMTransientError, Message
 from agent_core.providers import (
@@ -97,7 +103,12 @@ def _resolve(args: argparse.Namespace) -> dict:
 def _memory_config(args: argparse.Namespace) -> MemoryConfig:
     # Numeric tunables come from the [memory] toml table; enabled is overridable
     # by AGENT_MEMORY / --memory. (resolve_config above already loaded the .env.)
-    return resolve_memory_config(getattr(args, "memory", None), _config_file(args))
+    config = resolve_memory_config(getattr(args, "memory", None), _config_file(args))
+    override = getattr(args, "memory_dir", None)
+    if override:
+        config.dir = override
+        config.dir_trusted = True
+    return config
 
 
 def _permission_rules(args: argparse.Namespace) -> RuleSet:
@@ -938,8 +949,20 @@ def sessions_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _open_store(config: MemoryConfig) -> MemoryStore:
-    return MemoryStore(Path(config.dir) / "memory.jsonl")
+def _open_repository(config: MemoryConfig, *, scope: str = "private") -> MemoryRepository:
+    override = config.dir if config.dir_trusted and scope == "private" else None
+    resolver = MemoryPathResolver(Path.cwd(), private_override=override)
+    root = resolver.resolve(scope)  # type: ignore[arg-type]
+    repository = MemoryRepository(root, scope=scope)
+    legacy_root = Path(config.dir) if config.dir_trusted else Path.cwd() / "memory"
+    legacy = legacy_root / "memory.jsonl"
+    if legacy.exists() and scope == "private":
+        repository.migrate_jsonl(legacy)
+    return repository
+
+
+def _open_store(config: MemoryConfig) -> RepositoryMemoryStore:
+    return RepositoryMemoryStore(_open_repository(config))
 
 
 def dream_command(args: argparse.Namespace) -> int:
@@ -964,32 +987,96 @@ def dream_command(args: argparse.Namespace) -> int:
 
 
 def memory_command(args: argparse.Namespace) -> int:
-    """Inspect or curate stored memories: list / add / forget."""
-    store = _open_store(_memory_config(args))
+    """Inspect, search, validate, migrate, or curate Markdown memories."""
+    config = _memory_config(args)
+    scope = getattr(args, "scope", "private")
+    repository = _open_repository(config, scope=scope)
     if args.action == "list":
-        records = sorted(store.all(), key=lambda r: r.importance, reverse=True)
-        if not records:
+        documents = sorted(repository.list(), key=lambda item: item.updated_at, reverse=True)
+        if not documents:
             print("(no memories)")
             return 0
-        for record in records:
-            print(f"{record.id}  [{record.kind}] imp={record.importance:.2f}  {record.content}")
+        for document in documents:
+            print(
+                f"{document.id}  [{scope}/{document.type}] updated={document.updated_at}  "
+                f"{document.name}  {document.path}"
+            )
+        return 0
+    if args.action == "show":
+        if not args.value:
+            print("[error] `memory show` needs an id", file=sys.stderr)
+            return 1
+        shown_document = repository.get(args.value)
+        if shown_document is None:
+            print(f"[error] no memory {args.value}", file=sys.stderr)
+            return 1
+        print(
+            f"{shown_document.name}\n[{scope}/{shown_document.type}] "
+            f"updated={shown_document.updated_at}"
+        )
+        print(f"source={', '.join(shown_document.sources) or '-'}\npath={shown_document.path}\n")
+        print(shown_document.content)
+        return 0
+    if args.action == "search":
+        if not args.value:
+            print("[error] `memory search` needs a query", file=sys.stderr)
+            return 1
+        for document in repository.search(args.value, limit=getattr(args, "limit", 5)):
+            print(f"{document.id}  [{document.type}] {document.name}  {document.description}")
         return 0
     if args.action == "add":
         if not args.value:
             print("[error] `memory add` needs text", file=sys.stderr)
             return 1
-        record = asyncio.run(store.add(args.value, kind="fact", importance=0.6))
-        print(f"Added {record.id}")
+        name = getattr(args, "name", None) or " ".join(args.value.split())[:60]
+        description = getattr(args, "description", None) or " ".join(args.value.split())[:160]
+        document = repository.write(
+            name=name,
+            description=description,
+            type=getattr(args, "memory_type", "project"),
+            content=args.value,
+            confidence=0.6,
+            explicit=True,
+            sources=["cli"],
+        )
+        print(f"Added {document.id} at {document.path}")
+        return 0
+    if args.action == "edit":
+        if not args.value or not getattr(args, "text", None):
+            print("[error] `memory edit` needs an id and --text", file=sys.stderr)
+            return 1
+        document = repository.update(args.value, content=args.text, explicit=True)
+        print(f"Updated {document.id} at {document.path}")
         return 0
     if args.action == "forget":
         if not args.value:
             print("[error] `memory forget` needs an id", file=sys.stderr)
             return 1
-        if asyncio.run(store.delete(args.value)):
+        if repository.forget(args.value):
             print(f"Forgot {args.value}")
             return 0
         print(f"[error] no memory {args.value}", file=sys.stderr)
         return 1
+    if args.action == "validate":
+        validation = repository.validate(repair=getattr(args, "repair", False))
+        for warning in validation.warnings:
+            print(f"[warning] {warning}")
+        for error in validation.errors:
+            print(f"[error] {error}", file=sys.stderr)
+        print(
+            f"scanned={validation.scanned} valid={validation.valid} "
+            f"index_rebuilt={validation.index_rebuilt}"
+        )
+        return 0 if validation.valid else 1
+    if args.action == "migrate":
+        source = Path(args.value) if args.value else Path(config.dir) / "memory.jsonl"
+        migration = repository.migrate_jsonl(source)
+        print(
+            f"source={migration.source} total={migration.total} imported={migration.imported} "
+            f"skipped={migration.skipped} corrupt={len(migration.corrupt_lines)} "
+            f"already_complete={migration.already_complete}"
+        )
+        return 0 if not migration.corrupt_lines else 1
     return 0
 
 
@@ -1405,8 +1492,19 @@ def main(argv: list[str] | None = None) -> int:
     dream_parser.set_defaults(func=dream_command)
 
     memory_parser = subparsers.add_parser("memory", help="Inspect or curate stored memories.")
-    memory_parser.add_argument("action", choices=["list", "add", "forget"])
-    memory_parser.add_argument("value", nargs="?", default=None, help="Text for add, id for forget.")
+    memory_parser.add_argument(
+        "action",
+        choices=["list", "show", "search", "add", "edit", "forget", "validate", "migrate"],
+    )
+    memory_parser.add_argument("value", nargs="?", default=None, help="Text, query, id, or source path.")
+    memory_parser.add_argument("--scope", choices=["private", "team"], default="private")
+    memory_parser.add_argument("--memory-dir", metavar="PATH", default=None)
+    memory_parser.add_argument("--name", default=None)
+    memory_parser.add_argument("--description", default=None)
+    memory_parser.add_argument("--type", dest="memory_type", choices=["user", "feedback", "project", "reference"], default="project")
+    memory_parser.add_argument("--text", default=None, help="Replacement content for edit.")
+    memory_parser.add_argument("--limit", type=int, default=5)
+    memory_parser.add_argument("--repair", action="store_true")
     add_config_flag(memory_parser)
     memory_parser.set_defaults(func=memory_command)
 

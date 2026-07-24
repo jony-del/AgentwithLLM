@@ -59,6 +59,8 @@ class Skill:
     user_invocable: bool = True
     disable_model_invocation: bool = False
     context: SkillContext = SkillContext.INLINE
+    memory: str = "none"
+    agent_key: str | None = None
     source_path: Path | None = field(default=None, compare=False)
     # When set, the prompt is computed by this async callable at invocation time instead
     # of rendering ``body`` (a "programmatic" skill). ``body`` then holds a static

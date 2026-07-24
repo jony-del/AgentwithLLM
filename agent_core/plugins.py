@@ -23,7 +23,7 @@ from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapt
 from agent_core.hooks import ExternalHookSpec
 from agent_core.local_config import update_local_table, update_toml_table
 from agent_core.mcp import MCPAdapter, MCPClientManager, MCPConfig, MCPServerConfig
-from agent_core.skills import Skill, SkillContext, SkillRegistry, load_skill_file
+from agent_core.skills import Skill, SkillContext, SkillRegistry, load_skill_file, parse_frontmatter
 
 if TYPE_CHECKING:
     from agent_core.react import ReActAgent
@@ -459,6 +459,8 @@ def _clone_skill(skill: Skill, namespace: str) -> Skill:
         user_invocable=skill.user_invocable,
         disable_model_invocation=skill.disable_model_invocation,
         context=skill.context,
+        memory=skill.memory,
+        agent_key=f"{namespace}:{skill.agent_key or skill.name}",
         source_path=skill.source_path,
     )
 
@@ -509,19 +511,28 @@ def _load_plugin_agents(
         candidates.extend([location] if location.is_file() else location.glob("*.md"))
     for path in sorted(candidates):
         try:
-            body = path.read_text(encoding="utf-8").strip()
+            raw = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeDecodeError):
             continue
+        if not raw:
+            continue
+        meta, parsed_body = parse_frontmatter(raw)
+        body = parsed_body.strip()
         if not body:
             continue
         name = f"{namespace}:{path.stem}"
-        definitions[name] = body
+        definitions[name] = raw
+        memory = str(meta.get("memory", "none")).strip().lower()
+        if memory not in {"none", "user", "project", "local"}:
+            memory = "none"
         skills.append(
             Skill(
                 name=name,
                 description=f"Run the {path.stem} plugin agent.",
                 body=body + "\n\n$ARGUMENTS",
                 context=SkillContext.FORK,
+                memory=memory,
+                agent_key=name,
                 source_path=path,
             )
         )

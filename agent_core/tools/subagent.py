@@ -62,6 +62,15 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
                 "type": "string", "enum": ["shared", "worktree"],
                 "description": "shared uses the current workspace; worktree creates an isolated Git worktree.",
             },
+            "agent_name": {
+                "type": "string",
+                "description": "Stable safe name for an agent that is allowed independent memory.",
+            },
+            "memory": {
+                "type": "string",
+                "enum": ["none", "user", "project", "local"],
+                "description": "Named-agent memory scope. Anonymous dispatch must use none.",
+            },
         },
         "required": ["task"],
     }
@@ -112,6 +121,12 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         isolation = str(arguments.get("isolation", "shared"))
         if isolation not in {"shared", "worktree"}:
             isolation = "shared"
+        agent_name = str(arguments.get("agent_name", "")).strip() or None
+        memory = str(arguments.get("memory", "none"))
+        if memory not in {"none", "user", "project", "local"}:
+            memory = "none"
+        if agent_name is None:
+            memory = "none"
 
         factory = self.session.subagent_factory
         if factory is None:
@@ -124,11 +139,22 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         try:
             parameters = inspect.signature(factory).parameters
             factory_call = cast(Callable[..., Awaitable[str]], factory)
-            answer = (
-                await factory_call(task, preset, model, isolation)
-                if len(parameters) >= 4
-                else await factory_call(task, preset, model)
-            )
+            if len(parameters) >= 6:
+                answer = await factory_call(task, preset, model, isolation, agent_name, memory)
+            elif len(parameters) >= 4:
+                answer = await factory_call(task, preset, model, isolation)
+            else:
+                answer = await factory_call(task, preset, model)
         except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
             return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
-        return ToolResult(self.name, answer, metadata={"preset": preset, "model": model, "isolation": isolation})
+        return ToolResult(
+            self.name,
+            answer,
+            metadata={
+                "preset": preset,
+                "model": model,
+                "isolation": isolation,
+                "agent_name": agent_name,
+                "memory": memory,
+            },
+        )

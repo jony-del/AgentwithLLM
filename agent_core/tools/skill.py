@@ -148,7 +148,17 @@ class SkillTool(SessionAwareMixin, Tool):
             preset = fork_preset(skill.allowed_tools)
             try:
                 factory_call = cast(Callable[..., Awaitable[str]], factory)
-                answer = await factory_call(prompt, preset, skill.model)
+                if skill.memory != "none":
+                    answer = await factory_call(
+                        prompt,
+                        preset,
+                        skill.model,
+                        "shared",
+                        skill.agent_key or skill.name,
+                        skill.memory,
+                    )
+                else:
+                    answer = await factory_call(prompt, preset, skill.model)
             except Exception as exc:  # noqa: BLE001 - a skill failure must not crash the parent run
                 return ToolResult(self.name, f"Skill error: {type(exc).__name__}: {exc}", ok=False)
             return ToolResult(

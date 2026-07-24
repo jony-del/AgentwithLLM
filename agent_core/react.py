@@ -44,7 +44,13 @@ from agent_core.hooks import (
     MaxOutputPostHook,
     OutputLimitConfig,
 )
-from agent_core.memory import MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
+from agent_core.memory import Dreamer, MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
+from agent_core.memory.paths import MemoryPathResolver
+from agent_core.memory.repository import MemoryRepository
+from agent_core.memory.retrieval import RepositoryMemoryRetriever, SemanticMemorySelector
+from agent_core.memory.store import RepositoryMemoryStore
+from agent_core.memory.lifecycle import MemoryLifecycle
+from agent_core.file_lock import FileLock
 from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
 from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult
 from agent_core.model_validation import is_model_allowed, unsupported_model_message
@@ -309,7 +315,7 @@ class ReActAgent:
         tools: ToolRegistry | None = None,
         hooks: HookPipeline | None = None,
         logger: JSONLRunLogger | None = None,
-        memory_store: MemoryStore | None = None,
+        memory_store: MemoryStore | RepositoryMemoryStore | None = None,
         retriever: MemoryRetriever | None = None,
         extractor: MemoryExtractor | None = None,
         team_store: TeamStore | None = None,
@@ -563,6 +569,14 @@ class ReActAgent:
         self.memory_store, self.retriever, self.extractor = self._build_memory(
             memory_store, retriever, extractor
         )
+        repository = getattr(self.memory_store, "repository", None)
+        self.session.memory_repository = repository
+        self.session.memory_direct_write = (
+            self.extractor.mark_direct_write if self.extractor is not None else None
+        )
+        if repository is None:
+            for name in ("memory_search", "memory_write", "memory_forget"):
+                self.registry.unregister(name)
         # Running prompt-token figure from the last response's usage (Phase 2B). The
         # auto-compact gate thresholds against this (parity with the reference) instead
         # of a char ratio; 0 until the first response with usage arrives.
@@ -595,10 +609,10 @@ class ReActAgent:
 
     def _build_memory(
         self,
-        memory_store: MemoryStore | None,
+        memory_store: MemoryStore | RepositoryMemoryStore | None,
         retriever: MemoryRetriever | None,
         extractor: MemoryExtractor | None,
-    ) -> tuple[MemoryStore | None, MemoryRetriever | None, MemoryExtractor | None]:
+    ) -> tuple[MemoryStore | RepositoryMemoryStore | None, MemoryRetriever | None, MemoryExtractor | None]:
         """Wire up cross-conversation memory, but only when it's enabled.
 
         Injected components win (tests/customisation); otherwise the missing pieces
@@ -607,8 +621,51 @@ class ReActAgent:
         """
         if not self.config.memory.enabled:
             return None, None, None
-        store = memory_store or MemoryStore(Path(self.config.memory.dir) / "memory.jsonl")
-        retriever = retriever or MemoryRetriever(store, self.config.memory)
+        store: MemoryStore | RepositoryMemoryStore
+        repository: MemoryRepository | None
+        if memory_store is None:
+            override = self.config.memory.dir if self.config.memory.dir_trusted else None
+            root = MemoryPathResolver(
+                self._initial_workspace,
+                private_override=override,
+            ).resolve("private")
+            repository = MemoryRepository(root, scope="private")
+            legacy_root = (
+                Path(self.config.memory.dir)
+                if self.config.memory.dir_trusted
+                else self._initial_workspace / "memory"
+            )
+            legacy_path = legacy_root / "memory.jsonl"
+            if legacy_path.exists():
+                try:
+                    repository.migrate_jsonl(legacy_path)
+                except Exception as exc:  # noqa: BLE001 - migration never blocks an agent run
+                    logging.getLogger(__name__).warning(
+                        "legacy memory migration failed; source remains readable: %s",
+                        type(exc).__name__,
+                    )
+            store = RepositoryMemoryStore(repository)
+        else:
+            store = memory_store
+            candidate_repository = getattr(store, "repository", None)
+            repository = candidate_repository if isinstance(candidate_repository, MemoryRepository) else None
+        if retriever is None and repository is not None:
+            selector_config = self._provider_config()
+            if self.config.memory.memory_model:
+                selector_config = replace(selector_config, model=self.config.memory.memory_model)
+            selector = (
+                SemanticMemorySelector(self.provider, selector_config)
+                if self.config.memory.semantic_selection
+                else None
+            )
+            retriever = RepositoryMemoryRetriever(
+                store,
+                repository,
+                self.config.memory,
+                selector=selector,
+            )
+        else:
+            retriever = retriever or MemoryRetriever(store, self.config.memory)
         extractor = extractor or MemoryExtractor(
             self.provider, store, self.config.memory, self._provider_config()
         )
@@ -1770,14 +1827,37 @@ class ReActAgent:
         """Inject relevant past memories as a pinned system block before the task."""
         if self.retriever is None:
             return
+        if any(
+            phrase in task.casefold()
+            for phrase in ("ignore memory", "ignore memories", "忽略记忆", "不要使用记忆")
+        ):
+            return
         recalled = await self.retriever.recall(task)
-        if not recalled:
+        repository = getattr(self.memory_store, "repository", None)
+        index = ""
+        if repository is not None and repository.list(headers_only=True):
+            index = repository.index_text()
+        if not recalled and not index:
             return
         block = self.retriever.format_block(recalled)
+        if index:
+            block += (
+                "\n\nMemory topic index (descriptions only; use as low-priority historical context):\n"
+                + index
+            )
+        budget = max(1024, self.config.memory.content_budget_bytes)
+        block = block.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
         # Right after the main system prompt, before the user task, tagged so
         # extraction skips it and context_collapse keeps it pinned.
         messages.insert(1, Message("system", block, metadata={"memory": "recall"}))
-        await self.logger.write("memory_recall", {"count": len(recalled), "ids": [r.id for r in recalled]})
+        await self.logger.write(
+            "memory_recall",
+            {
+                "count": len(recalled),
+                "ids": [r.id for r in recalled],
+                **getattr(self.retriever, "last_metrics", {}),
+            },
+        )
 
     async def _inject_project_context(self, messages: list[Message]) -> None:
         """Assemble run-start context the reference Open-ClaudeCode way.
@@ -1853,12 +1933,65 @@ class ReActAgent:
         if self.extractor is None or not self.config.memory.auto_extract:
             return
         try:
-            stored = await self.extractor.extract(messages, source_run_id=self.logger.run_id)
+            stored = await self.extractor.extract(
+                messages,
+                source_run_id=self.logger.run_id,
+                cursor_key=self.session_id,
+            )
         except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
             await self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
             return
         if stored:
             await self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
+        await self._maybe_auto_dream()
+
+    async def _maybe_auto_dream(self) -> None:
+        repository = getattr(self.memory_store, "repository", None)
+        if (
+            repository is None
+            or not self.config.memory.auto_dream
+            or self.memory_store is None
+        ):
+            return
+        lifecycle = MemoryLifecycle(
+            repository.root,
+            min_hours=self.config.memory.dream_min_hours,
+            min_sessions=self.config.memory.dream_min_sessions,
+        )
+        eligibility = await asyncio.to_thread(lifecycle.record_session)
+        if not eligibility.due:
+            return
+        lock = FileLock(repository.root / ".dream.lock", timeout=0)
+        try:
+            lock.__enter__()
+        except TimeoutError:
+            return
+        try:
+            dreamer = Dreamer(
+                self.memory_store,
+                self.config.memory,
+                self.provider,
+                self._provider_config(),
+            )
+            report = await dreamer.dream()
+        except Exception as exc:  # noqa: BLE001 - background lifecycle cannot fail the run
+            await self.logger.write(
+                "memory_dream",
+                {"error": type(exc).__name__},
+            )
+        else:
+            await asyncio.to_thread(lifecycle.mark_dream_succeeded)
+            await self.logger.write(
+                "memory_dream",
+                {
+                    "scanned": report.scanned,
+                    "forgotten": report.forgotten,
+                    "merged": report.merged,
+                    "insights_added": report.insights_added,
+                },
+            )
+        finally:
+            lock.__exit__(None, None, None)
 
     def _compaction_reporter(self, reactive: bool) -> Callable[[int, int, CompressionEvent], None]:
         """Build the per-stage callback that drives the UI's compaction progress bar.
@@ -2172,7 +2305,12 @@ class ReActAgent:
         }
 
     def _make_subagent_child(
-        self, preset: str, model: str | None = None, workspace: Path | None = None
+        self,
+        preset: str,
+        model: str | None = None,
+        workspace: Path | None = None,
+        agent_name: str | None = None,
+        memory_scope: str = "none",
     ) -> "ReActAgent | str":
         """Build the ``dispatch_agent`` child (or a refusal string at the depth ceiling).
 
@@ -2205,6 +2343,10 @@ class ReActAgent:
             "team_message_send",
         }
         allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
+        if agent_name and memory_scope != "none":
+            allowed_tools = allowed_tools | {"memory_search"}
+            if preset == "full":
+                allowed_tools = allowed_tools | {"memory_write", "memory_forget"}
         child_workspace = (workspace or self.session.workspace).resolve()
         for tool in default_tools(workspace=child_workspace):
             if getattr(tool, "name", "") in excluded:
@@ -2216,10 +2358,23 @@ class ReActAgent:
         # the ``skill`` tool, so there's nothing to load) in the child. The child's
         # permission mode comes from the preset, never inherited wholesale — see
         # _child_permission_mode (no escalation via spawning).
+        memory_config = replace(self.config.memory, enabled=False)
+        if agent_name and memory_scope in {"user", "project", "local"}:
+            agent_root = MemoryPathResolver(child_workspace).resolve(
+                memory_scope,  # type: ignore[arg-type]
+                agent_key=agent_name,
+            )
+            memory_config = replace(
+                self.config.memory,
+                enabled=True,
+                dir=str(agent_root),
+                dir_trusted=True,
+                scope=memory_scope,
+            )
         child_config = replace(
             self.config,
             permission=_child_permission_mode(self.config.permission, preset),
-            memory=replace(self.config.memory, enabled=False),
+            memory=memory_config,
             skills=replace(self.config.skills, enabled=False),
         )
         if model:
@@ -2242,6 +2397,7 @@ class ReActAgent:
         child.session.parent_run_id = self.logger.run_id
         child.session.agent_id = agent_id
         child.session.parent_agent_id = self.session.agent_id
+        child.session.agent_name = agent_name or child.session.agent_name
         child.permissions.is_subagent = True
         child.permissions.parent_mode = PermissionMode(self.config.permission)
         child.permissions.parent_agent_id = self.session.agent_id
@@ -2267,6 +2423,8 @@ class ReActAgent:
     async def _spawn_subagent(
         self, task: str, preset: str = "read_only", model: str | None = None,
         isolation: str = "shared",
+        agent_name: str | None = None,
+        memory_scope: str = "none",
     ) -> str:
         """``dispatch_agent`` factory — awaits the child on the shared event loop.
 
@@ -2275,10 +2433,19 @@ class ReActAgent:
         being torn down).
         """
         isolated = await self._create_agent_worktree("agent") if isolation == "worktree" else None
-        child = (
-            self._make_subagent_child(preset, model, isolated["path"])
-            if isolated is not None else self._make_subagent_child(preset, model)
-        )
+        if agent_name is not None and memory_scope != "none":
+            child = self._make_subagent_child(
+                preset,
+                model,
+                isolated["path"] if isolated is not None else None,
+                agent_name,
+                memory_scope,
+            )
+        elif isolated is not None:
+            child = self._make_subagent_child(preset, model, isolated["path"])
+        else:
+            # Preserve the long-standing two-argument factory seam for embeddings/tests.
+            child = self._make_subagent_child(preset, model)
         if isinstance(child, str):
             if isolated is not None:
                 await self._finalize_agent_worktree(isolated)
@@ -2292,6 +2459,8 @@ class ReActAgent:
             "depth": getattr(getattr(child, "session", None), "depth", None),
             "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
             "isolation": isolation,
+            "agent_name": agent_name,
+            "memory": memory_scope,
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
@@ -2345,6 +2514,7 @@ class ReActAgent:
         preset: str,
         model: str | None = None,
         workspace: Path | None = None,
+        memory_scope: str = "none",
     ) -> "tuple[ReActAgent, str] | str":
         """Build a teammate child and its prompt (or a refusal string at the ceiling).
 
@@ -2370,6 +2540,10 @@ class ReActAgent:
         sub_registry = ToolRegistry()
         excluded = {"dispatch_agent", "skill", "team_create", "task_create", "teammate_spawn", "team_status"}
         allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
+        if memory_scope != "none":
+            allowed_tools = allowed_tools | {"memory_search"}
+            if preset == "full":
+                allowed_tools = allowed_tools | {"memory_write", "memory_forget"}
         child_workspace = (workspace or self.session.workspace).resolve()
         for tool in default_tools(workspace=child_workspace):
             tool_name = getattr(tool, "name", "")
@@ -2385,11 +2559,24 @@ class ReActAgent:
         # escalation. Now they get the preset-mapped mode like any child, plus explicit
         # allow rules for the team-coordination tools (which write team state, not the
         # workspace), so a read_only teammate can still claim tasks and report back.
+        memory_config = replace(self.config.memory, enabled=False)
+        if memory_scope in {"user", "project", "local"}:
+            agent_root = MemoryPathResolver(child_workspace).resolve(
+                memory_scope,  # type: ignore[arg-type]
+                agent_key=name,
+            )
+            memory_config = replace(
+                self.config.memory,
+                enabled=True,
+                dir=str(agent_root),
+                dir_trusted=True,
+                scope=memory_scope,
+            )
         child_config = replace(
             self.config,
             permission=_child_permission_mode(self.config.permission, preset),
             permission_rules=self.config.permission_rules.merge(_TEAMMATE_COORDINATION_RULES),
-            memory=replace(self.config.memory, enabled=False),
+            memory=memory_config,
             skills=replace(self.config.skills, enabled=False),
         )
         if model:
@@ -2431,15 +2618,34 @@ class ReActAgent:
         preset: str = "read_only",
         model: str | None = None,
         isolation: str = "shared",
+        memory_scope: str = "none",
     ) -> str:
         """Teammate factory — awaits the teammate turn on the shared event loop.
 
         Fires SubagentStart/SubagentStop (observational, ``kind="teammate"``) around
         the child run; a cancellation skips the Stop event (best-effort)."""
         isolated = await self._create_agent_worktree("teammate") if isolation == "worktree" else None
-        built = await self._make_teammate_child(
-            team_id, name, role, task_id, preset, model, isolated["path"] if isolated else None
-        )
+        if memory_scope != "none":
+            built = await self._make_teammate_child(
+                team_id,
+                name,
+                role,
+                task_id,
+                preset,
+                model,
+                isolated["path"] if isolated else None,
+                memory_scope,
+            )
+        else:
+            built = await self._make_teammate_child(
+                team_id,
+                name,
+                role,
+                task_id,
+                preset,
+                model,
+                isolated["path"] if isolated else None,
+            )
         if isinstance(built, str):
             if isolated is not None:
                 await self._finalize_agent_worktree(isolated)
@@ -2454,6 +2660,7 @@ class ReActAgent:
             "depth": getattr(getattr(child, "session", None), "depth", None),
             "child_run_id": getattr(getattr(child, "logger", None), "run_id", None),
             "isolation": isolation,
+            "memory": memory_scope,
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()

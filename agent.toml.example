@@ -48,20 +48,31 @@ effort = "high"
 # configurable via this file.
 [memory]
 enabled = true               # turn recall + extraction on by default
-dir = "memory"                # where memory.jsonl lives (gitignored)
+# Private memory is stored under ~/.polaris/projects/<project-id>/memory/private.
+# A repository agent.toml cannot redirect that path. For an explicit trusted
+# override, set AGENT_MEMORY_DIR, --memory-dir on `polaris memory`, or put
+# `dir = "..."` in the gitignored agent.local.toml.
 
-# Recall: how relevant past memories are selected and ranked.
+# Recall: semantic header selection with Unicode lexical fallback.
 recall_k = 5                  # how many memories to inject per run
-w_relevance = 1.0             # weight: lexical overlap with the task
-w_importance = 0.5            # weight: stored salience
-w_recency = 0.3               # weight: how recently the memory was used
-recency_decay_per_hour = 0.01 # exponential recency decay rate
+semantic_selection = true
+memory_model = ""             # empty inherits the active model
+content_budget_bytes = 65536
+# Legacy v0 ranking keys remain accepted for one compatibility release:
+w_relevance = 1.0
+w_importance = 0.5
+w_recency = 0.3
+recency_decay_per_hour = 0.01
 
 # Extraction: distilling durable memories after a run.
 auto_extract = true           # extract automatically when a run completes
+team_auto_extract = false      # team memory requires explicit writes by default
 dedup_threshold = 0.85        # skip a new memory this similar to an existing one
 
-# Dreaming: offline consolidation (`python -m agent_core dream`).
+# Dreaming: manual (`polaris dream`) and gated automatic consolidation.
+auto_dream = true
+dream_min_hours = 24.0
+dream_min_sessions = 5
 forget_threshold = 0.15       # drop memories whose decayed importance falls below this
 forget_min_access = 1         # ...unless they've been recalled at least this many times
 importance_half_life_days = 14.0  # forgetting curve half-life

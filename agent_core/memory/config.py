@@ -17,9 +17,14 @@ class MemoryConfig:
 
     enabled: bool = False
     dir: str = "memory"
+    dir_trusted: bool = True
+    scope: str = "private"
 
     # --- Recall ---------------------------------------------------------------
     recall_k: int = 5
+    semantic_selection: bool = True
+    memory_model: str | None = None
+    content_budget_bytes: int = 64 * 1024
     # Weights for the blended recall score (need not sum to 1; ranking is relative).
     w_relevance: float = 1.0
     w_importance: float = 0.5
@@ -29,6 +34,7 @@ class MemoryConfig:
 
     # --- Extraction -----------------------------------------------------------
     auto_extract: bool = True
+    team_auto_extract: bool = False
     # Skip storing a freshly extracted memory if it overlaps an existing one above
     # this lexical-relevance threshold (avoids slow-growing near-duplicates).
     dedup_threshold: float = 0.85
@@ -44,6 +50,9 @@ class MemoryConfig:
     merge_threshold: float = 0.6
     # Whether dreaming asks the LLM to synthesise higher-level insight memories.
     synthesize_insights: bool = True
+    auto_dream: bool = True
+    dream_min_hours: float = 24.0
+    dream_min_sessions: int = 5
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "MemoryConfig":
