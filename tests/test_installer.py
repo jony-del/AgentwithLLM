@@ -243,6 +243,143 @@ def test_reused_polaris_is_recorded_as_external_not_owned(tmp_path) -> None:
     assert not state.component_owned("polaris")
 
 
+def test_dev_install_reuses_valid_environment_and_sets_resilient_http_defaults(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    scripts = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    python = scripts / ("python.exe" if os.name == "nt" else "python")
+    python.write_text("launcher", encoding="utf-8")
+    executable = scripts / ("polaris.exe" if os.name == "nt" else "polaris")
+
+    class DevRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__({"uv"})
+            self.pip_env: dict[str, str] = {}
+
+        def run(self, argv, **kwargs):
+            rendered = [str(item) for item in argv]
+            self.calls.append(rendered)
+            if rendered[0] == str(python):
+                return subprocess.CompletedProcess(rendered, 0, "3.12\n", "")
+            if rendered[1:3] == ["pip", "install"]:
+                self.pip_env = dict(kwargs["env"])
+                executable.write_text("launcher", encoding="utf-8")
+            return subprocess.CompletedProcess(rendered, 0, "", "")
+
+    runner = DevRunner()
+    installer = Installer(
+        _options(tmp_path, dev=True, skip_sandbox=True),
+        runner=runner,
+        state=StateStore(tmp_path / "state.json"),
+        system="windows" if os.name == "nt" else "linux",
+        machine="x86_64",
+    )
+
+    installer._install_project()
+
+    assert not any(call[1:2] == ["venv"] for call in runner.calls)
+    assert any(call[1:3] == ["pip", "install"] for call in runner.calls)
+    assert runner.pip_env["UV_HTTP_CONNECT_TIMEOUT"] == "30"
+    assert runner.pip_env["UV_HTTP_TIMEOUT"] == "120"
+    assert runner.pip_env["UV_HTTP_RETRIES"] == "5"
+    assert installer.state.component("polaris")["environment"] == str(
+        (tmp_path / ".venv").resolve()
+    )
+
+
+def test_dev_install_preserves_user_uv_http_settings(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    scripts = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    python = scripts / ("python.exe" if os.name == "nt" else "python")
+    python.write_text("launcher", encoding="utf-8")
+    executable = scripts / ("polaris.exe" if os.name == "nt" else "polaris")
+    monkeypatch.setenv("UV_HTTP_TIMEOUT", "600")
+
+    class DevRunner(FakeRunner):
+        pip_env: dict[str, str] = {}
+
+        def run(self, argv, **kwargs):
+            rendered = [str(item) for item in argv]
+            self.calls.append(rendered)
+            if rendered[0] == str(python):
+                return subprocess.CompletedProcess(rendered, 0, "3.12\n", "")
+            if rendered[1:3] == ["pip", "install"]:
+                self.pip_env = dict(kwargs["env"])
+                executable.write_text("launcher", encoding="utf-8")
+            return subprocess.CompletedProcess(rendered, 0, "", "")
+
+    runner = DevRunner({"uv"})
+    installer = Installer(
+        _options(tmp_path, dev=True, skip_sandbox=True),
+        runner=runner,
+        state=StateStore(tmp_path / "state.json"),
+        system="windows" if os.name == "nt" else "linux",
+        machine="x86_64",
+    )
+
+    installer._install_project()
+
+    assert runner.pip_env["UV_HTTP_TIMEOUT"] == "600"
+
+
+def test_memory_models_can_only_degrade_after_explicit_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_root = tmp_path / "models"
+    monkeypatch.setenv("POLARIS_MEMORY_MODELS_DIR", str(model_root))
+    state = StateStore(tmp_path / "state.json")
+    installer = Installer(
+        _options(tmp_path, skip_sandbox=True, skip_memory_models=True),
+        runner=FakeRunner({"polaris"}),
+        state=state,
+        system="windows" if os.name == "nt" else "linux",
+        machine="x86_64",
+    )
+
+    installer._install_memory_models()
+
+    marker = model_root / ".explicitly-skipped"
+    assert marker.is_file()
+    receipt = state.component("memory-models-policy")
+    assert receipt["installed_by_polaris"] is True
+    assert Path(receipt["path"]) == marker.resolve()
+
+
+def test_memory_model_install_records_exact_owned_bundle(tmp_path: Path) -> None:
+    bundle_root = tmp_path / "models" / "bundle-v1"
+    bundle_root.mkdir(parents=True)
+    (bundle_root / ".polaris-owned").write_text("{}", encoding="utf-8")
+
+    class ModelRunner(FakeRunner):
+        def run(self, argv, **kwargs):
+            rendered = [str(item) for item in argv]
+            self.calls.append(rendered)
+            return subprocess.CompletedProcess(
+                rendered,
+                0,
+                json.dumps({"valid": True, "root": str(bundle_root)}),
+                "",
+            )
+
+    state = StateStore(tmp_path / "state.json")
+    installer = Installer(
+        _options(tmp_path, skip_sandbox=True),
+        runner=ModelRunner({"polaris"}),
+        state=state,
+        system="windows" if os.name == "nt" else "linux",
+        machine="x86_64",
+    )
+
+    installer._install_memory_models()
+
+    receipt = state.component("memory-models")
+    assert receipt["installed_by_polaris"] is True
+    assert Path(receipt["path"]) == bundle_root.resolve()
+
+
 def test_runner_dry_run_executes_probes_but_skips_mutations(monkeypatch) -> None:
     calls = []
 

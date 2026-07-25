@@ -14,6 +14,8 @@ UPGRADE=0
 CHECK=0
 DRY_RUN=0
 SKIP_SANDBOX=0
+SKIP_MEMORY_MODELS=0
+MODEL_BUNDLE=""
 NON_INTERACTIVE=0
 
 while (($#)); do
@@ -48,6 +50,17 @@ while (($#)); do
       FORWARD_ARGS+=("$1")
       shift
       ;;
+    --skip-memory-models)
+      SKIP_MEMORY_MODELS=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --model-bundle)
+      [[ $# -ge 2 ]] || { echo "--model-bundle requires a path" >&2; exit 2; }
+      MODEL_BUNDLE="$2"
+      FORWARD_ARGS+=("$1" "$2")
+      shift 2
+      ;;
     --non-interactive)
       NON_INTERACTIVE=1
       FORWARD_ARGS+=("$1")
@@ -72,9 +85,14 @@ while (($#)); do
   esac
 done
 
+if ((SKIP_MEMORY_MODELS)) && [[ -n "$MODEL_BUNDLE" ]]; then
+  echo "[usage] --skip-memory-models cannot be combined with --model-bundle" >&2
+  exit 2
+fi
+
 if ((UNINSTALL)); then
-  if ((DEV || UPGRADE || CHECK || SKIP_SANDBOX)); then
-    echo "[usage] --uninstall cannot be combined with --dev, --upgrade, --check, or --skip-sandbox" >&2
+  if ((DEV || UPGRADE || CHECK || SKIP_SANDBOX || SKIP_MEMORY_MODELS)) || [[ -n "$MODEL_BUNDLE" ]]; then
+    echo "[usage] --uninstall cannot be combined with install/upgrade options" >&2
     exit 2
   fi
   if ((NON_INTERACTIVE && !ASSUME_YES && !DRY_RUN)); then
@@ -166,7 +184,9 @@ if ((!UNINSTALL && !CHECK && !DRY_RUN)); then
 else
   export UV_PYTHON_DOWNLOADS=never
 fi
-PYTHON="$("$UV" python find 3.12 | tail -n 1)"
+# Do not let project discovery select the .venv that uninstall is about to
+# remove.  The worker must run from uv's external managed Python.
+PYTHON="$("$UV" python find --system --no-project 3.12 | tail -n 1)"
 [[ -x "$PYTHON" ]] || { echo "uv did not return a Python 3.12 executable" >&2; exit 10; }
 if ((UNINSTALL)); then
   UNINSTALL_ARGS=()

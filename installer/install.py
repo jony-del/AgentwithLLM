@@ -74,6 +74,8 @@ class Options:
     check: bool = False
     dry_run: bool = False
     skip_sandbox: bool = False
+    skip_memory_models: bool = False
+    model_bundle: Path | None = None
     non_interactive: bool = False
 
 
@@ -245,6 +247,7 @@ class Installer:
         if not self.options.skip_sandbox:
             self._ensure_container_runtime()
         self._install_project()
+        self._install_memory_models()
         self._install_scheduler()
         if self.options.dry_run:
             return before
@@ -833,17 +836,64 @@ class Installer:
         uv = self.runner.which("uv") or "uv"
         if self.options.dev:
             venv = source / ".venv"
-            self.runner.run(
-                [uv, "venv", "--python", PYTHON_SERIES, venv],
-                check=True,
-                mutates=True,
-            )
             python = venv_python(venv, self.system)
-            self.runner.run(
-                [uv, "pip", "install", "--python", python, "-e", spec],
-                check=True,
-                mutates=True,
-            )
+            if venv.exists():
+                if not venv.is_dir() or not python.is_file():
+                    raise InstallError(
+                        f"the existing development environment is incomplete: {venv}\n"
+                        "Close Python/Ruff/Polaris processes using it, remove only that "
+                        "`.venv` directory, then rerun the installer."
+                    )
+                probe = self.runner.run(
+                    [
+                        python,
+                        "-c",
+                        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+                    ],
+                    capture=True,
+                )
+                if probe.returncode or probe.stdout.strip() != PYTHON_SERIES:
+                    detail = (probe.stderr or probe.stdout).strip()
+                    suffix = f" ({detail})" if detail else ""
+                    raise InstallError(
+                        f"the existing development environment is not usable with "
+                        f"Python {PYTHON_SERIES}: {venv}{suffix}\n"
+                        "Close processes using it, remove only that `.venv` directory, "
+                        "then rerun the installer."
+                    )
+                print(f"Reusing existing development environment: {venv}")
+            else:
+                self.runner.run(
+                    [uv, "venv", "--python", PYTHON_SERIES, venv],
+                    check=True,
+                    mutates=True,
+                )
+
+            dependency_env = os.environ.copy()
+            # PyPI access can be slow behind enterprise proxies or high-latency
+            # connections. Keep explicit user settings authoritative while making the
+            # default substantially more tolerant than uv's 10s connect / 30s read
+            # timeouts. A failed install remains resumable because the valid venv is
+            # reused on the next run.
+            dependency_env.setdefault("UV_HTTP_CONNECT_TIMEOUT", "30")
+            dependency_env.setdefault("UV_HTTP_TIMEOUT", "120")
+            dependency_env.setdefault("UV_HTTP_RETRIES", "5")
+            try:
+                self.runner.run(
+                    [uv, "pip", "install", "--python", python, "-e", spec],
+                    check=True,
+                    mutates=True,
+                    env=dependency_env,
+                )
+            except InstallError as exc:
+                raise InstallError(
+                    f"{exc}\n"
+                    "Python dependency installation failed. The development environment "
+                    "was kept and will be reused on the next run. Check access to "
+                    "https://pypi.org/simple/, or configure HTTPS_PROXY/UV_DEFAULT_INDEX; "
+                    "UV_HTTP_CONNECT_TIMEOUT, UV_HTTP_TIMEOUT, and UV_HTTP_RETRIES may "
+                    "also be overridden."
+                ) from exc
             if not self.options.dry_run:
                 executable = python.parent / (
                     "polaris.exe" if self.system == "windows" else "polaris"
@@ -928,8 +978,76 @@ class Installer:
                 },
             )
 
+    def _install_memory_models(self) -> None:
+        command = self._project_command()
+        if command is None and self.options.dry_run:
+            command = "polaris"
+        if command is None:
+            raise InstallError("cannot install memory models before Polaris is available")
+        if self.options.skip_memory_models:
+            root_override = os.getenv("POLARIS_MEMORY_MODELS_DIR")
+            polaris_home = os.getenv("POLARIS_HOME")
+            if root_override:
+                root = Path(root_override).expanduser()
+            elif polaris_home:
+                root = Path(polaris_home).expanduser() / "models" / "memory"
+            else:
+                root = Path.home() / ".polaris" / "models" / "memory"
+            marker = root / ".explicitly-skipped"
+            print(f"Memory models explicitly skipped; lexical retrieval marker: {marker}")
+            if not self.options.dry_run:
+                root.mkdir(parents=True, exist_ok=True)
+                temporary = root / ".explicitly-skipped.tmp"
+                temporary.write_text(
+                    json.dumps({"schema": 1, "reason": "installer flag"}) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temporary, marker)
+                self.state.mark(
+                    "memory-models:skipped",
+                    component="memory-models-policy",
+                    source="--skip-memory-models",
+                    details={"path": str(marker.resolve()), "install_kind": "explicit-skip"},
+                )
+            return
+        arguments: list[str | os.PathLike[str]] = [
+            command,
+            "memory",
+            "models",
+            "install",
+        ]
+        if self.options.model_bundle is not None:
+            arguments.extend(["--model-bundle", self.options.model_bundle.resolve()])
+        result = self.runner.run(
+            arguments,
+            check=True,
+            capture=True,
+            mutates=True,
+            cwd=Path.home(),
+        )
+        if not self.options.dry_run:
+            try:
+                status = json.loads(result.stdout)
+                root = Path(str(status["root"])).expanduser().resolve()
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise InstallError(
+                    "memory model installer did not return a valid ownership receipt"
+                ) from exc
+            if not (root / ".polaris-owned").is_file():
+                raise InstallError(
+                    "memory model installation is missing its ownership marker"
+                )
+            self.state.mark(
+                "memory-models:installed",
+                component="memory-models",
+                source=str(self.options.model_bundle or "locked release bundle"),
+                details={"path": str(root.resolve()), "install_kind": "model-bundle"},
+            )
+
     def _install_scheduler(self) -> None:
         command = self._project_command()
+        if command is None and self.options.dry_run:
+            command = "polaris"
         if command is None:
             raise InstallError("cannot install the scheduler service before Polaris is available")
         if not self.options.dry_run and not self.state.component_owned("polaris"):
@@ -1349,12 +1467,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true", help="detect dependencies without installing")
     parser.add_argument("--dry-run", action="store_true", help="print changes without executing them")
     parser.add_argument("--skip-sandbox", action="store_true", help="explicitly omit a container runtime")
+    parser.add_argument(
+        "--skip-memory-models",
+        action="store_true",
+        help="explicitly allow lexical-only memory retrieval",
+    )
+    parser.add_argument(
+        "--model-bundle",
+        type=Path,
+        default=None,
+        help="install memory models from a checksummed offline bundle",
+    )
     parser.add_argument("--non-interactive", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.skip_memory_models and args.model_bundle is not None:
+        parser.error("--skip-memory-models cannot be combined with --model-bundle")
     options = Options(
         source=args.source,
         dev=args.dev,
@@ -1362,6 +1494,8 @@ def main(argv: list[str] | None = None) -> int:
         check=args.check,
         dry_run=args.dry_run,
         skip_sandbox=args.skip_sandbox,
+        skip_memory_models=args.skip_memory_models,
+        model_bundle=args.model_bundle,
         non_interactive=args.non_interactive,
     )
     try:

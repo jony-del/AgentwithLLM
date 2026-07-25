@@ -47,6 +47,8 @@ bash install.sh --version v0.1.0
 | `-Check` | `--check` | 只检测，不修改主机 |
 | `-DryRun` | `--dry-run` | 打印计划执行的命令 |
 | `-SkipSandbox` | `--skip-sandbox` | 明确接受不安装容器运行时 |
+| `-SkipMemoryModels` | `--skip-memory-models` | 明确接受仅 exact+BM25 的记忆检索降级 |
+| `-ModelBundle PATH` | `--model-bundle PATH` | 从离线、带校验清单的 ONNX 模型包安装 |
 | `-NonInteractive` | `--non-interactive` | 不弹出交互；缺权限或前置条件时失败 |
 | `-Uninstall` | `--uninstall` | 从安装脚本进入恢复卸载流程 |
 | `-PurgeData` | `--purge-data` | 卸载后额外删除用户级 Polaris 数据和安装状态 |
@@ -55,6 +57,12 @@ bash install.sh --version v0.1.0
 重复运行默认只补缺失项，不强制升级已有工具。安装状态位于
 `%LOCALAPPDATA%\Polaris\install-state.json`（Windows）或
 `${XDG_STATE_HOME:-~/.local/state}/polaris/install-state.json`，其中只记录步骤、来源和所有权。
+源码开发安装会复用已有且可运行的 `.venv`，因此 PyPI 临时超时后可直接重跑，不会为了续装而删除
+整个环境。安装器默认给 uv 使用 30 秒连接超时、120 秒读取超时和 5 次重试；可分别通过
+`UV_HTTP_CONNECT_TIMEOUT`、`UV_HTTP_TIMEOUT`、`UV_HTTP_RETRIES` 覆盖，也可用
+`HTTPS_PROXY` 或 `UV_DEFAULT_INDEX` 指向组织认可的代理/镜像。
+Scheduler 的已有收据、解释器、数据库和平台注册资源完全匹配时同样直接复用，不会先删除再重建
+当前用户服务。
 
 新安装收据还记录安装类型、CLI/环境根目录、uv 路径和外部 worker Python。记录中不含 API 密钥或
 其他凭据。旧 schema 1 收据不会被直接信任；只有重新探测能精确匹配 uv tool 或源码 `.venv` 时
@@ -67,7 +75,9 @@ Git、rg 或 Podman 的记录，但当前终端尚未获得新 PATH，安装器�
 
 默认沙箱档可能需要 UAC 来安装 Podman 或启用 WSL2；Windows 首次启用 WSL2 后需要重启，并以
 退出码 `20` 提示重新运行相同命令。只需 Python/Node/主机命令而明确不需要容器沙箱时，可使用
-`-SkipSandbox`；这属于显式选择的降级安装。若用户取消 UAC，安装器会把它明确映射为 Windows
+`-SkipSandbox`；这属于显式选择的降级安装。记忆模型默认必须成功安装并通过 SHA-256 与
+golden inference；离线环境使用 `-ModelBundle`/`--model-bundle`。只有显式传入
+`-SkipMemoryModels`/`--skip-memory-models` 才会写入词法降级标记。若用户取消 UAC，安装器会把它明确映射为 Windows
 错误 `1223 (0x000004C7)` 并立即停止，不会继续尝试其他 WSL 系统修改。
 
 安装器会先探测 WSL 状态：尚未安装时先执行 `wsl --install --no-distribution`；命令失败且重新
@@ -126,6 +136,7 @@ bash install.sh --uninstall --purge-data --yes
 - 安装器拥有的 `agent-with-llm` uv tool 环境、`polaris` 启动器及环境内专用 Python 依赖；
 - 安装器创建且具有匹配所有权标记的开发 `.venv`，但保留源码 checkout；
 - 安装在 Polaris 私有 runtime 根目录中、路径收据完全匹配的 Node 和对应 PATH/符号链接；
+- 带 `.polaris-owned` 标记且路径收据精确匹配的记忆模型包，以及可重建的 SQLite 记忆索引；
 - Polaris 程序和私有 runtime 的状态收据。
 
 默认保留 `~/.polaris` 配置、信任信息、技能、计划和会话，以及项目内 `.polaris`、`agent.toml`、

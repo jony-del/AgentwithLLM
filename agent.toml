@@ -20,7 +20,9 @@ model = "claude-opus-4-8"
 permission = "default"        # canonical: default | acceptedits | plan | auto | dontask | bypass
 # Compatibility aliases accepted on input: acceptEdits | dontAsk | bypassPermissions
 # Live chat: /permissions opens the six-mode picker; /permissions <mode> switches
-# directly. Shift+Tab cycles default -> acceptedits -> plan -> auto -> default.
+# directly. The composer stays mounted while the agent streams, so Shift+Tab
+# (BackTab/ESC[Z or Alt+M fallback) cycles
+# default -> acceptedits -> plan -> auto -> default during an active run too.
 # default=manual confirmation; acceptedits=native workspace edits; plan=strict read-only;
 # auto=AI-classify pending actions; dontask=deny prompts; bypass=allow unmatched actions.
 provider = "claude"           # claude | openai | openai-compat | fake
@@ -46,25 +48,44 @@ effort = "high"
 # configurable via this file.
 [memory]
 enabled = true               # turn recall + extraction on by default
-dir = "memory"                # where memory.jsonl lives (gitignored)
+# Private memory is stored under ~/.polaris/projects/<project-id>/memory/private.
+# A repository agent.toml cannot redirect that path. For an explicit trusted
+# override, set AGENT_MEMORY_DIR, --memory-dir on `polaris memory`, or put
+# `dir = "..."` in the gitignored agent.local.toml.
 
-# Recall: how relevant past memories are selected and ranked.
+# Recall output and whole-passage context budget.
 recall_k = 5                  # how many memories to inject per run
-w_relevance = 1.0             # weight: lexical overlap with the task
-w_importance = 0.5            # weight: stored salience
-w_recency = 0.3               # weight: how recently the memory was used
-recency_decay_per_hour = 0.01 # exponential recency decay rate
+content_budget_bytes = 65536
 
 # Extraction: distilling durable memories after a run.
 auto_extract = true           # extract automatically when a run completes
+team_auto_extract = false      # team memory requires explicit writes by default
 dedup_threshold = 0.85        # skip a new memory this similar to an existing one
 
-# Dreaming: offline consolidation (`python -m agent_core dream`).
+# Dreaming: manual (`polaris dream`) and gated automatic consolidation.
+auto_dream = true
+dream_min_hours = 24.0
+dream_min_sessions = 5
 forget_threshold = 0.15       # drop memories whose decayed importance falls below this
 forget_min_access = 1         # ...unless they've been recalled at least this many times
 importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
+
+# Local CPU hybrid retrieval. Models are installed as checksummed ONNX bundles.
+[memory.retrieval]
+mode = "hybrid"
+exact_k = 32
+bm25_k = 64
+dense_k = 64
+rrf_k = 60
+rerank_k = 24
+chunk_tokens = 384
+chunk_overlap_tokens = 64
+min_rerank_score = 0.5
+dense_fallback_min = 0.45
+timeout_seconds = 10
+model_threads = 4
 
 # --- Run-level safety limits ------------------------------------------------
 # Bound a whole `run()`. The wall-clock budget is SHARED across the sub-agent
@@ -261,9 +282,9 @@ api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
 # to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official
 # git/fetch/time reference servers are core deps, available by default.
-# Every tool defaults to risk = "dangerous" (confirmed in default/acceptedits,
-# classified in auto, denied in plan/dontask); set risk per server to "read" or
-# "write" only after reviewing what the server can actually do.
+# MCP tools currently use ToolRisk as a conservative fallback unless the server adapter
+# supplies a call-specific check_permissions policy. Dangerous/write calls ask in attended
+# modes, are evaluator candidates in auto, and are denied in plan/dontask.
 # Inspect what a server exposes with:  python -m agent_core mcp list
 #
 # # stdio transport — launch a server as a subprocess:
@@ -386,6 +407,7 @@ include_subagents = false             # default: only the leader narrates (not s
 allowed_domains = []                   # e.g. ["docs.python.org", "github.com"]
 blocked_domains = []                   # e.g. ["evil.example"]
 
+# --- Tool platform ----------------------------------------------------------
 [tools.shell]
 enabled = true
 timeout = 30
@@ -397,9 +419,10 @@ log_bytes = 33554432
 shutdown_grace_seconds = 3
 [tools.shell.bash]
 enabled = true
-executable = "D:/Git/bin/bash.exe"
+# executable = "D:/Git/bin/bash.exe"
 [tools.shell.powershell]
 enabled = true
+# executable = "pwsh"
 [tools.notebook]
 max_bytes = 16777216
 max_output_chars = 8000
@@ -424,14 +447,16 @@ timeout = 15
 # --- Fine-grained permission rules (policy layer) ---------------------------
 # Argument-aware allow/deny/ask rules plus capability-aware permission modes. Each rule
 # is "ToolName(content)" (or bare "ToolName" for the whole tool). Precedence:
-# deny > strict plan write block > secret/sensitive-path safety nets > session grant >
-# ask > sandbox auto-allow > bypass mode > allow > mode decision/auto classifier.
+# managed/explicit deny > central non-bypassable checks > explicit ask > tool ask >
+# sandbox auto-allow > bypass passthrough > session/explicit allow > tool allow >
+# mode transform > ToolRisk fallback. See docs/permission-system.md for the contract.
 #   - bash/powershell content is matched with shell decomposition + anti-evasion:
 #     a compound command (a && b | c) must have EVERY sub-command covered to allow,
 #     but ANY sub-command hitting a deny denies the whole line. "npm:*" = prefix,
 #     "git * --force" = wildcard, "npm run build" = exact.
 #   - file tools match a path glob ("/src/**"); web tools match "domain:example.com".
-# CLI --allow/--deny/--ask append session rules on top of this table.
+# Rules retain provenance: managed/user/project/local/cli/session. Default resolution reads
+# ~/.polaris/agent.toml, project agent.toml, then ignored agent.local.toml; CLI flags are CLI rules.
 [permissions]
 allow = ["bash(git *)", "bash(npm run test:*)", "read_text_file(/src/**)"]
 deny  = ["bash(rm *)", "bash(curl *)", "web_fetch(domain:evil.example)"]
@@ -442,10 +467,10 @@ ask   = ["bash", "powershell"]
 # bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
 # environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
 # the permission rules above are the boundary. The built-in default is disabled;
-# this repository config enables it explicitly.
+# this shipped example enables it explicitly.
 # Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
 [sandbox]
-enabled = true                         # master switch
+enabled = true                        # master switch
 backend = "auto"                       # isolation tier: "auto" (container→native→noop),
                                        #   "native" (bwrap/sandbox-exec), "container"
                                        #   (podman/docker), or "vm" (Hyper-V/Kata/Lima).
@@ -480,7 +505,7 @@ allow_local_binding = false            # permit binding local ports (servers/tes
 # workspace is bind-mounted (drive path E:\proj → /mnt/e/proj inside the container).
 runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
 image = "docker.io/library/debian:stable-slim"   # image the command runs inside
-auto_pull = true                       # pull the image at startup if missing
+auto_pull = true                      # pull the image at startup if missing
 oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
 read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
 drop_all_capabilities = true           # --cap-drop ALL

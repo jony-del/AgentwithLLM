@@ -22,6 +22,16 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+# ``install.ps1 -Uninstall`` and ``install.sh --uninstall`` deliberately run
+# this file with an external uv-managed Python.  When Python executes a package
+# file by path, only ``agent_core/`` (not its parent) is placed on ``sys.path``;
+# make the verified source checkout importable before scheduler cleanup is
+# loaded.  Installed/module execution already has a valid package context.
+if __package__ in {None, ""}:
+    _SOURCE_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _SOURCE_ROOT not in sys.path:
+        sys.path.insert(0, _SOURCE_ROOT)
+
 PACKAGE_NAME = "agent-with-llm"
 COMMAND_NAME = "polaris"
 STATE_SCHEMA = 2
@@ -66,6 +76,9 @@ class UninstallPlan:
     node_path: str = ""
     node_bin: str = ""
     node_links: tuple[str, ...] = ()
+    memory_model_path: str = ""
+    memory_skip_marker: str = ""
+    memory_index_path: str = ""
     purge_data: bool = False
     legacy: bool = False
     already_absent: bool = False
@@ -247,6 +260,7 @@ class Uninstaller:
             )
 
         self._attach_node(plan, components.get("node"))
+        self._attach_memory_derivatives(plan, components)
         return plan
 
     def _empty_plan(self, *, purge_data: bool) -> UninstallPlan:
@@ -345,7 +359,10 @@ class Uninstaller:
             return ""
         env = dict(os.environ)
         env["UV_PYTHON_DOWNLOADS"] = "never"
-        result = self.runner([uv, "python", "find", "3.12"], env=env)
+        result = self.runner(
+            [uv, "python", "find", "--system", "--no-project", "3.12"],
+            env=env,
+        )
         lines = _decode(result.stdout).strip().splitlines()
         if result.returncode or not lines:
             return ""
@@ -453,7 +470,11 @@ class Uninstaller:
         if self.current_executable and not same_path(self.current_executable, executable):
             raise OwnershipError(_external_guidance(self.current_executable))
         bootstrap = str(receipt.get("bootstrap_python", ""))
-        if not bootstrap or not _resolved(bootstrap).is_file():
+        if (
+            not bootstrap
+            or not _resolved(bootstrap).is_file()
+            or path_within(_resolved(bootstrap), environment)
+        ):
             bootstrap = self._find_bootstrap_python(str(receipt.get("uv", shutil.which("uv") or "")))
         if not bootstrap or path_within(bootstrap, environment):
             raise UninstallError(
@@ -497,6 +518,36 @@ class Uninstaller:
         plan.node_bin = str(node_bin)
         plan.node_links = links
 
+    def _attach_memory_derivatives(
+        self,
+        plan: UninstallPlan,
+        components: dict[str, Any],
+    ) -> None:
+        model = components.get("memory-models")
+        if isinstance(model, dict) and model.get("installed_by_polaris"):
+            if model.get("install_kind") != "model-bundle":
+                raise OwnershipError("Memory model receipt has an unsupported install kind")
+            raw_path = Path(str(model.get("path", ""))).expanduser()
+            if raw_path.is_symlink():
+                raise OwnershipError("Refusing to follow a symlinked memory model bundle")
+            model_path = _resolved(raw_path)
+            if same_path(model_path, Path.home()) or model_path == Path(model_path.anchor):
+                raise OwnershipError("Memory model receipt points at an unsafe broad path")
+            marker = model_path / ".polaris-owned"
+            if model_path.exists() and not marker.is_file():
+                raise OwnershipError("Memory model bundle lacks its ownership marker")
+            plan.memory_model_path = str(model_path)
+        policy = components.get("memory-models-policy")
+        if isinstance(policy, dict) and policy.get("installed_by_polaris"):
+            if policy.get("install_kind") != "explicit-skip":
+                raise OwnershipError("Memory model policy receipt is malformed")
+            marker = _resolved(str(policy.get("path", "")))
+            if marker.name != ".explicitly-skipped":
+                raise OwnershipError("Memory model policy receipt points at an unsafe target")
+            plan.memory_skip_marker = str(marker)
+        # The default index tree contains only versioned, rebuildable SQLite data.
+        plan.memory_index_path = str(_resolved(self.data_path / "indexes"))
+
 
 def render_plan(plan: UninstallPlan) -> str:
     lines = ["\nUninstall plan", "--------------"]
@@ -509,6 +560,10 @@ def render_plan(plan: UninstallPlan) -> str:
         lines.append(f"[REMOVE  ] installer-owned development environment: {plan.environment}")
     if plan.node_path:
         lines.append(f"[REMOVE  ] Polaris private Node runtime: {plan.node_path}")
+    if plan.memory_model_path:
+        lines.append(f"[REMOVE  ] installer-owned memory models: {plan.memory_model_path}")
+    if plan.memory_index_path:
+        lines.append(f"[REMOVE  ] rebuildable memory indexes: {plan.memory_index_path}")
     if plan.purge_data:
         lines.append(f"[REMOVE  ] user data: {plan.data_path}")
         lines.append(f"[REMOVE  ] install state: {plan.state_path}")
@@ -557,6 +612,9 @@ def _validate_worker_plan(plan: UninstallPlan) -> UninstallPlan:
         "node_path",
         "node_bin",
         "node_links",
+        "memory_model_path",
+        "memory_skip_marker",
+        "memory_index_path",
         "purge_data",
     )
     if any(getattr(current, key) != getattr(plan, key) for key in keys):
@@ -583,6 +641,8 @@ def _remove_component_receipts(state_path: Path, names: set[str]) -> None:
     prefixes = {
         "polaris": ("project:",),
         "node": ("runtime:node",),
+        "memory-models": ("memory-models:",),
+        "memory-models-policy": ("memory-models:",),
     }
     for name in names:
         for key in list(completed):
@@ -645,6 +705,42 @@ def _remove_private_node(plan: UninstallPlan) -> None:
         pass
 
 
+def _remove_memory_derivatives(plan: UninstallPlan) -> None:
+    if plan.memory_model_path:
+        model = Path(plan.memory_model_path).expanduser()
+        if model.is_symlink():
+            raise OwnershipError("Memory model bundle became a symbolic link")
+        resolved_model = _resolved(model)
+        if same_path(resolved_model, Path.home()) or resolved_model == Path(resolved_model.anchor):
+            raise OwnershipError("Refusing to remove an unsafe memory model path")
+        marker = resolved_model / ".polaris-owned"
+        if resolved_model.exists() and not marker.is_file():
+            raise OwnershipError("Memory model ownership marker disappeared")
+        if resolved_model.exists():
+            shutil.rmtree(resolved_model)
+        pointer = resolved_model.parent / "active.json"
+        try:
+            active = json.loads(pointer.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            active = {}
+        if str(active.get("bundle_id", "")) == resolved_model.name:
+            pointer.unlink(missing_ok=True)
+    if plan.memory_skip_marker:
+        marker = Path(plan.memory_skip_marker).expanduser()
+        if marker.name != ".explicitly-skipped":
+            raise OwnershipError("Refusing to remove an unsafe memory policy path")
+        marker.unlink(missing_ok=True)
+    if plan.memory_index_path:
+        index = Path(plan.memory_index_path).expanduser()
+        expected = _resolved(Path(plan.data_path) / "indexes")
+        if not same_path(index, expected) or same_path(index, Path.home()):
+            raise OwnershipError("Refusing to remove an unexpected memory index path")
+        if index.is_symlink():
+            raise OwnershipError("Refusing to follow a symlinked memory index path")
+        if index.exists():
+            shutil.rmtree(index)
+
+
 def _remove_user_data(path: Path) -> None:
     expected = _resolved(default_data_path())
     if not same_path(path, expected) or same_path(path, Path.home()):
@@ -683,6 +779,12 @@ def apply_plan(plan: UninstallPlan) -> None:
     if plan.node_path:
         _remove_private_node(plan)
         _remove_component_receipts(state_path, {"node"})
+
+    _remove_memory_derivatives(plan)
+    _remove_component_receipts(
+        state_path,
+        {"memory-models", "memory-models-policy"},
+    )
 
     if plan.purge_data:
         _remove_user_data(Path(plan.data_path))
@@ -846,7 +948,13 @@ def _remove_scheduler_service(plan: UninstallPlan) -> None:
         or _resolved(str(component.get("service_executable", ""))) != recorded_executable.resolve()
     ):
         raise UninstallError("scheduler service receipt does not match the installer receipt")
-    from agent_core.scheduler_service import uninstall_user_service
+    try:
+        from agent_core.scheduler_service import uninstall_user_service
+    except (ImportError, OSError) as exc:
+        raise UninstallError(
+            "could not load the scheduler service cleanup code from the verified "
+            f"Polaris source ({type(exc).__name__}: {exc})"
+        ) from exc
 
     try:
         uninstall_user_service(

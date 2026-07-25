@@ -39,9 +39,11 @@ from agent_core.permissions import (
 from agent_core.interrupt import KeyInterrupt
 from agent_core.memory import (
     Dreamer,
+    HybridMemoryRetriever,
     MemoryConfig,
     MemoryPathResolver,
     MemoryRepository,
+    MemorySearchRequest,
     RepositoryMemoryStore,
 )
 from agent_core.model_validation import PROVIDERS
@@ -988,6 +990,38 @@ def dream_command(args: argparse.Namespace) -> int:
 
 def memory_command(args: argparse.Namespace) -> int:
     """Inspect, search, validate, migrate, or curate Markdown memories."""
+    if args.action == "models":
+        from agent_core.memory.models_manager import MemoryModelManager, ModelInstallError
+
+        operation = args.value or "status"
+        manager = MemoryModelManager()
+        golden_ok = True
+        golden_detail = ""
+        if operation == "status":
+            status = manager.status()
+        elif operation == "install":
+            try:
+                status = manager.install(
+                    bundle=getattr(args, "model_bundle", None),
+                )
+            except ModelInstallError as exc:
+                print(f"[error] {exc}", file=sys.stderr)
+                return 1
+            if status.valid:
+                from agent_core.memory.runtime import golden_inference_check
+
+                golden_ok, golden_detail = golden_inference_check(manager=manager)
+        else:
+            print("[error] `memory models` accepts status or install", file=sys.stderr)
+            return 1
+        payload = status.to_dict()
+        if operation == "install":
+            payload["golden_inference"] = {
+                "valid": golden_ok,
+                "detail": golden_detail,
+            }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0 if status.valid and golden_ok else 1
     config = _memory_config(args)
     scope = getattr(args, "scope", "private")
     repository = _open_repository(config, scope=scope)
@@ -1021,8 +1055,42 @@ def memory_command(args: argparse.Namespace) -> int:
         if not args.value:
             print("[error] `memory search` needs a query", file=sys.stderr)
             return 1
-        for document in repository.search(args.value, limit=getattr(args, "limit", 5)):
-            print(f"{document.id}  [{document.type}] {document.name}  {document.description}")
+        filters = {
+            key: list(getattr(args, f"filter_{key}", None) or [])
+            for key in ("id", "tag", "source")
+        }
+        if getattr(args, "memory_type", None):
+            filters["type"] = [args.memory_type]
+        retriever = HybridMemoryRetriever(repository, config)
+        request = MemorySearchRequest.from_values(
+            args.value,
+            scope=scope,
+            limit=getattr(args, "limit", 5),
+            filters=filters,
+            include_content=bool(getattr(args, "full_content", False)),
+            explain=bool(getattr(args, "explain", False)),
+        )
+        hits = retriever.search(request)
+        if request.explain:
+            print(
+                json.dumps(
+                    {
+                        "hits": [hit.to_dict() for hit in hits],
+                        "trace": retriever.last_trace.to_dict(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        for hit in hits:
+            print(f"{hit.id}  [{hit.type}] {hit.name}  {hit.description}")
+            if request.include_content and hit.content is not None:
+                print(hit.content)
+            else:
+                for passage in hit.passages:
+                    heading = f" ({passage.heading})" if passage.heading else ""
+                    print(f"  {passage.chunk_id}{heading}: {passage.content}")
         return 0
     if args.action == "add":
         if not args.value:
@@ -1033,7 +1101,7 @@ def memory_command(args: argparse.Namespace) -> int:
         document = repository.write(
             name=name,
             description=description,
-            type=getattr(args, "memory_type", "project"),
+            type=getattr(args, "memory_type", None) or "project",
             content=args.value,
             confidence=0.6,
             explicit=True,
@@ -1077,6 +1145,24 @@ def memory_command(args: argparse.Namespace) -> int:
             f"already_complete={migration.already_complete}"
         )
         return 0 if not migration.corrupt_lines else 1
+    if args.action == "index":
+        operation = args.value or "status"
+        assert config.retrieval is not None
+        # Construct the same engine as runtime recall so the active model
+        # fingerprint selects the same versioned derived-index directory.
+        index = HybridMemoryRetriever(repository, config).index
+        if operation == "rebuild":
+            index_status = index.rebuild()
+        elif operation == "status":
+            try:
+                index_status = index.ensure_current()
+            except Exception:
+                index_status = index.status()
+        else:
+            print("[error] `memory index` accepts status or rebuild", file=sys.stderr)
+            return 1
+        print(json.dumps(index_status.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if index_status.schema_version else 1
     return 0
 
 
@@ -1212,6 +1298,69 @@ def health_command(args: argparse.Namespace) -> int:
             checks.append(
                 HealthCheck("memory", True, "ok", detail=f"{memory_count} memories stored")
             )
+            import sqlite3
+
+            try:
+                with sqlite3.connect(":memory:") as connection:
+                    connection.execute("CREATE VIRTUAL TABLE probe_fts USING fts5(content)")
+            except sqlite3.DatabaseError as exc:
+                checks.append(HealthCheck("memory-fts5", True, "error", detail=str(exc)))
+            else:
+                checks.append(HealthCheck("memory-fts5", True, "ok", detail="available"))
+            repository = store.repository
+            assert memory_config.retrieval is not None
+            index_status = HybridMemoryRetriever(repository, memory_config).index.ensure_current()
+            checks.append(
+                HealthCheck(
+                    "memory-index",
+                    True,
+                    "ok" if index_status.schema_version else "error",
+                    version=str(index_status.schema_version),
+                    detail=(
+                        f"documents={index_status.documents} chunks={index_status.chunks} "
+                        f"coverage={index_status.coverage:.1%} "
+                        f"pending={index_status.pending_embeddings}"
+                    ),
+                )
+            )
+            if index_status.pending_embeddings:
+                checks.append(
+                    HealthCheck(
+                        "memory-index-coverage",
+                        False,
+                        "degraded",
+                        detail=(
+                            f"{index_status.pending_embeddings} embedding(s) pending; "
+                            "lexical retrieval remains available"
+                        ),
+                    )
+                )
+            from agent_core.memory.models_manager import MemoryModelManager
+
+            manager = MemoryModelManager()
+            model_status = manager.status()
+            model_required = not manager.explicitly_skipped
+            checks.append(
+                HealthCheck(
+                    "memory-models",
+                    model_required,
+                    "ok" if model_status.valid else ("missing" if not model_required else "error"),
+                    version=model_status.bundle_id,
+                    detail=model_status.detail,
+                )
+            )
+            if model_status.valid:
+                from agent_core.memory.runtime import golden_inference_check
+
+                golden_ok, golden_detail = golden_inference_check(manager=manager)
+                checks.append(
+                    HealthCheck(
+                        "memory-model-golden",
+                        model_required,
+                        "ok" if golden_ok else "error",
+                        detail=golden_detail,
+                    )
+                )
         else:
             checks.append(HealthCheck("memory", False, "ok", detail="disabled"))
     except Exception as e:
@@ -1494,16 +1643,25 @@ def main(argv: list[str] | None = None) -> int:
     memory_parser = subparsers.add_parser("memory", help="Inspect or curate stored memories.")
     memory_parser.add_argument(
         "action",
-        choices=["list", "show", "search", "add", "edit", "forget", "validate", "migrate"],
+        choices=[
+            "list", "show", "search", "add", "edit", "forget", "validate",
+            "migrate", "index", "models",
+        ],
     )
     memory_parser.add_argument("value", nargs="?", default=None, help="Text, query, id, or source path.")
     memory_parser.add_argument("--scope", choices=["private", "team"], default="private")
     memory_parser.add_argument("--memory-dir", metavar="PATH", default=None)
     memory_parser.add_argument("--name", default=None)
     memory_parser.add_argument("--description", default=None)
-    memory_parser.add_argument("--type", dest="memory_type", choices=["user", "feedback", "project", "reference"], default="project")
+    memory_parser.add_argument("--type", dest="memory_type", choices=["user", "feedback", "project", "reference"], default=None)
     memory_parser.add_argument("--text", default=None, help="Replacement content for edit.")
     memory_parser.add_argument("--limit", type=int, default=5)
+    memory_parser.add_argument("--id", dest="filter_id", action="append", default=[])
+    memory_parser.add_argument("--tag", dest="filter_tag", action="append", default=[])
+    memory_parser.add_argument("--source", dest="filter_source", action="append", default=[])
+    memory_parser.add_argument("--explain", action="store_true")
+    memory_parser.add_argument("--full-content", action="store_true")
+    memory_parser.add_argument("--model-bundle", metavar="PATH", default=None)
     memory_parser.add_argument("--repair", action="store_true")
     add_config_flag(memory_parser)
     memory_parser.set_defaults(func=memory_command)

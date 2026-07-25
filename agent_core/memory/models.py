@@ -4,7 +4,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, Protocol, runtime_checkable
 
 # A memory's ``kind`` is a free-form label, but these are the values the rest of the
 # subsystem produces and reasons about. ``insight`` is reserved for the higher-level
@@ -14,6 +15,181 @@ MEMORY_TYPES = ("user", "feedback", "project", "reference")
 MemoryType = Literal["user", "feedback", "project", "reference", "legacy"]
 MemoryScope = Literal["private", "team", "user", "project", "local"]
 MemoryOperation = Literal["create", "update", "archive", "forget"]
+
+
+@dataclass(slots=True)
+class MemorySearchRequest:
+    """Public, serializable contract for one bounded memory search."""
+
+    query: str
+    scope: str = "private"
+    limit: int = 5
+    filters: dict[str, list[str]] = field(default_factory=dict)
+    include_content: bool = False
+    explain: bool = False
+
+    def __post_init__(self) -> None:
+        self.query = str(self.query)[:65_536]
+        self.scope = str(self.scope)
+        self.limit = max(0, min(20, int(self.limit)))
+        normalized: dict[str, list[str]] = {}
+        for key, raw in self.filters.items():
+            values = [raw] if isinstance(raw, str) else list(raw)
+            normalized[str(key)] = [
+                str(value)[:1024] for value in values[:50] if str(value).strip()
+            ]
+        self.filters = normalized
+
+    @classmethod
+    def from_values(
+        cls,
+        query: str,
+        *,
+        scope: str = "private",
+        limit: int = 5,
+        filters: Mapping[str, str | Sequence[str]] | None = None,
+        include_content: bool = False,
+        explain: bool = False,
+    ) -> "MemorySearchRequest":
+        return cls(
+            query=str(query),
+            scope=str(scope),
+            limit=int(limit),
+            filters=dict(filters or {}),  # type: ignore[arg-type]
+            include_content=bool(include_content),
+            explain=bool(explain),
+        )
+
+
+@dataclass(slots=True)
+class MemoryPassage:
+    chunk_id: str
+    content: str
+    heading: str = ""
+    ordinal: int = 0
+    score: float = 0.0
+    start_char: int = 0
+    end_char: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "heading": self.heading,
+            "ordinal": self.ordinal,
+            "score": self.score,
+            "start_char": self.start_char,
+            "end_char": self.end_char,
+            "content": self.content,
+        }
+
+
+@dataclass(slots=True)
+class RetrievalTrace:
+    """Privacy-safe observability for retrieval; it never contains query or content."""
+
+    mode: str = "hybrid"
+    candidate_counts: dict[str, int] = field(default_factory=dict)
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    index_coverage: float = 0.0
+    index_fingerprint: str = ""
+    embedding_fingerprint: str = ""
+    reranker_fingerprint: str = ""
+    degraded_reasons: list[str] = field(default_factory=list)
+    final_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "candidate_counts": dict(self.candidate_counts),
+            "timings_ms": dict(self.timings_ms),
+            "index_coverage": round(float(self.index_coverage), 6),
+            "index_fingerprint": self.index_fingerprint,
+            "embedding_fingerprint": self.embedding_fingerprint,
+            "reranker_fingerprint": self.reranker_fingerprint,
+            "degraded_reasons": list(self.degraded_reasons),
+            "final_ids": list(self.final_ids),
+        }
+
+
+@dataclass(slots=True)
+class MemorySearchHit:
+    id: str
+    name: str
+    description: str
+    type: str
+    updated_at: str
+    passages: list[MemoryPassage] = field(default_factory=list)
+    score: float = 0.0
+    rrf_score: float = 0.0
+    exact: bool = False
+    explicit_filter: bool = False
+    confidence: float = 0.5
+    verified: bool = False
+    explicit: bool = False
+    tags: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    content: str | None = None
+    stale_until_verified: bool = True
+    trace: RetrievalTrace | None = None
+
+    def to_dict(self, *, include_trace: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "type": self.type,
+            "updated_at": self.updated_at,
+            "score": self.score,
+            "rrf_score": self.rrf_score,
+            "exact": self.exact,
+            "explicit_filter": self.explicit_filter,
+            "confidence": self.confidence,
+            "verified": self.verified,
+            "explicit": self.explicit,
+            "tags": list(self.tags),
+            "sources": list(self.sources),
+            "stale_until_verified": self.stale_until_verified,
+            "passages": [passage.to_dict() for passage in self.passages],
+        }
+        if self.content is not None:
+            result["content"] = self.content
+        if include_trace and self.trace is not None:
+            result["trace"] = self.trace.to_dict()
+        return result
+
+
+@runtime_checkable
+class EmbeddingBackend(Protocol):
+    """Injectable dense encoder. Implementations must return one vector per text."""
+
+    @property
+    def fingerprint(self) -> str: ...
+
+    @property
+    def dimension(self) -> int: ...
+
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        deadline: float | None = None,
+    ) -> Sequence[Sequence[float]]: ...
+
+
+@runtime_checkable
+class RerankerBackend(Protocol):
+    """Injectable cross-encoder returning probabilities or declared logits."""
+
+    @property
+    def fingerprint(self) -> str: ...
+
+    def rerank(
+        self,
+        query: str,
+        passages: Sequence[str],
+        *,
+        deadline: float | None = None,
+    ) -> Sequence[float]: ...
 
 
 def utc_now() -> str:
@@ -107,8 +283,8 @@ class MemoryChange:
 class MemoryRecord:
     """A single durable thing the agent has chosen to remember.
 
-    ``importance`` is a 0..1 salience score used (together with relevance and
-    recency) to rank recall and to decide what to forget during dreaming.
+    ``importance`` is a 0..1 lifecycle salience score used by dreaming and
+    forgetting. It is deliberately not mixed into retrieval relevance.
     """
 
     content: str

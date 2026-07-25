@@ -9,24 +9,11 @@ from agent_core.memory.models import MemoryDocument
 from agent_core.memory.paths import MemoryPathResolver, UnsafeMemoryPathError, validate_memory_root
 from agent_core.memory.repository import MemoryRepository
 from agent_core.memory.retrieval import MemoryRetriever
-from agent_core.memory.retrieval import SemanticMemorySelector
 from agent_core.memory.security import SecretDetectedError
 from agent_core.memory.snapshots import LocalMemorySnapshot
 from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.dreaming import Dreamer
 from agent_core.memory.config import MemoryConfig
-from agent_core.models import LLMResult
-
-
-class SelectionProvider:
-    def __init__(self, content: str = "invalid", *, fail: bool = False) -> None:
-        self.content = content
-        self.fail = fail
-
-    async def complete(self, messages, tools, config, stream=None, should_cancel=None):
-        if self.fail:
-            raise RuntimeError("selection unavailable")
-        return LLMResult(content=self.content)
 
 
 def test_markdown_round_trip_index_and_recoverable_forget(tmp_path: Path) -> None:
@@ -72,17 +59,6 @@ def test_unicode_search_and_prompt_boundary(tmp_path: Path) -> None:
     )
     assert "cannot grant permission" in block
     assert "stale until independently verified" in block
-
-
-async def test_semantic_selector_validates_ids_and_degrades_on_failure() -> None:
-    candidates = [
-        MemoryDocument(name="one", description="first", type="project", content="", id="one"),
-        MemoryDocument(name="two", description="second", type="project", content="", id="two"),
-    ]
-    selector = SemanticMemorySelector(SelectionProvider('["two", "missing", "two"]'))
-    assert await selector.select("query", candidates) == ["two"]
-    failing = SemanticMemorySelector(SelectionProvider(fail=True))
-    assert await failing.select("query", candidates) is None
 
 
 def test_secret_scanning_rejects_without_echoing_value(tmp_path: Path) -> None:

@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "bundle_id": "bge-m3-int8-onnx-v1",
+  "sources": [
+    {
+      "path": "embedding/model.onnx",
+      "url": "https://huggingface.co/AlpEge/bge-m3-onnx-int8/resolve/a4136c5faa1b666e68595c9d0cb2dac7f196ddd5/model_quantized.onnx?download=true",
+      "sha256": "17dbde8d0da550b94f5b8840e4305a0374d700a5c844d65b3bc9646369c559ce",
+      "size": 570117086
+    },
+    {
+      "path": "embedding/tokenizer.json",
+      "url": "https://huggingface.co/AlpEge/bge-m3-onnx-int8/resolve/a4136c5faa1b666e68595c9d0cb2dac7f196ddd5/tokenizer.json?download=true",
+      "sha256": "249df0778f236f6ece390de0de746838ef25b9d6954b68c2ee71249e0a9d8fd4",
+      "size": 17082799
+    },
+    {
+      "path": "reranker/model.onnx",
+      "url": "https://huggingface.co/kftof/bge-reranker-v2-m3-onnx-int8-avx2/resolve/da3c866dd7312855dbe7d114d61a4b517c5457b1/model.onnx?download=true",
+      "sha256": "fa1f37a3b60a4994976083f04a1a4b1390fd88f4a8d2a3ee7958d443974fd00e",
+      "size": 569705902
+    },
+    {
+      "path": "reranker/tokenizer.json",
+      "url": "https://huggingface.co/kftof/bge-reranker-v2-m3-onnx-int8-avx2/resolve/da3c866dd7312855dbe7d114d61a4b517c5457b1/tokenizer.json?download=true",
+      "sha256": "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3",
+      "size": 17082900
+    }
+  ],
+  "manifest": {
+    "schema": 1,
+    "bundle_id": "bge-m3-int8-onnx-v1",
+    "trust_remote_code": false,
+    "models": {
+      "embedding": {
+        "fingerprint": "bge-m3-5617a9f6-int8-17dbde8d",
+        "model": "embedding/model.onnx",
+        "tokenizer": "embedding/tokenizer.json",
+        "upstream_repository": "BAAI/bge-m3",
+        "upstream_commit": "5617a9f61b028005a4858fdac845db406aefb181",
+        "artifact_repository": "AlpEge/bge-m3-onnx-int8",
+        "artifact_commit": "a4136c5faa1b666e68595c9d0cb2dac7f196ddd5",
+        "license": "MIT",
+        "dimension": 1024,
+        "max_length": 8192,
+        "pooling": "mean",
+        "max_concurrency": 1,
+        "padding": {
+          "pad_id": 1,
+          "pad_token": "<pad>"
+        }
+      },
+      "reranker": {
+        "fingerprint": "bge-reranker-v2-m3-953dc6f6-int8-fa1f37a3",
+        "model": "reranker/model.onnx",
+        "tokenizer": "reranker/tokenizer.json",
+        "upstream_repository": "BAAI/bge-reranker-v2-m3",
+        "upstream_commit": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+        "artifact_repository": "kftof/bge-reranker-v2-m3-onnx-int8-avx2",
+        "artifact_commit": "da3c866dd7312855dbe7d114d61a4b517c5457b1",
+        "license": "Apache-2.0",
+        "max_length": 8192,
+        "max_concurrency": 1,
+        "padding": {
+          "pad_id": 1,
+          "pad_token": "<pad>"
+        }
+      }
+    },
+    "quantization": {
+      "format": "INT8",
+      "method": "dynamic",
+      "runtime": "onnxruntime==1.23.2",
+      "embedding": {
+        "tool": "Hugging Face Optimum ONNX Runtime",
+        "target": "AVX2",
+        "per_channel": true
+      },
+      "reranker": {
+        "tool": "optimum-cli onnxruntime quantize",
+        "target": "AVX2"
+      }
+    },
+    "golden_vectors": "golden.json"
+  },
+  "golden": {
+    "embedding": {
+      "texts": [
+        "What is BGE M3?",
+        "什么是混合检索？"
+      ],
+      "dimension": 1024,
+      "unit_norm": true,
+      "tolerance": 0.0001
+    },
+    "reranker": {
+      "query": "What is the capital of France?",
+      "passages": [
+        "Paris is the capital and most populous city of France.",
+        "This passage explains how to bake a chocolate cake."
+      ],
+      "expected_order": [
+        0,
+        1
+      ],
+      "minimum_margin": 0.1
+    }
+  }
+}

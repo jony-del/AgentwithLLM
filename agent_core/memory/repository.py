@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import yaml
 
@@ -18,7 +18,15 @@ from agent_core.file_lock import FileLock
 from agent_core.memory.models import MEMORY_TYPES, MemoryChange, MemoryDocument, MemoryRecord, utc_now
 from agent_core.memory.paths import validate_memory_root
 from agent_core.memory.security import require_secret_free
-from agent_core.memory.text import lexical_relevance, tokenize
+
+if TYPE_CHECKING:
+    from agent_core.memory.config import MemoryConfig
+    from agent_core.memory.models import (
+        EmbeddingBackend,
+        MemorySearchHit,
+        MemorySearchRequest,
+        RerankerBackend,
+    )
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _CONFLICT_MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
@@ -128,7 +136,27 @@ class MemoryRepository:
         ]
         if include_archived and (self.root / "archive").exists():
             paths.extend((self.root / "archive").glob("*.md"))
-        return sorted(paths, key=lambda item: item.name)[:_INDEX_MAX_LINES]
+        # MEMORY.md is a bounded human summary, not an enumeration source. The
+        # authoritative Markdown corpus must remain complete beyond 200 topics.
+        return sorted(paths, key=lambda item: item.name)
+
+    def document_paths(self, *, include_archived: bool = False) -> list[Path]:
+        """Return every authoritative topic path (never the bounded MEMORY.md view)."""
+        return list(self._paths(include_archived=include_archived))
+
+    def load_document_path(
+        self,
+        path: str | Path,
+        *,
+        headers_only: bool = False,
+    ) -> MemoryDocument:
+        """Parse and validate one contained authoritative Markdown topic."""
+        candidate = self._contained(Path(path))
+        if candidate.name == "MEMORY.md" or candidate.suffix.casefold() != ".md":
+            raise ValueError("path is not an authoritative memory topic")
+        document = _parse_document(candidate, headers_only=headers_only)
+        self._validate_document(document, writing=False)
+        return document
 
     def list(self, *, include_archived: bool = False, headers_only: bool = False) -> list[MemoryDocument]:
         documents: list[MemoryDocument] = []
@@ -142,12 +170,42 @@ class MemoryRepository:
             documents.append(document)
         return documents
 
+    def scan_documents(
+        self,
+        *,
+        include_archived: bool = False,
+        headers_only: bool = False,
+    ) -> tuple[builtins.list[MemoryDocument], ValidationReport]:
+        """Parse the corpus once, returning valid documents and visible diagnostics."""
+        documents: builtins.list[MemoryDocument] = []
+        report = ValidationReport()
+        seen: set[str] = set()
+        for path in self._paths(include_archived=include_archived):
+            report.scanned += 1
+            try:
+                document = _parse_document(path, headers_only=headers_only)
+                self._validate_document(document, writing=False)
+            except Exception as exc:  # noqa: BLE001 - every malformed source is diagnosed
+                report.errors.append(f"{path}: {type(exc).__name__}: {exc}")
+                continue
+            if document.id in seen:
+                report.errors.append(f"{path}: duplicate id {document.id}")
+                continue
+            seen.add(document.id)
+            if document.archived and not include_archived:
+                continue
+            documents.append(document)
+        return documents, report
+
     def get(self, memory_id: str) -> MemoryDocument | None:
         self._validate_id(memory_id)
-        for document in self.list(include_archived=True):
-            if document.id == memory_id:
-                return document
-        return None
+        path = self._find_path(memory_id)
+        if path is None:
+            return None
+        try:
+            return _parse_document(path)
+        except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+            return None
 
     def create(self, document: MemoryDocument) -> MemoryDocument:
         self._validate_document(document, writing=True)
@@ -387,17 +445,44 @@ class MemoryRepository:
                 shutil.rmtree(backup, ignore_errors=True)
 
     def search(self, query: str, limit: int = 5) -> builtins.list[MemoryDocument]:
-        query_tokens = tokenize(query)
-        if not query_tokens or limit <= 0:
-            return []
-        scored: builtins.list[tuple[float, str, MemoryDocument]] = []
-        for document in self.list():
-            text = f"{document.name}\n{document.description}\n{' '.join(document.tags)}\n{document.content}"
-            score = lexical_relevance(query_tokens, tokenize(text))
-            if score:
-                scored.append((score, document.updated_at, document))
-        scored.sort(key=lambda value: (value[0], value[1]), reverse=True)
-        return [value[2] for value in scored[:limit]]
+        """Compatibility document view over the passage-first retrieval contract."""
+        from agent_core.memory.models import MemorySearchRequest
+
+        hits = self.search_hits(
+            MemorySearchRequest.from_values(
+                query,
+                scope=self.scope,
+                limit=limit,
+                include_content=True,
+            )
+        )
+        documents: builtins.list[MemoryDocument] = []
+        for hit in hits:
+            document = self.get(hit.id)
+            if document is not None:
+                documents.append(document)
+        return documents
+
+    def search_hits(
+        self,
+        request: "MemorySearchRequest",
+        *,
+        config: "MemoryConfig | None" = None,
+        embedding_backend: "EmbeddingBackend | None" = None,
+        reranker_backend: "RerankerBackend | None" = None,
+        index_base: str | Path | None = None,
+    ) -> builtins.list["MemorySearchHit"]:
+        """Search passages without making SQLite an authoritative data source."""
+        from agent_core.memory.retrieval import HybridMemoryRetriever
+
+        retriever = HybridMemoryRetriever(
+            self,
+            config,
+            embedding_backend=embedding_backend,
+            reranker_backend=reranker_backend,
+            index_base=index_base,
+        )
+        return retriever.search(request)
 
     def rebuild_index(self) -> str:
         self._ensure_root()

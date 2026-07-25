@@ -1,67 +1,127 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, fields
 from typing import Any
+
+
+class RemovedMemoryConfigWarning(UserWarning):
+    """An old retrieval setting was ignored because its semantics were removed."""
+
+
+REMOVED_RETRIEVAL_KEYS = frozenset(
+    {
+        "semantic_selection",
+        "memory_model",
+        "w_relevance",
+        "w_importance",
+        "w_recency",
+        "recency_decay_per_hour",
+    }
+)
+
+
+@dataclass(slots=True)
+class MemoryRetrievalConfig:
+    """Stable hybrid-retrieval defaults.
+
+    Model paths are deliberately not configuration knobs here. Installed model
+    manifests select exact, checksummed artifacts and contribute their fingerprints
+    to the derived-index path.
+    """
+
+    mode: str = "hybrid"
+    exact_k: int = 32
+    bm25_k: int = 64
+    dense_k: int = 64
+    rrf_k: int = 60
+    rerank_k: int = 24
+    chunk_tokens: int = 384
+    chunk_overlap_tokens: int = 64
+    min_rerank_score: float = 0.5
+    dense_fallback_min: float = 0.45
+    timeout_seconds: float = 10.0
+    model_threads: int = 4
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MemoryRetrievalConfig":
+        from agent_core.config import coerce_to_type
+
+        config = cls()
+        if data:
+            valid = {item.name: item.type for item in fields(config)}
+            for key, value in data.items():
+                if key in valid:
+                    setattr(config, key, coerce_to_type(valid[key], value))
+        config.mode = config.mode if config.mode in {"hybrid", "lexical"} else "hybrid"
+        for name in ("exact_k", "bm25_k", "dense_k", "rerank_k"):
+            setattr(config, name, max(0, int(getattr(config, name))))
+        config.rrf_k = max(1, int(config.rrf_k))
+        config.chunk_tokens = max(32, int(config.chunk_tokens))
+        config.chunk_overlap_tokens = max(
+            0, min(int(config.chunk_overlap_tokens), config.chunk_tokens - 1)
+        )
+        config.min_rerank_score = max(0.0, min(1.0, float(config.min_rerank_score)))
+        config.dense_fallback_min = max(-1.0, min(1.0, float(config.dense_fallback_min)))
+        config.timeout_seconds = max(0.1, float(config.timeout_seconds))
+        config.model_threads = max(1, int(config.model_threads))
+        return config
 
 
 @dataclass(slots=True)
 class MemoryConfig:
-    """Tunables for the memory subsystem.
-
-    Disabled by default: an agent built without opting in behaves exactly as before
-    (no recall injection, no extraction calls, no files written). This repo's own
-    ``agent.toml`` opts in via ``[memory] enabled = true``; the built-in default
-    staying ``False`` is a documented invariant (CLAUDE.md "Memory is off by
-    built-in default").
-    """
+    """Configuration for authoritative Markdown memory and derived retrieval."""
 
     enabled: bool = False
     dir: str = "memory"
     dir_trusted: bool = True
     scope: str = "private"
 
-    # --- Recall ---------------------------------------------------------------
     recall_k: int = 5
-    semantic_selection: bool = True
-    memory_model: str | None = None
     content_budget_bytes: int = 64 * 1024
-    # Weights for the blended recall score (need not sum to 1; ranking is relative).
-    w_relevance: float = 1.0
-    w_importance: float = 0.5
-    w_recency: float = 0.3
-    # Exponential recency decay per hour since a memory was last accessed.
-    recency_decay_per_hour: float = 0.01
+    retrieval: MemoryRetrievalConfig | None = None
 
-    # --- Extraction -----------------------------------------------------------
     auto_extract: bool = True
     team_auto_extract: bool = False
-    # Skip storing a freshly extracted memory if it overlaps an existing one above
-    # this lexical-relevance threshold (avoids slow-growing near-duplicates).
     dedup_threshold: float = 0.85
 
-    # --- Dreaming -------------------------------------------------------------
-    # Drop a memory whose time-decayed importance falls below this, unless it has
-    # been recalled enough to have earned its keep (see Dreamer.forget logic).
     forget_threshold: float = 0.15
     forget_min_access: int = 1
-    # Half-life (in days) of importance for the forgetting curve during dreaming.
     importance_half_life_days: float = 14.0
-    # Merge two memories during dreaming when their lexical relevance exceeds this.
     merge_threshold: float = 0.6
-    # Whether dreaming asks the LLM to synthesise higher-level insight memories.
     synthesize_insights: bool = True
     auto_dream: bool = True
     dream_min_hours: float = 24.0
     dream_min_sessions: int = 5
 
+    def __post_init__(self) -> None:
+        if self.retrieval is None:
+            self.retrieval = MemoryRetrievalConfig()
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "MemoryConfig":
-        """Build a config from a mapping (e.g. an ``[memory]`` toml table).
+        """Build config while rejecting removed ranking/model-selection semantics."""
+        from agent_core.config import coerce_to_type
 
-        Unknown keys are ignored and every absent field keeps its default, so a
-        partial or forward-compatible table still loads cleanly. Values are coerced
-        to each field's declared type to tolerate toml/string inputs.
-        """
-        from agent_core.config import overlay_dataclass
-
-        return overlay_dataclass(cls(), data)
+        config = cls()
+        if not data:
+            return config
+        for key in sorted(REMOVED_RETRIEVAL_KEYS.intersection(data)):
+            warnings.warn(
+                f"[memory].{key} was removed and is ignored; configure [memory.retrieval] instead",
+                RemovedMemoryConfigWarning,
+                stacklevel=2,
+            )
+        valid = {item.name: item.type for item in fields(config)}
+        for key, value in data.items():
+            if key in REMOVED_RETRIEVAL_KEYS or key == "retrieval":
+                continue
+            if key in valid:
+                setattr(config, key, coerce_to_type(valid[key], value))
+        nested = data.get("retrieval")
+        config.retrieval = MemoryRetrievalConfig.from_dict(
+            nested if isinstance(nested, dict) else None
+        )
+        config.recall_k = max(0, int(config.recall_k))
+        config.content_budget_bytes = max(1024, int(config.content_budget_bytes))
+        return config

@@ -4,7 +4,9 @@ import json
 from typing import Any
 
 from agent_core.memory.paths import MemoryPathResolver
+from agent_core.memory.models import MemorySearchRequest
 from agent_core.memory.repository import MemoryRepository
+from agent_core.memory.retrieval import HybridMemoryRetriever
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.session import SessionAwareMixin
 from agent_core.tools.base import ConcurrencySpec, LockMode, ResourceLock, Tool, coerce_int
@@ -39,6 +41,22 @@ class MemorySearchTool(_MemoryTool):
             "query": {"type": "string"},
             "scope": {"type": "string", "enum": ["private", "team"], "default": "private"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            "filters": {
+                "type": "object",
+                "properties": {
+                    key: {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                        ]
+                    }
+                    for key in ("id", "tag", "type", "source")
+                },
+                "additionalProperties": False,
+                "default": {},
+            },
+            "include_content": {"type": "boolean", "default": False},
+            "explain": {"type": "boolean", "default": False},
         },
         "required": ["query"],
     }
@@ -47,23 +65,35 @@ class MemorySearchTool(_MemoryTool):
     def _invoke(self, arguments: dict[str, Any]) -> ToolResult:
         repository = self._repository(str(arguments.get("scope", "private")))
         limit = max(1, min(20, coerce_int(arguments.get("limit", 5))))
-        results = repository.search(str(arguments.get("query", "")), limit=limit)
-        content = json.dumps(
-            [
-                {
-                    "id": item.id,
-                    "name": item.name,
-                    "description": item.description,
-                    "type": item.type,
-                    "updated_at": item.updated_at,
-                    "stale_until_verified": True,
-                    "content": item.content,
-                }
-                for item in results
-            ],
-            ensure_ascii=False,
+        raw_filters = arguments.get("filters")
+        request = MemorySearchRequest.from_values(
+            str(arguments.get("query", "")),
+            scope=str(arguments.get("scope", "private")),
+            limit=limit,
+            filters=raw_filters if isinstance(raw_filters, dict) else None,
+            include_content=bool(arguments.get("include_content", False)),
+            explain=bool(arguments.get("explain", False)),
         )
-        return ToolResult(self.name, content, metadata={"count": len(results)})
+        retriever = HybridMemoryRetriever(repository)
+        results = retriever.search(request)
+        payload: object = [
+            item.to_dict(include_trace=False)
+            for item in results
+        ]
+        if request.explain:
+            payload = {
+                "hits": payload,
+                "trace": retriever.last_trace.to_dict(),
+            }
+        content = json.dumps(payload, ensure_ascii=False)
+        return ToolResult(
+            self.name,
+            content,
+            metadata={
+                "count": len(results),
+                "retrieval": retriever.last_trace.to_dict(),
+            },
+        )
 
 
 @builtin_tool

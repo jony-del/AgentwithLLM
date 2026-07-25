@@ -1,7 +1,13 @@
 from pathlib import Path
 
+import pytest
+
 from agent_core.config import resolve_memory_config
-from agent_core.memory.config import MemoryConfig
+from agent_core.memory.config import (
+    MemoryConfig,
+    MemoryRetrievalConfig,
+    RemovedMemoryConfigWarning,
+)
 
 
 def test_builtin_default_is_off() -> None:
@@ -23,6 +29,36 @@ def test_from_dict_applies_known_fields_and_coerces() -> None:
 def test_from_dict_handles_none_and_empty() -> None:
     assert MemoryConfig.from_dict(None) == MemoryConfig()
     assert MemoryConfig.from_dict({}) == MemoryConfig()
+
+
+def test_hybrid_retrieval_defaults_are_stable() -> None:
+    assert MemoryConfig().retrieval == MemoryRetrievalConfig(
+        mode="hybrid",
+        exact_k=32,
+        bm25_k=64,
+        dense_k=64,
+        rrf_k=60,
+        rerank_k=24,
+        chunk_tokens=384,
+        chunk_overlap_tokens=64,
+        min_rerank_score=0.5,
+        dense_fallback_min=0.45,
+        timeout_seconds=10,
+        model_threads=4,
+    )
+
+
+def test_removed_retrieval_keys_warn_and_are_not_mapped() -> None:
+    with pytest.warns(RemovedMemoryConfigWarning, match="semantic_selection"):
+        config = MemoryConfig.from_dict(
+            {
+                "semantic_selection": True,
+                "retrieval": {"mode": "lexical", "bm25_k": 7},
+            }
+        )
+    assert config.retrieval.mode == "lexical"
+    assert config.retrieval.bm25_k == 7
+    assert not hasattr(config, "semantic_selection")
 
 
 def _write_toml(tmp_path: Path, body: str) -> Path:

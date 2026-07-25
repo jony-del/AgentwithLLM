@@ -26,6 +26,9 @@ _RUNTIME_DISTRIBUTIONS = (
     "mcp-server-time",
     "rich",
     "prompt-toolkit",
+    "numpy",
+    "tokenizers",
+    "onnxruntime",
 )
 _DEV_DISTRIBUTIONS = ("pytest", "pytest-asyncio", "ruff", "mypy")
 _HOST_COMMANDS = ("git", "rg", "node", "npm", "npx")

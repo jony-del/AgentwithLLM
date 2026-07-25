@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ from agent_core.uninstall import (
     EXIT_OK,
     OwnershipError,
     UninstallPlan,
+    UninstallError,
     Uninstaller,
     UsageError,
     apply_plan,
@@ -122,6 +124,37 @@ def test_uv_tool_uninstall_removes_private_environment_but_preserves_host_and_da
     assert "host:git" in state["completed"]
 
 
+def test_uninstall_removes_only_owned_models_and_rebuildable_indexes(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _make_uv_install(tmp_path)
+    bundle = paths["data"] / "models" / "memory" / "bundle-v1"
+    bundle.mkdir(parents=True)
+    (bundle / ".polaris-owned").write_text("{}", encoding="utf-8")
+    (bundle / "model.onnx").write_bytes(b"model")
+    indexes = paths["data"] / "indexes"
+    indexes.mkdir()
+    (indexes / "memory.sqlite3").write_bytes(b"derived")
+    authoritative = paths["data"] / "projects" / "memory" / "topic.md"
+    authoritative.parent.mkdir(parents=True)
+    authoritative.write_text("authoritative", encoding="utf-8")
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state["components"]["memory-models"] = {
+        "installed_by_polaris": True,
+        "install_kind": "model-bundle",
+        "path": str(bundle),
+    }
+    paths["state"].write_text(json.dumps(state), encoding="utf-8")
+    plan = _uninstaller(paths).build_plan()
+    monkeypatch.setattr(uninstall, "_run_process", _fake_uv_uninstall(paths))
+
+    apply_plan(plan)
+
+    assert not bundle.exists()
+    assert not indexes.exists()
+    assert authoritative.is_file()
+
+
 def test_purge_data_removes_only_user_level_data_and_state(tmp_path, monkeypatch) -> None:
     paths = _make_uv_install(tmp_path)
     project = tmp_path / "project"
@@ -226,7 +259,13 @@ def test_legacy_uv_receipt_is_accepted_only_after_uv_show_paths_confirmation(
             output = str(paths["tool_root"])
         elif args[1:] == ["tool", "dir", "--bin"]:
             output = str(paths["bin_dir"])
-        elif args[1:] == ["python", "find", "3.12"]:
+        elif args[1:] == [
+            "python",
+            "find",
+            "--system",
+            "--no-project",
+            "3.12",
+        ]:
             output = str(paths["python"])
         else:
             raise AssertionError(args)
@@ -304,6 +343,70 @@ def test_installer_owned_dev_venv_uses_marker_and_preserves_source(tmp_path) -> 
 
     assert not environment.exists()
     assert (source / "keep.txt").read_text(encoding="utf-8") == "source"
+
+
+def test_dev_plan_replaces_bootstrap_recorded_inside_target_venv(tmp_path) -> None:
+    source = tmp_path / "checkout"
+    environment = source / ".venv"
+    scripts = environment / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    executable = scripts / _executable_name()
+    target_python = scripts / ("python.exe" if os.name == "nt" else "python")
+    executable.write_text("launcher", encoding="utf-8")
+    target_python.write_text("python", encoding="utf-8")
+    (environment / ".polaris-install.json").write_text(
+        json.dumps({"package": "agent-with-llm", "source": str(source)}),
+        encoding="utf-8",
+    )
+    external_python = tmp_path / ("python.exe" if os.name == "nt" else "python")
+    external_python.write_text("python", encoding="utf-8")
+    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
+    uv.write_text("uv", encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "completed": {"project:dev": 1},
+                "components": {
+                    "polaris": {
+                        "installed_by_polaris": True,
+                        "install_kind": "dev-venv",
+                        "package": "agent-with-llm",
+                        "source": str(source),
+                        "environment": str(environment),
+                        "executable": str(executable),
+                        "bootstrap_python": str(target_python),
+                        "uv": str(uv),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def runner(argv, **kwargs):
+        args = [str(item) for item in argv]
+        assert args[1:] == [
+            "python",
+            "find",
+            "--system",
+            "--no-project",
+            "3.12",
+        ]
+        return subprocess.CompletedProcess(args, 0, str(external_python), "")
+
+    plan = Uninstaller(
+        state_path=state_path,
+        data_path=tmp_path / "data",
+        runtime_root=tmp_path / "runtime",
+        current_executable=executable,
+        runner=runner,
+    ).build_plan()
+
+    assert plan.kind == "dev-venv"
+    assert Path(plan.bootstrap_python) == external_python.resolve()
+    assert not uninstall.path_within(plan.bootstrap_python, environment)
 
 
 def test_tampered_dev_receipt_outside_source_is_rejected(tmp_path) -> None:
@@ -487,6 +590,66 @@ def test_public_bootstraps_expose_recovery_uninstall_without_installing_uv() -> 
     assert "[switch]$Uninstall" in powershell
     assert "agent_core\\uninstall.py" in powershell
     assert "$Uninstall -or $Check -or $DryRun" in powershell
+    assert "python find --system --no-project 3.12" in powershell
     assert "--uninstall" in shell
     assert "agent_core/uninstall.py" in shell
     assert "if ((UNINSTALL))" in shell
+    assert "python find --system --no-project 3.12" in shell
+
+
+def test_direct_uninstall_script_bootstraps_verified_source_imports(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = root / "agent_core" / "uninstall.py"
+    probe = (
+        "import runpy; "
+        f"runpy.run_path({str(script)!r}, run_name='polaris_uninstall_probe'); "
+        "from agent_core.scheduler_service import uninstall_user_service; "
+        "print(uninstall_user_service.__name__)"
+    )
+
+    completed = subprocess.run(
+        [os.fspath(Path(os.sys.executable)), "-I", "-S", "-c", probe],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "uninstall_user_service"
+
+
+def test_scheduler_cleanup_import_failure_becomes_uninstall_error(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _make_uv_install(tmp_path)
+    receipt = paths["data"] / "scheduler-service.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "service_id": "polaris-scheduler",
+                "executable": str(paths["python"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = json.loads(paths["state"].read_text(encoding="utf-8"))
+    state["components"]["scheduler"] = {
+        "installed_by_polaris": True,
+        "receipt": str(receipt),
+        "service_id": "polaris-scheduler",
+        "service_executable": str(paths["python"]),
+    }
+    paths["state"].write_text(json.dumps(state), encoding="utf-8")
+    plan = _uninstaller(paths).build_plan()
+    real_import = builtins.__import__
+
+    def fail_scheduler_import(name, *args, **kwargs):
+        if name == "agent_core.scheduler_service":
+            raise ModuleNotFoundError("simulated damaged source")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_scheduler_import)
+
+    with pytest.raises(UninstallError, match="could not load the scheduler"):
+        uninstall._remove_scheduler_service(plan)

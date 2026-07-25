@@ -20,7 +20,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BLOCKER = """
 import sys
 
-BLOCKED = {"rich", "prompt_toolkit", "mcp", "bs4", "ddgs", "markdownify"}
+BLOCKED = {
+    "rich",
+    "prompt_toolkit",
+    "mcp",
+    "bs4",
+    "ddgs",
+    "markdownify",
+    "numpy",
+    "tokenizers",
+    "onnxruntime",
+}
 
 
 class _Blocker:

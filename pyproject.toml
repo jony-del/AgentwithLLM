@@ -39,8 +39,13 @@ terminal = [
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
 ]
+memory = [
+    "numpy>=1.26,<3",
+    "tokenizers>=0.20,<1",
+    "onnxruntime==1.23.2",
+]
 all = [
-    "agent-with-llm[web,mcp,terminal]",
+    "agent-with-llm[web,mcp,terminal,memory]",
 ]
 dev = [
     "pytest>=8.0",
@@ -68,6 +73,7 @@ include = ["agent_core*"]
 # them straight from the source tree.
 [tool.setuptools.package-data]
 "agent_core.skills" = ["bundled/*.md"]
+"agent_core.memory" = ["model_bundle.json"]
 
 # Lint/type-check were introduced incrementally (revision guide D6). Ruff checks
 # E (pycodestyle errors) + F (pyflakes), with E501 excluded because long lines are

@@ -14,8 +14,6 @@ import tempfile
 import time
 from typing import Any
 
-from agent_core.scheduler import SchedulerStore
-
 
 SERVICE_ID = "polaris-scheduler"
 
@@ -66,6 +64,30 @@ def _run(argv: list[str]) -> None:
         raise RuntimeError(f"service command failed ({completed.returncode}): {detail[:4000]}")
 
 
+def _service_is_registered(receipt: dict[str, Any]) -> bool:
+    """Probe the exact resource named by a trusted matching receipt."""
+
+    resources = [str(item) for item in receipt.get("resources", [])]
+    if not resources:
+        return False
+    platform = receipt.get("platform")
+    if platform == "win32":
+        command = ["schtasks", "/Query", "/TN", resources[0]]
+    elif str(platform).startswith("linux"):
+        command = ["systemctl", "--user", "is-enabled", Path(resources[0]).name]
+    elif platform == "darwin":
+        command = ["launchctl", "print", f"gui/{_uid()}/com.openai.{SERVICE_ID}"]
+    else:
+        return False
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=30, check=False
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
 def install_user_service(
     *, executable: str | Path = sys.executable, database: str | Path,
     receipt_path: str | Path | None = None,
@@ -74,6 +96,18 @@ def install_user_service(
     database = Path(database).expanduser().resolve()
     receipt_path = Path(receipt_path) if receipt_path is not None else default_receipt_path()
     if receipt_path.exists():
+        try:
+            existing = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if (
+            existing.get("service_id") == SERVICE_ID
+            and existing.get("platform") == sys.platform
+            and Path(str(existing.get("executable", ""))).resolve() == executable
+            and Path(str(existing.get("database", ""))).resolve() == database
+            and _service_is_registered(existing)
+        ):
+            return existing
         uninstall_user_service(
             expected_executable=executable, receipt_path=receipt_path, purge_data=False
         )
@@ -163,6 +197,8 @@ def uninstall_user_service(
 
 
 async def run_daemon(database: str | Path, *, interval: float = 30.0) -> None:
+    from agent_core.scheduler import SchedulerStore
+
     store = SchedulerStore(database)
     while True:
         await asyncio.to_thread(store.route_due)

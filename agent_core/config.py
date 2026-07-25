@@ -232,9 +232,11 @@ def resolve_memory_config(cli_enabled: bool | None, config_file: str | Path = "a
     table = load_agent_toml(config_file).get("memory")
     config = MemoryConfig.from_dict(table if isinstance(table, dict) else None)
     path = Path(config_file)
-    if isinstance(table, dict) and "dir" in table:
-        # A checked-out repository must not be able to redirect private memory IO
-        # outside the project. Only the explicitly local config variant is trusted.
+    # A checked-out repository must not redirect private memory IO, including via
+    # the built-in relative default. Only the explicitly local config variant is
+    # treated as a trusted path source; direct MemoryConfig construction remains an
+    # application/test injection seam.
+    if isinstance(table, dict):
         config.dir_trusted = path.name == "agent.local.toml"
 
     env = os.getenv("AGENT_MEMORY")

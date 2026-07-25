@@ -6,6 +6,8 @@ param(
     [switch]$Check,
     [switch]$DryRun,
     [switch]$SkipSandbox,
+    [switch]$SkipMemoryModels,
+    [string]$ModelBundle,
     [switch]$NonInteractive,
     [switch]$Uninstall,
     [switch]$PurgeData,
@@ -17,8 +19,12 @@ $UvVersion = "0.11.28"
 $Repository = "https://github.com/jony-del/AgentwithLLM"
 $TemporaryRoot = $null
 
-if ($Uninstall -and ($Dev -or $Upgrade -or $Check -or $SkipSandbox)) {
-    [Console]::Error.WriteLine("[usage] -Uninstall cannot be combined with -Dev, -Upgrade, -Check, or -SkipSandbox")
+if ($Uninstall -and ($Dev -or $Upgrade -or $Check -or $SkipSandbox -or $SkipMemoryModels -or $ModelBundle)) {
+    [Console]::Error.WriteLine("[usage] -Uninstall cannot be combined with install/upgrade options")
+    exit 2
+}
+if ($SkipMemoryModels -and $ModelBundle) {
+    [Console]::Error.WriteLine("[usage] -SkipMemoryModels cannot be combined with -ModelBundle")
     exit 2
 }
 if ((-not $Uninstall) -and ($PurgeData -or $Yes)) {
@@ -102,7 +108,10 @@ try {
     } else {
         $env:UV_PYTHON_DOWNLOADS = "never"
     }
-    $pythonOutput = & $uv python find 3.12 | Select-Object -Last 1
+    # Never bootstrap uninstall/check from the project's .venv.  uv normally
+    # prefers a discovered project environment, but that environment may be the
+    # exact target the uninstall worker must remove.
+    $pythonOutput = & $uv python find --system --no-project 3.12 | Select-Object -Last 1
     $findExitCode = $LASTEXITCODE
     $python = if ($pythonOutput) { $pythonOutput.Trim() } else { "" }
     if ($findExitCode -ne 0 -or -not $python -or -not (Test-Path -LiteralPath $python)) {
@@ -124,6 +133,8 @@ try {
         if ($Check) { $arguments += "--check" }
         if ($DryRun) { $arguments += "--dry-run" }
         if ($SkipSandbox) { $arguments += "--skip-sandbox" }
+        if ($SkipMemoryModels) { $arguments += "--skip-memory-models" }
+        if ($ModelBundle) { $arguments += @("--model-bundle", $ModelBundle) }
         if ($NonInteractive) { $arguments += "--non-interactive" }
         & $python (Join-Path $source "installer\install.py") @arguments
         $exitCode = $LASTEXITCODE

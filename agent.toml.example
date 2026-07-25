@@ -53,16 +53,9 @@ enabled = true               # turn recall + extraction on by default
 # override, set AGENT_MEMORY_DIR, --memory-dir on `polaris memory`, or put
 # `dir = "..."` in the gitignored agent.local.toml.
 
-# Recall: semantic header selection with Unicode lexical fallback.
+# Recall output and whole-passage context budget.
 recall_k = 5                  # how many memories to inject per run
-semantic_selection = true
-memory_model = ""             # empty inherits the active model
 content_budget_bytes = 65536
-# Legacy v0 ranking keys remain accepted for one compatibility release:
-w_relevance = 1.0
-w_importance = 0.5
-w_recency = 0.3
-recency_decay_per_hour = 0.01
 
 # Extraction: distilling durable memories after a run.
 auto_extract = true           # extract automatically when a run completes
@@ -78,6 +71,21 @@ forget_min_access = 1         # ...unless they've been recalled at least this ma
 importance_half_life_days = 14.0  # forgetting curve half-life
 merge_threshold = 0.6         # fuse two memories above this lexical similarity
 synthesize_insights = true    # let the LLM infer higher-level "insight" memories
+
+# Local CPU hybrid retrieval. Models are installed as checksummed ONNX bundles.
+[memory.retrieval]
+mode = "hybrid"
+exact_k = 32
+bm25_k = 64
+dense_k = 64
+rrf_k = 60
+rerank_k = 24
+chunk_tokens = 384
+chunk_overlap_tokens = 64
+min_rerank_score = 0.5
+dense_fallback_min = 0.45
+timeout_seconds = 10
+model_threads = 4
 
 # --- Run-level safety limits ------------------------------------------------
 # Bound a whole `run()`. The wall-clock budget is SHARED across the sub-agent

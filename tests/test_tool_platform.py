@@ -245,6 +245,7 @@ def test_scheduler_windows_service_receipt_upgrade_and_exact_uninstall(
     calls: list[list[str]] = []
     monkeypatch.setattr(scheduler_service.sys, "platform", "win32")
     monkeypatch.setattr(scheduler_service, "_run", lambda argv: calls.append(argv))
+    monkeypatch.setattr(scheduler_service, "_service_is_registered", lambda value: True)
 
     installed = scheduler_service.install_user_service(
         executable=executable, database=database, receipt_path=receipt
@@ -259,8 +260,15 @@ def test_scheduler_windows_service_receipt_upgrade_and_exact_uninstall(
     assert any(call[:2] == ["schtasks", "/Run"] for call in calls)
 
     calls.clear()
-    scheduler_service.install_user_service(
+    reused = scheduler_service.install_user_service(
         executable=executable, database=database, receipt_path=receipt
+    )
+    assert calls == []
+    assert reused == installed
+
+    changed_database = tmp_path / "changed.sqlite3"
+    scheduler_service.install_user_service(
+        executable=executable, database=changed_database, receipt_path=receipt
     )
     assert calls[0][:2] == ["schtasks", "/Delete"]
     with pytest.raises(RuntimeError, match="does not match"):

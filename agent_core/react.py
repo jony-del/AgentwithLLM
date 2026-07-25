@@ -47,7 +47,7 @@ from agent_core.hooks import (
 from agent_core.memory import Dreamer, MemoryConfig, MemoryExtractor, MemoryRetriever, MemoryStore
 from agent_core.memory.paths import MemoryPathResolver
 from agent_core.memory.repository import MemoryRepository
-from agent_core.memory.retrieval import RepositoryMemoryRetriever, SemanticMemorySelector
+from agent_core.memory.retrieval import RepositoryMemoryRetriever
 from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.lifecycle import MemoryLifecycle
 from agent_core.file_lock import FileLock
@@ -316,7 +316,7 @@ class ReActAgent:
         hooks: HookPipeline | None = None,
         logger: JSONLRunLogger | None = None,
         memory_store: MemoryStore | RepositoryMemoryStore | None = None,
-        retriever: MemoryRetriever | None = None,
+        retriever: Any | None = None,
         extractor: MemoryExtractor | None = None,
         team_store: TeamStore | None = None,
         ui: AgentUI | None = None,
@@ -610,9 +610,9 @@ class ReActAgent:
     def _build_memory(
         self,
         memory_store: MemoryStore | RepositoryMemoryStore | None,
-        retriever: MemoryRetriever | None,
+        retriever: Any | None,
         extractor: MemoryExtractor | None,
-    ) -> tuple[MemoryStore | RepositoryMemoryStore | None, MemoryRetriever | None, MemoryExtractor | None]:
+    ) -> tuple[MemoryStore | RepositoryMemoryStore | None, Any | None, MemoryExtractor | None]:
         """Wire up cross-conversation memory, but only when it's enabled.
 
         Injected components win (tests/customisation); otherwise the missing pieces
@@ -650,19 +650,10 @@ class ReActAgent:
             candidate_repository = getattr(store, "repository", None)
             repository = candidate_repository if isinstance(candidate_repository, MemoryRepository) else None
         if retriever is None and repository is not None:
-            selector_config = self._provider_config()
-            if self.config.memory.memory_model:
-                selector_config = replace(selector_config, model=self.config.memory.memory_model)
-            selector = (
-                SemanticMemorySelector(self.provider, selector_config)
-                if self.config.memory.semantic_selection
-                else None
-            )
             retriever = RepositoryMemoryRetriever(
                 store,
                 repository,
                 self.config.memory,
-                selector=selector,
             )
         else:
             retriever = retriever or MemoryRetriever(store, self.config.memory)
@@ -1832,21 +1823,29 @@ class ReActAgent:
             for phrase in ("ignore memory", "ignore memories", "忽略记忆", "不要使用记忆")
         ):
             return
-        recalled = await self.retriever.recall(task)
-        repository = getattr(self.memory_store, "repository", None)
-        index = ""
-        if repository is not None and repository.list(headers_only=True):
-            index = repository.index_text()
-        if not recalled and not index:
-            return
-        block = self.retriever.format_block(recalled)
-        if index:
-            block += (
-                "\n\nMemory topic index (descriptions only; use as low-priority historical context):\n"
-                + index
+        try:
+            recalled = await self.retriever.recall(task)
+            block = self.retriever.format_block(recalled)
+        except Exception as exc:  # noqa: BLE001 - memory must never sink an executable run
+            await self.logger.write(
+                "memory_recall",
+                {
+                    "count": 0,
+                    "ids": [],
+                    "degraded_reasons": [f"recall_failed:{type(exc).__name__}"],
+                },
             )
-        budget = max(1024, self.config.memory.content_budget_bytes)
-        block = block.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+            return
+        if not recalled or not block:
+            await self.logger.write(
+                "memory_recall",
+                {
+                    "count": 0,
+                    "ids": [],
+                    **getattr(self.retriever, "last_metrics", {}),
+                },
+            )
+            return
         # Right after the main system prompt, before the user task, tagged so
         # extraction skips it and context_collapse keeps it pinned.
         messages.insert(1, Message("system", block, metadata={"memory": "recall"}))
