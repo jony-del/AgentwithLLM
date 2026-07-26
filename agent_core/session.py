@@ -192,6 +192,8 @@ class SessionContext:
     audit_event: Callable[[str, dict[str, object]], Awaitable[None]] | None = None
     scheduler_store: Any | None = None
     memory_repository: Any | None = None
+    memory_config: Any | None = None
+    memory_retrievers: dict[str, Any] = field(default_factory=dict)
     memory_direct_write: Callable[[], None] | None = None
     should_background: Callable[[], bool] | None = None
     depth: int = 0

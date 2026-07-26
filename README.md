@@ -145,7 +145,8 @@ effort 与 fast mode 只在当前会话生效；sandbox 变更原子应用并写
 不可信历史数据处理，涉及当前代码或配置的说法需要重新验证。命令、目录结构、
 迁移和隐私边界见 [长期记忆文档](docs/long-term-memory.md)。
 
-检索使用可重建的本地 SQLite 索引，默认执行 exact → BM25 → BGE-M3 dense →
+检索使用可重建的本地 SQLite 索引，默认执行 exact → BM25 → 自适应 BGE-M3
+dense（小集合分块精确扫描，大集合 USearch HNSW 召回后 FP32 精确重算）→
 加权 RRF → BGE reranker，只注入命中的完整片段。`MEMORY.md` 的 200 行上限仅是
 人类摘要限制，不限制主题枚举。可用 `polaris memory index status` 和
 `polaris memory models status` 检查覆盖率；离线安装模型使用

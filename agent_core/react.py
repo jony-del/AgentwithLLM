@@ -571,6 +571,10 @@ class ReActAgent:
         )
         repository = getattr(self.memory_store, "repository", None)
         self.session.memory_repository = repository
+        self.session.memory_config = self.config.memory
+        recall_engine = getattr(self.retriever, "engine", None)
+        if recall_engine is not None:
+            self.session.memory_retrievers["private"] = recall_engine
         self.session.memory_direct_write = (
             self.extractor.mark_direct_write if self.extractor is not None else None
         )

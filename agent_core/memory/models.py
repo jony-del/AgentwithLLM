@@ -94,6 +94,10 @@ class RetrievalTrace:
     index_fingerprint: str = ""
     embedding_fingerprint: str = ""
     reranker_fingerprint: str = ""
+    dense_strategy: str = ""
+    ann_coverage: float = 0.0
+    ann_generation: str = ""
+    fallback_reasons: list[str] = field(default_factory=list)
     degraded_reasons: list[str] = field(default_factory=list)
     final_ids: list[str] = field(default_factory=list)
 
@@ -106,6 +110,10 @@ class RetrievalTrace:
             "index_fingerprint": self.index_fingerprint,
             "embedding_fingerprint": self.embedding_fingerprint,
             "reranker_fingerprint": self.reranker_fingerprint,
+            "dense_strategy": self.dense_strategy,
+            "ann_coverage": round(float(self.ann_coverage), 6),
+            "ann_generation": self.ann_generation,
+            "fallback_reasons": list(self.fallback_reasons),
             "degraded_reasons": list(self.degraded_reasons),
             "final_ids": list(self.final_ids),
         }

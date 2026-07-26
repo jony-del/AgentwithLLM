@@ -42,6 +42,10 @@ class MemoryRetrievalConfig:
     dense_fallback_min: float = 0.45
     timeout_seconds: float = 10.0
     model_threads: int = 4
+    dense_strategy: str = "auto"
+    ann_min_vectors: int = 10_000
+    ann_candidate_multiplier: int = 4
+    ann_expansion_search: int = 256
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "MemoryRetrievalConfig":
@@ -54,6 +58,11 @@ class MemoryRetrievalConfig:
                 if key in valid:
                     setattr(config, key, coerce_to_type(valid[key], value))
         config.mode = config.mode if config.mode in {"hybrid", "lexical"} else "hybrid"
+        config.dense_strategy = (
+            config.dense_strategy
+            if config.dense_strategy in {"auto", "exact", "ann"}
+            else "auto"
+        )
         for name in ("exact_k", "bm25_k", "dense_k", "rerank_k"):
             setattr(config, name, max(0, int(getattr(config, name))))
         config.rrf_k = max(1, int(config.rrf_k))
@@ -65,6 +74,13 @@ class MemoryRetrievalConfig:
         config.dense_fallback_min = max(-1.0, min(1.0, float(config.dense_fallback_min)))
         config.timeout_seconds = max(0.1, float(config.timeout_seconds))
         config.model_threads = max(1, int(config.model_threads))
+        config.ann_min_vectors = max(1, int(config.ann_min_vectors))
+        config.ann_candidate_multiplier = max(
+            1, min(32, int(config.ann_candidate_multiplier))
+        )
+        config.ann_expansion_search = max(
+            16, min(8192, int(config.ann_expansion_search))
+        )
         return config
 
 

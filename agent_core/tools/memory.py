@@ -74,7 +74,14 @@ class MemorySearchTool(_MemoryTool):
             include_content=bool(arguments.get("include_content", False)),
             explain=bool(arguments.get("explain", False)),
         )
-        retriever = HybridMemoryRetriever(repository)
+        scope = str(arguments.get("scope", "private"))
+        retriever = self.session.memory_retrievers.get(scope)
+        if retriever is None:
+            retriever = HybridMemoryRetriever(
+                repository,
+                self.session.memory_config,
+            )
+            self.session.memory_retrievers[scope] = retriever
         results = retriever.search(request)
         payload: object = [
             item.to_dict(include_trace=False)

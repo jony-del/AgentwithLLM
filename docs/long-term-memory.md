@@ -20,6 +20,8 @@ Search data is disposable and rebuildable:
 
 ```text
 ~/.polaris/indexes/<memory-root-hash>/<index-fingerprint>/memory.sqlite3
+~/.polaris/indexes/<memory-root-hash>/<index-fingerprint>/dense/active.json
+~/.polaris/indexes/<memory-root-hash>/<index-fingerprint>/dense/<generation>.usearch
 ```
 
 The fingerprint covers the schema, chunker, lexical normalizer, chunk sizes, and
@@ -40,7 +42,9 @@ The default local CPU pipeline is:
 
 1. Deterministic exact atoms and `id`, `tag`, `type`, and `source` filters.
 2. SQLite FTS5 BM25 with `name=4`, `tags=3`, `description=2`, and `content=1`.
-3. normalized BGE-M3 dense embeddings and exact NumPy cosine scan.
+3. normalized BGE-M3 dense embeddings. Collections below 10,000 eligible
+   vectors use bounded exact scans; larger collections use memory-mapped USearch
+   HNSW recall followed by exact FP32 cosine rescoring.
 4. weighted reciprocal-rank fusion (`exact=2`, `BM25=1`, `dense=1`).
 5. BGE reranking of the first 24 chunks, then document aggregation.
 
@@ -61,8 +65,8 @@ tie-breaks only. Stored importance and access recency do not alter relevance.
 
 ## Models and degradation
 
-The `[memory]` Python extra contains NumPy, tokenizers, and
-`onnxruntime==1.23.2`. Core imports do not load them. Model bundles are INT8 CPU
+The `[memory]` Python extra contains NumPy, tokenizers, `onnxruntime==1.23.2`,
+and `usearch==2.26.0`. Core imports do not load them. Model bundles are INT8 CPU
 ONNX artifacts with pinned upstream commits, per-file SHA-256 values, licenses,
 quantization metadata, and golden vectors. Remote code is forbidden.
 
@@ -83,8 +87,9 @@ Missing models otherwise fail installation with a recovery command.
 
 Dense indexing is resumable in the background. Until coverage reaches 100%, exact
 and BM25 are immediately available and traces report `lexical_degraded`. A missing
-reranker falls back to RRF. A damaged index falls back to a full Unicode lexical
-scan and schedules a rebuild. Memory failures never make an otherwise executable
+reranker falls back to RRF. Missing or damaged ANN data falls back to a
+memory-bounded exact dense scan and schedules a rebuild; damaged SQLite falls back
+to a full Unicode lexical scan. Memory failures never make an otherwise executable
 agent run fail.
 
 ## Configuration
@@ -108,7 +113,16 @@ min_rerank_score = 0.5
 dense_fallback_min = 0.45
 timeout_seconds = 10
 model_threads = 4
+dense_strategy = "auto"
+ann_min_vectors = 10000
+ann_candidate_multiplier = 4
+ann_expansion_search = 256
 ```
+
+`dense_strategy=exact` is the rollback/compatibility mode. `auto` uses exact
+search for small or selective filtered sets and ANN for larger sets. ANN files
+are immutable, versioned sidecars next to `memory.sqlite3`; SQLite FP32
+embeddings remain the rebuild and exact-rescore source of truth.
 
 Removed keys (`semantic_selection`, `memory_model`, `w_relevance`,
 `w_importance`, `w_recency`, and `recency_decay_per_hour`) produce explicit
@@ -135,6 +149,19 @@ explicit request.
 `memory_recall` events contain per-stage counts and timing, coverage, model/index
 fingerprints, degradation reasons, and final ids. They never record the query,
 passages, full documents, or embeddings.
+
+## Dense benchmark
+
+After an index has complete embedding coverage, compare exhaustive search with
+ANN plus exact rescoring on the same stored BGE-M3 vectors:
+
+```text
+python benchmarks/memory_ann.py path/to/memory.sqlite3 --max-vectors 100000
+```
+
+The report includes build time, exact and ANN p50/p95 latency, candidate count,
+and mean recall at K. Release validation targets recall@64 of at least 0.98 and
+measures 10K, 100K, and 1M-vector indexes on the same host.
 
 ## Safety and privacy
 

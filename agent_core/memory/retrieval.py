@@ -4,7 +4,7 @@ import asyncio
 import math
 import sqlite3
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -27,13 +27,6 @@ from agent_core.memory.models import (
     RetrievalTrace,
 )
 from agent_core.memory.text import lexical_relevance, normalize_text, tokenize
-
-_DENSE_CACHE_MAX_INDEXES = 2
-_DENSE_CACHE: OrderedDict[
-    str,
-    tuple[tuple[int, int], Any, list[sqlite3.Row]],
-] = OrderedDict()
-
 
 class MemoryStoreLike(Protocol):
     def all(self) -> list[MemoryRecord]: ...
@@ -114,14 +107,18 @@ class HybridMemoryRetriever:
         reranker_backend: RerankerBackend | None = None,
         index_base: str | Any | None = None,
         background_embeddings: bool = True,
+        ann_index: Any | None = None,
     ) -> None:
         self.repository = repository
         self.config = config or MemoryConfig()
         self.retrieval = self.config.retrieval or MemoryRetrievalConfig()
-        if embedding_backend is None or reranker_backend is None:
+        # Treat constructor injection as an isolated backend set. Mixing a custom
+        # test/embedding model with an unrelated installed reranker makes scores
+        # non-reproducible and can pair incompatible model families.
+        if embedding_backend is None and reranker_backend is None:
             loaded_embedding, loaded_reranker = self._installed_backends()
-            embedding_backend = embedding_backend or loaded_embedding
-            reranker_backend = reranker_backend or loaded_reranker
+            embedding_backend = loaded_embedding
+            reranker_backend = loaded_reranker
         self.embedding_backend = embedding_backend
         self.reranker_backend = reranker_backend
         embedding_fingerprint = _safe_backend_fingerprint(
@@ -136,6 +133,11 @@ class HybridMemoryRetriever:
             index_base=index_base,
             embedding_fingerprint=embedding_fingerprint,
         )
+        if ann_index is None:
+            from agent_core.memory.ann import DenseAnnIndex
+
+            ann_index = DenseAnnIndex(self.index)
+        self.ann_index = ann_index
         self.background_embeddings = background_embeddings
         self.last_trace = RetrievalTrace()
 
@@ -167,6 +169,8 @@ class HybridMemoryRetriever:
             trace.timings_ms["index_sync"] = _elapsed(started)
             trace.index_coverage = status.coverage
             trace.index_fingerprint = status.index_fingerprint
+            trace.ann_coverage = status.ann_coverage
+            trace.ann_generation = status.ann_generation
             if not status.fts5:
                 trace.degraded_reasons.append("fts5_unavailable")
             if status.diagnostics:
@@ -236,6 +240,7 @@ class HybridMemoryRetriever:
                         request.filters,
                         limit=self.retrieval.dense_k,
                         deadline=deadline,
+                        trace=trace,
                     )
                 except Exception as exc:
                     trace.degraded_reasons.append(f"dense_unavailable:{type(exc).__name__}")
@@ -321,6 +326,7 @@ class HybridMemoryRetriever:
         *,
         limit: int,
         deadline: float,
+        trace: RetrievalTrace,
     ) -> list[IndexCandidate]:
         if self.embedding_backend is None or limit <= 0:
             return []
@@ -334,68 +340,224 @@ class HybridMemoryRetriever:
         if not math.isfinite(norm) or norm <= 0:
             raise ValueError("embedding backend returned an invalid query vector")
         query_vector = query_vector / norm
-        # Cache one contiguous matrix per versioned index. Structured filters are
-        # applied as a row mask so arbitrary filter combinations cannot duplicate
-        # a ~400 MB 100k x 1024 matrix in process memory.
-        rows = self.index.embedded_rows({})
-        if not rows:
+        eligible_count = self.index.embedded_count(filters)
+        if eligible_count <= 0:
+            trace.dense_strategy = "empty"
             return []
+        all_count = self.index.embedded_count({})
+        strategy = self.retrieval.dense_strategy
+        should_try_ann = (
+            strategy == "ann"
+            or (
+                strategy == "auto"
+                and all_count >= self.retrieval.ann_min_vectors
+                and eligible_count >= self.retrieval.ann_min_vectors
+            )
+        )
+        if should_try_ann:
+            candidates = self._ann_dense_candidates(
+                query_vector,
+                filters,
+                limit=limit,
+                eligible_count=eligible_count,
+                all_count=all_count,
+                deadline=deadline,
+                trace=trace,
+            )
+            if candidates is not None:
+                return candidates
+        trace.dense_strategy = "exact"
+        return self._exact_dense_candidates(
+            query_vector,
+            filters,
+            limit=limit,
+            deadline=deadline,
+        )
+
+    def _ann_dense_candidates(
+        self,
+        query_vector: Any,
+        filters: dict[str, list[str]],
+        *,
+        limit: int,
+        eligible_count: int,
+        all_count: int,
+        deadline: float,
+        trace: RetrievalTrace,
+    ) -> list[IndexCandidate] | None:
         if time.monotonic() >= deadline:
             raise TimeoutError("memory retrieval deadline exceeded")
-        signature = (len(rows), int(self.index.path.stat().st_mtime_ns))
-        cache_key = str(self.index.path)
-        cached = _DENSE_CACHE.get(cache_key)
-        if cached is None or cached[0] != signature:
-            dimensions = {int(row["embedding_dim"]) for row in rows}
-            if len(dimensions) != 1:
-                raise ValueError("index contains mixed embedding dimensions")
-            dimension = dimensions.pop()
-            matrix = np.empty((len(rows), dimension), dtype=np.float32)
-            for index, row in enumerate(rows):
-                if index % 1024 == 0 and time.monotonic() >= deadline:
-                    raise TimeoutError("memory retrieval deadline exceeded")
-                matrix[index] = np.frombuffer(row["embedding"], dtype=np.float32, count=dimension)
-            matrix = np.ascontiguousarray(matrix)
-            _DENSE_CACHE[cache_key] = (signature, matrix, rows)
-            _DENSE_CACHE.move_to_end(cache_key)
-            while len(_DENSE_CACHE) > _DENSE_CACHE_MAX_INDEXES:
-                _DENSE_CACHE.popitem(last=False)
-        else:
-            _, matrix, rows = cached
-            _DENSE_CACHE.move_to_end(cache_key)
-        if matrix.shape[1] != query_vector.shape[0]:
+        target = max(256, limit * self.retrieval.ann_candidate_multiplier)
+        requested = target
+        if any(filters.values()):
+            selectivity = eligible_count / max(1, all_count)
+            requested = math.ceil(target / max(selectivity, 1.0 / max(1, all_count)))
+            if requested > 8192:
+                trace.fallback_reasons.append("ann_filter_too_selective")
+                return None
+        requested = min(8192, all_count, max(target, requested))
+        try:
+            labels, ann_status = self.ann_index.search(
+                query_vector,
+                count=requested,
+            )
+        except Exception as exc:
+            trace.fallback_reasons.append(
+                f"ann_error:{type(exc).__name__}"
+            )
+            self._schedule_ann_rebuild(trace)
+            return None
+        trace.ann_coverage = ann_status.coverage
+        trace.ann_generation = ann_status.generation
+        trace.candidate_counts["dense_ann"] = len(labels)
+        if ann_status.state not in {"ready", "stale"}:
+            trace.fallback_reasons.append(f"ann_{ann_status.state}")
+            if ann_status.state in {
+                "missing",
+                "stale",
+                "corrupt",
+                "backend_unavailable",
+            }:
+                self._schedule_ann_rebuild(trace)
+            return None
+        if ann_status.state == "stale":
+            self._schedule_ann_rebuild(trace)
+        rows = self.index.embedded_rows_for_labels(labels, filters)
+        scored = self._score_dense_rows(query_vector, rows, deadline=deadline)
+        delta_scored: list[tuple[float, sqlite3.Row]] = []
+        if ann_status.base_revision > 0:
+            delta_scored = self._score_dense_batches(
+                query_vector,
+                self.index.iter_embedded_batches(
+                    filters,
+                    min_revision=ann_status.base_revision,
+                ),
+                keep=max(256, limit * 16),
+                deadline=deadline,
+            )
+        trace.candidate_counts["dense_delta"] = len(delta_scored)
+        merged: dict[int, tuple[float, sqlite3.Row]] = {}
+        for score, row in [*scored, *delta_scored]:
+            label = int(row["ann_label"])
+            current = merged.get(label)
+            if current is None or score > current[0]:
+                merged[label] = (score, row)
+        trace.candidate_counts["dense_exact_rescored"] = len(merged)
+        if len(merged) < min(limit, eligible_count):
+            trace.fallback_reasons.append("ann_insufficient_filtered_candidates")
+            return None
+        trace.dense_strategy = "ann_exact_rescore"
+        return self._dense_candidates_from_scored(list(merged.values()), limit=limit)
+
+    def _schedule_ann_rebuild(self, trace: RetrievalTrace) -> None:
+        try:
+            self.ann_index.schedule_build()
+        except Exception as exc:
+            trace.fallback_reasons.append(
+                f"ann_rebuild_schedule_failed:{type(exc).__name__}"
+            )
+
+    def _exact_dense_candidates(
+        self,
+        query_vector: Any,
+        filters: dict[str, list[str]],
+        *,
+        limit: int,
+        deadline: float,
+    ) -> list[IndexCandidate]:
+        scored = self._score_dense_batches(
+            query_vector,
+            self.index.iter_embedded_batches(filters, batch_size=4096),
+            keep=max(256, limit * 16),
+            deadline=deadline,
+        )
+        return self._dense_candidates_from_scored(scored, limit=limit)
+
+    @staticmethod
+    def _score_dense_rows(
+        query_vector: Any,
+        rows: list[sqlite3.Row],
+        *,
+        deadline: float,
+    ) -> list[tuple[float, sqlite3.Row]]:
+        if not rows:
+            return []
+        import numpy as np
+
+        dimensions = {int(row["embedding_dim"]) for row in rows}
+        if len(dimensions) != 1:
+            raise ValueError("index contains mixed embedding dimensions")
+        dimension = dimensions.pop()
+        if dimension != int(query_vector.shape[0]):
             raise ValueError("query/index embedding dimensions differ")
         if time.monotonic() >= deadline:
             raise TimeoutError("memory retrieval deadline exceeded")
-        scores = matrix @ query_vector
-        eligible = self.index.eligible_document_ids(filters)
-        if eligible is None:
-            row_indices = np.arange(len(rows))
-        else:
-            row_indices = np.asarray(
-                [
-                    index
-                    for index, row in enumerate(rows)
-                    if str(row["document_id"]) in eligible
-                ],
-                dtype=np.int64,
+        matrix = np.empty((len(rows), dimension), dtype=np.float32)
+        for offset, row in enumerate(rows):
+            matrix[offset] = np.frombuffer(
+                row["embedding"],
+                dtype=np.float32,
+                count=dimension,
             )
-        if len(row_indices) <= 0:
-            return []
-        ranked = row_indices[np.argsort(-scores[row_indices], kind="stable")]
+        scores = matrix @ query_vector
+        return [
+            (float(score), row)
+            for score, row in zip(scores.tolist(), rows, strict=True)
+        ]
+
+    def _score_dense_batches(
+        self,
+        query_vector: Any,
+        batches: Any,
+        *,
+        keep: int,
+        deadline: float,
+    ) -> list[tuple[float, sqlite3.Row]]:
+        import heapq
+
+        best: list[tuple[float, int, sqlite3.Row]] = []
+        for rows in batches:
+            for score, row in self._score_dense_rows(
+                query_vector,
+                rows,
+                deadline=deadline,
+            ):
+                label = int(row["ann_label"])
+                item = (score, -label, row)
+                if len(best) < keep:
+                    heapq.heappush(best, item)
+                elif item[:2] > best[0][:2]:
+                    heapq.heapreplace(best, item)
+        return [
+            (score, row)
+            for score, _, row in sorted(
+                best,
+                key=lambda item: (-item[0], -item[1]),
+            )
+        ]
+
+    def _dense_candidates_from_scored(
+        self,
+        scored: list[tuple[float, sqlite3.Row]],
+        *,
+        limit: int,
+    ) -> list[IndexCandidate]:
+        ranked = sorted(
+            scored,
+            key=lambda item: (-item[0], int(item[1]["ann_label"])),
+        )
         result: list[IndexCandidate] = []
         per_document: dict[str, int] = defaultdict(int)
-        for row_index in ranked.tolist():
-            row = rows[row_index]
+        for score, row in ranked:
             document_id = str(row["document_id"])
             if per_document[document_id] >= 3:
                 continue
             per_document[document_id] += 1
             result.append(
-                self.index._candidate(  # noqa: SLF001 - same subsystem's row contract
+                self.index._candidate(  # noqa: SLF001 - same subsystem row contract
                     row,
                     rank=len(result) + 1,
-                    raw_score=float(scores[row_index]),
+                    raw_score=score,
                 )
             )
             if len(result) >= limit:

@@ -86,6 +86,10 @@ min_rerank_score = 0.5
 dense_fallback_min = 0.45
 timeout_seconds = 10
 model_threads = 4
+dense_strategy = "auto"      # auto | exact | ann
+ann_min_vectors = 10000
+ann_candidate_multiplier = 4
+ann_expansion_search = 256
 
 # --- Run-level safety limits ------------------------------------------------
 # Bound a whole `run()`. The wall-clock budget is SHARED across the sub-agent

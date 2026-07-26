@@ -45,6 +45,10 @@ def test_hybrid_retrieval_defaults_are_stable() -> None:
         dense_fallback_min=0.45,
         timeout_seconds=10,
         model_threads=4,
+        dense_strategy="auto",
+        ann_min_vectors=10_000,
+        ann_candidate_multiplier=4,
+        ann_expansion_search=256,
     )
 
 
@@ -59,6 +63,21 @@ def test_removed_retrieval_keys_warn_and_are_not_mapped() -> None:
     assert config.retrieval.mode == "lexical"
     assert config.retrieval.bm25_k == 7
     assert not hasattr(config, "semantic_selection")
+
+
+def test_ann_retrieval_config_is_validated_and_bounded() -> None:
+    retrieval = MemoryRetrievalConfig.from_dict(
+        {
+            "dense_strategy": "unsupported",
+            "ann_min_vectors": "0",
+            "ann_candidate_multiplier": "100",
+            "ann_expansion_search": "2",
+        }
+    )
+    assert retrieval.dense_strategy == "auto"
+    assert retrieval.ann_min_vectors == 1
+    assert retrieval.ann_candidate_multiplier == 32
+    assert retrieval.ann_expansion_search == 16
 
 
 def _write_toml(tmp_path: Path, body: str) -> Path:

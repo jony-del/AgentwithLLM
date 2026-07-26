@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from agent_core.memory.config import MemoryConfig
+from agent_core.memory.config import MemoryConfig, MemoryRetrievalConfig
 from agent_core.providers import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 
@@ -9,7 +9,14 @@ from agent_core.react import ReActAgent, ReActConfig
 def _agent(tmp_path: Path, *, memory: bool) -> ReActAgent:
     config = ReActConfig(
         run_dir=str(tmp_path / "runs"),
-        memory=MemoryConfig(enabled=memory, dir=str(tmp_path / "memory")),
+        # This suite exercises agent integration, not optional local model
+        # installation. Lexical mode keeps it deterministic on developer hosts
+        # that may already have a production embedding/reranker bundle active.
+        memory=MemoryConfig(
+            enabled=memory,
+            dir=str(tmp_path / "memory"),
+            retrieval=MemoryRetrievalConfig(mode="lexical"),
+        ),
     )
     return ReActAgent(provider=FakeProvider(), config=config)
 
@@ -33,7 +40,7 @@ async def test_memory_enabled_recalls_relevant_memory(tmp_path: Path) -> None:
 
     result = await agent.run("remind me about my dark mode preference")
     recall_blocks = [m for m in result.messages if m.metadata.get("memory") == "recall"]
-    assert len(recall_blocks) == 1
+    assert len(recall_blocks) == 1, agent.retriever.last_trace.to_dict()
     assert "dark mode" in recall_blocks[0].content
     assert any(e["event"] == "memory_recall" for e in _events(agent))
 

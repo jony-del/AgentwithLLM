@@ -1150,9 +1150,21 @@ def memory_command(args: argparse.Namespace) -> int:
         assert config.retrieval is not None
         # Construct the same engine as runtime recall so the active model
         # fingerprint selects the same versioned derived-index directory.
-        index = HybridMemoryRetriever(repository, config).index
+        engine = HybridMemoryRetriever(repository, config)
+        index = engine.index
         if operation == "rebuild":
-            index_status = index.rebuild()
+            index.rebuild()
+            if engine.embedding_backend is not None:
+                index.populate_embeddings(engine.embedding_backend)
+                index_status = index.status()
+                if (
+                    config.retrieval.dense_strategy != "exact"
+                    and index_status.coverage >= 1.0
+                    and index_status.embedded_chunks
+                    >= config.retrieval.ann_min_vectors
+                ):
+                    engine.ann_index.build()
+            index_status = index.status()
         elif operation == "status":
             try:
                 index_status = index.ensure_current()
@@ -1319,7 +1331,9 @@ def health_command(args: argparse.Namespace) -> int:
                     detail=(
                         f"documents={index_status.documents} chunks={index_status.chunks} "
                         f"coverage={index_status.coverage:.1%} "
-                        f"pending={index_status.pending_embeddings}"
+                        f"pending={index_status.pending_embeddings} "
+                        f"ann={index_status.ann_state} "
+                        f"ann_coverage={index_status.ann_coverage:.1%}"
                     ),
                 )
             )
@@ -1335,6 +1349,25 @@ def health_command(args: argparse.Namespace) -> int:
                         ),
                     )
                 )
+            checks.append(
+                HealthCheck(
+                    "memory-ann",
+                    False,
+                    (
+                        "ok"
+                        if index_status.ann_state
+                        in {"ready", "not_needed", "disabled"}
+                        else "degraded"
+                    ),
+                    version=index_status.ann_generation,
+                    detail=(
+                        f"state={index_status.ann_state} "
+                        f"vectors={index_status.ann_vectors} "
+                        f"coverage={index_status.ann_coverage:.1%}; "
+                        f"dense_backend={index_status.dense_backend}"
+                    ),
+                )
+            )
             from agent_core.memory.models_manager import MemoryModelManager
 
             manager = MemoryModelManager()

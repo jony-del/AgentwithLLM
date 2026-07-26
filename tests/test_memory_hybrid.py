@@ -244,6 +244,158 @@ def test_dense_backend_is_incremental_and_resumable(tmp_path: Path) -> None:
     assert engine.index.status().coverage == 1.0
 
 
+def test_ann_generation_exact_rescore_and_delta_visibility(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+    pytest.importorskip("usearch")
+
+    class TinyEmbedding:
+        fingerprint = "tiny-ann-embedding-v1"
+        dimension = 2
+
+        def embed(self, texts, *, deadline=None):
+            vectors = []
+            for text in texts:
+                lowered = text.casefold()
+                if "cat" in lowered or "feline" in lowered:
+                    vectors.append([1.0, 0.0])
+                elif "dog" in lowered or "puppy" in lowered:
+                    vectors.append([0.0, 1.0])
+                else:
+                    vectors.append([0.7, 0.7])
+            return vectors
+
+    repository = MemoryRepository(tmp_path / "memory")
+    cat = _document(
+        repository,
+        memory_id="cat-ann-topic",
+        name="Animals",
+        content="A cat sleeps here.",
+    )
+    _document(
+        repository,
+        memory_id="other-ann-topic",
+        name="Other",
+        content="A neutral note.",
+    )
+    engine = HybridMemoryRetriever(
+        repository,
+        _config(
+            dense_strategy="ann",
+            ann_min_vectors=1,
+            ann_candidate_multiplier=4,
+            ann_expansion_search=32,
+        ),
+        embedding_backend=TinyEmbedding(),
+        index_base=tmp_path / "indexes",
+        background_embeddings=False,
+    )
+    engine.index.ensure_current()
+    engine.index.populate_embeddings(TinyEmbedding())
+    status = engine.ann_index.build()
+    assert status.state == "ready"
+
+    hits = engine.search(MemorySearchRequest.from_values("feline"))
+    assert hits and hits[0].id == cat.id
+    assert engine.last_trace.dense_strategy == "ann_exact_rescore"
+    assert engine.last_trace.candidate_counts["dense_exact_rescored"] >= 1
+
+    dog = _document(
+        repository,
+        memory_id="dog-ann-topic",
+        name="Canines",
+        content="A dog waits here.",
+    )
+    delta_hits = engine.search(MemorySearchRequest.from_values("puppy"))
+    assert delta_hits and delta_hits[0].id == dog.id
+    assert engine.last_trace.candidate_counts["dense_delta"] >= 1
+
+
+def test_ann_failure_falls_back_to_bounded_exact_dense_search(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+
+    class TinyEmbedding:
+        fingerprint = "tiny-fallback-embedding-v1"
+        dimension = 2
+
+        def embed(self, texts, *, deadline=None):
+            return [
+                [1.0, 0.0] if "target" in text.casefold() else [0.0, 1.0]
+                for text in texts
+            ]
+
+    class MissingAnn:
+        def search(self, query_vector, *, count):
+            from agent_core.memory.ann import AnnStatus
+
+            return [], AnnStatus(state="backend_unavailable")
+
+        def schedule_build(self):
+            return None
+
+    repository = MemoryRepository(tmp_path / "memory")
+    target = _document(
+        repository,
+        memory_id="fallback-topic",
+        name="Fallback",
+        content="semantic target",
+    )
+    engine = HybridMemoryRetriever(
+        repository,
+        _config(dense_strategy="ann", ann_min_vectors=1),
+        embedding_backend=TinyEmbedding(),
+        index_base=tmp_path / "indexes",
+        background_embeddings=False,
+        ann_index=MissingAnn(),
+    )
+    hits = engine.search(MemorySearchRequest.from_values("target"))
+    assert hits and hits[0].id == target.id
+    assert engine.last_trace.dense_strategy == "exact"
+    assert "ann_backend_unavailable" in engine.last_trace.fallback_reasons
+
+
+def test_auto_strategy_uses_exact_search_for_selective_filters(tmp_path: Path) -> None:
+    pytest.importorskip("numpy")
+
+    class TinyEmbedding:
+        fingerprint = "tiny-filter-embedding-v1"
+        dimension = 2
+
+        def embed(self, texts, *, deadline=None):
+            return [[1.0, 0.0] for _ in texts]
+
+    repository = MemoryRepository(tmp_path / "memory")
+    selected = _document(
+        repository,
+        memory_id="selected-filter-topic",
+        name="Selected",
+        content="semantic marker",
+        tags=["selected"],
+    )
+    for index in range(3):
+        _document(
+            repository,
+            memory_id=f"other-filter-topic-{index}",
+            name="Other",
+            content=f"other content {index}",
+            tags=["other"],
+        )
+    engine = HybridMemoryRetriever(
+        repository,
+        _config(dense_strategy="auto", ann_min_vectors=2),
+        embedding_backend=TinyEmbedding(),
+        index_base=tmp_path / "indexes",
+        background_embeddings=False,
+    )
+    hits = engine.search(
+        MemorySearchRequest.from_values(
+            "semantic",
+            filters={"tag": "selected"},
+        )
+    )
+    assert hits and hits[0].id == selected.id
+    assert engine.last_trace.dense_strategy == "exact"
+
+
 def test_manual_edit_incremental_sync_and_corrupt_index_recovery(tmp_path: Path) -> None:
     repository = MemoryRepository(tmp_path / "memory")
     document = _document(

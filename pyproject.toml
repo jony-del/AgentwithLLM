@@ -43,6 +43,7 @@ memory = [
     "numpy>=1.26,<3",
     "tokenizers>=0.20,<1",
     "onnxruntime==1.23.2",
+    "usearch==2.26.0",
 ]
 all = [
     "agent-with-llm[web,mcp,terminal,memory]",

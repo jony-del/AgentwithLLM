@@ -30,6 +30,7 @@ BLOCKED = {
     "numpy",
     "tokenizers",
     "onnxruntime",
+    "usearch",
 }
 
 

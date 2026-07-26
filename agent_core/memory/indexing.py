@@ -8,10 +8,11 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agent_core.file_lock import FileLock
 from agent_core.memory.chunking import CHUNKER_VERSION, chunk_markdown
@@ -26,9 +27,10 @@ from agent_core.memory.text import (
     normalize_text,
 )
 
-INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION = 4
 LEXICAL_VERSION = "unicode-nfkc-cjk-code-v1"
 DEFAULT_EMBEDDING_FINGERPRINT = "BAAI-bge-m3-int8-onnx-v1"
+ANN_INDEX_VERSION = "usearch-hnsw-f16-m32-v1"
 _BACKGROUND_LOCK = threading.Lock()
 _BACKGROUND_JOBS: set[str] = set()
 
@@ -68,6 +70,11 @@ class MemoryIndexStatus:
     coverage: float
     fts5: bool
     diagnostics: list[str]
+    ann_state: str = "unavailable"
+    ann_vectors: int = 0
+    ann_coverage: float = 0.0
+    ann_generation: str = ""
+    dense_backend: str = "exact"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,6 +106,7 @@ def retrieval_fingerprint(
         "chunk_tokens": config.chunk_tokens,
         "chunk_overlap_tokens": config.chunk_overlap_tokens,
         "embedding": embedding_fingerprint,
+        "ann": ANN_INDEX_VERSION,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:24]
@@ -125,6 +133,12 @@ def _decode_json_list(raw: str) -> list[str]:
     except (TypeError, json.JSONDecodeError):
         return []
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _ann_label_value(chunk_id: str, nonce: int = 0) -> int:
+    payload = chunk_id if nonce == 0 else f"{chunk_id}\0{nonce}"
+    raw = hashlib.sha256(payload.encode("utf-8")).digest()[:8]
+    return int.from_bytes(raw, "big") & ((1 << 63) - 1)
 
 
 class MemoryIndex:
@@ -217,6 +231,7 @@ class MemoryIndex:
             CREATE TABLE IF NOT EXISTS chunks (
                 rowid INTEGER PRIMARY KEY,
                 chunk_id TEXT NOT NULL UNIQUE,
+                ann_label INTEGER NOT NULL UNIQUE,
                 document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL,
                 heading TEXT NOT NULL,
@@ -227,7 +242,8 @@ class MemoryIndex:
                 end_char INTEGER NOT NULL,
                 embedding BLOB,
                 embedding_dim INTEGER,
-                embedding_fingerprint TEXT
+                embedding_fingerprint TEXT,
+                embedding_revision INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS chunks_document_idx ON chunks(document_id, ordinal);
             CREATE TABLE IF NOT EXISTS exact_atoms (
@@ -248,6 +264,10 @@ class MemoryIndex:
             );
             CREATE INDEX IF NOT EXISTS embedding_queue_status_idx
                 ON embedding_queue(status, updated_at);
+            CREATE TABLE IF NOT EXISTS dense_tombstones (
+                ann_label INTEGER PRIMARY KEY,
+                deleted_revision INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS diagnostics (
                 path TEXT PRIMARY KEY,
                 mtime_ns INTEGER NOT NULL,
@@ -282,12 +302,39 @@ class MemoryIndex:
             "lexical_version": LEXICAL_VERSION,
             "fts5": "1" if fts5 else "0",
             "updated_at": str(time.time()),
+            "dense_epoch": uuid.uuid4().hex,
+            "dense_revision": "0",
         }
         connection.executemany(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
             list(metadata.items()),
         )
         return fts5
+
+    @staticmethod
+    def _next_dense_revision(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key='dense_revision'"
+        ).fetchone()
+        revision = int(row[0]) + 1 if row is not None else 1
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('dense_revision', ?)",
+            (str(revision),),
+        )
+        return revision
+
+    @staticmethod
+    def _ann_label(connection: sqlite3.Connection, chunk_id: str) -> int:
+        nonce = 0
+        while True:
+            label = _ann_label_value(chunk_id, nonce)
+            collision = connection.execute(
+                "SELECT chunk_id FROM chunks WHERE ann_label=?",
+                (label,),
+            ).fetchone()
+            if collision is None or str(collision[0]) == chunk_id:
+                return label
+            nonce += 1
 
     def _schema_valid(self, connection: sqlite3.Connection) -> bool:
         try:
@@ -625,6 +672,25 @@ class MemoryIndex:
         )
 
     def _delete_document(self, connection: sqlite3.Connection, document_id: str) -> None:
+        embedded_labels = [
+            int(row[0])
+            for row in connection.execute(
+                """
+                SELECT ann_label FROM chunks
+                WHERE document_id=? AND embedding IS NOT NULL
+                """,
+                (document_id,),
+            )
+        ]
+        if embedded_labels:
+            revision = self._next_dense_revision(connection)
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO dense_tombstones(ann_label, deleted_revision)
+                VALUES (?, ?)
+                """,
+                [(label, revision) for label in embedded_labels],
+            )
         try:
             connection.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document_id,))
         except sqlite3.OperationalError:
@@ -701,16 +767,18 @@ class MemoryIndex:
             *[(kind, value) for kind, value in exact_atoms(document.description)],
         ]
         for chunk in chunks:
+            ann_label = self._ann_label(connection, chunk.chunk_id)
             cursor = connection.execute(
                 """
                 INSERT INTO chunks(
-                    chunk_id, document_id, ordinal, heading, content,
+                    chunk_id, ann_label, document_id, ordinal, heading, content,
                     normalized_content, token_count,
                     start_char, end_char
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chunk.chunk_id,
+                    ann_label,
                     document.id,
                     chunk.ordinal,
                     chunk.heading,
@@ -1010,25 +1078,169 @@ class MemoryIndex:
                 )
             }
 
-    def embedded_rows(self, filters: dict[str, list[str]]) -> list[sqlite3.Row]:
-        eligible = self.eligible_document_ids(filters)
+    @staticmethod
+    def _embedding_columns() -> str:
+        return """
+            c.chunk_id, c.ann_label, c.document_id, c.ordinal, c.heading, c.content,
+            c.start_char, c.end_char, c.embedding, c.embedding_dim,
+            c.embedding_revision,
+            d.name, d.description, d.type, d.updated_at, d.confidence,
+            d.explicit, d.verified_at, d.tags_json, d.sources_json
+        """
+
+    def dense_snapshot(self) -> dict[str, int | str]:
         with closing(self._connect()) as connection:
-            rows = list(
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            row = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(MIN(embedding_dim), 0),
+                       COALESCE(MAX(embedding_dim), 0)
+                FROM chunks
+                WHERE embedding IS NOT NULL AND embedding_fingerprint=?
+                """,
+                (self.embedding_fingerprint,),
+            ).fetchone()
+            chunks = int(connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+            return {
+                "epoch": str(metadata.get("dense_epoch", "")),
+                "revision": int(metadata.get("dense_revision", 0)),
+                "count": int(row[0]),
+                "chunks": chunks,
+                "min_dimension": int(row[1]),
+                "max_dimension": int(row[2]),
+            }
+
+    def embedded_count(
+        self,
+        filters: dict[str, list[str]],
+        *,
+        min_revision: int | None = None,
+        max_revision: int | None = None,
+    ) -> int:
+        filter_sql, parameters = self._filter_sql(filters)
+        revision_sql = ""
+        revision_values: list[int] = []
+        if min_revision is not None:
+            revision_sql += " AND c.embedding_revision > ?"
+            revision_values.append(int(min_revision))
+        if max_revision is not None:
+            revision_sql += " AND c.embedding_revision <= ?"
+            revision_values.append(int(max_revision))
+        with closing(self._connect()) as connection:
+            return int(
                 connection.execute(
-                    """
-                    SELECT c.chunk_id, c.document_id, c.ordinal, c.heading, c.content,
-                           c.start_char, c.end_char, c.embedding, c.embedding_dim,
-                           d.name, d.description, d.type, d.updated_at, d.confidence,
-                           d.explicit, d.verified_at, d.tags_json, d.sources_json
+                    f"""
+                    SELECT COUNT(*)
                     FROM chunks c JOIN documents d ON d.id = c.document_id
                     WHERE c.embedding IS NOT NULL
                       AND c.embedding_fingerprint = ?
-                    ORDER BY c.chunk_id
+                      {revision_sql} {filter_sql}
                     """,
-                    (self.embedding_fingerprint,),
-                )
+                    (self.embedding_fingerprint, *revision_values, *parameters),
+                ).fetchone()[0]
             )
-        return rows if eligible is None else [row for row in rows if str(row["document_id"]) in eligible]
+
+    def iter_embedded_batches(
+        self,
+        filters: dict[str, list[str]],
+        *,
+        batch_size: int = 4096,
+        min_revision: int | None = None,
+        max_revision: int | None = None,
+    ) -> Iterator[list[sqlite3.Row]]:
+        filter_sql, parameters = self._filter_sql(filters)
+        revision_sql = ""
+        revision_values: list[int] = []
+        if min_revision is not None:
+            revision_sql += " AND c.embedding_revision > ?"
+            revision_values.append(int(min_revision))
+        if max_revision is not None:
+            revision_sql += " AND c.embedding_revision <= ?"
+            revision_values.append(int(max_revision))
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                f"""
+                SELECT {self._embedding_columns()}
+                FROM chunks c JOIN documents d ON d.id = c.document_id
+                WHERE c.embedding IS NOT NULL
+                  AND c.embedding_fingerprint=?
+                  {revision_sql} {filter_sql}
+                ORDER BY c.ann_label
+                """,
+                (self.embedding_fingerprint, *revision_values, *parameters),
+            )
+            while True:
+                rows = cursor.fetchmany(max(1, int(batch_size)))
+                if not rows:
+                    break
+                yield rows
+        finally:
+            connection.close()
+
+    def embedded_rows(self, filters: dict[str, list[str]]) -> list[sqlite3.Row]:
+        return [
+            row
+            for batch in self.iter_embedded_batches(filters)
+            for row in batch
+        ]
+
+    def embedded_rows_for_labels(
+        self,
+        labels: list[int],
+        filters: dict[str, list[str]],
+    ) -> list[sqlite3.Row]:
+        if not labels:
+            return []
+        filter_sql, parameters = self._filter_sql(filters)
+        result: list[sqlite3.Row] = []
+        with closing(self._connect()) as connection:
+            for start in range(0, len(labels), 900):
+                batch = labels[start : start + 900]
+                placeholders = ",".join("?" for _ in batch)
+                result.extend(
+                    connection.execute(
+                        f"""
+                        SELECT {self._embedding_columns()}
+                        FROM chunks c JOIN documents d ON d.id = c.document_id
+                        WHERE c.ann_label IN ({placeholders})
+                          AND c.embedding IS NOT NULL
+                          AND c.embedding_fingerprint=?
+                          {filter_sql}
+                        """,
+                        (*batch, self.embedding_fingerprint, *parameters),
+                    )
+                )
+        order = {label: index for index, label in enumerate(labels)}
+        return sorted(result, key=lambda row: order.get(int(row["ann_label"]), len(order)))
+
+    def tombstones_after(self, revision: int) -> int:
+        with closing(self._connect()) as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dense_tombstones WHERE deleted_revision > ?",
+                    (int(revision),),
+                ).fetchone()[0]
+            )
+
+    def prune_tombstones_through(
+        self,
+        revision: int,
+        *,
+        expected_epoch: str,
+    ) -> None:
+        with FileLock(self.lock_path, timeout=self.config.timeout_seconds):
+            with closing(self._connect(write=True)) as connection:
+                epoch_row = connection.execute(
+                    "SELECT value FROM metadata WHERE key='dense_epoch'"
+                ).fetchone()
+                if epoch_row is None or str(epoch_row[0]) != expected_epoch:
+                    return
+                connection.execute(
+                    "DELETE FROM dense_tombstones WHERE deleted_revision <= ?",
+                    (int(revision),),
+                )
+                connection.commit()
 
     def populate_embeddings(
         self,
@@ -1107,14 +1319,22 @@ class MemoryIndex:
                 break
             with FileLock(self.lock_path, timeout=self.config.timeout_seconds):
                 with closing(self._connect(write=True)) as connection:
+                    revision = self._next_dense_revision(connection)
                     connection.executemany(
                         """
                         UPDATE chunks
-                        SET embedding=?, embedding_dim=?, embedding_fingerprint=?
+                        SET embedding=?, embedding_dim=?, embedding_fingerprint=?,
+                            embedding_revision=?
                         WHERE chunk_id=?
                         """,
                         [
-                            (blob, dimension, self.embedding_fingerprint, chunk_id)
+                            (
+                                blob,
+                                dimension,
+                                self.embedding_fingerprint,
+                                revision,
+                                chunk_id,
+                            )
                             for blob, dimension, chunk_id in encoded
                         ],
                     )
@@ -1141,6 +1361,15 @@ class MemoryIndex:
         def worker() -> None:
             try:
                 self.populate_embeddings(backend)
+                status = self.status()
+                if (
+                    status.coverage >= 1.0
+                    and status.embedded_chunks >= self.config.ann_min_vectors
+                    and self.config.dense_strategy != "exact"
+                ):
+                    from agent_core.memory.ann import DenseAnnIndex
+
+                    DenseAnnIndex(self).schedule_build()
             except Exception:
                 return
             finally:
@@ -1184,6 +1413,12 @@ class MemoryIndex:
                         "SELECT reason FROM diagnostics ORDER BY created_at LIMIT 100"
                     )
                 ]
+            try:
+                from agent_core.memory.ann import DenseAnnIndex
+
+                ann = DenseAnnIndex(self).status()
+            except Exception:
+                ann = None
             return MemoryIndexStatus(
                 str(self.path),
                 int(metadata.get("schema_version", 0)),
@@ -1195,6 +1430,15 @@ class MemoryIndex:
                 embedded / chunks if chunks else 1.0,
                 metadata.get("fts5") == "1",
                 diagnostics,
+                ann_state=ann.state if ann is not None else "unavailable",
+                ann_vectors=ann.vectors if ann is not None else 0,
+                ann_coverage=ann.coverage if ann is not None else 0.0,
+                ann_generation=ann.generation if ann is not None else "",
+                dense_backend=(
+                    "ann_exact_rescore"
+                    if ann is not None and ann.state in {"ready", "stale"}
+                    else "exact"
+                ),
             )
         except sqlite3.DatabaseError as exc:
             return MemoryIndexStatus(
