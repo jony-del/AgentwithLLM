@@ -1,22 +1,24 @@
-"""Claude-compatible plugin installation, validation, and idle-time reload.
+"""Claude-compatible plugin installation, validation, and generation swaps.
 
 No marketplace is preloaded. Installation only copies/records files; executable
 components (hooks and MCP servers) are activated solely by an explicit enable followed
-by ``/reload-plugins``.
+by ``/reload-plugins``, or by the policy-gated capability manager at a turn boundary.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from agent_core.config import user_settings_path
 from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapter
@@ -24,16 +26,33 @@ from agent_core.hooks import ExternalHookSpec
 from agent_core.local_config import update_local_table, update_toml_table
 from agent_core.mcp import MCPAdapter, MCPClientManager, MCPConfig, MCPServerConfig
 from agent_core.skills import Skill, SkillContext, SkillRegistry, load_skill_file, parse_frontmatter
+from agent_core.tools.base import ExecutionScope, Tool
 
 if TYPE_CHECKING:
     from agent_core.react import ReActAgent
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _REMOTE_SOURCE = re.compile(r"^(?:https?|ssh|git)://|^git@")
+_SHA256_PIN = re.compile(r"^[0-9a-fA-F]{64}$")
+_IMMUTABLE_GIT_COMMIT = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 
 
 class PluginError(RuntimeError):
     pass
+
+
+def is_safe_plugin_name(value: str) -> bool:
+    return bool(_SAFE_NAME.fullmatch(value))
+
+
+def is_sha256_pin(value: str) -> bool:
+    return bool(_SHA256_PIN.fullmatch(value))
+
+
+def is_git_commit_pin(value: str) -> bool:
+    """Return true only for a full immutable Git object id, never a branch/tag/ref."""
+
+    return bool(_IMMUTABLE_GIT_COMMIT.fullmatch(value))
 
 
 @dataclass(slots=True)
@@ -45,6 +64,10 @@ class PluginRecord:
     source: str
     version: str = ""
     installed_at: float = 0.0
+    description: str = ""
+    keywords: tuple[str, ...] = ()
+    integrity: str = ""
+    commit: str = ""
 
 
 @dataclass(slots=True)
@@ -54,6 +77,13 @@ class PluginBundle:
     mcp_manager: MCPClientManager | None
     mcp_tools: list[Any]
     agents: dict[str, str]
+
+
+@dataclass(slots=True)
+class PluginGeneration:
+    bundle: PluginBundle
+    skills: SkillRegistry
+    hooks: Any
 
 
 def plugin_home() -> Path:
@@ -100,6 +130,29 @@ def _inside(path: Path, root: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def plugin_tree_digest(root: str | Path) -> str:
+    """Return a deterministic SHA-256 for plugin contents, excluding VCS metadata."""
+
+    base = Path(root).resolve()
+    digest = hashlib.sha256()
+    for path in sorted(base.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(base)
+        if ".git" in relative.parts or path.is_dir():
+            continue
+        if path.is_symlink():
+            raise PluginError(f"cannot hash symlinked plugin content: {relative}")
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as stream:
+                while block := stream.read(1024 * 1024):
+                    digest.update(block)
+        except OSError as exc:
+            raise PluginError(f"could not hash plugin file {relative}: {exc}") from exc
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _manifest_path(root: Path) -> Path:
@@ -155,7 +208,11 @@ class PluginManager:
             if not isinstance(item, dict):
                 continue
             try:
-                record = PluginRecord(**{key: value for key, value in item.items() if key in valid})
+                values = {key: value for key, value in item.items() if key in valid}
+                keywords = values.get("keywords")
+                if isinstance(keywords, list):
+                    values["keywords"] = tuple(str(value) for value in keywords)
+                record = PluginRecord(**values)
             except TypeError:
                 continue
             records[str(plugin_id)] = record
@@ -201,6 +258,14 @@ class PluginManager:
             _git(["-C", str(path), "pull", "--ff-only"])
         return len(self._load_marketplace(path))
 
+    def marketplace_plugins(self, name: str) -> list[dict[str, Any]]:
+        """Read one configured marketplace's bounded manifest entries."""
+
+        values = self.marketplaces()
+        if name not in values:
+            raise PluginError(f"unknown marketplace: {name}")
+        return self._load_marketplace(Path(values[name]))
+
     @staticmethod
     def _load_marketplace(source: Path) -> list[dict[str, Any]]:
         path = (
@@ -215,7 +280,9 @@ class PluginManager:
             raise PluginError(f"invalid marketplace manifest: {path}")
         return [item for item in data["plugins"] if isinstance(item, dict)]
 
-    def _resolve_marketplace_plugin(self, name: str, marketplace: str) -> Path:
+    def _marketplace_entry(self, name: str, marketplace: str) -> dict[str, Any]:
+        if not is_safe_plugin_name(name):
+            raise PluginError("plugin name must be filesystem-safe")
         markets = self.marketplaces()
         if marketplace not in markets:
             raise PluginError(f"unknown marketplace: {marketplace}")
@@ -223,46 +290,98 @@ class PluginManager:
         for entry in self._load_marketplace(market_source):
             if str(entry.get("name") or "") != name:
                 continue
-            source = entry.get("source") or entry.get("path")
-            if isinstance(source, dict):
-                if source.get("source") == "github" and source.get("repo"):
-                    source = f"https://github.com/{source['repo']}.git"
-                else:
-                    source = source.get("path") or source.get("url") or source.get("repo")
-            if not isinstance(source, str):
-                raise PluginError(f"plugin {name!r} has no local source")
-            if _REMOTE_SOURCE.match(source):
-                destination = self.root / "sources" / marketplace / name
-                _clone_remote(source, destination)
-                return destination.resolve()
-            candidate = Path(source).expanduser()
-            if not candidate.is_absolute():
-                candidate = market_source.resolve().parent / candidate
-                if market_source.is_dir():
-                    candidate = market_source / source
-            return candidate.resolve()
+            return entry
         raise PluginError(f"plugin {name!r} not found in marketplace {marketplace!r}")
 
-    def install(self, source: str, marketplace: str = "local") -> PluginRecord:
+    def _resolve_marketplace_plugin(
+        self,
+        name: str,
+        marketplace: str,
+        *,
+        expected_sha256: str = "",
+        expected_commit: str = "",
+    ) -> Path:
+        markets = self.marketplaces()
+        if marketplace not in markets:
+            raise PluginError(f"unknown marketplace: {marketplace}")
+        market_source = Path(markets[marketplace])
+        entry = self._marketplace_entry(name, marketplace)
+        source = entry.get("source") or entry.get("path")
+        if isinstance(source, dict):
+            if source.get("source") == "github" and source.get("repo"):
+                source = f"https://github.com/{source['repo']}.git"
+            else:
+                source = source.get("path") or source.get("url") or source.get("repo")
+        if not isinstance(source, str):
+            raise PluginError(f"plugin {name!r} has no local source")
+        if _REMOTE_SOURCE.match(source):
+            source_key = expected_commit[:12] or expected_sha256[:12] or "current"
+            destination = self.root / "sources" / marketplace / name / source_key
+            _clone_remote(source, destination, commit=expected_commit or None)
+            return destination.resolve()
+        candidate = Path(source).expanduser()
+        if not candidate.is_absolute():
+            candidate = market_source.resolve().parent / candidate
+            if market_source.is_dir():
+                candidate = market_source / source
+        return candidate.resolve()
+
+    def install(
+        self,
+        source: str,
+        marketplace: str = "local",
+        *,
+        expected_sha256: str = "",
+        expected_commit: str = "",
+    ) -> PluginRecord:
+        expected_sha256 = expected_sha256.strip().lower()
+        expected_commit = expected_commit.strip().lower()
+        if expected_sha256 and not is_sha256_pin(expected_sha256):
+            raise PluginError("plugin sha256 pin must contain exactly 64 hexadecimal characters")
+        if expected_commit and not is_git_commit_pin(expected_commit):
+            raise PluginError("plugin commit pin must be a full 40- or 64-character object id")
         temporary_source: Path | None = None
         if _REMOTE_SOURCE.match(source):
             staging = self.root / "staging"
             staging.mkdir(parents=True, exist_ok=True)
             temporary_source = Path(tempfile.mkdtemp(prefix="plugin.", dir=str(staging)))
             source_path = temporary_source / "source"
-            _clone_remote(source, source_path)
+            _clone_remote(source, source_path, commit=expected_commit or None)
         else:
             source_path = Path(source).expanduser()
         if not source_path.exists() and marketplace != "local":
-            source_path = self._resolve_marketplace_plugin(source, marketplace)
+            entry = self._marketplace_entry(source, marketplace)
+            expected_sha256 = (expected_sha256 or str(entry.get("sha256") or "")).strip().lower()
+            expected_commit = (expected_commit or str(entry.get("commit") or "")).strip().lower()
+            if expected_sha256 and not is_sha256_pin(expected_sha256):
+                raise PluginError("plugin sha256 pin must contain exactly 64 hexadecimal characters")
+            if expected_commit and not is_git_commit_pin(expected_commit):
+                raise PluginError("plugin commit pin must be a full 40- or 64-character object id")
+            source_path = self._resolve_marketplace_plugin(
+                source,
+                marketplace,
+                expected_sha256=expected_sha256,
+                expected_commit=expected_commit,
+            )
         source_path = source_path.resolve()
         try:
             manifest = validate_plugin(source_path)
             name = str(manifest["name"])
             version = str(manifest.get("version") or "")
+            actual_commit = _git_head(source_path) if (source_path / ".git").is_dir() else ""
+            if expected_commit and actual_commit.casefold() != expected_commit.casefold():
+                raise PluginError(
+                    f"plugin commit mismatch: expected {expected_commit}, got {actual_commit or '(none)'}"
+                )
+            source_digest = plugin_tree_digest(source_path)
+            if expected_sha256 and source_digest.casefold() != expected_sha256.casefold():
+                raise PluginError(
+                    f"plugin sha256 mismatch: expected {expected_sha256}, got {source_digest}"
+                )
             plugin_id = f"{name}@{marketplace}"
             cache_root = (self.root / "cache").resolve()
-            destination = cache_root / marketplace / name / (version or "current")
+            cache_key = expected_commit[:12] or expected_sha256[:12] or version or "current"
+            destination = cache_root / marketplace / name / cache_key
             if not _inside(destination, cache_root):
                 raise PluginError("computed cache path escaped managed plugin cache")
             if not destination.exists():
@@ -276,6 +395,16 @@ class PluginManager:
                     os.replace(temporary / "plugin", destination)
                 finally:
                     shutil.rmtree(temporary, ignore_errors=True)
+            cached_digest = plugin_tree_digest(destination)
+            if cached_digest != source_digest:
+                raise PluginError(
+                    "plugin cache content differs from the validated source; remove the stale cache entry"
+                )
+            keywords_raw = manifest.get("keywords", [])
+            keywords = tuple(
+                str(item).strip() for item in keywords_raw
+                if isinstance(item, str) and str(item).strip()
+            ) if isinstance(keywords_raw, list) else ()
             record = PluginRecord(
                 plugin_id=plugin_id,
                 name=name,
@@ -284,6 +413,10 @@ class PluginManager:
                 source=source,
                 version=version,
                 installed_at=time.time(),
+                description=str(manifest.get("description") or "").strip(),
+                keywords=keywords,
+                integrity=cached_digest,
+                commit=actual_commit,
             )
             records = self.records()
             records[plugin_id] = record
@@ -325,6 +458,52 @@ class PluginManager:
             if item not in disabled
         ]
 
+    def component_selections(self) -> dict[str, tuple[str, ...]]:
+        """Return per-project component filters; absence preserves legacy all-components."""
+
+        path = self.workspace / "agent.local.toml"
+        if not path.is_file():
+            return {}
+        try:
+            import tomllib
+
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return {}
+        plugins = data.get("plugins")
+        raw = plugins.get("components", {}) if isinstance(plugins, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        allowed = {"skills", "agents", "hooks", "mcp"}
+        result: dict[str, tuple[str, ...]] = {}
+        for plugin_id, values in raw.items():
+            if not isinstance(values, list):
+                continue
+            result[str(plugin_id)] = tuple(
+                dict.fromkeys(str(value) for value in values if str(value) in allowed)
+            )
+        return result
+
+    def hook_selections(self) -> dict[str, tuple[str, ...]]:
+        path = self.workspace / "agent.local.toml"
+        if not path.is_file():
+            return {}
+        try:
+            import tomllib
+
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return {}
+        plugins = data.get("plugins")
+        raw = plugins.get("allowed_hooks", {}) if isinstance(plugins, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(plugin_id): tuple(str(value) for value in values if isinstance(value, str))
+            for plugin_id, values in raw.items()
+            if isinstance(values, list)
+        }
+
     def set_enabled(self, plugin_id: str, enabled: bool, *, scope: str = "project") -> None:
         if plugin_id not in self.records():
             raise PluginError(f"plugin is not installed: {plugin_id}")
@@ -350,6 +529,42 @@ class PluginManager:
         else:
             raise PluginError("scope must be project or user")
 
+    def set_activation(
+        self,
+        plugin_id: str,
+        components: tuple[str, ...],
+        *,
+        allowed_hooks: tuple[str, ...] = (),
+    ) -> None:
+        """Atomically enable a plugin with a project-local component selection."""
+
+        if plugin_id not in self.records():
+            raise PluginError(f"plugin is not installed: {plugin_id}")
+        enabled = _changed_enabled(
+            _read_plugin_list(self.workspace / "agent.local.toml", "enabled"),
+            plugin_id,
+            True,
+        )
+        disabled = _changed_enabled(
+            _read_plugin_list(self.workspace / "agent.local.toml", "disabled"),
+            plugin_id,
+            False,
+        )
+        selected = self.component_selections()
+        selected[plugin_id] = tuple(dict.fromkeys(components))
+        hook_ids = self.hook_selections()
+        hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_hooks))
+        update_local_table(
+            self.workspace,
+            "plugins",
+            {
+                "enabled": enabled,
+                "disabled": disabled,
+                "components": {key: list(value) for key, value in selected.items()},
+                "allowed_hooks": {key: list(value) for key, value in hook_ids.items()},
+            },
+        )
+
     def executable_components(self, plugin_id: str) -> bool:
         record = self.records().get(plugin_id)
         if record is None:
@@ -357,29 +572,68 @@ class PluginManager:
         root = Path(record.path)
         return (root / "hooks").exists() or (root / ".mcp.json").is_file()
 
-    def build_bundle(self, agent: "ReActAgent") -> PluginBundle:
+    def build_bundle(
+        self,
+        agent: "ReActAgent",
+        *,
+        enabled_ids: list[str] | None = None,
+        component_selections: dict[str, tuple[str, ...]] | None = None,
+        hook_selections: dict[str, tuple[str, ...]] | None = None,
+    ) -> PluginBundle:
         records = self.records()
         skills: list[Skill] = []
         hook_pairs: list[tuple[str, Any]] = []
         agents: dict[str, str] = {}
         mcp_servers: list[MCPServerConfig] = []
-        for plugin_id in self.enabled_ids():
+        selected_components = (
+            self.component_selections() if component_selections is None else component_selections
+        )
+        selected_hooks = self.hook_selections() if hook_selections is None else hook_selections
+        for plugin_id in self.enabled_ids() if enabled_ids is None else enabled_ids:
             record = records.get(plugin_id)
             if record is None:
                 raise PluginError(f"enabled plugin is not installed: {plugin_id}")
             root = Path(record.path).resolve()
             manifest = validate_plugin(root)
+            if record.integrity:
+                actual_digest = plugin_tree_digest(root)
+                if actual_digest != record.integrity:
+                    raise PluginError(
+                        f"installed plugin {plugin_id} failed integrity verification: "
+                        f"expected {record.integrity}, got {actual_digest}"
+                    )
             namespace = str(manifest["name"])
-            skills.extend(_load_plugin_skills(root, namespace, manifest))
-            plugin_agents, agent_skills = _load_plugin_agents(
-                root, namespace, manifest
+            components = set(
+                selected_components.get(
+                    plugin_id,
+                    ("skills", "agents", "hooks", "mcp"),
+                )
             )
-            agents.update(plugin_agents)
-            skills.extend(agent_skills)
-            hook_pairs.extend(
-                _load_plugin_hooks(root, agent, namespace, manifest)
-            )
-            mcp_servers.extend(_load_plugin_mcp(root, namespace, manifest))
+            if "skills" in components:
+                skills.extend(_load_plugin_skills(root, namespace, manifest))
+            if "agents" in components:
+                plugin_agents, agent_skills = _load_plugin_agents(
+                    root, namespace, manifest
+                )
+                agents.update(plugin_agents)
+                skills.extend(agent_skills)
+            if "hooks" in components:
+                allowed = selected_hooks.get(plugin_id)
+                hook_pairs.extend(
+                    _load_plugin_hooks(
+                        root,
+                        agent,
+                        namespace,
+                        manifest,
+                        plugin_id=plugin_id,
+                        allowed_hook_ids=allowed,
+                    )
+                )
+            if "mcp" in components:
+                plugin_mcp = _load_plugin_mcp(root, namespace, manifest)
+                if plugin_id in selected_components:
+                    plugin_mcp = _restrict_autonomous_mcp(agent, root, plugin_mcp)
+                mcp_servers.extend(plugin_mcp)
 
         manager: MCPClientManager | None = None
         tools: list[Any] = []
@@ -429,15 +683,45 @@ def _git(args: list[str]) -> None:
         raise PluginError(detail[:1000])
 
 
-def _clone_remote(source: str, destination: Path) -> None:
+def _git_head(root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PluginError(f"could not read plugin git revision: {exc}") from exc
+    if completed.returncode != 0:
+        raise PluginError((completed.stderr or "could not read plugin git revision")[:1000])
+    return completed.stdout.strip()
+
+
+def _clone_remote(source: str, destination: Path, *, commit: str | None = None) -> None:
     if destination.exists():
+        if commit:
+            actual = _git_head(destination)
+            if actual.casefold() != commit.casefold():
+                raise PluginError(
+                    f"cached source commit mismatch: expected {commit}, got {actual}"
+                )
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     if temporary.exists():
         shutil.rmtree(temporary)
     try:
-        _git(["clone", "--depth", "1", source, str(temporary)])
+        clone_args = ["clone"]
+        if not commit:
+            clone_args += ["--depth", "1"]
+        clone_args += [source, str(temporary)]
+        _git(clone_args)
+        if commit:
+            _git(["-C", str(temporary), "checkout", "--detach", commit])
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
@@ -544,9 +828,16 @@ def _load_plugin_hooks(
     agent: "ReActAgent",
     namespace: str,
     manifest: dict[str, Any],
+    *,
+    plugin_id: str,
+    allowed_hook_ids: tuple[str, ...] | None = None,
 ) -> list[tuple[str, Any]]:
     result: list[tuple[str, Any]] = []
-    valid_fields = {field.name for field in fields(ExternalHookSpec)}
+    # command_argv is an internal post-sandbox transport and must never be supplied
+    # by plugin metadata itself.
+    valid_fields = {
+        field.name for field in fields(ExternalHookSpec) if field.name != "command_argv"
+    }
     locations = _component_paths(root, manifest, "hooks", root / "hooks")
     for location in locations:
         path = location / "hooks.json" if location.is_dir() else location
@@ -566,6 +857,11 @@ def _load_plugin_hooks(
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
+                    if allowed_hook_ids is not None:
+                        entry_id = str(entry.get("id") or "").strip()
+                        qualified = f"{plugin_id}:{entry_id}" if entry_id else ""
+                        if not qualified or qualified not in allowed_hook_ids:
+                            continue
                     values = dict(entry)
                     values["event"] = event
                     if "matcher" not in values and isinstance(group.get("matcher"), str):
@@ -582,6 +878,8 @@ def _load_plugin_hooks(
                                 if key in valid_fields
                             }
                         )
+                        if allowed_hook_ids is not None:
+                            spec = _restrict_autonomous_hook(agent, root, plugin_id, spec)
                         adapter = build_external_adapter(
                             spec,
                             logger=agent.logger,
@@ -596,6 +894,43 @@ def _load_plugin_hooks(
                     if adapter is not None:
                         result.append((LIFECYCLE_EVENT_ATTRS[event], adapter))
     return result
+
+
+def _restrict_autonomous_hook(
+    agent: "ReActAgent",
+    root: Path,
+    plugin_id: str,
+    spec: ExternalHookSpec,
+) -> ExternalHookSpec:
+    if spec.type == "command":
+        if not spec.command or not agent.sandbox.is_enabled():
+            raise PluginError(
+                f"autonomous command hook from {plugin_id} requires a real sandbox"
+            )
+        guest_root = agent.sandbox.translate_path(root)
+        command = spec.command.replace(str(root), guest_root)
+        scope = ExecutionScope.for_workspace(
+            agent.session.workspace,
+            read_only_roots=(root,),
+            network="deny",
+        )
+        wrapped, shell = agent.sandbox.wrap(command, True, command=command, scope=scope)
+        if shell or not isinstance(wrapped, list) or not wrapped:
+            raise PluginError(f"sandbox could not wrap autonomous hook from {plugin_id}")
+        return replace(spec, command_argv=[str(item) for item in wrapped])
+    if spec.type == "http":
+        parsed = urlparse(spec.url or "")
+        host = parsed.hostname or ""
+        loopback = host in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not (loopback and parsed.scheme == "http"):
+            raise PluginError(
+                f"autonomous HTTP hook from {plugin_id} requires HTTPS or loopback"
+            )
+        if not loopback and not _domain_allowed(host, agent.config.web.allowed_domains):
+            raise PluginError(
+                f"autonomous HTTP hook domain {host!r} is not in web.allowed_domains"
+            )
+    return spec
 
 
 def _load_plugin_mcp(
@@ -622,6 +957,85 @@ def _load_plugin_mcp(
     return result
 
 
+def _domain_allowed(host: str, allowed: list[str]) -> bool:
+    normalized = host.casefold().strip(".")
+    return any(
+        normalized == item.casefold().strip(".")
+        or normalized.endswith("." + item.casefold().strip("."))
+        for item in allowed
+        if item.strip()
+    )
+
+
+def _translate_plugin_path(value: str, root: Path, guest_root: str) -> str:
+    try:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            return value
+        relative = candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return value
+    return str(Path(guest_root) / relative).replace("\\", "/")
+
+
+def _restrict_autonomous_mcp(
+    agent: "ReActAgent", root: Path, servers: list[MCPServerConfig]
+) -> list[MCPServerConfig]:
+    """Fail closed unless autonomous MCP transport is constrained by host policy."""
+
+    restricted: list[MCPServerConfig] = []
+    for server in servers:
+        transport = (server.transport or "stdio").casefold()
+        if transport in {"streamable-http", "streamable_http", "http"}:
+            parsed = urlparse(server.url)
+            host = parsed.hostname or ""
+            loopback = host in {"localhost", "127.0.0.1", "::1"}
+            if parsed.scheme != "https" and not (loopback and parsed.scheme == "http"):
+                raise PluginError(
+                    f"autonomous HTTP MCP {server.name} requires HTTPS or a loopback URL"
+                )
+            if not loopback and not _domain_allowed(host, agent.config.web.allowed_domains):
+                raise PluginError(
+                    f"autonomous HTTP MCP domain {host!r} is not in web.allowed_domains"
+                )
+            restricted.append(server)
+            continue
+
+        if transport != "stdio":
+            raise PluginError(f"unsupported autonomous MCP transport: {server.transport}")
+        if not agent.sandbox.is_enabled():
+            raise PluginError(
+                f"autonomous stdio MCP {server.name} requires a real sandbox backend"
+            )
+        if server.env:
+            raise PluginError(
+                f"autonomous stdio MCP {server.name} cannot inject host environment secrets"
+            )
+        guest_root = agent.sandbox.translate_path(root)
+        argv = [
+            _translate_plugin_path(server.command, root, guest_root),
+            *[_translate_plugin_path(item, root, guest_root) for item in server.args],
+        ]
+        scope = ExecutionScope.for_workspace(
+            agent.session.workspace,
+            read_only_roots=(root,),
+            network="deny",
+        )
+        wrapped, shell = agent.sandbox.wrap(argv, False, scope=scope)
+        if shell or not isinstance(wrapped, list) or not wrapped:
+            raise PluginError(f"sandbox could not wrap autonomous MCP {server.name}")
+        restricted.append(
+            replace(
+                server,
+                command=str(wrapped[0]),
+                args=[str(item) for item in wrapped[1:]],
+                env={},
+                cwd="",
+            )
+        )
+    return restricted
+
+
 def _expand_plugin_root(value: Any, root: Path) -> Any:
     if isinstance(value, str):
         return value.replace("${CLAUDE_PLUGIN_ROOT}", str(root))
@@ -635,11 +1049,9 @@ def _expand_plugin_root(value: Any, root: Path) -> Any:
     return value
 
 
-def reload_plugins(agent: "ReActAgent") -> tuple[int, int, int]:
-    """Build every component first, then atomically swap the live plugin generation."""
+def _prepare_generation(agent: "ReActAgent", bundle: PluginBundle) -> PluginGeneration:
+    """Validate a complete candidate without mutating the active generation."""
 
-    manager = PluginManager(agent.session.workspace)
-    bundle = manager.build_bundle(agent)
     try:
         base = agent._load_skills()
         merged = SkillRegistry(base.list())
@@ -650,7 +1062,10 @@ def reload_plugins(agent: "ReActAgent") -> tuple[int, int, int]:
         for attr, adapter in bundle.hooks:
             getattr(base_hooks, attr).append(adapter)
 
-        existing_tool_names = {tool.name for tool in agent.registry.list()}
+        existing_tool_names = {
+            *[tool.name for tool in agent.registry.list()],
+            *[tool.name for tool in agent.registry.deferred()],
+        }
         previous_plugin_names = set(getattr(agent, "_plugin_tool_names", set()))
         collisions = {
             tool.name
@@ -665,12 +1080,34 @@ def reload_plugins(agent: "ReActAgent") -> tuple[int, int, int]:
         if bundle.mcp_manager is not None:
             bundle.mcp_manager.close()
         raise
+    return PluginGeneration(bundle, merged, base_hooks)
+
+
+def _commit_generation(agent: "ReActAgent", generation: PluginGeneration) -> tuple[int, int, int]:
+    """Publish an already-validated generation; the operations below cannot block."""
+
+    bundle = generation.bundle
+    merged = generation.skills
+    base_hooks = generation.hooks
 
     old_manager = getattr(agent, "_plugin_mcp_manager", None)
     for name in getattr(agent, "_plugin_tool_names", set()):
         agent.registry.unregister(name)
     for tool in bundle.mcp_tools:
-        agent.registry.register(tool)
+
+        def factory(bound_tool: Tool = tool) -> Tool:
+            return bound_tool
+
+        agent.registry.register_deferred(
+            tool.name,
+            tool.description,
+            factory,
+            metadata={
+                "kind": "mcp",
+                "server": str(getattr(tool, "_server", "")),
+                "remote": str(getattr(tool, "_remote", "")),
+            },
+        )
     if merged.model_invocable():
         try:
             agent.registry.get("skill")
@@ -689,3 +1126,49 @@ def reload_plugins(agent: "ReActAgent") -> tuple[int, int, int]:
     if old_manager is not None:
         old_manager.close()
     return len(bundle.skills), len(bundle.hooks), len(bundle.mcp_tools)
+
+
+def reload_plugins(agent: "ReActAgent") -> tuple[int, int, int]:
+    """Build every component first, then atomically swap the live plugin generation."""
+
+    manager = PluginManager(agent.session.workspace)
+    return _commit_generation(agent, _prepare_generation(agent, manager.build_bundle(agent)))
+
+
+def activate_plugin(
+    agent: "ReActAgent",
+    plugin_id: str,
+    *,
+    components: tuple[str, ...],
+    allowed_hooks: tuple[str, ...] = (),
+) -> tuple[int, int, int]:
+    """Build a proposed component-scoped state, persist it, then publish it."""
+
+    manager = PluginManager(agent.session.workspace)
+    if plugin_id not in manager.records():
+        raise PluginError(f"plugin is not installed: {plugin_id}")
+    enabled = list(dict.fromkeys([*manager.enabled_ids(), plugin_id]))
+    selections = manager.component_selections()
+    selections[plugin_id] = tuple(dict.fromkeys(components))
+    hook_ids = manager.hook_selections()
+    hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_hooks))
+    generation = _prepare_generation(
+        agent,
+        manager.build_bundle(
+            agent,
+            enabled_ids=enabled,
+            component_selections=selections,
+            hook_selections=hook_ids,
+        ),
+    )
+    try:
+        manager.set_activation(
+            plugin_id,
+            selections[plugin_id],
+            allowed_hooks=hook_ids[plugin_id],
+        )
+    except Exception:
+        if generation.bundle.mcp_manager is not None:
+            generation.bundle.mcp_manager.close()
+        raise
+    return _commit_generation(agent, generation)

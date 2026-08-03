@@ -119,6 +119,9 @@ class ExternalHookSpec:
     type: str
     matcher: str | None = None
     command: str | None = None
+    # Framework-produced argv for sandboxed plugin hooks. Repo/user TOML does not
+    # populate this field; it avoids re-parsing a wrapped command through a host shell.
+    command_argv: list[str] | None = None
     url: str | None = None
     prompt: str | None = None
     model: str | None = None

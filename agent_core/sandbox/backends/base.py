@@ -72,6 +72,11 @@ class SandboxBackend:
         """
         return True
 
+    def translate_path(self, path: Path) -> str:
+        """Return the path spelling visible to commands inside this backend."""
+
+        return str(path)
+
     # -- lifecycle (eager per the eager-loading invariant; no-op for native) ----------
 
     def prepare(self) -> None:

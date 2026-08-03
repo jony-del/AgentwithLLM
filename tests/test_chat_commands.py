@@ -66,9 +66,14 @@ async def test_inline_skill_returns_rendered_prompt() -> None:
     assert turn.prompt == "Do: buy milk"
 
 
-async def test_fork_skill_runs_via_subagent_and_handles(capsys) -> None:
+async def test_fork_skill_runs_via_subagent_and_handles(capsys, tmp_path) -> None:
     skill = Skill(name="explore", description="d", body="Explore the repo", context=SkillContext.FORK)
-    turn = await dispatch("/explore now", _agent(skills=[skill]), NullUI(), [])
+    turn = await dispatch(
+        "/explore now",
+        _agent(skills=[skill], run_dir=str(tmp_path / "runs")),
+        NullUI(),
+        [],
+    )
     assert turn == ChatTurn()  # fully handled
     assert "Final answer: Explore the repo\n\nnow" in capsys.readouterr().out
 
@@ -100,6 +105,21 @@ async def test_skills_lists_user_invocable(capsys) -> None:
     await dispatch("/skills", _agent(skills=[visible, hidden]), NullUI(), [])
     out = capsys.readouterr().out
     assert "/visible" in out and "/hidden" not in out
+
+
+async def test_capabilities_command_searches_runtime_catalog(capsys) -> None:
+    skill = Skill(
+        name="security-review",
+        description="Review security vulnerabilities",
+        body="b",
+    )
+    agent = _agent(skills=[skill])
+
+    await dispatch("/capabilities security", agent, NullUI(), [])
+
+    output = capsys.readouterr().out
+    assert "skill:security-review" in output
+    assert "catalog_digest" in output
 
 
 async def test_clear_returns_empty_history(capsys) -> None:

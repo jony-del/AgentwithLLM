@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-resolver
+    from agent_core.capabilities import CapabilitiesConfig
     from agent_core.compression import CompressionConfig
     from agent_core.hooks import ExternalHookSpec, HooksConfig, OutputLimitConfig
     from agent_core.mcp.config import MCPConfig
@@ -158,7 +159,8 @@ def _apply_repo_trust(config_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
     """D2: filter privilege-widening keys of the in-repo agent.toml through TOFU.
 
     Deny/ask rules and every non-widening table pass through; allow rules, external
-    hooks, sandbox relaxations, and MCP servers require recorded (or freshly granted)
+    hooks, sandbox relaxations, MCP servers, and autonomous capability sources require
+    recorded (or freshly granted)
     user trust — see :mod:`agent_core.trust`. Failures degrade in the strict
     direction: if the policy itself errors, the widening keys are stripped.
     """
@@ -479,6 +481,17 @@ def resolve_skills_config(config_file: str | Path = "agent.toml") -> "SkillsConf
     if env is not None:
         config.enabled = env.strip().lower() in {"1", "true", "yes", "on"}
     return config
+
+
+def resolve_capabilities_config(
+    config_file: str | Path = "agent.toml",
+) -> "CapabilitiesConfig":
+    """Resolve model-facing capability discovery and trusted activation policy."""
+
+    from agent_core.capabilities import CapabilitiesConfig
+
+    table = load_agent_toml(config_file).get("capabilities")
+    return CapabilitiesConfig.from_dict(table if isinstance(table, dict) else None)
 
 
 _HOOK_TYPES = frozenset({"command", "http", "prompt", "agent"})

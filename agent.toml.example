@@ -146,6 +146,19 @@ project_dir = ".polaris/skills"    # per-project skills, resolved against the wo
 skills_dirs = []               # extra highest-precedence directories to scan
 disabled = []                  # skill names to suppress (e.g. ["commit"])
 
+# --- Runtime capability discovery -------------------------------------------
+# The model can search loaded skills, connected/deferred MCP tools, installed
+# plugins, and explicitly trusted plugin marketplaces. Remote activation is off by
+# default. "autonomous-trusted" is privilege-widening and therefore follows repo TOFU.
+[capabilities]
+mode = "local"                 # disabled | local | autonomous-trusted
+trusted_marketplaces = []      # names previously added with /plugin marketplace add
+require_integrity = true       # remote entries need sha256 or an immutable git commit
+auto_components = ["skills", "agents", "mcp"]  # hooks are excluded by default
+allowed_hooks = []             # exact plugin@marketplace:hook-id grants
+max_results = 8
+marketplace_refresh_ttl_seconds = 86400
+
 # --- Lifecycle hooks --------------------------------------------------------
 # Two sources feed the lifecycle hooks (UserPromptSubmit / PostSampling /
 # PreCompact / PostCompact / Stop, plus the observational SessionStart /

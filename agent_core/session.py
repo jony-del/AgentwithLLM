@@ -187,6 +187,7 @@ class SessionContext:
     mcp_manager: Any | None = None
     tool_suite: Any | None = None
     registry: Any | None = None
+    capability_manager: Any | None = None
     ask_user: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]] | None = None
     logger: Any | None = None
     audit_event: Callable[[str, dict[str, object]], Awaitable[None]] | None = None

@@ -1,7 +1,7 @@
 import json
 import sys
 
-from agent_core.cli import _clean_surrogates, _force_utf8_output, _make_provider
+from agent_core.cli import _clean_surrogates, _force_utf8_output, _make_provider, main
 from agent_core.providers import ClaudeProvider, FakeProvider, OpenAICompatProvider, OpenAIResponsesProvider
 from agent_core.storage import JSONLRunLogger
 
@@ -65,3 +65,21 @@ def test_run_logger_write_survives_surrogates(tmp_path) -> None:
     lines = logger.path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["event"] == "user"
+
+
+def test_capabilities_status_reports_configured_mode(tmp_path, monkeypatch, capsys) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        '[capabilities]\nmode = "autonomous-trusted"\ntrusted_marketplaces = ["team"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("POLARIS_PLUGIN_HOME", str(tmp_path / "plugins"))
+    monkeypatch.setenv("POLARIS_SETTINGS_PATH", str(tmp_path / "settings.toml"))
+
+    exit_code = main(["capabilities", "status", "--config", str(config_file)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "mode=autonomous-trusted" in output
+    assert "trusted_marketplaces=team" in output

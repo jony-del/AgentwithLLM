@@ -15,6 +15,7 @@ class DeferredTool:
     description: str
     factory: Callable[[], Tool]
     available: Callable[[], tuple[bool, str | None]] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class RegistryAwareMixin:
@@ -84,10 +85,11 @@ class ToolRegistry:
         factory: Callable[[], Tool],
         *,
         available: Callable[[], tuple[bool, str | None]] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if name in self._tools or name in self._deferred:
             raise ValueError(f"Tool already registered: {name}")
-        self._deferred[name] = DeferredTool(name, description, factory, available)
+        self._deferred[name] = DeferredTool(name, description, factory, available, metadata)
 
     def activate(self, name: str) -> Tool:
         existing = self._tools.get(name)
@@ -108,9 +110,26 @@ class ToolRegistry:
         self.register(tool)
         return tool
 
-    def register_adapter(self, adapter: ToolAdapter) -> None:
+    def register_adapter(self, adapter: ToolAdapter, *, deferred: bool = False) -> None:
         for tool in adapter.list_tools():
-            self.register(tool)
+            if deferred:
+                metadata: dict[str, Any] | None = None
+                server = getattr(tool, "_server", None)
+                remote = getattr(tool, "_remote", None)
+                if server and remote:
+                    metadata = {"kind": "mcp", "server": str(server), "remote": str(remote)}
+
+                def factory(bound_tool: Tool = tool) -> Tool:
+                    return bound_tool
+
+                self.register_deferred(
+                    tool.name,
+                    tool.description,
+                    factory,
+                    metadata=metadata,
+                )
+            else:
+                self.register(tool)
 
     def unregister(self, name: str) -> None:
         """Drop a tool if present (idempotent). Used to hide conditionally-disabled tools."""

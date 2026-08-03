@@ -145,6 +145,9 @@ class SandboxManager:
             return False
         return True
 
+    def translate_path(self, path: str | Path) -> str:
+        return self._backend.translate_path(Path(path).resolve())
+
     def _is_excluded(self, command: str) -> bool:
         patterns = self.config.excluded_commands
         if not patterns:

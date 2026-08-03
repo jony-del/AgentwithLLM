@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from agent_core.config import (
+    resolve_capabilities_config,
     resolve_compression_config,
     resolve_concurrency_config,
     resolve_config,
@@ -239,7 +240,9 @@ def _start_mcp(
     from agent_core.mcp import MCPAdapter
 
     manager = _connect_mcp(mcp_config)
-    registry.register_adapter(MCPAdapter(manager))
+    # MCP descriptors are discoverable immediately, but their full JSON schemas are
+    # exposed only after tool_search/capability_activate selects a matching tool.
+    registry.register_adapter(MCPAdapter(manager), deferred=True)
     return manager
 
 
@@ -299,6 +302,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         session_dir=_session_dir(args),
         persist_compaction_boundary=resolve_persist_compaction_boundary(config_file),
         skills=resolve_skills_config(config_file),
+        capabilities=resolve_capabilities_config(config_file),
         hooks=resolve_hooks_config(config_file),
         sandbox=_sandbox_config(args),
         permission_rules=_permission_rules(args),
@@ -1483,6 +1487,54 @@ def mcp_command(args: argparse.Namespace) -> int:
         manager.close()
 
 
+def capabilities_command(args: argparse.Namespace) -> int:
+    """Inspect the configured local/trusted discovery inputs without constructing an agent."""
+
+    from agent_core.plugins import PluginError, PluginManager
+    from agent_core.skills import discover_skill_dirs, load_skills
+
+    config_file = _config_file(args)
+    config = resolve_capabilities_config(config_file)
+    skills_config = resolve_skills_config(config_file)
+    manager = PluginManager(Path.cwd())
+    if args.action == "status":
+        print(f"mode={config.mode}")
+        print(f"trusted_marketplaces={','.join(config.trusted_marketplaces) or '(none)'}")
+        print(f"installed_plugins={len(manager.records())}")
+        print(f"enabled_plugins={len(manager.enabled_ids())}")
+        return 0
+
+    query = str(args.query or "").casefold().strip()
+    if not query:
+        print("[error] capabilities search requires a query", file=sys.stderr)
+        return 2
+    matches: list[tuple[str, str]] = []
+    for skill in load_skills(discover_skill_dirs(Path.cwd(), skills_config), skills_config.disabled):
+        haystack = f"{skill.name} {skill.description} {skill.when_to_use}".casefold()
+        if query in haystack:
+            matches.append((f"skill:{skill.name}", skill.description))
+    for server in resolve_mcp_config(config_file).servers:
+        if query in server.name.casefold():
+            matches.append((f"mcp:{server.name}", f"configured {server.transport} server"))
+    for marketplace in config.trusted_marketplaces:
+        try:
+            entries = manager.marketplace_plugins(marketplace)
+        except PluginError as exc:
+            print(f"[warning] {marketplace}: {exc}", file=sys.stderr)
+            continue
+        for entry in entries:
+            name = str(entry.get("name") or "")
+            description = str(entry.get("description") or "")
+            keywords = " ".join(str(item) for item in entry.get("keywords", []) if isinstance(item, str))
+            if query in f"{name} {description} {keywords}".casefold():
+                matches.append((f"plugin:{name}@{marketplace}", description))
+    for capability_id, description in matches[: config.max_results]:
+        print(f"{capability_id}  {description}".rstrip())
+    if not matches:
+        print("(no matching capabilities)")
+    return 0
+
+
 def _force_utf8_output() -> None:
     """Ensure stdout/stderr use UTF-8 so model output (emoji, CJK) prints on
     consoles whose default codec is narrow (e.g. GBK on zh-CN Windows)."""
@@ -1703,6 +1755,14 @@ def main(argv: list[str] | None = None) -> int:
     mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
     add_config_flag(mcp_parser)
     mcp_parser.set_defaults(func=mcp_command)
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities", help="Inspect or search configured capability discovery sources."
+    )
+    capabilities_parser.add_argument("action", choices=["status", "search"])
+    capabilities_parser.add_argument("query", nargs="?", default=None)
+    add_config_flag(capabilities_parser)
+    capabilities_parser.set_defaults(func=capabilities_command)
 
     replay_parser = subparsers.add_parser(
         "replay", help="Re-render a recorded run's JSONL event log as a readable timeline."

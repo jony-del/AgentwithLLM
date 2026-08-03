@@ -238,6 +238,28 @@ async def _cmd_model(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
     return ChatTurn()
 
 
+async def _cmd_capabilities(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    import json
+
+    query = args.strip()
+    if query:
+        print(json.dumps(agent.capability_manager.search(query), ensure_ascii=False, indent=2))
+        return ChatTurn()
+    records, digest = agent.capability_manager.snapshot()
+    counts: dict[str, int] = {}
+    for record in records:
+        counts[record.kind] = counts.get(record.kind, 0) + 1
+    print(
+        f"Capability mode: {agent.config.capabilities.mode}; catalog {digest[:12]}; "
+        f"skills={counts.get('skill', 0)}, mcp={counts.get('mcp', 0)}, "
+        f"plugins={counts.get('plugin', 0)}"
+    )
+    print("Search with: /capabilities <query>")
+    return ChatTurn()
+
+
 async def _cmd_effort(
     agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
 ) -> ChatTurn:
@@ -807,6 +829,10 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
     "quit": CommandSpec(None, "Leave the chat.", immediate=True, canonical="exit"),
     "help": CommandSpec(_cmd_help, "Show this help."),
     "skills": CommandSpec(_cmd_skills, "List available skills."),
+    "capabilities": CommandSpec(
+        _cmd_capabilities,
+        "Inspect or search runtime skills, MCP tools, and plugins.",
+    ),
     "clear": CommandSpec(_cmd_clear, "Clear conversation history (aliases /reset /new)."),
     "reset": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),
     "new": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),

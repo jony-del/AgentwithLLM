@@ -68,6 +68,9 @@ class ContainerBackend(SandboxBackend):
     def available(self) -> bool:
         return self._runtime is not None
 
+    def translate_path(self, path: Path) -> str:
+        return _map_workspace_path(path, self._container.windows_isolation)
+
     # -- lifecycle -------------------------------------------------------------------
 
     def prepare(self) -> None:
@@ -123,6 +126,13 @@ class ContainerBackend(SandboxBackend):
         for path in expand_paths(config.filesystem.allow_write, workspace):
             guest = _map_workspace_path(Path(path), cfg.windows_isolation)
             prefix += ["-v", f"{path}:{guest}"]
+
+        writable = set(expand_paths(config.filesystem.allow_write, workspace))
+        for path in expand_paths(config.filesystem.allow_read, workspace):
+            if path in writable:
+                continue
+            guest = _map_workspace_path(Path(path), cfg.windows_isolation)
+            prefix += ["-v", f"{path}:{guest}:ro"]
 
         # Network: default-deny; opt back in with a bridge when domains/binding requested.
         if config.network.allowed_domains or config.network.allow_local_binding:

@@ -2,8 +2,8 @@
 
 An in-repo ``agent.toml`` is repo-controlled input: cloning a repository must not be
 able to grant itself allow rules, external hooks (arbitrary commands/URLs), sandbox
-relaxations, MCP servers (arbitrary subprocesses launched at startup), or a web
-egress allowlist (unattended exfiltration targets). The rule:
+relaxations, MCP servers (arbitrary subprocesses launched at startup), autonomous
+capability sources, or a web egress allowlist (unattended exfiltration targets). The rule:
 
 - Repo config may always TIGHTEN policy — deny/ask rules and every non-widening table
   pass through untouched.
@@ -71,6 +71,14 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(mcp, dict) and mcp.get("servers"):
         subset["mcp.servers"] = mcp["servers"]
 
+    capabilities = raw.get("capabilities")
+    if isinstance(capabilities, dict) and (
+        capabilities.get("mode") == "autonomous-trusted"
+        or capabilities.get("trusted_marketplaces")
+        or capabilities.get("allowed_hooks")
+    ):
+        subset["capabilities"] = capabilities
+
     tools = raw.get("tools")
     if isinstance(tools, dict):
         shell = tools.get("shell")
@@ -113,6 +121,13 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
     mcp = out.get("mcp")
     if isinstance(mcp, dict):
         mcp.pop("servers", None)
+    capabilities = out.get("capabilities")
+    if isinstance(capabilities, dict) and (
+        capabilities.get("mode") == "autonomous-trusted"
+        or capabilities.get("trusted_marketplaces")
+        or capabilities.get("allowed_hooks")
+    ):
+        out.pop("capabilities", None)
     tools = out.get("tools")
     if isinstance(tools, dict):
         shell = tools.get("shell")

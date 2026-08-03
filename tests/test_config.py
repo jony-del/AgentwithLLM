@@ -6,6 +6,7 @@ import pytest
 from agent_core.config import (
     load_agent_toml,
     load_dotenv,
+    resolve_capabilities_config,
     resolve_concurrency_config,
     resolve_config,
     resolve_permission_rules,
@@ -30,6 +31,32 @@ def test_load_dotenv_sets_missing_environment_variables(tmp_path: Path, monkeypa
 
     assert os.environ["ANTHROPIC_API_KEY"] == "test-key"
     assert os.environ["AGENT_MODEL"] == "claude-test-model"
+
+
+def test_resolve_capabilities_config_clamps_and_filters_policy_values(tmp_path: Path) -> None:
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text(
+        """
+        [capabilities]
+        mode = "autonomous-trusted"
+        trusted_marketplaces = ["team", "team"]
+        require_integrity = true
+        auto_components = ["skills", "hooks", "unknown"]
+        allowed_hooks = ["review@team:gate"]
+        max_results = 999
+        marketplace_refresh_ttl_seconds = -1
+        """,
+        encoding="utf-8",
+    )
+
+    config = resolve_capabilities_config(config_file)
+
+    assert config.mode == "autonomous-trusted"
+    assert config.trusted_marketplaces == ("team",)
+    assert config.auto_components == ("skills", "hooks")
+    assert config.allowed_hooks == ("review@team:gate",)
+    assert config.max_results == 20
+    assert config.marketplace_refresh_ttl_seconds == 0
 
 
 def test_load_dotenv_does_not_override_existing_environment(tmp_path: Path, monkeypatch) -> None:

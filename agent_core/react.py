@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_core.agents.team import TeamStore
+from agent_core.capabilities import CapabilitiesConfig, CapabilityManager
 from agent_core.compression import (
     CompressionConfig,
     CompressionEvent,
@@ -260,7 +261,9 @@ class ReActConfig:
         "the team tools explicitly: team_create, task_create, teammate_spawn, task_update, "
         "and team_status. Use bash or powershell for commands; long-running commands may "
         "continue in the background and can be inspected or stopped with task_output and "
-        "task_stop. Use tool_search to discover deferred capabilities such as LSP, notebook, "
+        "task_stop. Use capability_search when a task may benefit from a skill, MCP tool, "
+        "or trusted plugin that is not already visible; activate only the returned stable id. "
+        "Use tool_search to discover other deferred capabilities such as LSP, notebook, "
         "worktree, configuration, MCP resources, and scheduling tools. Multiple tool calls "
         "in the same turn may run concurrently when "
         "their resources are independent; if an action needs the output from a previous "
@@ -283,6 +286,7 @@ class ReActConfig:
     tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
     # Skill / slash-command subsystem (loaded eagerly at startup when enabled).
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     # Lifecycle-hook subsystem: built-in programmatic hook toggles + config-driven
     # external hooks. Assembled into the shared HookPipeline by _build_hook_pipeline.
     hooks: HooksConfig = field(default_factory=HooksConfig)
@@ -515,6 +519,9 @@ class ReActAgent:
         # offering the model a tool it can't use).
         if not self.skills.model_invocable():
             self.registry.unregister("skill")
+        if not self.config.capabilities.enabled:
+            self.registry.unregister("capability_search")
+            self.registry.unregister("capability_activate")
         # Session-only acknowledgement for explicitly accepted unsandboxed
         # unattended operation. It is never persisted or inherited by children.
         self._unsandboxed_permission_ack = False
@@ -610,6 +617,8 @@ class ReActAgent:
                 type(exc).__name__,
                 exc,
             )
+        self.capability_manager = CapabilityManager(self, self.config.capabilities)
+        self.session.capability_manager = self.capability_manager
 
     def _build_memory(
         self,
@@ -1269,6 +1278,20 @@ class ReActAgent:
                 should_cancel=cancelled,
                 messages=messages,
             )
+            if any(item.metadata.get("activation_pending") for item in tool_results):
+                activation_outcomes = await asyncio.to_thread(
+                    self.capability_manager.commit_pending
+                )
+                for item in tool_results:
+                    capability_id = str(item.metadata.get("capability_id") or "")
+                    outcome = activation_outcomes.get(capability_id)
+                    if outcome is None:
+                        continue
+                    item.content = json.dumps(outcome, ensure_ascii=False, indent=2)
+                    item.ok = outcome.get("status") != "failed"
+                    item.metadata["activation_pending"] = False
+                    item.metadata["activation_status"] = outcome.get("status")
+                    await self.logger.write("capability_activation", outcome)
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 await self._emit(

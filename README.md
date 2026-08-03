@@ -163,6 +163,33 @@ agents、hooks（含 `${CLAUDE_PLUGIN_ROOT}`）和 `.mcp.json`。可执行 hooks
 失败时继续使用旧代。插件组件使用 `plugin:component` 命名空间，安装 ID 使用
 `plugin@marketplace`。
 
+## 运行时能力发现
+
+Agent 可通过 `capability_search` 自行检索当前 skills、已连接但尚未暴露的 MCP tools、已安装
+plugins，以及明确列入信任名单的 marketplace 元数据。默认 `[capabilities].mode = "local"`，
+只允许发现和启用本地已连接的能力，不会下载插件。可用 `/capabilities <query>` 检查运行时目录，
+或用 `polaris capabilities search <query>` 检查当前配置的发现来源。
+
+将模式设为 `"autonomous-trusted"` 后，模型才能请求安装受信 marketplace 中的插件。远程条目
+必须带 `sha256` 或不可变 Git `commit`，请求只能引用刚刚检索到的稳定 ID 和目录摘要，不能把任意
+URL、路径或命令传给安装器。激活在当前工具批次结束的回合边界提交；候选组件验证失败时保留旧代，
+并把失败作为工具结果返回。自动激活默认只包含 skills、agents 和受沙箱/网络策略约束的 MCP；
+hooks 必须同时出现在 `auto_components` 和 `allowed_hooks` 的精确授权列表中。
+
+Polaris 不预置信任源。管理员需先添加 marketplace，再在项目配置中显式信任其名称：
+
+```toml
+[capabilities]
+mode = "autonomous-trusted"
+trusted_marketplaces = ["team"]
+require_integrity = true
+auto_components = ["skills", "agents", "mcp"]
+allowed_hooks = []
+```
+
+Marketplace 的每个插件项可声明 `description`、`keywords`、`components`、`sha256` 和 `commit`；
+开启完整性要求时至少需要后两项之一。该配置扩大仓库权限边界，因此仍受项目 TOFU 信任检查保护。
+
 ## 源码开发
 
 开发者应使用仓库根目录下的 `.venv` editable 安装，而不是在多个 Conda 环境中分别安装。普通

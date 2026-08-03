@@ -3,7 +3,9 @@
 Polaris tools share a session lifecycle, permission policy, sandbox scope, process
 supervisor and JSONL audit stream. Core tools are advertised at startup; less common
 Notebook, LSP, Worktree, Scheduler, Config and MCP-resource tools are activated through
-`tool_search` only when configured and permitted.
+`tool_search` only when configured and permitted. Configured MCP business tools remain connected but deferred;
+`capability_search` can find them and `capability_activate` exposes an exact returned tool
+at the next model-call boundary.
 
 ## Shell and tasks
 
@@ -20,6 +22,13 @@ standard locations. PowerShell prefers `pwsh`, then Windows PowerShell 5.1.
 
 ## Deferred capabilities
 
+- `capability_search` searches model-invocable skills, connected/deferred MCP tools,
+  installed plugins, and configured trusted marketplaces. `capability_activate` accepts
+  only a stable catalog id plus its snapshot digest. Local activation is the default;
+  remote installation requires `autonomous-trusted`, an explicitly trusted marketplace,
+  and a pinned SHA-256 or immutable Git commit. Plugin swaps occur atomically at a turn
+  boundary. Autonomous hooks are deny-by-default and executable plugin components are
+  sandbox- and network-policy constrained.
 - `notebook_edit` edits cells by stable ID after `read_text_file` records a notebook
   fingerprint. External changes make the edit fail closed.
 - `lsp` lazily starts the configured server for a file extension and supports definitions,

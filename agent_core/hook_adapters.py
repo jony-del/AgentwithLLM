@@ -257,15 +257,23 @@ class CommandHookAdapter(_ExternalHookAdapter):
     """Spawn a subprocess, feed projected JSON on stdin, read stdout/exit-code decision."""
 
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
-        if not self.spec.command:
+        if not self.spec.command and not self.spec.command_argv:
             return HookOutcome()
         payload = json.dumps(project_hook_input(ctx)).encode("utf-8")
-        proc = await asyncio.create_subprocess_shell(
-            self.spec.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        if self.spec.command_argv:
+            proc = await asyncio.create_subprocess_exec(
+                *self.spec.command_argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                self.spec.command or "",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         try:
             stdout, _stderr = await asyncio.wait_for(
                 proc.communicate(payload), timeout=self.spec.timeout

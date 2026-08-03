@@ -78,6 +78,24 @@ def test_widening_subset_extracts_only_grants(tmp_path: Path) -> None:
     assert trust.widening_subset({"permissions": {"deny": ["bash(rm *)"]}}) == {}
 
 
+def test_autonomous_capability_sources_are_tofu_gated() -> None:
+    raw = {
+        "capabilities": {
+            "mode": "autonomous-trusted",
+            "trusted_marketplaces": ["company"],
+            "allowed_hooks": ["review@company:gate"],
+        },
+        "skills": {"enabled": True},
+    }
+
+    subset = trust.widening_subset(raw)
+    stripped = trust.strip_widening(raw)
+
+    assert subset == {"capabilities": raw["capabilities"]}
+    assert "capabilities" not in stripped
+    assert stripped["skills"] == {"enabled": True}
+
+
 def test_strip_widening_keeps_tightening(tmp_path: Path) -> None:
     raw = load_agent_toml(_write_repo(tmp_path) / "agent.toml")
     stripped = trust.strip_widening(raw)

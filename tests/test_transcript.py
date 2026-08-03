@@ -37,7 +37,11 @@ class ToolThenDoneProvider:
 
 
 def _config(tmp_path: Path) -> ReActConfig:
-    return ReActConfig(session_dir=str(tmp_path), memory=MemoryConfig(enabled=False))
+    return ReActConfig(
+        run_dir=str(tmp_path / "runs"),
+        session_dir=str(tmp_path),
+        memory=MemoryConfig(enabled=False),
+    )
 
 
 # --------------------------------------------------------------------------- contract
@@ -101,11 +105,17 @@ async def test_run_persists_faithful_chain(tmp_path: Path) -> None:
 
 
 async def test_disabled_persistence_writes_nothing(tmp_path: Path) -> None:
-    cfg = ReActConfig(session_dir="", memory=_config(tmp_path).memory)
+    cfg = ReActConfig(
+        run_dir=str(tmp_path / "runs"),
+        session_dir="",
+        memory=_config(tmp_path).memory,
+    )
     agent = ReActAgent(provider=FakeProvider(), config=cfg)
     assert agent.transcript is None
     await agent.run("hello")
-    assert not any(tmp_path.rglob("*.jsonl"))
+    # The observational run audit still exists; disabling session persistence must
+    # create no second transcript file.
+    assert list(tmp_path.rglob("*.jsonl")) == [agent.logger.path]
 
 
 # --------------------------------------------------------------------------- resume

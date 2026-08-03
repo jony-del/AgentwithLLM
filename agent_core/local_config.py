@@ -21,6 +21,11 @@ def _toml_value(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        entries = []
+        for key, item in value.items():
+            entries.append(f"{json.dumps(str(key), ensure_ascii=False)} = {_toml_value(item)}")
+        return "{" + ", ".join(entries) + "}"
     if isinstance(value, (int, float)):
         return str(value)
     raise LocalConfigError(f"unsupported local setting value: {type(value).__name__}")
