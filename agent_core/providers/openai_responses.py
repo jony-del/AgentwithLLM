@@ -25,7 +25,12 @@ from agent_core.models import (
     TokenUsage,
     ToolCall,
 )
-from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.base import (
+    LLMProvider,
+    ProviderConfig,
+    StreamHandler,
+    notify_tool_call_complete,
+)
 from agent_core.providers.openai_capabilities import (
     capabilities_for_responses_model,
     reasoning_effort_for_model,
@@ -61,6 +66,8 @@ class _ResponsesStreamAccumulator:
         self.output_items: dict[str, dict[str, Any]] = {}
         self.output_order: list[str] = []
         self.function_args: dict[str, list[str]] = {}
+        self.completed_function_args: set[str] = set()
+        self.emitted_function_calls: set[str] = set()
         self.stop_reason: str | None = None
         self.usage: TokenUsage | None = None
 
@@ -446,6 +453,8 @@ class OpenAIResponsesProvider(LLMProvider):
                 if clean.get("type") == "function_call" and key in acc.function_args:
                     clean["arguments"] = "".join(acc.function_args[key]) or clean.get("arguments", "")
                     acc.output_items[key] = clean
+                if etype == "response.output_item.done":
+                    self._maybe_emit_function_call(key, acc, sink, item_done=True)
             return
         if etype in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
             key = self._item_key(event)
@@ -462,6 +471,9 @@ class OpenAIResponsesProvider(LLMProvider):
             item = acc.output_items.get(key)
             if item is not None:
                 item["arguments"] = "".join(acc.function_args.get(key, [])) or item.get("arguments", "")
+            if etype == "response.function_call_arguments.done":
+                acc.completed_function_args.add(key)
+                self._maybe_emit_function_call(key, acc, sink, item_done=False)
             return
         if etype in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta"}:
             chunk = str(event.get("delta") or event.get("text") or "")
@@ -478,6 +490,31 @@ class OpenAIResponsesProvider(LLMProvider):
         if etype in {"response.failed", "response.incomplete", "error"}:
             error = event.get("error") or event.get("response") or event
             raise LLMTransientError(f"OpenAI Responses stream error: {error}")
+
+    @staticmethod
+    def _maybe_emit_function_call(
+        key: str,
+        acc: _ResponsesStreamAccumulator,
+        sink: StreamHandler | None,
+        *,
+        item_done: bool,
+    ) -> None:
+        """Emit once an output item or its explicit argument stream is complete."""
+        if key in acc.emitted_function_calls:
+            return
+        item = acc.output_items.get(key)
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return
+        # ``output_item.done`` is authoritative for the item. Some Responses-compatible
+        # servers instead send only ``function_call_arguments.done``; accept that once
+        # the corresponding item has already been observed.
+        if not item_done and key not in acc.completed_function_args:
+            return
+        calls = OpenAIResponsesProvider._parse_function_calls([item])
+        if not calls:
+            return
+        acc.emitted_function_calls.add(key)
+        notify_tool_call_complete(sink, calls[0])
 
     @classmethod
     async def _iter_sse_events(cls, raw_lines):

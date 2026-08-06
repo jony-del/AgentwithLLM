@@ -20,7 +20,12 @@ from agent_core.models import (
     TokenUsage,
     ToolCall,
 )
-from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.base import (
+    LLMProvider,
+    ProviderConfig,
+    StreamHandler,
+    notify_tool_call_complete,
+)
 
 # HTTP statuses worth retrying: request timeout / lock conflict, rate limiting, and
 # transient upstream failures. 529 is Anthropic's "overloaded" signal. Everything
@@ -649,13 +654,15 @@ class ClaudeProvider(LLMProvider):
         elif etype == "content_block_stop":
             index = event.get("index")
             if isinstance(index, int):
-                self._finalize_block(
+                tool_call = self._finalize_block(
                     acc.blocks.get(index),
                     acc.text_parts,
                     acc.thinking_parts,
                     acc.thinking_blocks,
                     acc.tool_calls,
                 )
+                if tool_call is not None:
+                    notify_tool_call_complete(stream, tool_call)
         elif etype == "message_delta":
             acc.stop_reason = event.get("delta", {}).get("stop_reason") or acc.stop_reason
             # message_delta carries the running output token total at top level.
@@ -706,9 +713,9 @@ class ClaudeProvider(LLMProvider):
         thinking_parts: list[str],
         thinking_blocks: list[dict[str, Any]],
         tool_calls: list[ToolCall],
-    ) -> None:
+    ) -> ToolCall | None:
         if block is None:
-            return
+            return None
         kind = block["kind"]
         if kind == "text":
             text_parts.append(block.get("text", ""))
@@ -728,7 +735,12 @@ class ClaudeProvider(LLMProvider):
                 arguments = {}
             if not isinstance(arguments, dict):
                 arguments = {}
-            tool_calls.append(ToolCall(id=block.get("id"), name=block.get("name", ""), arguments=arguments))
+            tool_call = ToolCall(
+                id=block.get("id"), name=block.get("name", ""), arguments=arguments
+            )
+            tool_calls.append(tool_call)
+            return tool_call
+        return None
 
     @staticmethod
     def _sse_feed(raw, data_parts: list[str]) -> dict[str, Any] | None:

@@ -289,6 +289,7 @@ summary_timeout_seconds = 120    # single (non-stacked) timeout (s) bounding the
 [concurrency]
 parallel_tools = true          # false = execute tool calls one at a time
 max_tool_workers = 10          # worker threads for one independent wave
+streaming_tool_execution = true # start complete tool calls while the model keeps streaming
 # When several sub-agents/teammates run at once, their LLM API calls now overlap.
 # These bound the shared budget across the whole fan-out (env: AGENT_MAX_API_CONCURRENCY,
 # AGENT_API_RATE_LIMIT; CLI: --max-api-concurrency).

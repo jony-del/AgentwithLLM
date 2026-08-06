@@ -137,13 +137,14 @@ class TerminalRenderer:
         self._open_block = False
 
     def _start_thinking(self) -> None:
-        if not self._streamed_thinking:
+        if not self._streamed_thinking or not self._open_block:
+            self.close_block()
             self.emit(Text(f"{SYMBOLS['thinking']} Thinking…", style="thinking"))
             self._streamed_thinking = True
             self._open_block = True
 
     def _start_answer(self) -> None:
-        if not self._streamed_text:
+        if not self._streamed_text or not self._open_block:
             self.close_block()
             self.console.print(Text(f"{SYMBOLS['answer']} ", style="answer"), end="", markup=False)
             self._streamed_text = True

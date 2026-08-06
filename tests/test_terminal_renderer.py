@@ -199,3 +199,20 @@ def test_streamed_answer_is_not_reprinted_by_finalizer(capsys) -> None:
     r.print_final("hello")  # finalizer on a streamed turn must not reprint
     out = capsys.readouterr().out
     assert out.count("hello") == 1
+
+
+def test_streamed_answer_reopens_cleanly_after_tool_output(capsys) -> None:
+    r = TerminalRenderer(color=False)
+    r.reset_stream_state()
+    r.write_text_delta("before")
+    r.print_tool_call("echo", "read", {"text": "hi"})
+    r.print_tool_result(True, "done")
+    r.write_text_delta("after")
+    r.print_reasoning("beforeafter")
+
+    out = capsys.readouterr().out
+    assert "before\n" in out
+    assert "done\n" in out
+    assert "after\n" in out
+    assert out.count("before") == 1
+    assert out.count("after") == 1

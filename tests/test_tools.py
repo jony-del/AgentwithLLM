@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 
@@ -25,6 +26,11 @@ class RewritePathHook:
         if tool_call.name == "path_sleep":
             return HookResult(tool_call=ToolCall("path_sleep", {**tool_call.arguments, "path": "same.txt"}))
         return HookResult()
+
+
+class BoomPreHook:
+    def before_tool(self, tool_call: ToolCall) -> HookResult:
+        raise RuntimeError("pre hook crashed")
 
 
 class PathSleepTool(Tool):
@@ -109,6 +115,30 @@ class StateAppendTool(Tool):
         return ToolResult(self.name, value)
 
 
+class AsyncGateTool(Tool):
+    name = "async_gate"
+    description = "Expose deterministic start/release events for scheduler tests."
+    input_schema = {"type": "object", "properties": {}}
+    risk = ToolRisk.READ
+
+    def __init__(self) -> None:
+        self.started: dict[str, asyncio.Event] = {}
+        self.release: dict[str, asyncio.Event] = {}
+        self.runs: list[str] = []
+
+    def concurrency_spec(self, arguments: dict) -> ConcurrencySpec:
+        return ConcurrencySpec(
+            (ResourceLock("gate", str(arguments.get("resource", "default")), str(arguments.get("mode", "read"))),)  # type: ignore[arg-type]
+        )
+
+    async def run(self, arguments: dict) -> ToolResult:
+        label = str(arguments["label"])
+        self.runs.append(label)
+        self.started.setdefault(label, asyncio.Event()).set()
+        await self.release.setdefault(label, asyncio.Event()).wait()
+        return ToolResult(self.name, label)
+
+
 class _VerdictClassifier:
     def __init__(self, allowed: bool) -> None:
         self.allowed = allowed
@@ -135,6 +165,93 @@ async def test_executor_returns_failed_result_for_unknown_tool() -> None:
     assert result.metadata["error_type"] == "UnknownTool"
 
 
+async def test_streaming_batch_starts_before_final_result_is_available() -> None:
+    registry = ToolRegistry()
+    tool = AsyncGateTool()
+    registry.register(tool)
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
+    batch = executor.begin_batch()
+    call = ToolCall("async_gate", {"label": "early", "resource": "a"}, id="t1")
+
+    assert batch.submit_streamed(call)
+    while "early" not in tool.started:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(tool.started["early"].wait(), timeout=1)
+    assert batch.model_finished_at is None
+
+    tool.release["early"].set()
+    results = await batch.finish([call])
+
+    assert [result.content for result in results] == ["early"]
+    assert batch.metrics["early_started"] == 1
+
+
+async def test_streaming_batch_honors_conflicting_resource_order() -> None:
+    registry = ToolRegistry()
+    tool = AsyncGateTool()
+    registry.register(tool)
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
+    batch = executor.begin_batch()
+    first = ToolCall(
+        "async_gate", {"label": "first", "resource": "same", "mode": "write"}, id="t1"
+    )
+    second = ToolCall(
+        "async_gate", {"label": "second", "resource": "same", "mode": "read"}, id="t2"
+    )
+
+    batch.submit_streamed(first)
+    batch.submit_streamed(second)
+    while "first" not in tool.started:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert "second" not in tool.started
+
+    tool.release["first"].set()
+    while "second" not in tool.started:
+        await asyncio.sleep(0)
+    tool.release["second"].set()
+    results = await batch.finish([first, second])
+
+    assert [result.content for result in results] == ["first", "second"]
+
+
+async def test_streaming_batch_abort_cancels_native_async_tool() -> None:
+    registry = ToolRegistry()
+    tool = AsyncGateTool()
+    registry.register(tool)
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
+    batch = executor.begin_batch()
+    call = ToolCall("async_gate", {"label": "cancel", "resource": "a"}, id="t1")
+
+    batch.submit_streamed(call)
+    while "cancel" not in tool.started:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(batch.abort("provider_error"), timeout=1)
+
+    assert tool.runs == ["cancel"]
+    assert batch.metrics["abort_reason"] == "provider_error"
+
+
+async def test_streaming_batch_never_reexecutes_mismatched_final_call() -> None:
+    registry = ToolRegistry()
+    tool = AsyncGateTool()
+    registry.register(tool)
+    executor = ToolExecutor(registry, PermissionPolicy(PermissionMode.AUTO))
+    batch = executor.begin_batch()
+    streamed = ToolCall("async_gate", {"label": "old", "resource": "a"}, id="t1")
+    final = ToolCall("async_gate", {"label": "new", "resource": "a"}, id="t1")
+
+    batch.submit_streamed(streamed)
+    while "old" not in tool.started:
+        await asyncio.sleep(0)
+    tool.release["old"].set()
+    results = await batch.finish([final])
+
+    assert tool.runs == ["old"]
+    assert not results[0].ok
+    assert results[0].metadata["error_type"] == "StreamingToolProtocolMismatch"
+
+
 async def test_executor_uses_tool_call_rewritten_by_pre_hook() -> None:
     registry = ToolRegistry()
     registry.register(EchoTool())
@@ -149,6 +266,21 @@ async def test_executor_uses_tool_call_rewritten_by_pre_hook() -> None:
     assert result.ok
     assert result.name == "echo"
     assert result.content == "rewritten"
+
+
+async def test_incremental_scheduler_propagates_prepare_failure_without_hanging() -> None:
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    executor = ToolExecutor(
+        registry,
+        PermissionPolicy(PermissionMode.AUTO),
+        HookPipeline(pre_hooks=[BoomPreHook()]),
+    )
+
+    with pytest.raises(RuntimeError, match="pre hook crashed"):
+        await asyncio.wait_for(
+            executor.execute_many([ToolCall("echo", {"text": "hi"})]), timeout=1
+        )
 
 
 async def test_execute_many_runs_independent_read_tools_concurrently() -> None:

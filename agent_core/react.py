@@ -62,7 +62,7 @@ from agent_core.permission_classifier import (
 from agent_core.permission_rules import RuleSet
 from agent_core.permission_types import PermissionRuleSource, ToolCallSource
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import LLMProvider, ProviderConfig, gated_provider
+from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler, gated_provider
 from agent_core.sandbox import (
     SandboxAwareMixin,
     SandboxConfig,
@@ -96,7 +96,7 @@ from agent_core.tool_use_summary import (
 )
 from agent_core.transcript import TranscriptStore, new_session_id
 from agent_core.tools.catalog import default_tools, populate_registry
-from agent_core.tools.executor import ToolExecutor
+from agent_core.tools.executor import StreamingToolBatch, ToolExecutor
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.tools.web import WebPolicyAwareMixin, WebPolicyConfig
@@ -226,13 +226,18 @@ class ReActConfig:
     # 4.8-best but errors on Sonnet 4.6/Opus<=4.6). The provider drops it for models
     # that don't support the level (see providers/claude.py _effort_for_model). None omits it.
     effort: str | None = "high"
-    # Stream tokens to a live UI as they arrive. Only takes effect when the UI is
-    # live (ConsoleUI); NullUI never streams. CLI exposes this via --no-stream.
+    # Use the provider's streaming transport. A live UI renders deltas; a NullUI stays
+    # silent but may still consume the stream to start complete tool calls early.
+    # CLI exposes the transport-level opt-out via --no-stream.
     stream: bool = True
     # Tools returned in the same model turn may run concurrently when their declared
     # resources do not conflict.
     parallel_tools: bool = True
     max_tool_workers: int = 4
+    # Start a tool as soon as its protocol-level call block is complete, overlapping
+    # execution with the rest of the model stream. Providers without such a boundary
+    # transparently fall back to post-response execution.
+    streaming_tool_execution: bool = True
     # Cap on simultaneous in-flight LLM API calls across the whole multi-agent
     # fan-out (leader + concurrent children), enforced by the shared provider gate.
     max_api_concurrency: int = 8
@@ -309,6 +314,39 @@ class AgentRunResult:
     messages: list[Message]
     steps: int
     run_id: str
+
+
+class _TurnStreamHandler(StreamHandler):
+    """Forward display deltas and hand immutable tool calls to the turn batch."""
+
+    def __init__(
+        self,
+        ui: AgentUI,
+        batch: StreamingToolBatch | None,
+        *,
+        display: bool,
+    ) -> None:
+        self.ui = ui
+        self.batch = batch
+        self.display = display
+        self._text_parts: list[str] = []
+
+    def on_text_delta(self, text: str) -> None:
+        self._text_parts.append(text)
+        if self.display:
+            self.ui.on_text_delta(text)
+
+    def on_thinking_delta(self, text: str) -> None:
+        if self.display:
+            self.ui.on_thinking_delta(text)
+
+    def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None:
+        if self.display:
+            self.ui.on_tool_args_delta(tool_name, partial_json)
+
+    def on_tool_call_complete(self, tool_call: ToolCall) -> None:
+        if self.batch is not None:
+            self.batch.submit_streamed(tool_call, assistant_content="".join(self._text_parts))
 
 
 class ReActAgent:
@@ -1051,8 +1089,17 @@ class ReActAgent:
                 if events:
                     await self._run_post_compact_hooks(messages, before_compaction, "auto")
 
-            # Stream tokens to the UI only when it is live and streaming is enabled.
-            sink = self.ui if (self.ui.is_live and self.config.stream) else None
+            # One batch spans this provider attempt. In quiet/headless runs the sink is
+            # still installed when streaming tool execution is enabled: transport
+            # streaming is what exposes completed tool blocks early; display is optional.
+            tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
+            sink: StreamHandler | None = None
+            if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
+                sink = _TurnStreamHandler(
+                    self.ui,
+                    tool_batch if self.config.streaming_tool_execution else None,
+                    display=self.ui.is_live,
+                )
             self.ui.on_turn_start()
             try:
                 self._sync_permission_mode_context(messages)
@@ -1061,10 +1108,12 @@ class ReActAgent:
                     should_cancel=cancelled,
                 )
             except asyncio.CancelledError:
+                await tool_batch.abort("provider_cancelled")
                 if cancelled():
                     return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
                 raise
             except LLMContextTooLongError as exc:
+                await tool_batch.abort("context_too_long")
                 # Reactive recovery, bounded so a 413 can never loop forever: summarize
                 # aggressively once, then retry ``complete`` up to MAX_PTL_RETRIES times,
                 # peeling the oldest whole API rounds before each retry. If a retry still
@@ -1091,6 +1140,14 @@ class ReActAgent:
                     await self._run_post_compact_hooks(messages, before_compaction, "reactive")
                 result = None
                 for _ in range(MAX_PTL_RETRIES):
+                    tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
+                    sink = None
+                    if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
+                        sink = _TurnStreamHandler(
+                            self.ui,
+                            tool_batch if self.config.streaming_tool_execution else None,
+                            display=self.ui.is_live,
+                        )
                     self.ui.on_turn_start()
                     try:
                         self._sync_permission_mode_context(messages)
@@ -1100,12 +1157,14 @@ class ReActAgent:
                         )
                         break
                     except asyncio.CancelledError:
+                        await tool_batch.abort("provider_cancelled")
                         if cancelled():
                             return await self._stopped(
                                 messages, step, "interrupted", "being interrupted by the user (Esc)"
                             )
                         raise
                     except LLMContextTooLongError as exc_retry:
+                        await tool_batch.abort("context_too_long")
                         gap = parse_prompt_too_long_gap(str(exc_retry)) or gap
                         truncated = truncate_head_for_ptl_retry(
                             messages, token_gap=gap, token_estimator=self._estimate_tokens
@@ -1136,10 +1195,14 @@ class ReActAgent:
                             "compression",
                             {"stage": "ptl_shrink", "reactive": True, "kept": len(messages)},
                         )
+                    except Exception:
+                        await tool_batch.abort("provider_error")
+                        raise
                 if result is None:
                     # Exhausted MAX_PTL_RETRIES without a successful completion.
                     raise exc
             except Exception:
+                await tool_batch.abort("provider_error")
                 # A fast request may already have transparently fallen back before the
                 # normal-speed retry failed. Reflect that session-state transition even
                 # though this provider call itself did not complete.
@@ -1170,6 +1233,7 @@ class ReActAgent:
             # the non-streaming path where deltas can't be polled) is honored here at
             # the next safe point instead of being silently swallowed.
             if cancelled():
+                await tool_batch.abort("cancelled_after_stream")
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
 
             # Emit the previous tool batch's progress label here — the model call just
@@ -1235,6 +1299,9 @@ class ReActAgent:
 
             # Natural termination: the model stopped requesting tools, so this is the answer.
             if not result.tool_calls:
+                # Usually empty and immediate. This also drains/logs a provider anomaly
+                # where a streamed tool block disappeared from the authoritative result.
+                await tool_batch.finish([], messages=messages)
                 # Stop hook: a hook may BLOCK this stop and force the loop to keep running
                 # ("可阻断/可续跑"), bounded by config.max_stop_blocks so it can't loop
                 # forever. A block injects the continuation directive and re-enters the loop.
@@ -1272,12 +1339,11 @@ class ReActAgent:
             self.ui.on_reasoning(result.content)
 
             if cancelled():
+                await tool_batch.abort("cancelled_before_tool_join")
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
-            tool_results = await self.executor.execute_many(
-                result.tool_calls,
-                should_cancel=cancelled,
-                messages=messages,
-            )
+            # Calls already completed during model sampling resolve immediately here;
+            # only the unhidden tail remains on the critical path.
+            tool_results = await tool_batch.finish(result.tool_calls, messages=messages)
             if any(item.metadata.get("activation_pending") for item in tool_results):
                 activation_outcomes = await asyncio.to_thread(
                     self.capability_manager.commit_pending

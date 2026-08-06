@@ -193,6 +193,19 @@ def test_console_ui_finalizer_prints_full_when_not_streamed(capsys) -> None:
     assert "the answer" in out
 
 
+def test_console_ui_defers_stream_output_while_permission_prompt_is_active(capsys) -> None:
+    ui = ConsoleUI(color=False)
+    ui.on_turn_start()
+    ui._prompt_active = True
+    ui.on_text_delta("buffered")
+    assert "buffered" not in capsys.readouterr().out
+
+    ui._prompt_active = False
+    ui._flush_deferred_live_events()
+    ui.on_final("buffered")
+    assert capsys.readouterr().out.count("buffered") == 1
+
+
 # --- compaction progress bar -------------------------------------------------
 
 

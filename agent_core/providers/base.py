@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Protocol, runtime_checkable
 
-from agent_core.models import LLMResult, Message
+from agent_core.models import LLMResult, Message, ToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,26 @@ class StreamHandler(Protocol):
     def on_thinking_delta(self, text: str) -> None: ...
 
     def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None: ...
+
+
+@runtime_checkable
+class ToolCallStreamHandler(StreamHandler, Protocol):
+    """Optional extension notified when one streamed tool call is immutable.
+
+    This is deliberately separate from :class:`StreamHandler`: existing UI sinks and
+    third-party providers only implement the three display callbacks and must keep
+    working unchanged. Providers call :func:`notify_tool_call_complete`, which performs
+    a structural, best-effort lookup instead of assuming the extension is present.
+    """
+
+    def on_tool_call_complete(self, tool_call: ToolCall) -> None: ...
+
+
+def notify_tool_call_complete(stream: StreamHandler | None, tool_call: ToolCall) -> None:
+    """Publish a completed streamed tool call without making the callback mandatory."""
+    callback = getattr(stream, "on_tool_call_complete", None)
+    if callable(callback):
+        callback(tool_call)
 
 
 class LLMProvider(ABC):

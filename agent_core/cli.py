@@ -294,6 +294,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         stream=not getattr(args, "no_stream", False),
         parallel_tools=bool(concurrency["parallel_tools"]),
         max_tool_workers=int(concurrency["max_tool_workers"]),
+        streaming_tool_execution=bool(concurrency["streaming_tool_execution"]),
         max_api_concurrency=max_api_concurrency,
         api_rate_limit_per_min=int(concurrency["api_rate_limit_per_min"]),
         max_wall_seconds=max_wall_seconds,

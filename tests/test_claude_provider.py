@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from agent_core.models import LLMTransientError, Message
+from agent_core.models import LLMTransientError, Message, ToolCall
 from agent_core.providers.base import ProviderConfig
 from agent_core.providers.claude import ClaudeProvider
 
@@ -270,6 +270,15 @@ class _RecordingStream:
         self.tool_args.append((tool_name, partial_json))
 
 
+class _ToolCallRecordingStream(_RecordingStream):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_calls: list[ToolCall] = []
+
+    def on_tool_call_complete(self, tool_call: ToolCall) -> None:
+        self.tool_calls.append(tool_call)
+
+
 class _FakeStreamResponse:
     """Stands in for an httpx streaming response: just an async line iterator."""
 
@@ -325,6 +334,22 @@ async def test_consume_stream_assembles_result_and_pushes_deltas() -> None:
     assert sink.thinking == ["Let me think"]
     assert sink.text == ["Hello", " world"]
     assert sink.tool_args == [("echo", "{\"text\":"), ("echo", " \"hi\"}")]
+
+
+async def test_stream_notifies_when_tool_block_is_complete() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    sink = _ToolCallRecordingStream()
+    raw = _sse_lines(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "echo"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"text\":\"hi\"}"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        {"type": "message_stop"},
+    )
+
+    await provider._consume_stream(_FakeStreamResponse(raw), sink)
+
+    assert sink.tool_calls == [ToolCall("echo", {"text": "hi"}, id="t1")]
 
 
 async def test_stream_error_event_raises_transient() -> None:

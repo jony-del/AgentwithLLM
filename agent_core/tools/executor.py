@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import PurePath
 
 from agent_core.hooks import HookContext, HookEvent, HookOutcome, HookPipeline
@@ -76,7 +77,7 @@ class ToolExecutor:
         should_cancel: Callable[[], bool] | None = None,
         messages: list[Message] | None = None,
     ) -> list[ToolResult]:
-        """Execute a turn's tool calls, used by ``ReActAgent.run``.
+        """Execute a complete turn through the incremental resource scheduler.
 
         Calls are prepared (hooks, permissions), partitioned into resource-conflict
         free waves, and each wave runs via ``asyncio.gather``: async-native tools
@@ -84,43 +85,17 @@ class ToolExecutor:
         overlap, while ordinary blocking tools are offloaded to worker threads —
         bounded by ``max_workers`` so the thread ceiling holds.
         """
-        if not tool_calls:
-            return []
-        if not self.parallel_tools:
-            return await self._execute_sequential(tool_calls, should_cancel, messages)
+        batch = self.begin_batch(messages=messages, should_cancel=should_cancel)
+        return await batch.finish(tool_calls, messages=messages)
 
-        sync_semaphore = asyncio.Semaphore(self.max_workers)
-        results: list[ToolResult | None] = [None] * len(tool_calls)
-        runnable: list[_PreparedCall] = []
-        for index, tool_call in enumerate(tool_calls):
-            if should_cancel is not None and should_cancel():
-                results[index] = await self._finish(tool_call, self._cancelled_result(tool_call.name), "cancelled")
-                continue
-            prepared = await self._prepare(index, tool_call, messages, should_cancel)
-            if isinstance(prepared, ToolResult):
-                results[index] = prepared
-            else:
-                runnable.append(prepared)
-
-        for wave in self._waves(runnable):
-            if should_cancel is not None and should_cancel():
-                for prepared in wave:
-                    results[prepared.index] = await self._finish(
-                        prepared.tool_call, self._cancelled_result(prepared.tool.name), "cancelled"
-                    )
-                continue
-            wave_results = await asyncio.gather(
-                *(self._run_tool(prepared, sync_semaphore) for prepared in wave)
-            )
-            for prepared, wave_result in zip(wave, wave_results, strict=True):
-                results[prepared.index] = wave_result
-
-        completed: list[ToolResult] = []
-        for index, maybe_result in enumerate(results):
-            if maybe_result is None:
-                raise RuntimeError(f"missing tool result at index {index}")
-            completed.append(maybe_result)
-        return completed
+    def begin_batch(
+        self,
+        *,
+        messages: list[Message] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> "StreamingToolBatch":
+        """Create one turn-scoped incremental execution batch."""
+        return StreamingToolBatch(self, messages=messages, should_cancel=should_cancel)
 
     async def _run_tool(self, prepared: _PreparedCall, sync_semaphore: asyncio.Semaphore) -> ToolResult:
         if type(prepared.tool).run is not Tool.run:
@@ -497,6 +472,7 @@ class ToolExecutor:
                 "tool_result",
                 {
                     "tool": tool_call.name,
+                    "tool_call_id": tool_call.id,
                     "arguments_summary": summarize_arguments(tool_call.name, tool_call.arguments),
                     "result": summarize_tool_result(result.content, result.metadata, result.ok),
                     "reason": reason,
@@ -560,3 +536,334 @@ class ToolExecutor:
         except ValueError:
             return False
         return True
+
+
+@dataclass(slots=True)
+class _TrackedCall:
+    index: int
+    original_call: ToolCall
+    messages: list[Message]
+    streamed: bool
+    state: str = "preparing"
+    prepared: _PreparedCall | None = None
+    result: ToolResult | None = None
+    error: Exception | None = None
+    preparation_task: asyncio.Task[None] | None = None
+    execution_task: asyncio.Task[None] | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    cancel_requested: bool = False
+    ready_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+class StreamingToolBatch:
+    """Incremental FIFO/resource scheduler for one assistant turn.
+
+    Preparation is serialized because permission state and interactive prompts are
+    ordered control paths. Prepared calls run as soon as they do not conflict with
+    active earlier calls. Results remain buffered until the core loop appends the
+    authoritative assistant message and its ordered tool observations.
+    """
+
+    def __init__(
+        self,
+        executor: ToolExecutor,
+        *,
+        messages: list[Message] | None,
+        should_cancel: Callable[[], bool] | None,
+    ) -> None:
+        self.executor = executor
+        self.base_messages = list(messages or [])
+        self.should_cancel = should_cancel
+        self.created_at = time.monotonic()
+        self.model_finished_at: float | None = None
+        self.finished_at: float | None = None
+        self._calls: list[_TrackedCall] = []
+        self._by_id: dict[str, _TrackedCall] = {}
+        self._prepare_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self._sync_semaphore = asyncio.Semaphore(executor.max_workers)
+        self._aborted = False
+        self._closed = False
+        self._duplicate_events = 0
+        self._mismatched_events = 0
+        self._orphaned_events = 0
+        self.metrics: dict[str, object] = {}
+
+    @staticmethod
+    def _same_call(left: ToolCall, right: ToolCall) -> bool:
+        return left.id == right.id and left.name == right.name and left.arguments == right.arguments
+
+    def submit_streamed(self, tool_call: ToolCall, *, assistant_content: str = "") -> bool:
+        """Queue a provider-finalized call without blocking the provider read loop."""
+        if self._closed or self._aborted or not tool_call.id:
+            return False
+        existing = self._by_id.get(tool_call.id)
+        if existing is not None:
+            if self._same_call(existing.original_call, tool_call):
+                self._duplicate_events += 1
+            else:
+                self._mismatched_events += 1
+            return False
+        streamed_calls = [tracked.original_call for tracked in self._calls if tracked.streamed]
+        provisional = Message(
+            "assistant",
+            assistant_content,
+            metadata={"tool_calls": [asdict(call) for call in [*streamed_calls, tool_call]]},
+        )
+        self._submit(tool_call, messages=[*self.base_messages, provisional], streamed=True)
+        return True
+
+    def _submit(self, tool_call: ToolCall, *, messages: list[Message], streamed: bool) -> _TrackedCall:
+        tracked = _TrackedCall(len(self._calls), tool_call, list(messages), streamed)
+        self._calls.append(tracked)
+        if tool_call.id:
+            self._by_id[tool_call.id] = tracked
+        tracked.preparation_task = asyncio.create_task(self._prepare(tracked))
+        return tracked
+
+    async def _prepare(self, tracked: _TrackedCall) -> None:
+        try:
+            await self._prepare_call(tracked)
+        except asyncio.CancelledError:
+            await self._complete_cancelled(tracked)
+        except Exception as exc:  # preserve execute_many's fail-loud control-path behavior
+            await self._complete_error(tracked, exc)
+
+    async def _prepare_call(self, tracked: _TrackedCall) -> None:
+        async with self._prepare_lock:
+            if self._should_stop(tracked):
+                await self._complete_cancelled(tracked)
+                return
+            prepared = await self.executor._prepare(
+                tracked.index,
+                tracked.original_call,
+                tracked.messages,
+                self.should_cancel,
+            )
+        if isinstance(prepared, ToolResult):
+            await self._complete(tracked, prepared)
+            return
+        tracked.ready_at = time.monotonic()
+        async with self._state_lock:
+            if self._should_stop(tracked):
+                tracked.state = "cancelling"
+                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+                return
+            tracked.prepared = prepared
+            tracked.state = "queued"
+            self._start_ready_locked()
+
+    def _should_stop(self, tracked: _TrackedCall) -> bool:
+        return (
+            self._aborted
+            or tracked.cancel_requested
+            or (self.should_cancel is not None and self.should_cancel())
+        )
+
+    def _start_ready_locked(self) -> None:
+        if self._aborted:
+            return
+        active = [tracked for tracked in self._calls if tracked.state == "running"]
+        for tracked in self._calls:
+            if tracked.state in {"completed", "running", "cancelling"}:
+                continue
+            # An earlier call that is not prepared yet is an ordering barrier.
+            if tracked.state == "preparing":
+                break
+            if tracked.state != "queued" or tracked.prepared is None:
+                break
+            if tracked.cancel_requested:
+                tracked.state = "cancelling"
+                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+                continue
+            if not self.executor.parallel_tools and active:
+                break
+            if any(
+                active_call.prepared is not None
+                and self.executor._conflicts(tracked.prepared.spec, active_call.prepared.spec)
+                for active_call in active
+            ):
+                break
+            tracked.state = "running"
+            tracked.started_at = time.monotonic()
+            tracked.execution_task = asyncio.create_task(self._execute(tracked))
+            active.append(tracked)
+
+    async def _execute(self, tracked: _TrackedCall) -> None:
+        prepared = tracked.prepared
+        if prepared is None:
+            await self._complete_cancelled(tracked)
+            return
+        try:
+            result = await self.executor._run_tool(prepared, self._sync_semaphore)
+        except asyncio.CancelledError:
+            result = await self.executor._finish(
+                prepared.tool_call,
+                self.executor._cancelled_result(prepared.tool.name),
+                "cancelled",
+                tool=prepared.tool,
+            )
+        await self._complete(tracked, result)
+
+    async def _complete_cancelled(self, tracked: _TrackedCall) -> None:
+        if tracked.done.is_set():
+            return
+        call = tracked.prepared.tool_call if tracked.prepared is not None else tracked.original_call
+        result = await self.executor._finish(
+            call, self.executor._cancelled_result(call.name), "cancelled"
+        )
+        await self._complete(tracked, result)
+
+    async def _complete(self, tracked: _TrackedCall, result: ToolResult) -> None:
+        async with self._state_lock:
+            if tracked.done.is_set():
+                return
+            tracked.result = result
+            tracked.finished_at = time.monotonic()
+            tracked.state = "completed"
+            tracked.done.set()
+            self._start_ready_locked()
+
+    async def _complete_error(self, tracked: _TrackedCall, error: Exception) -> None:
+        async with self._state_lock:
+            if tracked.done.is_set():
+                return
+            tracked.error = error
+            tracked.finished_at = time.monotonic()
+            tracked.state = "completed"
+            tracked.done.set()
+            self._start_ready_locked()
+
+    async def _cancel_not_started(self, tracked: _TrackedCall) -> None:
+        async with self._state_lock:
+            if tracked.state not in {"queued", "preparing"}:
+                return
+            tracked.cancel_requested = True
+            if tracked.state == "queued":
+                tracked.state = "cancelling"
+                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+
+    async def abort(self, reason: str) -> None:
+        """Stop admitting calls and drain every task so none escapes the turn."""
+        if self._closed:
+            return
+        self._aborted = True
+        for tracked in self._calls:
+            await self._cancel_not_started(tracked)
+            prepared = tracked.prepared
+            task = tracked.execution_task
+            # Native async tools receive cooperative cancellation (shell tools stop
+            # their supervised process tree). Default ``Tool.run`` calls are backed by
+            # ``to_thread`` and cannot be killed safely, so those are drained instead.
+            if (
+                tracked.state == "running"
+                and prepared is not None
+                and type(prepared.tool).run is not Tool.run
+                and task is not None
+            ):
+                task.cancel()
+        await self._wait_all()
+        self.finished_at = time.monotonic()
+        self._closed = True
+        await self._write_metrics(abort_reason=reason)
+
+    async def finish(
+        self,
+        final_calls: list[ToolCall],
+        *,
+        messages: list[Message] | None = None,
+    ) -> list[ToolResult]:
+        """Reconcile the authoritative response and return results in its order."""
+        if self._closed:
+            raise RuntimeError("streaming tool batch is already closed")
+        self.model_finished_at = time.monotonic()
+        bindings: list[tuple[ToolCall, _TrackedCall | None]] = []
+        final_ids = {call.id for call in final_calls if call.id}
+
+        for call in final_calls:
+            tracked = self._by_id.get(call.id) if call.id else None
+            if tracked is not None:
+                if self._same_call(tracked.original_call, call):
+                    bindings.append((call, tracked))
+                else:
+                    self._mismatched_events += 1
+                    await self._cancel_not_started(tracked)
+                    bindings.append((call, None))
+                continue
+            tracked = self._submit(call, messages=list(messages or self.base_messages), streamed=False)
+            bindings.append((call, tracked))
+
+        for tracked in self._calls:
+            if tracked.streamed and tracked.original_call.id not in final_ids:
+                self._orphaned_events += 1
+                await self._cancel_not_started(tracked)
+
+        await self._wait_all()
+        results: list[ToolResult] = []
+        for call, tracked in bindings:
+            if tracked is None:
+                mismatch = ToolResult(
+                    call.name,
+                    "Tool skipped: streamed tool call differed from the final response",
+                    ok=False,
+                    metadata={"error_type": "StreamingToolProtocolMismatch"},
+                )
+                results.append(await self.executor._finish(call, mismatch, "protocol mismatch"))
+                continue
+            if tracked.error is not None:
+                raise tracked.error
+            if tracked.result is None:
+                raise RuntimeError(f"missing tool result at index {tracked.index}")
+            results.append(tracked.result)
+
+        self.finished_at = time.monotonic()
+        self._closed = True
+        await self._write_metrics()
+        return results
+
+    async def _wait_all(self) -> None:
+        while True:
+            snapshot = list(self._calls)
+            if snapshot:
+                await asyncio.gather(*(tracked.done.wait() for tracked in snapshot))
+            if len(snapshot) == len(self._calls):
+                return
+
+    async def _write_metrics(self, abort_reason: str | None = None) -> None:
+        if not any(tracked.streamed for tracked in self._calls):
+            return
+        model_end = self.model_finished_at or time.monotonic()
+        end = self.finished_at or time.monotonic()
+        overlap = 0.0
+        first_start: float | None = None
+        early_started = 0
+        for tracked in self._calls:
+            if not tracked.streamed or tracked.started_at is None:
+                continue
+            first_start = (
+                tracked.started_at if first_start is None else min(first_start, tracked.started_at)
+            )
+            # Windows' monotonic clock can quantize both boundaries to the same
+            # millisecond even though submission happened before ``finish`` entered.
+            early_started += int(tracked.started_at <= model_end)
+            tracked_end = tracked.finished_at or end
+            overlap += max(0.0, min(tracked_end, model_end) - tracked.started_at)
+        self.metrics = {
+            "streamed_calls": sum(tracked.streamed for tracked in self._calls),
+            "early_started": early_started,
+            "post_stream_submitted": sum(not tracked.streamed for tracked in self._calls),
+            "first_tool_start_ms": (
+                round((first_start - self.created_at) * 1000, 3) if first_start is not None else None
+            ),
+            "overlap_ms": round(overlap * 1000, 3),
+            "post_stream_wait_ms": round(max(0.0, end - model_end) * 1000, 3),
+            "duplicate_events": self._duplicate_events,
+            "mismatched_events": self._mismatched_events,
+            "orphaned_events": self._orphaned_events,
+        }
+        if abort_reason is not None:
+            self.metrics["abort_reason"] = abort_reason
+        if self.executor.logger is not None:
+            await self.executor.logger.write("streaming_tool_batch", dict(self.metrics))

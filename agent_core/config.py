@@ -305,6 +305,7 @@ def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[s
     values = {
         "parallel_tools": True,
         "max_tool_workers": 4,
+        "streaming_tool_execution": True,
         "max_api_concurrency": 8,
         "api_rate_limit_per_min": 0,
     }
@@ -313,6 +314,10 @@ def resolve_concurrency_config(config_file: str | Path = "agent.toml") -> dict[s
             values["parallel_tools"] = coerce_to_type(bool, table["parallel_tools"])
         if "max_tool_workers" in table:
             values["max_tool_workers"] = max(1, coerce_to_type(int, table["max_tool_workers"]))
+        if "streaming_tool_execution" in table:
+            values["streaming_tool_execution"] = coerce_to_type(
+                bool, table["streaming_tool_execution"]
+            )
         if "max_api_concurrency" in table:
             values["max_api_concurrency"] = max(1, coerce_to_type(int, table["max_api_concurrency"]))
         if "api_rate_limit_per_min" in table:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any, Literal
 
 from agent_core.models import ToolResult
@@ -182,6 +183,19 @@ class ConsoleUI(AgentUI):
             ) from exc
         self._renderer = TerminalRenderer(color=color, preview_chars=preview_chars, verbose=verbose)
         self._loop: Any = None
+        self._prompt_active = False
+        self._deferred_live_events: list[Callable[[], None]] = []
+
+    def _render_or_defer(self, callback: Callable[[], None]) -> None:
+        if self._prompt_active:
+            self._deferred_live_events.append(callback)
+        else:
+            callback()
+
+    def _flush_deferred_live_events(self) -> None:
+        pending, self._deferred_live_events = self._deferred_live_events, []
+        for callback in pending:
+            callback()
 
     def bind_event_loop(self, loop: Any) -> None:
         self._loop = loop
@@ -194,27 +208,31 @@ class ConsoleUI(AgentUI):
         self._renderer.reset_stream_state()
 
     def on_thinking_delta(self, text: str) -> None:
-        self._renderer.write_thinking_delta(text)
+        self._render_or_defer(lambda: self._renderer.write_thinking_delta(text))
 
     def on_text_delta(self, text: str) -> None:
-        self._renderer.write_text_delta(text)
+        self._render_or_defer(lambda: self._renderer.write_text_delta(text))
 
     def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None:
-        self._renderer.write_tool_args_delta(partial_json)
+        self._render_or_defer(lambda: self._renderer.write_tool_args_delta(partial_json))
 
     def on_thinking(self, text: str) -> None:
-        self._renderer.print_thinking(text)
+        self._render_or_defer(lambda: self._renderer.print_thinking(text))
 
     def on_reasoning(self, text: str) -> None:
-        self._renderer.print_reasoning(text)
+        self._render_or_defer(lambda: self._renderer.print_reasoning(text))
 
     def on_tool_call(
         self, tool_name: str, risk: str, arguments: dict[str, Any], label: str | None = None
     ) -> None:
-        self._renderer.print_tool_call(tool_name, risk, arguments, label=label)
+        args = dict(arguments)
+        self._render_or_defer(
+            lambda: self._renderer.print_tool_call(tool_name, risk, args, label=label)
+        )
 
     def on_tool_result(self, result: ToolResult, diff: str | None = None) -> None:
-        self._renderer.print_tool_result(result.ok, result.content, diff=diff)
+        ok, content = result.ok, result.content
+        self._render_or_defer(lambda: self._renderer.print_tool_result(ok, content, diff=diff))
 
     def on_final(self, answer: str) -> None:
         self._renderer.print_final(answer)
@@ -294,10 +312,15 @@ class ConsoleUI(AgentUI):
         async def ask() -> PermissionChoice:
             from prompt_toolkit.application import in_terminal
 
-            async with in_terminal():
-                return await self._renderer.ask_permission_async(
-                    tool_name, risk, arguments
-                )
+            self._prompt_active = True
+            try:
+                async with in_terminal():
+                    return await self._renderer.ask_permission_async(
+                        tool_name, risk, arguments
+                    )
+            finally:
+                self._prompt_active = False
+                self._flush_deferred_live_events()
 
         future = asyncio.run_coroutine_threadsafe(ask(), loop)
         try:
@@ -312,8 +335,13 @@ class ConsoleUI(AgentUI):
         async def ask() -> PermissionResponse:
             from prompt_toolkit.application import in_terminal
 
-            async with in_terminal():
-                return await self._renderer.ask_permission_request_async(request)
+            self._prompt_active = True
+            try:
+                async with in_terminal():
+                    return await self._renderer.ask_permission_request_async(request)
+            finally:
+                self._prompt_active = False
+                self._flush_deferred_live_events()
 
         future = asyncio.run_coroutine_threadsafe(ask(), loop)
         try:

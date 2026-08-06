@@ -132,6 +132,7 @@ def test_resolve_config_accepts_openai_compat_provider_from_env(tmp_path: Path, 
     assert values == {
         "parallel_tools": False,
         "max_tool_workers": 1,
+        "streaming_tool_execution": True,
         "max_api_concurrency": 8,
         "api_rate_limit_per_min": 0,
     }
