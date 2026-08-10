@@ -49,6 +49,13 @@ class _Server:
     private_temp: Path | None = None
 
     async def start(self) -> None:
+        if self.config.transport not in {"stdio", "socket"}:
+            raise RuntimeError(f"unsupported LSP transport: {self.config.transport}")
+        if self.config.transport == "socket":
+            raise RuntimeError(
+                "socket LSP transport requires a server-specific socket endpoint; "
+                "configure the server through stdio in this runtime"
+            )
         executable = shutil.which(self.config.command)
         if executable is None and Path(self.config.command).is_file():
             executable = str(Path(self.config.command).resolve())
@@ -59,14 +66,30 @@ class _Server:
             if key.casefold() in {"http_proxy", "https_proxy", "all_proxy"}:
                 env.pop(key, None)
         env["NO_PROXY"] = "*"
-        argv: object = [executable, *self.config.args]
+        argv: list[str] = [executable, *self.config.args]
         if self.sandbox is not None:
             if self.private_temp is None:
                 self.private_temp = Path(tempfile.mkdtemp(prefix=f"polaris-lsp-{self.config.name}-"))
+            read_only_roots: tuple[Path, ...] = ()
+            if self.config.plugin_root:
+                plugin_root = Path(self.config.plugin_root).resolve()
+                read_only_roots = (plugin_root,)
+                guest_root = self.sandbox.translate_path(plugin_root)
+                translated: list[str] = []
+                for item in argv:
+                    value = str(item)
+                    try:
+                        relative = Path(value).resolve().relative_to(plugin_root)
+                    except (OSError, ValueError):
+                        translated.append(value)
+                    else:
+                        translated.append(str(Path(guest_root) / relative).replace("\\", "/"))
+                argv = translated
             argv, shell = self.sandbox.wrap(
                 argv, False,
                 scope=ExecutionScope.for_workspace(
                     self.workspace, private_temp=self.private_temp, network="deny",
+                    read_only_roots=read_only_roots,
                     workspace_writable=False,
                 ),
             )
@@ -84,8 +107,14 @@ class _Server:
         )
         self.reader_task = asyncio.create_task(self._read_loop(), name=f"lsp-{self.config.name}-reader")
         self.stderr_task = asyncio.create_task(self._stderr_loop(), name=f"lsp-{self.config.name}-stderr")
-        root_uri = path_to_uri(self.workspace)
-        await self.request(
+        workspace = (
+            (self.workspace / self.config.workspace_folder).resolve()
+            if self.config.workspace_folder and not Path(self.config.workspace_folder).is_absolute()
+            else Path(self.config.workspace_folder).resolve()
+            if self.config.workspace_folder else self.workspace
+        )
+        root_uri = path_to_uri(workspace)
+        await asyncio.wait_for(self.request(
             "initialize",
             {
                 "processId": os.getpid(),
@@ -95,8 +124,12 @@ class _Server:
                 "initializationOptions": self.config.initialization_options,
             },
             allow_restart=False,
-        )
+        ), timeout=self.config.startup_timeout)
         await self.notify("initialized", {})
+        if self.config.settings:
+            await self.notify(
+                "workspace/didChangeConfiguration", {"settings": self.config.settings}
+            )
         self.initialized = True
 
     async def _read_loop(self) -> None:
@@ -150,6 +183,8 @@ class _Server:
                 future.set_result(message.get("result"))
             return
         if message.get("method") == "textDocument/publishDiagnostics":
+            if not self.config.diagnostics:
+                return
             params = message.get("params", {})
             if isinstance(params, dict):
                 self.diagnostics[str(params.get("uri", ""))] = list(params.get("diagnostics", []))
@@ -196,7 +231,7 @@ class _Server:
         if self.process.returncode is None:
             self.process.terminate()
             try:
-                await asyncio.wait_for(self.process.wait(), 2)
+                await asyncio.wait_for(self.process.wait(), self.config.shutdown_timeout)
             except asyncio.TimeoutError:
                 self.process.kill()
                 await self.process.wait()
@@ -240,7 +275,10 @@ class LSPManager:
         if server is not None and server.process is not None and server.process.returncode is None and server.initialized:
             return server
         restarts = server.restarts + 1 if server is not None else 0
-        if restarts > self.config.max_restarts:
+        limit = min(self.config.max_restarts, config.max_restarts)
+        if server is not None and not config.restart_on_crash:
+            raise RuntimeError(f"LSP server {config.name} crashed and restartOnCrash is false")
+        if restarts > limit:
             raise RuntimeError(f"LSP server {config.name} exceeded restart limit")
         if server is not None:
             await server.close()

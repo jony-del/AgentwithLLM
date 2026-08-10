@@ -148,16 +148,50 @@ disabled = []                  # skill names to suppress (e.g. ["commit"])
 
 # --- Runtime capability discovery -------------------------------------------
 # The model can search loaded skills, connected/deferred MCP tools, installed
-# plugins, and explicitly trusted plugin marketplaces. Remote activation is off by
-# default. "autonomous-trusted" is privilege-widening and therefore follows repo TOFU.
+# plugins, and explicitly trusted plugin marketplaces. The built-in fallback is local;
+# this file opts into trusted catalogs and therefore follows repo TOFU.
 [capabilities]
-mode = "local"                 # disabled | local | autonomous-trusted
-trusted_marketplaces = []      # names previously added with /plugin marketplace add
-require_integrity = true       # remote entries need sha256 or an immutable git commit
-auto_components = ["skills", "agents", "mcp"]  # hooks are excluded by default
+mode = "autonomous-trusted"       # disabled | local | autonomous-trusted
+trusted_marketplaces = [
+  "claude-plugins-official",
+  "anthropic-agent-skills",
+  "knowledge-work-plugins",
+]
+require_integrity = true       # require a fixed artifact or immutable marketplace snapshot
+auto_components = ["skills", "agents", "mcp", "lsp"]
 allowed_hooks = []             # exact plugin@marketplace:hook-id grants
 max_results = 8
 marketplace_refresh_ttl_seconds = 86400
+auto_discovery = true
+auto_install_tiers = ["anthropic_first_party"]
+auto_install_max_risk = "low"
+remote_skill_policy = "tiered"
+legacy_state_policy = "prompt_interactive"
+plan_ttl_seconds = 900
+
+[capabilities.mcp_registry]
+enabled = true
+endpoint = "https://registry.modelcontextprotocol.io"
+mode = "search_only"          # Registry install/connect always requires host approval
+allowed_package_types = ["remote", "npm", "pypi", "nuget", "oci", "mcpb"]
+refresh_ttl_seconds = 3600
+request_timeout_seconds = 10
+max_results = 20
+
+[capabilities.marketplaces.claude-plugins-official]
+kind = "github"
+repo = "anthropics/claude-plugins-official"
+ref = "main"
+
+[capabilities.marketplaces.anthropic-agent-skills]
+kind = "github"
+repo = "anthropics/skills"
+ref = "main"
+
+[capabilities.marketplaces.knowledge-work-plugins]
+kind = "github"
+repo = "anthropics/knowledge-work-plugins"
+ref = "main"
 
 # --- Lifecycle hooks --------------------------------------------------------
 # Two sources feed the lifecycle hooks (UserPromptSubmit / PostSampling /

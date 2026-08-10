@@ -52,6 +52,8 @@ class Skill:
     when_to_use: str = ""
     argument_hint: str = ""
     allowed_tools: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
+    preload_skills: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     hooks: tuple[str, ...] = ()
     model: str | None = None
@@ -60,7 +62,17 @@ class Skill:
     disable_model_invocation: bool = False
     context: SkillContext = SkillContext.INLINE
     memory: str = "none"
+    effort: str | None = None
+    permission_mode: str | None = None
+    isolation: str | None = None
+    background: bool = False
+    max_turns: int | None = None
     agent_key: str | None = None
+    # Host-owned provenance.  Remote/community skills are forced into a fork by the
+    # plugin runtime; frontmatter cannot override these values.
+    trust_tier: str = "local_user_declared"
+    source_identity: str = ""
+    plugin_id: str = ""
     source_path: Path | None = field(default=None, compare=False)
     # When set, the prompt is computed by this async callable at invocation time instead
     # of rendering ``body`` (a "programmatic" skill). ``body`` then holds a static

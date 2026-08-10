@@ -220,6 +220,7 @@ class ProcessSupervisor:
         *,
         argv: list[str] | None = None,
         timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> ProcessTask:
         if self._closed:
             raise RuntimeError("process supervisor is closed")
@@ -259,12 +260,13 @@ class ProcessSupervisor:
             process = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(resolved_cwd), stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
             process = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(resolved_cwd), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+                stderr=asyncio.subprocess.STDOUT, start_new_session=True, env=env,
             )
         digest = hashlib.sha256(command.encode("utf-8", errors="replace")).hexdigest()
         task = ProcessTask(

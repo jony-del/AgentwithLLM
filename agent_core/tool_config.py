@@ -42,18 +42,42 @@ class LSPServerConfig:
     extensions: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
     initialization_options: dict[str, Any] = field(default_factory=dict)
+    settings: dict[str, Any] = field(default_factory=dict)
+    workspace_folder: str = ""
+    transport: str = "stdio"
+    startup_timeout: float = 15.0
+    shutdown_timeout: float = 2.0
+    restart_on_crash: bool = True
+    max_restarts: int = 3
+    plugin_root: str = ""
+    diagnostics: bool = True
     timeout: float = 15.0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "LSPServerConfig":
-        extensions = raw.get("extensions", raw.get("extension_language", {}))
+        extensions = raw.get(
+            "extensionToLanguage",
+            raw.get("extensions", raw.get("extension_language", {})),
+        )
+        initialization = raw.get("initializationOptions", raw.get("initialization_options", {}))
+        startup_ms = raw.get("startupTimeout")
+        shutdown_ms = raw.get("shutdownTimeout")
         return cls(
             name=str(raw.get("name", "")).strip(),
             command=str(raw.get("command", "")).strip(),
             args=tuple(str(item) for item in raw.get("args", ())),
             extensions={str(key).lower(): str(value) for key, value in dict(extensions or {}).items()},
             env={str(key): str(value) for key, value in dict(raw.get("env", {})).items()},
-            initialization_options=dict(raw.get("initialization_options", {}) or {}),
+            initialization_options=dict(initialization or {}),
+            settings=dict(raw.get("settings", {}) or {}),
+            workspace_folder=str(raw.get("workspaceFolder") or ""),
+            transport=str(raw.get("transport") or "stdio").casefold(),
+            startup_timeout=max(0.1, float(startup_ms) / 1000 if startup_ms is not None else 15.0),
+            shutdown_timeout=max(0.1, float(shutdown_ms) / 1000 if shutdown_ms is not None else 2.0),
+            restart_on_crash=raw.get("restartOnCrash", True) is not False,
+            max_restarts=max(0, int(raw.get("maxRestarts", 3))),
+            plugin_root=str(raw.get("plugin_root") or ""),
+            diagnostics=raw.get("diagnostics", True) is not False,
             timeout=max(0.1, float(raw.get("timeout", 15.0))),
         )
 

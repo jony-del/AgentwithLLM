@@ -13,6 +13,7 @@ rather than raising, matching the loader's "skip a bad file, never crash" contra
 from __future__ import annotations
 
 import yaml
+import re
 
 _FENCE = "---"
 
@@ -21,7 +22,9 @@ def _normalise_keys(data: dict) -> dict[str, object]:
     """Lower-case keys and turn hyphens into underscores (``allowed-tools`` -> ``allowed_tools``)."""
     normalised: dict[str, object] = {}
     for key, value in data.items():
-        normalised[str(key).strip().lower().replace("-", "_")] = value
+        raw = str(key).strip().replace("-", "_")
+        raw = re.sub(r"(?<!^)(?=[A-Z])", "_", raw).lower()
+        normalised[raw] = value
     return normalised
 
 

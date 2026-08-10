@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import ipaddress
 import os
+import re
+import socket
+import subprocess
 import threading
 from contextlib import AsyncExitStack
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, cast
+from urllib.parse import urlsplit
+
+from pydantic import FileUrl
 
 from agent_core.mcp.config import MCPConfig, MCPServerConfig
 
@@ -32,6 +41,8 @@ class MCPClientManager:
         *,
         connect_timeout: float = 30.0,
         call_timeout: float = 60.0,
+        channel_servers: set[str] | None = None,
+        notification_sink: Callable[[str, str, dict[str, str]], None] | None = None,
     ) -> None:
         self._config = config
         self._connect_timeout = connect_timeout
@@ -45,6 +56,8 @@ class MCPClientManager:
         self._sessions: dict[str, Any] = {}
         self._tools: list[tuple[MCPServerConfig, Any]] = []
         self._closed = False
+        self._channel_servers = set(channel_servers or ())
+        self._notification_sink = notification_sink
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -85,11 +98,51 @@ class MCPClientManager:
             self._ready.set()
 
     async def _connect(self, stack: AsyncExitStack, server: MCPServerConfig) -> None:
-        from mcp import ClientSession
+        from mcp import ClientSession, types
 
         read, write = await self._open_transport(stack, server)
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
+        async def handle_message(message: Any) -> None:
+            if server.name not in self._channel_servers or self._notification_sink is None:
+                return
+            try:
+                raw = message.model_dump(by_alias=True)
+                root = raw.get("root", raw) if isinstance(raw, dict) else {}
+                if not isinstance(root, dict) or root.get("method") != "notifications/claude/channel":
+                    return
+                params = root.get("params")
+                if not isinstance(params, dict) or not isinstance(params.get("content"), str):
+                    return
+                raw_meta = params.get("meta")
+                meta = {
+                    str(key): str(value)[:1000]
+                    for key, value in raw_meta.items()
+                    if re.fullmatch(r"[A-Za-z0-9_]+", str(key))
+                } if isinstance(raw_meta, dict) else {}
+                self._notification_sink(server.name, params["content"][:16_384], meta)
+            except Exception:
+                return
+
+        async def list_roots(_context: Any) -> Any:
+            roots = []
+            for raw in server.roots:
+                expanded = _expand_env(raw)
+                uri = expanded if "://" in expanded else Path(expanded).expanduser().resolve().as_uri()
+                roots.append(types.Root(uri=FileUrl(uri), name=Path(expanded).name or None))
+            return types.ListRootsResult(roots=roots)
+
+        session = await stack.enter_async_context(ClientSession(
+            read,
+            write,
+            message_handler=handle_message,
+            list_roots_callback=cast(Any, list_roots) if server.roots else None,
+        ))
+        initialized = await session.initialize()
+        if server.name in self._channel_servers:
+            experimental = getattr(initialized.capabilities, "experimental", None) or {}
+            if "claude/channel" not in experimental:
+                raise RuntimeError(
+                    f"configured channel MCP server {server.name} did not declare claude/channel"
+                )
         self._sessions[server.name] = session
         listed = await session.list_tools()
         for descriptor in listed.tools:
@@ -97,25 +150,41 @@ class MCPClientManager:
 
     async def _open_transport(self, stack: AsyncExitStack, server: MCPServerConfig):
         transport = (server.transport or "stdio").lower()
+        if server.network_policy == "public-only" and transport != "stdio":
+            _validate_public_remote(server.url)
+        headers = {key: _expand_env(value) for key, value in server.headers.items()}
+        if server.headers_helper:
+            headers.update(_run_headers_helper(server))
         if transport == "stdio":
             from mcp import StdioServerParameters
             from mcp.client.stdio import stdio_client
 
             params = StdioServerParameters(
-                command=server.command,
-                args=list(server.args),
-                # Always pass a full env so the child inherits PATH etc. (env=None gives
-                # the SDK's minimal default), with per-server overrides layered on top.
-                env={**os.environ, **server.env},
-                cwd=server.cwd or None,
+                command=_expand_env(server.command),
+                args=[_expand_env(item) for item in server.args],
+                # Never expose the full Polaris environment to an MCP child.  A small
+                # runtime baseline keeps executable lookup/platform startup working;
+                # everything else must be explicitly configured for this server.
+                env=_minimal_stdio_env(server),
+                cwd=_expand_env(server.cwd) or None,
             )
             streams = await stack.enter_async_context(stdio_client(params))
         elif transport in ("streamable-http", "streamable_http", "http"):
             from mcp.client.streamable_http import streamablehttp_client
 
             streams = await stack.enter_async_context(
-                streamablehttp_client(server.url, headers=server.headers or None)
+                streamablehttp_client(_expand_env(server.url), headers=headers or None)
             )
+        elif transport == "sse":
+            from mcp.client.sse import sse_client
+
+            streams = await stack.enter_async_context(
+                sse_client(_expand_env(server.url), headers=headers or None)
+            )
+        elif transport in {"ws", "wss", "websocket"}:
+            from mcp.client.websocket import websocket_client
+
+            streams = await stack.enter_async_context(websocket_client(_expand_env(server.url)))
         else:
             raise ValueError(f"Unknown MCP transport '{server.transport}' for server '{server.name}'")
         # streamable-http yields (read, write, get_session_id); stdio yields (read, write).
@@ -162,7 +231,7 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(
             session.call_tool(tool, arguments or {}), self._loop
         )
-        return future.result(timeout if timeout is not None else self._call_timeout)
+        return future.result(timeout if timeout is not None else server_config.timeout if (server_config := next((item for item in self._config.servers if item.name == server), None)) is not None else self._call_timeout)
 
     def list_resources(self, server: str | None = None, timeout: float | None = None) -> list[dict[str, Any]]:
         if self._loop is None or self._closed:
@@ -195,3 +264,81 @@ class MCPClientManager:
             raise KeyError(f"Unknown MCP server: {server}")
         future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
         return future.result(timeout if timeout is not None else self._call_timeout)
+
+
+_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _minimal_stdio_env(server: MCPServerConfig) -> dict[str, str]:
+    baseline_names = {
+        "PATH", "PATHEXT", "SystemRoot", "COMSPEC", "WINDIR",
+        "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    }
+    result = {
+        name: value
+        for name in baseline_names
+        if (value := os.environ.get(name)) is not None
+    }
+    result.update({key: _expand_env(value) for key, value in server.env.items()})
+    return result
+
+
+def _validate_public_remote(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("discovered remote MCP URL must be credential-free HTTPS")
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(
+                parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM
+            )
+        }
+    except OSError as exc:
+        raise ValueError(f"could not resolve remote MCP host: {parsed.hostname}") from exc
+    if not addresses:
+        raise ValueError(f"remote MCP host has no addresses: {parsed.hostname}")
+    for raw in addresses:
+        if not ipaddress.ip_address(raw).is_global:
+            raise ValueError(f"remote MCP host resolves to a non-public address: {raw}")
+
+
+def _expand_env(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        return os.environ.get(name, default or "")
+
+    return _ENV.sub(replace, value)
+
+
+def _run_headers_helper(server: MCPServerConfig) -> dict[str, str]:
+    env = {
+        **os.environ,
+        "CLAUDE_CODE_MCP_SERVER_NAME": server.name,
+        "CLAUDE_CODE_MCP_SERVER_URL": server.url,
+    }
+    try:
+        completed = subprocess.run(
+            server.headers_helper,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"MCP headersHelper failed: {type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        raise RuntimeError("MCP headersHelper returned a non-zero exit status")
+    try:
+        value = json.loads(completed.stdout)
+    except ValueError as exc:
+        raise RuntimeError("MCP headersHelper did not return JSON") from exc
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise RuntimeError("MCP headersHelper must return an object of string headers")
+    return value

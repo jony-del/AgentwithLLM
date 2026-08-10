@@ -31,6 +31,10 @@ def _toml_value(value: Any) -> str:
     raise LocalConfigError(f"unsupported local setting value: {type(value).__name__}")
 
 
+def _toml_key(value: str) -> str:
+    return value if re.fullmatch(r"[A-Za-z0-9_-]+", value) else json.dumps(value, ensure_ascii=False)
+
+
 def update_local_table(
     workspace: str | Path,
     table: str,
@@ -57,7 +61,9 @@ def update_toml_table(path: str | Path, table: str, values: dict[str, Any]) -> P
 
     header = re.compile(rf"(?m)^\[{re.escape(table)}\][ \t]*(?:#.*)?$")
     found = header.search(original)
-    assignments = "".join(f"{key} = {_toml_value(value)}\n" for key, value in values.items())
+    assignments = "".join(
+        f"{_toml_key(key)} = {_toml_value(value)}\n" for key, value in values.items()
+    )
     if found is None:
         prefix = original.rstrip()
         updated = (prefix + "\n\n" if prefix else "") + f"[{table}]\n" + assignments
@@ -67,9 +73,10 @@ def update_toml_table(path: str | Path, table: str, values: dict[str, Any]) -> P
         section_end = found.end() + (next_header.start() if next_header else len(tail))
         body = original[found.end() : section_end]
         for key, value in values.items():
-            rendered = f"{key} = {_toml_value(value)}"
+            rendered_key = _toml_key(key)
+            rendered = f"{rendered_key} = {_toml_value(value)}"
             assignment = re.compile(
-                rf"(?m)^[ \t]*{re.escape(key)}[ \t]*="
+                rf"(?m)^[ \t]*{re.escape(rendered_key)}[ \t]*="
             )
             match = assignment.search(body)
             if match is not None:

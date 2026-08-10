@@ -50,10 +50,23 @@ class MCPTool(Tool):
             "type": "object",
             "properties": {},
         }
-        self.risk = _RISK.get((server.risk or "dangerous").lower(), ToolRisk.DANGEROUS)
+        configured_risk = _RISK.get((server.risk or "dangerous").lower(), ToolRisk.DANGEROUS)
+        # Discovered third-party servers cannot self-annotate down to READ and bypass
+        # the normal permission prompt.  A user-owned local config remains explicit.
+        self.risk = (
+            ToolRisk.DANGEROUS
+            if server.discovered and server.trust_tier not in {
+                "anthropic_first_party", "local_user_declared"
+            }
+            else configured_risk
+        )
         self._manager = manager
         self._server = server.name
         self._remote = descriptor.name
+        self._always_load = server.always_load or bool(
+            getattr(descriptor, "_meta", {}).get("anthropic/alwaysLoad", False)
+            if isinstance(getattr(descriptor, "_meta", {}), dict) else False
+        )
 
     def concurrency_spec(self, arguments: dict[str, Any]) -> ConcurrencySpec:
         if self.risk is ToolRisk.READ:

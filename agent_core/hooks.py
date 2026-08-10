@@ -118,6 +118,9 @@ class ExternalHookSpec:
     event: str
     type: str
     matcher: str | None = None
+    # JSON hook metadata calls this field ``if``.  The loader maps it to this
+    # Python-safe name and evaluates it with the existing permission-rule parser.
+    condition: str | None = None
     command: str | None = None
     # Framework-produced argv for sandboxed plugin hooks. Repo/user TOML does not
     # populate this field; it avoids re-parsing a wrapped command through a host shell.
@@ -126,6 +129,7 @@ class ExternalHookSpec:
     prompt: str | None = None
     model: str | None = None
     headers: dict[str, str] | None = None
+    env: dict[str, str] | None = None
     timeout: float = 30.0
     fail_mode: str = "open"
 
@@ -349,6 +353,9 @@ class HookPipeline:
         subagent_stop_hooks: list[SubagentStopHook] | None = None,
         tool_failure_hooks: list[PostToolUseFailureHook] | None = None,
         permission_request_hooks: list[PermissionRequestHook] | None = None,
+        external_pre_tool_hooks: list[Any] | None = None,
+        external_post_tool_hooks: list[Any] | None = None,
+        unhandled_hooks: list[Any] | None = None,
     ) -> None:
         self.pre_hooks = pre_hooks or []
         self.post_hooks = post_hooks or []
@@ -363,6 +370,9 @@ class HookPipeline:
         self.subagent_stop_hooks = subagent_stop_hooks or []
         self.tool_failure_hooks = tool_failure_hooks or []
         self.permission_request_hooks = permission_request_hooks or []
+        self.external_pre_tool_hooks = external_pre_tool_hooks or []
+        self.external_post_tool_hooks = external_post_tool_hooks or []
+        self.unhandled_hooks = unhandled_hooks or []
 
     def run_pre(self, tool_call: ToolCall) -> tuple[ToolCall, list[HookResult]]:
         current = tool_call
@@ -381,6 +391,25 @@ class HookPipeline:
         for hook in self.post_hooks:
             current = hook.after_tool(tool_call, current)
         return current
+
+    async def run_external_pre_tool(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.external_pre_tool_hooks:
+            outcome = await hook.on_pre_tool(ctx)
+            if outcome is None:
+                continue
+            seen.append(outcome)
+            if outcome.block or outcome.decision == "deny":
+                return self._fold(seen, outcome)
+        return self._fold(seen, None)
+
+    async def run_external_post_tool(self, ctx: HookContext) -> HookOutcome:
+        seen: list[HookOutcome] = []
+        for hook in self.external_post_tool_hooks:
+            outcome = await hook.on_post_tool(ctx)
+            if outcome is not None:
+                seen.append(outcome)
+        return self._fold(seen, None)
 
     # --- Lifecycle runners -----------------------------------------------------
     #

@@ -154,10 +154,14 @@ dense（小集合分块精确扫描，大集合 USearch HNSW 召回后 FP32 精�
 
 ## Claude 兼容插件
 
-`/plugin` 支持 install/manage/uninstall/enable/disable/validate，以及 marketplace 的
-add/remove/update/list。Polaris 不预装 marketplace；安装记录和缓存位于 `~/.polaris/plugins`，
-项目启用状态默认写入 `agent.local.toml`。支持 `.claude-plugin/plugin.json`、skills/commands、
-agents、hooks（含 `${CLAUDE_PLUGIN_ROOT}`）和 `.mcp.json`。可执行 hooks/MCP 启用前需要确认。
+Marketplace source、不可变制品、依赖、组件策略和旧配置迁移详见
+[Claude Marketplace 兼容说明](docs/claude-marketplace-compatibility.md)。
+
+`/plugin` 支持 install/update/manage/details/uninstall/enable/disable/validate/configure/prune，
+以及 marketplace 的 add/remove/update/list。三个 Anthropic catalog 由能力配置按需同步；安装记录和
+不可变缓存位于 `~/.polaris/plugins`，项目启用状态默认写入 `agent.local.toml`。Manifestless、根目录
+skill、agents、hooks、MCP、LSP、workflows、monitors、channels 和展示/配置组件均参与统一校验；
+会执行代码、注入消息或改变提示的组件在启用前需要确认。
 
 安装或启用不会修改正在运行的组件代；在 Agent 空闲时运行 `/reload-plugins` 才会构建并原子切换，
 失败时继续使用旧代。插件组件使用 `plugin:component` 命名空间，安装 ID 使用
@@ -166,17 +170,18 @@ agents、hooks（含 `${CLAUDE_PLUGIN_ROOT}`）和 `.mcp.json`。可执行 hooks
 ## 运行时能力发现
 
 Agent 可通过 `capability_search` 自行检索当前 skills、已连接但尚未暴露的 MCP tools、已安装
-plugins，以及明确列入信任名单的 marketplace 元数据。默认 `[capabilities].mode = "local"`，
-只允许发现和启用本地已连接的能力，不会下载插件。可用 `/capabilities <query>` 检查运行时目录，
-或用 `polaris capabilities search <query>` 检查当前配置的发现来源。
+plugins，以及明确列入信任名单的 marketplace 元数据。仓库示例配置启用
+`"autonomous-trusted"` 并声明三个真实 Anthropic catalog；改为 `"local"` 可关闭远程下载。
+可用 `/capabilities <query>` 检查运行时目录，或用 `polaris capabilities search <query>` 检查
+当前配置的发现来源。
 
-将模式设为 `"autonomous-trusted"` 后，模型才能请求安装受信 marketplace 中的插件。远程条目
-必须带 `sha256` 或不可变 Git `commit`，请求只能引用刚刚检索到的稳定 ID 和目录摘要，不能把任意
-URL、路径或命令传给安装器。激活在当前工具批次结束的回合边界提交；候选组件验证失败时保留旧代，
-并把失败作为工具结果返回。自动激活默认只包含 skills、agents 和受沙箱/网络策略约束的 MCP；
-hooks 必须同时出现在 `auto_components` 和 `allowed_hooks` 的精确授权列表中。
+将模式设为 `"autonomous-trusted"` 后，Agent 会自动搜索配置的 Marketplace 和 MCP Registry。搜索结果必须先由
+`capability_plan` 解析为固定 source identity、commit 和内容 digest；Marketplace snapshot 本身不再被当作插件制品
+完整性证明，也不能把任意 URL、路径或命令传给安装器。激活在当前工具批次结束的回合边界原子提交，候选组件
+验证失败时保留旧 generation。默认无人值守激活只允许 Anthropic 第一方、不可变、低风险且只包含 skills/agents
+的制品；MCP、LSP、hooks、workflows、bin、依赖安装、社区内容及所有 Registry 条目都需要宿主确认。
 
-Polaris 不预置信任源。管理员需先添加 marketplace，再在项目配置中显式信任其名称：
+可增加组织自己的受信 Marketplace；表名必须与远端 manifest 的 `name` 一致：
 
 ```toml
 [capabilities]
@@ -187,8 +192,20 @@ auto_components = ["skills", "agents", "mcp"]
 allowed_hooks = []
 ```
 
-Marketplace 的每个插件项可声明 `description`、`keywords`、`components`、`sha256` 和 `commit`；
-开启完整性要求时至少需要后两项之一。该配置扩大仓库权限边界，因此仍受项目 TOFU 信任检查保护。
+Capability v3 uses a three-step host-owned activation protocol:
+`capability_search` discovers component-level metadata, `capability_plan` freezes the
+source and artifact digests, and `capability_activate` commits the verified generation.
+The default unattended allowlist is limited to immutable low-risk Anthropic first-party
+skills/agents. Third-party/community content and every MCP Registry connection/package
+(remote, npm, PyPI, NuGet, OCI, MCPB) require direct host approval.
+
+Old plugin state is intentionally not trusted after this upgrade. Interactive startup
+offers an exact reset preview; for headless use `polaris plugins reset --dry-run` and
+then `polaris plugins reset --yes`. `polaris plugins status`, `polaris plugins errors`,
+`/plugin status`, and `/plugin errors` expose state and redacted failures.
+
+Marketplace 的 source、snapshot、制品 digest、依赖图、组件选择和安全决策都会进入安装审计。
+该配置扩大仓库权限边界，因此仍受项目 TOFU 信任检查保护。
 
 ## 源码开发
 

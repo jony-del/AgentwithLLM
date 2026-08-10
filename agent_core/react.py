@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import subprocess
 import time
 import json
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -267,7 +270,11 @@ class ReActConfig:
         "and team_status. Use bash or powershell for commands; long-running commands may "
         "continue in the background and can be inspected or stopped with task_output and "
         "task_stop. Use capability_search when a task may benefit from a skill, MCP tool, "
-        "or trusted plugin that is not already visible; activate only the returned stable id. "
+        "or trusted plugin that is not already visible; pass its stable id and catalog digest "
+        "to capability_plan, then activate only the returned plan id and digest. Never invent "
+        "or pass a download URL, local "
+        "path, source declaration, or shell command to capability activation. A newly queued "
+        "capability becomes visible only after the next model-call boundary. "
         "Use tool_search to discover other deferred capabilities such as LSP, notebook, "
         "worktree, configuration, MCP resources, and scheduling tools. Multiple tool calls "
         "in the same turn may run concurrently when "
@@ -394,8 +401,22 @@ class ReActAgent:
         self._sandbox_cli_locked = False
         self._retired_sandboxes: list[SandboxManager] = []
         self._plugin_tool_names: set[str] = set()
+        self._plugin_lsp_names: set[str] = set()
         self._plugin_mcp_manager: Any | None = None
         self.plugin_agents: dict[str, str] = {}
+        self.plugin_workflows: dict[str, str] = {}
+        self.plugin_output_styles: dict[str, str] = {}
+        self.plugin_themes: dict[str, str] = {}
+        self._plugin_base_system_prompt = self.config.system_prompt
+        self._plugin_selected_output_style = ""
+        self._plugin_selected_theme = ""
+        self.plugin_monitors: list[dict[str, Any]] = []
+        self.plugin_channels: list[dict[str, Any]] = []
+        self.plugin_user_config: dict[str, Any] = {}
+        self.plugin_bin_paths: tuple[str, ...] = ()
+        self.plugin_settings: dict[str, Any] = {}
+        self._plugin_monitor_tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        self._plugin_notifications: deque[dict[str, str]] = deque(maxlen=100)
         self.registry = tools or self.default_registry()
         self.registry.rebind_workspace(str(self._initial_workspace))
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
@@ -464,6 +485,7 @@ class ReActAgent:
             audit_event=self._audit_event,
             mcp_manager=mcp_manager,
             registry=self.registry,
+            plugin_skill_invoked=self._start_skill_monitors,
         )
         self.process_supervisor = ProcessSupervisor(
             self.config.tools.shell,
@@ -559,6 +581,7 @@ class ReActAgent:
             self.registry.unregister("skill")
         if not self.config.capabilities.enabled:
             self.registry.unregister("capability_search")
+            self.registry.unregister("capability_plan")
             self.registry.unregister("capability_activate")
         # Session-only acknowledgement for explicitly accepted unsandboxed
         # unattended operation. It is never persisted or inherited by children.
@@ -642,12 +665,31 @@ class ReActAgent:
         # When this agent was created — a chat session builds one agent, so this doubles
         # as the session start for ``/cost`` duration.
         self._session_started: float = time.monotonic()
+        self._plugin_active_ids: frozenset[str] = frozenset()
+        self._registry_active_ids: frozenset[str] = frozenset()
+        self._registry_mcp_managers: dict[str, Any] = {}
+        self._registry_mcp_tool_groups: dict[str, set[str]] = {}
+        # v1/v2 plugin state is never silently trusted.  Interactive hosts show the
+        # exact managed targets and ask once; headless sessions keep capabilities
+        # disabled until the explicit reset command is run.
+        from agent_core.plugins import PluginManager, reload_plugins
+
+        startup_plugin_manager = PluginManager(self.session.workspace)
+        plugin_state = startup_plugin_manager.state_status()
+        if plugin_state.reset_required and self.ui.is_live and (
+            self.config.capabilities.legacy_state_policy == "prompt_interactive"
+        ):
+            preview = startup_plugin_manager.reset_preview()
+            detail = "Legacy plugin state must be cleared before capability v3 can run.\n" + "\n".join(
+                f"  - {item}" for item in preview
+            )
+            if self.ui.confirm_action(detail):
+                startup_plugin_manager.reset_state()
+                plugin_state = startup_plugin_manager.state_status()
         # Enabled plugins load eagerly at process/session start. A broken generation
         # never replaces the already-valid built-in registries.
         try:
-            from agent_core.plugins import PluginManager, reload_plugins
-
-            if PluginManager(self.session.workspace).enabled_ids():
+            if not plugin_state.reset_required and startup_plugin_manager.enabled_ids():
                 reload_plugins(self)
         except Exception as exc:  # noqa: BLE001 - plugins are optional
             logging.getLogger(__name__).warning(
@@ -897,6 +939,38 @@ class ReActAgent:
         populate_registry(registry)
         return registry
 
+    def select_plugin_presentation(self, kind: str, name: str) -> None:
+        values = self.plugin_output_styles if kind == "output-style" else self.plugin_themes
+        if name and name not in values:
+            raise ValueError(f"unknown plugin {kind}: {name}")
+        if kind == "output-style":
+            self._plugin_selected_output_style = name
+        elif kind == "theme":
+            self._plugin_selected_theme = name
+        else:
+            raise ValueError("plugin presentation kind must be output-style or theme")
+        self._refresh_plugin_presentation()
+
+    def _refresh_plugin_presentation(self) -> None:
+        if self._plugin_selected_output_style not in self.plugin_output_styles:
+            self._plugin_selected_output_style = ""
+        if self._plugin_selected_theme not in self.plugin_themes:
+            self._plugin_selected_theme = ""
+        additions: list[str] = []
+        if self._plugin_selected_output_style:
+            additions.append(
+                "Selected plugin output style:\n"
+                + self.plugin_output_styles[self._plugin_selected_output_style]
+            )
+        if self._plugin_selected_theme:
+            additions.append(
+                "Selected plugin presentation theme:\n"
+                + self.plugin_themes[self._plugin_selected_theme]
+            )
+        self.config.system_prompt = self._plugin_base_system_prompt + (
+            "\n\n" + "\n\n".join(additions) if additions else ""
+        )
+
     async def run(
         self,
         task: str,
@@ -938,6 +1012,7 @@ class ReActAgent:
         # the running loop so it can bridge the prompt back onto the main thread.
         if self.ui.is_live:
             self.ui.bind_event_loop(asyncio.get_running_loop())
+        await self._sync_plugin_monitors()
         user_messages = list(_user_messages) if _user_messages is not None else [Message("user", task)]
         if not user_messages:
             raise ValueError("at least one user message is required")
@@ -961,6 +1036,18 @@ class ReActAgent:
         # be in place. Final front order: system(+gitStatus) → (recall) → userContext → task.
         await self._recall(recalled_task, messages)
         await self._inject_project_context(messages)
+        if self._plugin_notifications:
+            pending = list(self._plugin_notifications)
+            self._plugin_notifications.clear()
+            encoded = json.dumps(pending, ensure_ascii=False)[:65536].replace("<", "\\u003c")
+            notice = Message(
+                "user",
+                "<untrusted-data source=\"plugin-notifications\">\n"
+                + encoded
+                + "\n</untrusted-data>",
+                metadata={"plugin_notification": True},
+            )
+            messages.insert(messages.index(user_message), notice)
         self._sync_permission_mode_context(messages)
         # Splice prior conversation in just before the new task (after the pinned context),
         # so the order is [system, (recall), userContext, ...history..., task]. System and
@@ -1018,6 +1105,34 @@ class ReActAgent:
             self._emit_recap(messages, 0, "blocked")
             await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
             return AgentRunResult(answer, messages, 0, self.logger.run_id)
+        discovery = await asyncio.to_thread(
+            self.capability_manager.auto_discover,
+            recalled_task,
+        )
+        if discovery.get("searched"):
+            encoded_discovery = json.dumps(
+                {
+                    "matches": discovery.get("matches", [])[:5],
+                    "activations": discovery.get("activations", {}),
+                },
+                ensure_ascii=False,
+            )[:65536].replace("<", "\\u003c")
+            messages.append(
+                Message(
+                    "user",
+                    '<untrusted-data source="capability-discovery">\n'
+                    + encoded_discovery
+                    + "\n</untrusted-data>",
+                    metadata={"capability_discovery": True},
+                )
+            )
+            await self.logger.write(
+                "capability_discovery",
+                {
+                    "match_count": len(discovery.get("matches", [])),
+                    "activations": discovery.get("activations", {}),
+                },
+            )
         # Exposed read-only to the persistent terminal's Ctrl+O transcript snapshot.
         self._active_messages = messages
 
@@ -1781,10 +1896,117 @@ class ReActAgent:
             payload["error"] = error
         await self.logger.write("hook", payload)
 
+    async def _run_plugin_monitor(self, spec: dict[str, Any]) -> None:
+        """Supervise one user-confirmed plugin monitor and bound its notifications."""
+
+        name = str(spec.get("name") or "plugin-monitor")[:160]
+        command = str(spec.get("command") or "")
+        if not command:
+            return
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process_kwargs: dict[str, Any] = {
+                "cwd": str(self.session.workspace),
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.STDOUT,
+            }
+            if os.name == "nt":
+                process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_kwargs["start_new_session"] = True
+            process = await asyncio.create_subprocess_shell(command, **process_kwargs)
+            assert process.stdout is not None
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                content = line.decode("utf-8", "replace").rstrip("\r\n")
+                if len(content) > 16_384:
+                    content = content[:16_384] + "..."
+                self._plugin_notifications.append(
+                    {"source": f"monitor:{name}", "content": content}
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - monitor failures are observational.
+            self._plugin_notifications.append(
+                {
+                    "source": f"monitor:{name}",
+                    "content": f"monitor stopped: {type(exc).__name__}",
+                }
+            )
+        finally:
+            if process is not None and process.returncode is None:
+                await self.process_supervisor._kill_process_tree(process)
+
+    def _queue_plugin_channel(
+        self, server: str, content: str, meta: dict[str, str]
+    ) -> None:
+        """Receive a bounded MCP channel event from the manager's I/O thread."""
+
+        self._plugin_notifications.append(
+            {
+                "source": f"channel:{server[:160]}",
+                "content": content[:16_384],
+                "meta": json.dumps(meta, ensure_ascii=False)[:4096],
+            }
+        )
+
+    async def _sync_plugin_monitors(self) -> None:
+        desired: dict[str, tuple[str, dict[str, Any]]] = {}
+        for spec in self.plugin_monitors:
+            if str(spec.get("when") or "always") != "always":
+                continue
+            name = str(spec.get("name") or "")
+            command = str(spec.get("command") or "")
+            if name and command:
+                digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+                desired[name] = (digest, spec)
+        retired: list[asyncio.Task[None]] = []
+        for name, (digest, task) in list(self._plugin_monitor_tasks.items()):
+            if name not in desired or desired[name][0] != digest or task.done():
+                if not task.done():
+                    task.cancel()
+                    retired.append(task)
+                del self._plugin_monitor_tasks[name]
+        if retired:
+            await asyncio.gather(*retired, return_exceptions=True)
+        for name, (digest, spec) in desired.items():
+            if name in self._plugin_monitor_tasks:
+                continue
+            task = asyncio.create_task(
+                self._run_plugin_monitor(spec), name=f"plugin-monitor-{name}"
+            )
+            self._plugin_monitor_tasks[name] = (digest, task)
+
+    async def _start_skill_monitors(self, skill_name: str) -> None:
+        for spec in self.plugin_monitors:
+            when = str(spec.get("when") or "always")
+            if not when.startswith("on-skill-invoke:"):
+                continue
+            target = when.split(":", 1)[1]
+            plugin = str(spec.get("plugin") or "")
+            if skill_name not in {target, f"{plugin}:{target}"}:
+                continue
+            name = str(spec.get("name") or "")
+            command = str(spec.get("command") or "")
+            if not name or not command or name in self._plugin_monitor_tasks:
+                continue
+            digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+            task = asyncio.create_task(
+                self._run_plugin_monitor(spec), name=f"plugin-monitor-{name}"
+            )
+            self._plugin_monitor_tasks[name] = (digest, task)
+
     async def fire_session_end(self, reason: str = "host_shutdown") -> None:
         """Fire SessionEnd (observational). The HOST owns the session boundary:
         the CLI calls this after a one-shot run and at chat exit; library embedders
         call it when their session concept closes. No-op before the first run()."""
+        monitor_tasks = [item[1] for item in self._plugin_monitor_tasks.values()]
+        self._plugin_monitor_tasks.clear()
+        for task in monitor_tasks:
+            task.cancel()
+        await asyncio.gather(*monitor_tasks, return_exceptions=True)
         await self.process_supervisor.shutdown()
         if self.session.scheduler_store is not None:
             await asyncio.to_thread(
@@ -1799,6 +2021,11 @@ class ReActAgent:
                 result = close()
                 if asyncio.iscoroutine(result):
                     await result
+        for manager in self._registry_mcp_managers.values():
+            await asyncio.to_thread(manager.close)
+        self._registry_mcp_managers.clear()
+        self._registry_mcp_tool_groups.clear()
+        self._registry_active_ids = frozenset()
         if not self._session_start_fired:
             return
         self._session_start_fired = False
@@ -2403,6 +2630,7 @@ class ReActAgent:
         workspace: Path | None = None,
         agent_name: str | None = None,
         memory_scope: str = "none",
+        tool_allowlist: frozenset[str] | None = None,
     ) -> "ReActAgent | str":
         """Build the ``dispatch_agent`` child (or a refusal string at the depth ceiling).
 
@@ -2435,6 +2663,8 @@ class ReActAgent:
             "team_message_send",
         }
         allowed_tools = _FULL_CHILD_TOOLS if preset == "full" else _READ_ONLY_CHILD_TOOLS
+        if tool_allowlist is not None:
+            allowed_tools = allowed_tools & tool_allowlist
         if agent_name and memory_scope != "none":
             allowed_tools = allowed_tools | {"memory_search"}
             if preset == "full":
@@ -2517,6 +2747,7 @@ class ReActAgent:
         isolation: str = "shared",
         agent_name: str | None = None,
         memory_scope: str = "none",
+        tool_allowlist: tuple[str, ...] | None = None,
     ) -> str:
         """``dispatch_agent`` factory — awaits the child on the shared event loop.
 
@@ -2526,18 +2757,35 @@ class ReActAgent:
         """
         isolated = await self._create_agent_worktree("agent") if isolation == "worktree" else None
         if agent_name is not None and memory_scope != "none":
-            child = self._make_subagent_child(
+            child_args = (
                 preset,
                 model,
                 isolated["path"] if isolated is not None else None,
                 agent_name,
                 memory_scope,
             )
+            child = (
+                self._make_subagent_child(*child_args, frozenset(tool_allowlist))
+                if tool_allowlist is not None
+                else self._make_subagent_child(*child_args)
+            )
         elif isolated is not None:
-            child = self._make_subagent_child(preset, model, isolated["path"])
+            child = (
+                self._make_subagent_child(
+                    preset, model, isolated["path"], tool_allowlist=frozenset(tool_allowlist)
+                )
+                if tool_allowlist is not None
+                else self._make_subagent_child(preset, model, isolated["path"])
+            )
         else:
             # Preserve the long-standing two-argument factory seam for embeddings/tests.
-            child = self._make_subagent_child(preset, model)
+            child = (
+                self._make_subagent_child(
+                    preset, model, tool_allowlist=frozenset(tool_allowlist)
+                )
+                if tool_allowlist is not None
+                else self._make_subagent_child(preset, model)
+            )
         if isinstance(child, str):
             if isolated is not None:
                 await self._finalize_agent_worktree(isolated)

@@ -242,8 +242,30 @@ def _start_mcp(
     manager = _connect_mcp(mcp_config)
     # MCP descriptors are discoverable immediately, but their full JSON schemas are
     # exposed only after tool_search/capability_activate selects a matching tool.
-    registry.register_adapter(MCPAdapter(manager), deferred=True)
+    for tool in MCPAdapter(manager).list_tools():
+        if getattr(tool, "_always_load", False):
+            registry.register(tool)
+        else:
+            registry.register_deferred(
+                tool.name,
+                tool.description,
+                _constant_factory(tool),
+                metadata={
+                    "kind": "mcp",
+                    "server": str(getattr(tool, "_server", "")),
+                    "remote": str(getattr(tool, "_remote", "")),
+                },
+            )
     return manager
+
+
+def _constant_factory(value: Any) -> Callable[[], Any]:
+    """Return a typed zero-argument loader for one deferred runtime object."""
+
+    def load() -> Any:
+        return value
+
+    return load
 
 
 def build_agent(args: argparse.Namespace) -> "BuiltAgent":
@@ -1491,8 +1513,12 @@ def mcp_command(args: argparse.Namespace) -> int:
 def capabilities_command(args: argparse.Namespace) -> int:
     """Inspect the configured local/trusted discovery inputs without constructing an agent."""
 
-    from agent_core.plugins import PluginError, PluginManager
-    from agent_core.skills import discover_skill_dirs, load_skills
+    from types import SimpleNamespace
+
+    from agent_core.capabilities import CapabilityManager
+    from agent_core.plugins import PluginManager
+    from agent_core.skills import SkillRegistry, discover_skill_dirs, load_skills
+    from agent_core.tools.registry import ToolRegistry
 
     config_file = _config_file(args)
     config = resolve_capabilities_config(config_file)
@@ -1503,36 +1529,85 @@ def capabilities_command(args: argparse.Namespace) -> int:
         print(f"trusted_marketplaces={','.join(config.trusted_marketplaces) or '(none)'}")
         print(f"installed_plugins={len(manager.records())}")
         print(f"enabled_plugins={len(manager.enabled_ids())}")
+        print(f"reset_required={str(manager.state_status().reset_required).lower()}")
+        print(f"mcp_registry={str(config.mcp_registry.enabled).lower()}")
         return 0
 
     query = str(args.query or "").casefold().strip()
     if not query:
         print("[error] capabilities search requires a query", file=sys.stderr)
         return 2
-    matches: list[tuple[str, str]] = []
-    for skill in load_skills(discover_skill_dirs(Path.cwd(), skills_config), skills_config.disabled):
-        haystack = f"{skill.name} {skill.description} {skill.when_to_use}".casefold()
-        if query in haystack:
-            matches.append((f"skill:{skill.name}", skill.description))
-    for server in resolve_mcp_config(config_file).servers:
-        if query in server.name.casefold():
-            matches.append((f"mcp:{server.name}", f"configured {server.transport} server"))
-    for marketplace in config.trusted_marketplaces:
-        try:
-            entries = manager.marketplace_plugins(marketplace)
-        except PluginError as exc:
-            print(f"[warning] {marketplace}: {exc}", file=sys.stderr)
-            continue
-        for entry in entries:
-            name = str(entry.get("name") or "")
-            description = str(entry.get("description") or "")
-            keywords = " ".join(str(item) for item in entry.get("keywords", []) if isinstance(item, str))
-            if query in f"{name} {description} {keywords}".casefold():
-                matches.append((f"plugin:{name}@{marketplace}", description))
-    for capability_id, description in matches[: config.max_results]:
-        print(f"{capability_id}  {description}".rstrip())
+    skills = SkillRegistry(
+        load_skills(discover_skill_dirs(Path.cwd(), skills_config), skills_config.disabled)
+    )
+    catalog_agent = SimpleNamespace(
+        skills=skills,
+        registry=ToolRegistry(),
+        session=SimpleNamespace(workspace=Path.cwd()),
+        _plugin_active_ids=frozenset(),
+    )
+    result = CapabilityManager(cast(Any, catalog_agent), config).search(query)
+    matches = result.get("matches", [])
+    for item in matches:
+        components = ",".join(item.get("components", []))
+        print(
+            f"{item['id']}  [{item.get('trust_tier')}; {components or item.get('kind')}]  "
+            f"{item.get('description', '')}".rstrip()
+        )
     if not matches:
         print("(no matching capabilities)")
+    return 0
+
+
+def plugins_command(args: argparse.Namespace) -> int:
+    """Inspect or explicitly clear capability/plugin v1-v2 state."""
+
+    from agent_core.plugins import PluginManager
+
+    manager = PluginManager(Path.cwd())
+    if args.action == "status":
+        state = manager.state_status()
+        print(f"schema_version={state.schema_version}")
+        print(f"reset_required={str(state.reset_required).lower()}")
+        print(f"installed_plugins={len(manager.records())}")
+        print(f"enabled_plugins={len(manager.enabled_ids())}")
+        for target in state.targets:
+            print(f"legacy_target={target}")
+        return 1 if state.reset_required else 0
+    if args.action == "errors":
+        path = manager.audit.path
+        if not path.is_file():
+            print("(no capability errors recorded)")
+            return 0
+        shown = 0
+        for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("event") not in {"activation_failed", "catalog_sync"}:
+                continue
+            detail = event.get("detail", {})
+            if event.get("event") == "catalog_sync" and detail.get("result") != "failed":
+                continue
+            print(json.dumps(event, ensure_ascii=False))
+            shown += 1
+            if shown >= 20:
+                break
+        if not shown:
+            print("(no capability errors recorded)")
+        return 0
+    targets = manager.reset_preview()
+    print("Plugin reset targets:")
+    for target in targets:
+        print(f"  {target}")
+    if args.dry_run:
+        return 0
+    if not args.yes:
+        print("[error] reset requires --yes (use --dry-run to preview)", file=sys.stderr)
+        return 2
+    removed = manager.reset_state()
+    print(f"Removed/reset {len(removed)} managed targets; capability schema v3 is ready.")
     return 0
 
 
@@ -1764,6 +1839,14 @@ def main(argv: list[str] | None = None) -> int:
     capabilities_parser.add_argument("query", nargs="?", default=None)
     add_config_flag(capabilities_parser)
     capabilities_parser.set_defaults(func=capabilities_command)
+
+    plugins_parser = subparsers.add_parser(
+        "plugins", help="Inspect/reset the capability v3 plugin state and audit errors."
+    )
+    plugins_parser.add_argument("action", choices=["status", "reset", "errors"])
+    plugins_parser.add_argument("--dry-run", action="store_true")
+    plugins_parser.add_argument("--yes", action="store_true")
+    plugins_parser.set_defaults(func=plugins_command)
 
     replay_parser = subparsers.add_parser(
         "replay", help="Re-render a recorded run's JSONL event log as a readable timeline."

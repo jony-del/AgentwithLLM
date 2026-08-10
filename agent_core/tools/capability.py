@@ -57,19 +57,97 @@ class CapabilitySearchTool(SessionAwareMixin, Tool):
 
 
 @builtin_tool
-class CapabilityActivateTool(SessionAwareMixin, Tool):
-    name = "capability_activate"
+class CapabilityPlanTool(SessionAwareMixin, Tool):
+    name = "capability_plan"
     description = (
-        "Queue activation of one capability id returned by capability_search. The id and "
-        "catalog_digest must be copied exactly; arbitrary URLs, paths, and commands are not accepted."
+        "Resolve one capability_search result into an immutable, expiring activation plan. "
+        "This may download bytes into a non-executable staging cache but never enables code."
     )
     input_schema = {
         "type": "object",
         "properties": {
             "id": {"type": "string", "minLength": 1},
             "catalog_digest": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+            "package_type": {
+                "type": "string",
+                "enum": ["remote", "npm", "pypi", "nuget", "oci", "mcpb"],
+                "description": "Optional MCP Registry package/connection type.",
+            },
+            "components": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "skills", "agents", "mcp", "lsp", "hooks", "workflows",
+                        "monitors", "channels", "output-styles", "themes",
+                        "user-config", "bin", "settings",
+                    ],
+                },
+                "uniqueItems": True,
+            },
         },
         "required": ["id", "catalog_digest"],
+        "additionalProperties": False,
+    }
+    risk = ToolRisk.READ
+
+    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
+        manager = getattr(self.session, "capability_manager", None)
+        if manager is None:
+            return ToolResult(self.name, "Capability planning is unavailable.", ok=False)
+        try:
+            values = arguments.get("components")
+            result = manager.create_plan(
+                str(arguments.get("id", "")),
+                str(arguments.get("catalog_digest", "")),
+                components=tuple(str(item) for item in values) if isinstance(values, list) else (),
+                sandbox_enabled=manager.agent.sandbox.is_enabled(),
+                package_type=str(arguments.get("package_type", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                self.name,
+                f"Capability plan failed: {type(exc).__name__}: {exc}",
+                ok=False,
+            )
+        return ToolResult(
+            self.name,
+            json.dumps(result, ensure_ascii=False, indent=2),
+            metadata={"plan_id": result.get("plan_id"), "requires_approval": result.get("requires_approval")},
+        )
+
+
+@builtin_tool
+class CapabilityActivateTool(SessionAwareMixin, Tool):
+    name = "capability_activate"
+    description = (
+        "Activate an immutable plan returned by capability_plan. A legacy id/catalog_digest "
+        "pair remains accepted only for already-safe, pinned capabilities."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "catalog_digest": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+            "plan_id": {"type": "string", "minLength": 1},
+            "plan_digest": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+            "components": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "skills", "agents", "mcp", "lsp", "hooks", "workflows",
+                        "monitors", "channels", "output-styles", "themes",
+                        "user-config", "bin", "settings",
+                    ],
+                },
+                "uniqueItems": True,
+            },
+        },
+        "oneOf": [
+            {"required": ["plan_id", "plan_digest"]},
+            {"required": ["id", "catalog_digest"]},
+        ],
         "additionalProperties": False,
     }
     risk = ToolRisk.DANGEROUS
@@ -80,11 +158,28 @@ class CapabilityActivateTool(SessionAwareMixin, Tool):
         manager = getattr(self.session, "capability_manager", None)
         if manager is None:
             return PermissionResult.deny("capability activation is unavailable")
-        allowed, reason = manager.authorization(
-            str(arguments.get("id", "")),
-            str(arguments.get("catalog_digest", "")),
-            sandbox_enabled=context.sandbox.enabled,
-        )
+        if arguments.get("plan_id"):
+            allowed, reason, approval = manager.authorization_plan(
+                str(arguments.get("plan_id", "")),
+                str(arguments.get("plan_digest", "")),
+                sandbox_enabled=context.sandbox.enabled,
+            )
+            if allowed and approval:
+                return PermissionResult.ask(
+                    "activation plan requires direct host approval",
+                    metadata={"plan_id": str(arguments.get("plan_id", ""))},
+                    bypass_immune=True,
+                )
+        else:
+            allowed, reason = manager.authorization(
+                str(arguments.get("id", "")),
+                str(arguments.get("catalog_digest", "")),
+                sandbox_enabled=context.sandbox.enabled,
+                components=tuple(
+                    str(item) for item in arguments.get("components", [])
+                    if isinstance(item, str)
+                ) if isinstance(arguments.get("components"), list) else (),
+            )
         if not allowed:
             return PermissionResult.deny(reason, decision_source=DecisionSource.TOOL)
         return PermissionResult.allow(reason, decision_source=DecisionSource.TOOL)
@@ -94,10 +189,22 @@ class CapabilityActivateTool(SessionAwareMixin, Tool):
         if manager is None:
             return ToolResult(self.name, "Capability activation is unavailable.", ok=False)
         try:
-            result = manager.request_activation(
-                str(arguments.get("id", "")),
-                str(arguments.get("catalog_digest", "")),
-            )
+            if arguments.get("plan_id"):
+                result = manager.request_plan_activation(
+                    str(arguments.get("plan_id", "")),
+                    str(arguments.get("plan_digest", "")),
+                    host_approved=True,
+                )
+            else:
+                component_values = arguments.get("components")
+                result = manager.request_activation(
+                    str(arguments.get("id", "")),
+                    str(arguments.get("catalog_digest", "")),
+                    components=tuple(
+                        str(item) for item in component_values
+                        if isinstance(item, str)
+                    ) if isinstance(component_values, list) else (),
+                )
         except Exception as exc:  # noqa: BLE001 - return a bounded model-correctable failure
             return ToolResult(
                 self.name,
@@ -107,5 +214,9 @@ class CapabilityActivateTool(SessionAwareMixin, Tool):
         return ToolResult(
             self.name,
             json.dumps(result, ensure_ascii=False),
-            metadata={"capability_id": result.get("id"), "activation_pending": result.get("status") == "queued"},
+            metadata={
+                "capability_id": result.get("id"),
+                "activation_pending": result.get("status") == "queued",
+                "activated_next_turn": result.get("status") == "queued",
+            },
         )

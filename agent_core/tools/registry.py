@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,7 @@ class ToolRegistry:
         self._deferred: dict[str, DeferredTool] = {}
         self._runtime: dict[str, Any] = {}
         self._workspace: str | None = None
+        self._lock = threading.RLock()
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
@@ -133,8 +135,51 @@ class ToolRegistry:
 
     def unregister(self, name: str) -> None:
         """Drop a tool if present (idempotent). Used to hide conditionally-disabled tools."""
-        self._tools.pop(name, None)
-        self._deferred.pop(name, None)
+        with self._lock:
+            self._tools.pop(name, None)
+            self._deferred.pop(name, None)
+            self._sync_session_names()
+
+    def replace_group(
+        self,
+        remove_names: set[str],
+        active: list[Tool],
+        deferred: list[DeferredTool],
+    ) -> None:
+        """Validate and atomically replace one runtime-owned group of tools."""
+
+        new_names = [tool.name for tool in active] + [item.name for item in deferred]
+        duplicates = sorted({name for name in new_names if new_names.count(name) > 1})
+        if duplicates:
+            raise ValueError("Duplicate tools in candidate group: " + ", ".join(duplicates))
+        with self._lock:
+            occupied = (set(self._tools) | set(self._deferred)) - set(remove_names)
+            collisions = sorted(occupied & set(new_names))
+            if collisions:
+                raise ValueError("Tool already registered: " + ", ".join(collisions))
+            tools = {key: value for key, value in self._tools.items() if key not in remove_names}
+            lazy = {key: value for key, value in self._deferred.items() if key not in remove_names}
+            for tool in active:
+                tools[tool.name] = tool
+            for item in deferred:
+                lazy[item.name] = item
+            previous_tools, previous_deferred = self._tools, self._deferred
+            self._tools, self._deferred = tools, lazy
+            try:
+                for tool in active:
+                    if isinstance(tool, RegistryAwareMixin):
+                        tool.bind_registry(self)
+                    self._bind_tool(tool)
+            except Exception:
+                self._tools, self._deferred = previous_tools, previous_deferred
+                self._sync_session_names()
+                raise
+            self._sync_session_names()
+
+    def _sync_session_names(self) -> None:
+        session = self._runtime.get("session")
+        if session is not None:
+            session.registered_tool_names = frozenset(self._tools)
 
     def get(self, name: str) -> Tool:
         try:

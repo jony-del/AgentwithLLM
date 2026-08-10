@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -36,6 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from agent_core.hooks import ExternalHookSpec, HookContext, HookOutcome
 from agent_core.models import Message
+from agent_core.permission_rules import ParsedRule, RuleSet, parse_rule
 from agent_core.providers.base import ProviderConfig
 
 if TYPE_CHECKING:
@@ -46,12 +48,15 @@ if TYPE_CHECKING:
 _MAX_PROJECTED_MESSAGES = 20
 _MAX_PROJECTED_CONTENT = 2000
 
-# The lifecycle events an external adapter can attach to, mapped to the HookPipeline list
-# they belong in. Tool events (Pre/PostToolUse) use the separate sync tool-hook surface and
-# are intentionally excluded here.
+# Official hook events mapped to the HookPipeline collection they belong in.  Events for
+# which Polaris does not yet have a host firing seam are retained in ``unhandled_hooks``
+# rather than being silently discarded; this preserves the manifest faithfully while the
+# two security-critical tool events are wired into ToolExecutor below.
 LIFECYCLE_EVENT_ATTRS: dict[str, str] = {
     "UserPromptSubmit": "user_prompt_hooks",
     "PostSampling": "post_sampling_hooks",
+    "PreToolUse": "external_pre_tool_hooks",
+    "PostToolUse": "external_post_tool_hooks",
     "PreCompact": "pre_compact_hooks",
     "PostCompact": "post_compact_hooks",
     "Stop": "stop_hooks",
@@ -63,6 +68,25 @@ LIFECYCLE_EVENT_ATTRS: dict[str, str] = {
     "PostToolUseFailure": "tool_failure_hooks",
     # Control-path event (R1): programmatic approval of an "ask" permission decision.
     "PermissionRequest": "permission_request_hooks",
+    "Setup": "unhandled_hooks",
+    "UserPromptExpansion": "unhandled_hooks",
+    "PermissionDenied": "unhandled_hooks",
+    "PostToolBatch": "unhandled_hooks",
+    "Notification": "unhandled_hooks",
+    "MessageDisplay": "unhandled_hooks",
+    "TaskCreated": "unhandled_hooks",
+    "TaskCompleted": "unhandled_hooks",
+    "StopFailure": "unhandled_hooks",
+    "TeammateIdle": "unhandled_hooks",
+    "InstructionsLoaded": "unhandled_hooks",
+    "ConfigChange": "unhandled_hooks",
+    "CwdChanged": "unhandled_hooks",
+    "DirectoryAdded": "unhandled_hooks",
+    "FileChanged": "unhandled_hooks",
+    "WorktreeCreate": "unhandled_hooks",
+    "WorktreeRemove": "unhandled_hooks",
+    "Elicitation": "unhandled_hooks",
+    "ElicitationResult": "unhandled_hooks",
 }
 
 
@@ -144,9 +168,39 @@ def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
             spec_out = data.get("hookSpecificOutput")
             if isinstance(spec_out, dict):
                 additional = spec_out.get("additionalContext")
+                permission = spec_out.get("permissionDecision")
+                if permission in {"deny", "block"}:
+                    block = True
+                    decision = "deny"
+                elif permission in {"allow", "ask"}:
+                    decision = str(permission)
+                if spec_out.get("permissionDecisionReason") and not reason:
+                    reason = str(spec_out["permissionDecisionReason"])
+                updated_input = spec_out.get("updatedInput")
+                updated_output = spec_out.get("updatedMCPToolOutput")
+                metadata = {
+                    key: value
+                    for key, value in {
+                        "updated_input": updated_input,
+                        "updated_output": updated_output,
+                    }.items()
+                    if value is not None
+                }
+            else:
+                metadata = {}
             if additional is None:
                 additional = data.get("additionalContext")
-    return HookOutcome(block=block, additional_context=additional, reason=reason, decision=decision)
+        else:
+            metadata = {}
+    else:
+        metadata = {}
+    return HookOutcome(
+        block=block,
+        additional_context=additional,
+        reason=reason,
+        decision=decision,
+        metadata=metadata,
+    )
 
 
 class _ExternalHookAdapter:
@@ -164,12 +218,30 @@ class _ExternalHookAdapter:
         self.event = spec.event
 
     def _matches(self, ctx: HookContext) -> bool:
-        # Matcher only applies where there's a trigger to match (the compaction events);
-        # elsewhere it's ignored. Pipe-separated exact match, mirroring the reference.
-        if self.spec.matcher is None or ctx.trigger is None:
+        if self.spec.matcher is not None and ctx.trigger is not None:
+            patterns = [part.strip() for part in self.spec.matcher.split("|")]
+            if not any(_tool_names_match(part, ctx.trigger) for part in patterns):
+                return False
+        if self.spec.condition is None:
             return True
-        patterns = [part.strip() for part in self.spec.matcher.split("|")]
-        return ctx.trigger in patterns
+        # Claude's ``if`` is valid only on tool events and uses permission-rule
+        # syntax (for example ``Bash(git *)``).  Reuse Polaris' command-aware
+        # matcher after rebasing the Claude tool alias to the actual registered
+        # tool name.  A malformed condition fails closed by not spawning the hook.
+        if ctx.trigger is None or not isinstance(ctx.detail, dict):
+            return False
+        arguments = ctx.detail.get("tool_input")
+        if not isinstance(arguments, dict):
+            return False
+        parsed = parse_rule(self.spec.condition)
+        if parsed is None or not _tool_names_match(parsed.tool_name, ctx.trigger):
+            return False
+        # RuleSet's shell-aware matcher uses Claude's canonical lowercase tool
+        # identifiers (``bash``/``powershell``), so keep that canonical name after
+        # checking it aliases the actual Polaris tool.
+        rule_name = parsed.tool_name.casefold()
+        rule = ParsedRule(rule_name, parsed.content, parsed.source)
+        return RuleSet(allow=[rule]).allow_matches(rule_name, arguments)
 
     async def _invoke(self, ctx: HookContext) -> HookOutcome:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -252,6 +324,34 @@ class _ExternalHookAdapter:
             outcome.decision = "deny"
         return outcome
 
+    async def on_pre_tool(self, ctx: HookContext) -> HookOutcome:
+        return await self._run(ctx)
+
+    async def on_post_tool(self, ctx: HookContext) -> HookOutcome:
+        return await self._run(ctx)
+
+
+_TOOL_ALIASES: dict[str, frozenset[str]] = {
+    "bash": frozenset({"bash", "shell", "shell_command"}),
+    "powershell": frozenset({"powershell", "powershell_command"}),
+    "read": frozenset({"read", "read_text_file"}),
+    "write": frozenset({"write", "write_text_file"}),
+    "edit": frozenset({"edit", "edit_file", "apply_patch"}),
+    "webfetch": frozenset({"webfetch", "web_fetch"}),
+    "websearch": frozenset({"websearch", "web_search"}),
+    "agent": frozenset({"agent", "dispatch", "task"}),
+}
+
+
+def _tool_names_match(expected: str, actual: str) -> bool:
+    left = expected.strip().casefold()
+    right = actual.strip().casefold()
+    if not left:
+        return True
+    if left == right:
+        return True
+    return any(left in aliases and right in aliases for aliases in _TOOL_ALIASES.values())
+
 
 class CommandHookAdapter(_ExternalHookAdapter):
     """Spawn a subprocess, feed projected JSON on stdin, read stdout/exit-code decision."""
@@ -266,6 +366,7 @@ class CommandHookAdapter(_ExternalHookAdapter):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **(self.spec.env or {})},
             )
         else:
             proc = await asyncio.create_subprocess_shell(
@@ -273,6 +374,7 @@ class CommandHookAdapter(_ExternalHookAdapter):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **(self.spec.env or {})},
             )
         try:
             stdout, _stderr = await asyncio.wait_for(

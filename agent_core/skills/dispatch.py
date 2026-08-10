@@ -31,9 +31,15 @@ _READ_ONLY_TOOLS = frozenset(
 )
 
 
-def fork_preset(allowed_tools: "tuple[str, ...] | list[str]") -> str:
+def fork_preset(
+    allowed_tools: "tuple[str, ...] | list[str]",
+    disallowed_tools: "tuple[str, ...] | list[str]" = (),
+) -> str:
     """Pick the sub-agent capability preset (``read_only``/``full``) for a fork skill."""
     if allowed_tools and all(tool in _READ_ONLY_TOOLS for tool in allowed_tools):
+        return "read_only"
+    denied = {item.casefold() for item in disallowed_tools}
+    if {"write", "edit", "edit_file", "write_text_file"} & denied:
         return "read_only"
     return "full"
 

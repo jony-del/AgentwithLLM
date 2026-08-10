@@ -188,6 +188,10 @@ class SessionContext:
     tool_suite: Any | None = None
     registry: Any | None = None
     capability_manager: Any | None = None
+    plugin_workflows: dict[str, str] = field(default_factory=dict)
+    plugin_bin_paths: tuple[str, ...] = ()
+    approved_workflow_digests: set[str] = field(default_factory=set)
+    plugin_skill_invoked: Callable[[str], Awaitable[None]] | None = None
     ask_user: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]] | None = None
     logger: Any | None = None
     audit_event: Callable[[str, dict[str, object]], Awaitable[None]] | None = None

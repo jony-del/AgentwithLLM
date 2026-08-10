@@ -157,6 +157,23 @@ class ToolExecutor:
         should_cancel: Callable[[], bool] | None,
     ) -> _PreparedCall | ToolResult:
         rewritten_call, pre_results = self.hooks.run_pre(tool_call)
+        external_pre = HookOutcome()
+        if self.hooks.external_pre_tool_hooks:
+            external_pre = await self.hooks.run_external_pre_tool(
+                HookContext(
+                    event=HookEvent.PRE_TOOL_USE,
+                    messages=list(messages or []),
+                    trigger=rewritten_call.name,
+                    detail={
+                        "tool_name": rewritten_call.name,
+                        "tool_input": dict(rewritten_call.arguments),
+                        "tool_use_id": rewritten_call.id,
+                    },
+                )
+            )
+            updated_input = external_pre.metadata.get("updated_input")
+            if isinstance(updated_input, dict):
+                rewritten_call = replace(rewritten_call, arguments=dict(updated_input))
         if self.logger:
             await self.logger.write(
                 "tool_pre",
@@ -169,10 +186,12 @@ class ToolExecutor:
                         ),
                     },
                     "pre_results": sanitize_log_payload([asdict(result) for result in pre_results]),
+                    "external_pre": sanitize_log_payload(asdict(external_pre)),
                 },
             )
-        if any(not result.allowed for result in pre_results):
-            result = ToolResult(rewritten_call.name, "Tool rejected by pre hook", ok=False)
+        if any(not result.allowed for result in pre_results) or external_pre.block:
+            reason = external_pre.reason or "Tool rejected by pre hook"
+            result = ToolResult(rewritten_call.name, reason, ok=False)
             return await self._finish(rewritten_call, result, None)
 
         try:
@@ -372,6 +391,28 @@ class ToolExecutor:
         return _PreparedCall(index, rewritten_call, tool, spec, decision.reason)
 
     async def _post_and_finish(self, prepared: _PreparedCall, result: ToolResult) -> ToolResult:
+        if result.ok and self.hooks.external_post_tool_hooks:
+            outcome = await self.hooks.run_external_post_tool(
+                HookContext(
+                    event=HookEvent.POST_TOOL_USE,
+                    messages=[],
+                    trigger=prepared.tool_call.name,
+                    detail={
+                        "tool_name": prepared.tool_call.name,
+                        "tool_input": dict(prepared.tool_call.arguments),
+                        "tool_use_id": prepared.tool_call.id,
+                        "tool_response": result.content[:50_000],
+                    },
+                )
+            )
+            updated_output = outcome.metadata.get("updated_output")
+            if updated_output is not None:
+                result = replace(result, content=str(updated_output))
+            if outcome.additional_context:
+                result = replace(
+                    result,
+                    content=result.content + "\n\n[PostToolUse hook]\n" + outcome.additional_context,
+                )
         result = self.hooks.run_post(prepared.tool_call, result)
         return await self._finish(prepared.tool_call, result, prepared.reason, tool=prepared.tool)
 

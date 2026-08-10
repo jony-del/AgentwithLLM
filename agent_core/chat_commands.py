@@ -15,12 +15,14 @@ pieces (never ``cli``) so there is no import cycle.
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import replace
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from agent_core import tokens
@@ -466,7 +468,62 @@ async def _cmd_plugin(
     action = parts[0].casefold() if parts else "manage"
     rest = parts[1:]
     try:
-        if action in {"manage", "list"}:
+        if action == "status":
+            plugin_state = manager.state_status()
+            print(
+                f"Plugin schema={plugin_state.schema_version}; reset_required={plugin_state.reset_required}; "
+                f"installed={len(manager.records())}; enabled={len(manager.enabled_ids())}."
+            )
+            for target in plugin_state.targets:
+                print(f"  legacy: {target}")
+        elif action == "errors":
+            path = manager.audit.path
+            if not path.is_file():
+                print("No capability errors recorded.")
+            else:
+                failures = []
+                for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    detail = item.get("detail", {})
+                    if item.get("event") == "activation_failed" or (
+                        item.get("event") == "catalog_sync" and detail.get("result") == "failed"
+                    ):
+                        failures.append(item)
+                    if len(failures) >= 20:
+                        break
+                print(
+                    "No capability errors recorded."
+                    if not failures else json.dumps(failures, ensure_ascii=False, indent=2)
+                )
+        elif action == "reset":
+            preview = manager.reset_preview()
+            message = "Clear managed plugin state?\n" + "\n".join(f"  - {item}" for item in preview)
+            confirmed = await asyncio.to_thread(ui.confirm_action, message)
+            if not confirmed:
+                print("Plugin reset was not confirmed.")
+                return ChatTurn()
+            removed = await asyncio.to_thread(manager.reset_state)
+            from agent_core.plugins import reload_plugins
+
+            await asyncio.to_thread(reload_plugins, agent)
+            print(f"Plugin state reset ({len(removed)} managed targets).")
+        elif action in {"output-style", "theme"}:
+            values = (
+                agent.plugin_output_styles if action == "output-style" else agent.plugin_themes
+            )
+            if not rest:
+                print(
+                    f"Available plugin {action}s: "
+                    + (", ".join(sorted(values)) if values else "(none)")
+                )
+            else:
+                name = "" if rest[0].casefold() in {"off", "none", "default"} else rest[0]
+                agent.select_plugin_presentation(action, name)
+                print(f"Plugin {action} set to {name or 'default'}.")
+        elif action in {"manage", "list"}:
             enabled = set(manager.enabled_ids())
             records = manager.records()
             if not records:
@@ -483,15 +540,41 @@ async def _cmd_plugin(
         elif action == "install":
             if not rest:
                 raise PluginError("usage: /plugin install <path|name> [marketplace]")
-            marketplace = rest[1] if len(rest) > 1 else "local"
-            record = await asyncio.to_thread(manager.install, rest[0], marketplace)
+            identifier = rest[0]
+            if "@" in identifier and len(rest) == 1 and not Path(identifier).exists():
+                plugin_name, marketplace = identifier.rsplit("@", 1)
+            else:
+                plugin_name = identifier
+                marketplace = rest[1] if len(rest) > 1 else "local"
+            if marketplace != "local":
+                plan = await asyncio.to_thread(
+                    manager.dependency_plan, plugin_name, marketplace
+                )
+            else:
+                plan = []
+            if len(plan) > 1:
+                summary = ", ".join(str(item["plugin_id"]) for item in plan[:-1])
+                confirmed = await asyncio.to_thread(
+                    ui.confirm_action,
+                    f"Install dependency graph for {plugin_name}@{marketplace}: {summary}?",
+                )
+                if not confirmed:
+                    print("Plugin dependency installation was not confirmed.")
+                    return ChatTurn()
+                record = await asyncio.to_thread(manager.install_dependency_plan, plan)
+            else:
+                record = await asyncio.to_thread(manager.install, plugin_name, marketplace)
             allow_enable = True
             if manager.executable_components(record.plugin_id):
                 allow_enable = await asyncio.to_thread(
                     ui.confirm_action,
                     f"Enable executable hooks/MCP components from {record.plugin_id}?",
                 )
-            if allow_enable:
+            default_enabled = not (
+                isinstance(record.manifest, dict)
+                and record.manifest.get("defaultEnabled") is False
+            )
+            if allow_enable and default_enabled:
                 await asyncio.to_thread(
                     manager.set_enabled,
                     record.plugin_id,
@@ -526,13 +609,38 @@ async def _cmd_plugin(
                 scope=scope,
             )
             print(f"{rest[0]} {action}d for {scope}; run /reload-plugins to apply.")
+        elif action == "update":
+            if not rest:
+                raise PluginError("usage: /plugin update <plugin@marketplace>")
+            record = await asyncio.to_thread(manager.update, rest[0])
+            print(f"Updated {record.plugin_id} to {record.version or record.commit or record.integrity[:12]}.")
+        elif action == "details":
+            if not rest:
+                raise PluginError("usage: /plugin details <plugin@marketplace>")
+            print(json.dumps(manager.details(rest[0]), ensure_ascii=False, indent=2))
+        elif action == "prune":
+            dry_run = "--dry-run" in rest
+            orphans = await asyncio.to_thread(manager.prune, dry_run=dry_run)
+            print("Nothing to prune." if not orphans else ("Would prune: " if dry_run else "Pruned: ") + ", ".join(orphans))
+        elif action == "configure":
+            if len(rest) < 2:
+                raise PluginError("usage: /plugin configure <plugin@marketplace> key=value ...")
+            values = dict(item.split("=", 1) for item in rest[1:] if "=" in item)
+            if len(values) != len(rest) - 1:
+                raise PluginError("plugin configuration values must use key=value")
+            await asyncio.to_thread(manager.configure, rest[0], values)
+            print(f"Configured {rest[0]} in user settings.")
         elif action == "validate":
             if not rest:
                 raise PluginError("usage: /plugin validate <path|plugin@marketplace>")
             installed = manager.records().get(rest[0])
             target = installed.path if installed is not None else rest[0]
-            manifest = await asyncio.to_thread(validate_plugin, target)
+            manifest = await asyncio.to_thread(
+                validate_plugin, target, None, strict_warnings="--strict" in rest[1:]
+            )
             print(f"Valid plugin: {manifest['name']} ({target})")
+            for warning in manifest.get("_warnings", []):
+                print(f"  warning: {warning}")
         elif action == "marketplace":
             sub = rest[0].casefold() if rest else "list"
             tail = rest[1:]
@@ -542,9 +650,13 @@ async def _cmd_plugin(
                     print("No marketplaces configured.")
                 for name, source in sorted(markets.items()):
                     print(f"  {name}  {source}")
-            elif sub == "add" and len(tail) >= 2:
-                await asyncio.to_thread(manager.marketplace_add, tail[0], tail[1])
-                print(f"Marketplace {tail[0]} added.")
+            elif sub == "add" and tail:
+                if len(tail) >= 2:
+                    await asyncio.to_thread(manager.marketplace_add, tail[0], tail[1])
+                    added_name = tail[0]
+                else:
+                    added_name = await asyncio.to_thread(manager.marketplace_add_source, tail[0])
+                print(f"Marketplace {added_name} added.")
             elif sub == "remove" and tail:
                 await asyncio.to_thread(manager.marketplace_remove, tail[0])
                 print(f"Marketplace {tail[0]} removed.")
@@ -557,7 +669,7 @@ async def _cmd_plugin(
                 )
         else:
             raise PluginError(
-                "usage: /plugin <install|manage|uninstall|enable|disable|validate|marketplace>"
+                "usage: /plugin <status|errors|reset|output-style|theme|install|update|manage|details|uninstall|enable|disable|validate|prune|configure|marketplace>"
             )
     except (OSError, PluginError) as exc:
         print(f"Plugin command failed: {exc}")
@@ -914,6 +1026,8 @@ async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Me
         print(f"Unknown command: /{parsed.name}. Try /skills to list skills or /help.")
         return ChatTurn()
 
+    if agent.session.plugin_skill_invoked is not None:
+        await agent.session.plugin_skill_invoked(skill.name)
     ctx = SkillPromptContext.from_session(agent.session, transcript=agent.transcript)
     prompt = await build_skill_prompt(skill, parsed.args, ctx)
     if skill.context is not SkillContext.FORK:
@@ -928,14 +1042,18 @@ async def dispatch(task: str, agent: "ReActAgent", ui: AgentUI, history: list[Me
         if skill.memory != "none":
             answer = await factory_call(
                 prompt,
-                fork_preset(skill.allowed_tools),
+                fork_preset(skill.allowed_tools, skill.disallowed_tools),
                 skill.model,
                 "shared",
                 skill.agent_key or skill.name,
                 skill.memory,
             )
         else:
-            answer = await factory_call(prompt, fork_preset(skill.allowed_tools), skill.model)
+            answer = await factory_call(
+                prompt,
+                fork_preset(skill.allowed_tools, skill.disallowed_tools),
+                skill.model,
+            )
     except Exception as exc:  # noqa: BLE001 - a skill failure must not tear down the chat
         print(f"[error] skill /{skill.name} failed: {type(exc).__name__}: {exc}")
         return ChatTurn()

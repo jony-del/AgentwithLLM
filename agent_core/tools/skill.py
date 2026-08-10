@@ -135,6 +135,10 @@ class SkillTool(SessionAwareMixin, Tool):
                 metadata={"error_type": "NotFound"},
             )
 
+        monitor_callback = self.session.plugin_skill_invoked
+        if monitor_callback is not None:
+            await monitor_callback(skill.name)
+
         prompt = await build_skill_prompt(skill, args, SkillPromptContext.from_session(self.session))
         if skill.context is SkillContext.FORK:
             factory = self.session.subagent_factory
@@ -145,10 +149,29 @@ class SkillTool(SessionAwareMixin, Tool):
                     ok=False,
                     metadata={"error_type": "Unavailable"},
                 )
-            preset = fork_preset(skill.allowed_tools)
+            remote_untrusted = skill.trust_tier in {"community", "verified_publisher"}
+            preset = (
+                "read_only"
+                if remote_untrusted and not skill.allowed_tools
+                else fork_preset(skill.allowed_tools, skill.disallowed_tools)
+            )
+            denied = {item for item in skill.disallowed_tools}
+            exact_tools = tuple(
+                item for item in skill.allowed_tools if item not in denied
+            ) if remote_untrusted else None
             try:
                 factory_call = cast(Callable[..., Awaitable[str]], factory)
-                if skill.memory != "none":
+                if remote_untrusted:
+                    answer = await factory_call(
+                        prompt,
+                        preset,
+                        skill.model,
+                        "shared",
+                        skill.agent_key or skill.name,
+                        skill.memory,
+                        exact_tools,
+                    )
+                elif skill.memory != "none":
                     answer = await factory_call(
                         prompt,
                         preset,

@@ -40,6 +40,11 @@ def _coerce_memory(value: object) -> str:
     return memory if memory in {"none", "user", "project", "local"} else "none"
 
 
+def _coerce_positive_int(value: object) -> int | None:
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
 def load_skill_file(path: Path) -> Skill | None:
     """Parse one skill file into a :class:`Skill`, or ``None`` if unusable.
 
@@ -66,6 +71,8 @@ def load_skill_file(path: Path) -> Skill | None:
         when_to_use=str(meta.get("when_to_use") or "").strip(),
         argument_hint=str(meta.get("argument_hint") or "").strip(),
         allowed_tools=_coerce_tuple(meta.get("allowed_tools")),
+        disallowed_tools=_coerce_tuple(meta.get("disallowed_tools")),
+        preload_skills=_coerce_tuple(meta.get("skills")),
         capabilities=_coerce_tuple(meta.get("capabilities")),
         hooks=_coerce_tuple(meta.get("hooks")),
         model=(str(meta.get("model")).strip() or None) if meta.get("model") else None,
@@ -74,6 +81,12 @@ def load_skill_file(path: Path) -> Skill | None:
         disable_model_invocation=meta.get("disable_model_invocation", False) is True,
         context=_coerce_context(meta.get("context")),
         memory=_coerce_memory(meta.get("memory")),
+        effort=(str(meta.get("effort")).strip() or None) if meta.get("effort") else None,
+        permission_mode=(str(meta.get("permission_mode")).strip() or None)
+        if meta.get("permission_mode") else None,
+        isolation=(str(meta.get("isolation")).strip() or None) if meta.get("isolation") else None,
+        background=meta.get("background", False) is True,
+        max_turns=_coerce_positive_int(meta.get("max_turns")),
         agent_key=name,
         source_path=path,
     )

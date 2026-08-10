@@ -112,9 +112,15 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
                     raise RuntimeError("sandbox returned a shell-string command; explicit argv is required")
             if not isinstance(argv, (list, tuple)):
                 raise RuntimeError("sandbox returned invalid argv")
+            child_env = None
+            if self.session.plugin_bin_paths:
+                child_env = dict(os.environ)
+                child_env["PATH"] = os.pathsep.join(
+                    [*self.session.plugin_bin_paths, child_env.get("PATH", "")]
+                )
             task = await supervisor.start(
                 self.dialect, command, self.session.workspace,
-                argv=[str(item) for item in argv], timeout=timeout,
+                argv=[str(item) for item in argv], timeout=timeout, env=child_env,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             return ToolResult(self.name, f"{self.dialect} failed to start: {exc}", ok=False)
