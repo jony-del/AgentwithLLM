@@ -7,9 +7,10 @@ from agent_core.hooks import HookResult
 from agent_core.memory import MemoryConfig
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.providers.fake import FakeProvider
+from agent_core.providers.base import ProviderCapabilities
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.storage import JSONLRunLogger
-from agent_core.tools.base import ConcurrencySpec, Tool
+from agent_core.tools.base import ConcurrencySpec, ExecutionSafety, Tool
 from agent_core.tools.registry import ToolRegistry
 from agent_core.ui import AgentUI
 
@@ -70,6 +71,7 @@ class _EarlySignalTool(Tool):
     description = "Signal deterministic execution during a provider stream."
     input_schema = {"type": "object", "properties": {}}
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     def __init__(self, completed: asyncio.Event) -> None:
         self.completed = completed
@@ -85,6 +87,8 @@ class _EarlySignalTool(Tool):
 
 
 class _StreamingOverlapProvider:
+    capabilities = ProviderCapabilities("explicit")
+
     def __init__(self, tool_completed: asyncio.Event) -> None:
         self.tool_completed = tool_completed
         self.calls = 0
@@ -95,9 +99,29 @@ class _StreamingOverlapProvider:
         if self.calls == 1:
             call = ToolCall("early_signal", {}, id="toolu_early")
             assert stream is not None
-            stream.on_tool_call_complete(call)
+            stream.on_tool_call_complete(call, ordinal=0)
             await asyncio.wait_for(self.tool_completed.wait(), timeout=1)
             self.observed_overlap = True
+            return LLMResult("working", tool_calls=[call], stop_reason="tool_use")
+        return LLMResult("done", stop_reason="end")
+
+
+class _UndeclaredBoundaryProvider:
+    """Legacy callback support must not grant speculative admission."""
+
+    def __init__(self, tool_completed: asyncio.Event) -> None:
+        self.tool_completed = tool_completed
+        self.calls = 0
+        self.observed_overlap = False
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.calls += 1
+        if self.calls == 1:
+            call = ToolCall("early_signal", {}, id="toolu_terminal")
+            assert stream is not None
+            stream.on_tool_call_complete(call, ordinal=0)
+            await asyncio.sleep(0.03)
+            self.observed_overlap = self.tool_completed.is_set()
             return LLMResult("working", tool_calls=[call], stop_reason="tool_use")
         return LLMResult("done", stop_reason="end")
 
@@ -107,6 +131,8 @@ class _CancellableEarlyTool(Tool):
     description = "Wait until the surrounding provider stream fails."
     input_schema = {"type": "object", "properties": {}}
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
+    safely_cancellable = True
 
     def __init__(self, started: asyncio.Event, cancelled: asyncio.Event) -> None:
         self.started = started
@@ -125,13 +151,15 @@ class _CancellableEarlyTool(Tool):
 
 
 class _FailingAfterToolProvider:
+    capabilities = ProviderCapabilities("explicit")
+
     def __init__(self, tool_started: asyncio.Event) -> None:
         self.tool_started = tool_started
 
     async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
         call = ToolCall("cancellable_early", {}, id="toolu_cancel")
         assert stream is not None
-        stream.on_tool_call_complete(call)
+        stream.on_tool_call_complete(call, ordinal=0)
         await asyncio.wait_for(self.tool_started.wait(), timeout=1)
         raise RuntimeError("stream failed")
 
@@ -171,6 +199,32 @@ async def test_react_executes_complete_tool_call_before_stream_returns(tmp_path:
     assistant = next(message for message in result.messages if message.metadata.get("tool_calls"))
     tool_message = next(message for message in result.messages if message.role == "tool")
     assert tool_message.metadata["tool_call_id"] == assistant.metadata["tool_calls"][0]["id"]
+
+
+async def test_undeclared_provider_boundary_degrades_to_terminal_only(tmp_path: Path) -> None:
+    completed = asyncio.Event()
+    provider = _UndeclaredBoundaryProvider(completed)
+    tool = _EarlySignalTool(completed)
+    registry = ToolRegistry()
+    registry.register(tool)
+    agent = ReActAgent(
+        provider,
+        ReActConfig(
+            run_dir=str(tmp_path),
+            session_dir="",
+            permission="auto",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False,
+            git_context=False,
+        ),
+        tools=registry,
+    )
+
+    result = await agent.run("run after terminal response")
+
+    assert result.answer == "done"
+    assert provider.observed_overlap is False
+    assert tool.calls == 1
 
 
 async def test_react_cleans_up_early_tool_when_provider_stream_fails(tmp_path: Path) -> None:

@@ -274,9 +274,11 @@ class _ToolCallRecordingStream(_RecordingStream):
     def __init__(self) -> None:
         super().__init__()
         self.tool_calls: list[ToolCall] = []
+        self.ordinals: list[int | None] = []
 
-    def on_tool_call_complete(self, tool_call: ToolCall) -> None:
+    def on_tool_call_complete(self, tool_call: ToolCall, ordinal: int | None = None) -> None:
         self.tool_calls.append(tool_call)
+        self.ordinals.append(ordinal)
 
 
 class _FakeStreamResponse:
@@ -350,6 +352,57 @@ async def test_stream_notifies_when_tool_block_is_complete() -> None:
     await provider._consume_stream(_FakeStreamResponse(raw), sink)
 
     assert sink.tool_calls == [ToolCall("echo", {"text": "hi"}, id="t1")]
+    assert sink.ordinals == [0]
+
+
+async def test_stream_silent_eof_does_not_prove_termination() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    sink = _ToolCallRecordingStream()
+    raw = _sse_lines(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "echo"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"text":"hi"}'}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+    )
+
+    result = await provider._consume_stream(_FakeStreamResponse(raw), sink)
+
+    assert result.tool_calls == [ToolCall("echo", {"text": "hi"}, id="t1")]
+    assert result.termination_proven is False
+    assert result.termination_event is None
+
+
+async def test_stream_requires_valid_stop_reason_with_message_stop() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    raw = _sse_lines(
+        {"type": "message_delta", "delta": {"stop_reason": "protocol_drift"}},
+        {"type": "message_stop"},
+    )
+
+    result = await provider._consume_stream(_FakeStreamResponse(raw), _RecordingStream())
+
+    assert result.termination_proven is False
+
+
+async def test_interleaved_tool_blocks_keep_model_output_ordinals() -> None:
+    provider = ClaudeProvider(api_key="test-key")
+    sink = _ToolCallRecordingStream()
+    raw = _sse_lines(
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "echo"}},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t2", "name": "echo"}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"text":"two"}'}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"text":"one"}'}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+        {"type": "message_stop"},
+    )
+
+    result = await provider._consume_stream(_FakeStreamResponse(raw), sink)
+
+    assert [call.id for call in sink.tool_calls] == ["t2", "t1"]
+    assert sink.ordinals == [1, 0]
+    assert [call.id for call in result.tool_calls] == ["t1", "t2"]
 
 
 async def test_stream_error_event_raises_transient() -> None:

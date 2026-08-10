@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from agent_core.models import LLMContextTooLongError, LLMTransientError, Message, ToolCall
-from agent_core.providers.base import ProviderConfig
+from agent_core.providers.base import ProviderConfig, StreamedToolCall
 from agent_core.providers.openai_responses import OpenAIResponsesProvider
 
 
@@ -60,9 +60,20 @@ class _ToolCallRecorder(_Recorder):
     def __init__(self) -> None:
         super().__init__()
         self.tool_calls: list[ToolCall] = []
+        self.ordinals: list[int | None] = []
 
-    def on_tool_call_complete(self, tool_call: ToolCall) -> None:
+    def on_tool_call_complete(self, tool_call: ToolCall, ordinal: int | None = None) -> None:
         self.tool_calls.append(tool_call)
+        self.ordinals.append(ordinal)
+
+
+class _RichToolCallRecorder(_Recorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[StreamedToolCall] = []
+
+    def on_streamed_tool_call(self, event: StreamedToolCall) -> None:
+        self.events.append(event)
 
 
 # --- non-streaming request/response -----------------------------------------
@@ -523,6 +534,55 @@ async def test_streaming_function_arguments() -> None:
     assert result.tool_calls[0].arguments == {"text": "hi"}
 
 
+async def test_stream_silent_eof_does_not_prove_termination() -> None:
+    body = _sse(
+        {"type": "response.output_item.added", "output_index": 0, "item": _call("call_1", arguments="")},
+        {"type": "response.function_call_arguments.done", "output_index": 0, "arguments": '{"text":"hi"}'},
+        {"type": "response.output_item.done", "output_index": 0, "item": _call("call_1", arguments='{"text":"hi"}')},
+    )
+
+    result = await _provider(lambda _request: httpx.Response(200, content=body)).complete(
+        [Message("user", "go")],
+        [_TOOL],
+        ProviderConfig(model="gpt-test", stream=True),
+        stream=_ToolCallRecorder(),
+    )
+
+    assert result.tool_calls
+    assert result.termination_proven is False
+
+
+async def test_official_item_id_and_output_index_share_one_identity() -> None:
+    item = {
+        "type": "function_call",
+        "id": "fc_item_1",
+        "call_id": "call_1",
+        "name": "echo",
+        "arguments": '{"text":"hi"}',
+    }
+    body = _sse(
+        {"type": "response.output_item.added", "output_index": 3, "item": {**item, "arguments": ""}},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc_item_1", "output_index": 3, "delta": '{"text":'},
+        {"type": "response.function_call_arguments.done", "item_id": "fc_item_1", "output_index": 3, "arguments": '{"text":"hi"}'},
+        {"type": "response.output_item.done", "output_index": 3, "item": item},
+        {"type": "response.completed", "response": _response([item])},
+    )
+    recorder = _RichToolCallRecorder()
+
+    result = await _provider(lambda _request: httpx.Response(200, content=body)).complete(
+        [Message("user", "go")],
+        [_TOOL],
+        ProviderConfig(model="gpt-test", stream=True),
+        stream=recorder,
+    )
+
+    assert result.termination_proven is True
+    assert len(recorder.events) == 1
+    assert recorder.events[0].call_id == "call_1"
+    assert recorder.events[0].provider_item_id == "fc_item_1"
+    assert recorder.events[0].ordinal == 0
+
+
 async def test_streaming_function_call_completion_is_emitted_once() -> None:
     final = _response([_call("call_1", arguments='{\"text\":\"hi\"}')])
     body = _sse(
@@ -541,6 +601,34 @@ async def test_streaming_function_call_completion_is_emitted_once() -> None:
     )
 
     assert recorder.tool_calls == [ToolCall("echo", {"text": "hi"}, id="call_1")]
+    assert recorder.ordinals == [0]
+
+
+async def test_interleaved_function_calls_keep_model_output_ordinals() -> None:
+    first = _call("call_1", arguments='{"text":"one"}')
+    second = _call("call_2", arguments='{"text":"two"}')
+    final = _response([first, second])
+    body = _sse(
+        {"type": "response.output_item.added", "output_index": 0, "item": _call("call_1", arguments="")},
+        {"type": "response.output_item.added", "output_index": 1, "item": _call("call_2", arguments="")},
+        {"type": "response.function_call_arguments.done", "output_index": 1, "arguments": '{"text":"two"}'},
+        {"type": "response.output_item.done", "output_index": 1, "item": second},
+        {"type": "response.function_call_arguments.done", "output_index": 0, "arguments": '{"text":"one"}'},
+        {"type": "response.output_item.done", "output_index": 0, "item": first},
+        {"type": "response.completed", "response": final},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    recorder = _ToolCallRecorder()
+    result = await _provider(handler).complete(
+        [Message("user", "go")], [_TOOL], ProviderConfig(model="gpt-test", stream=True), stream=recorder
+    )
+
+    assert [call.id for call in recorder.tool_calls] == ["call_2", "call_1"]
+    assert recorder.ordinals == [1, 0]
+    assert [call.id for call in result.tool_calls] == ["call_1", "call_2"]
 
 
 async def test_streaming_cancel_interrupts_promptly() -> None:

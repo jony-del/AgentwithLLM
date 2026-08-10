@@ -330,6 +330,33 @@ streaming_tool_execution = true # start complete tool calls while the model keep
 max_api_concurrency = 8        # max simultaneous in-flight LLM API calls
 api_rate_limit_per_min = 0     # sustained requests/min ceiling; 0 = unlimited
 
+# --- Trusted tool execution policies ---------------------------------------
+# ToolRisk does not authorize execution while a response is still streaming.
+# Every unannotated/third-party tool is final_only + exclusive. Trusted local
+# configuration may tighten or explicitly upgrade a qualified tool. These entries
+# are privilege-widening and therefore pass through the repository TOFU gate.
+# Resource keys must be static or extracted from one scalar argument path; a missing
+# argument, malformed template, or transactional policy without a backend degrades
+# to final_only + exclusive.
+#
+# [tools.execution_policies."local__lookup"]
+# safety = "speculative_safe"       # speculative_safe | transactional | final_only
+# exclusive = false
+# safely_cancellable = true
+# execution_timeout = 30.0           # required bound for early work that cannot cancel safely
+#
+# [[tools.execution_policies."local__lookup".resources]]
+# namespace = "fs"
+# argument = "path"                 # dotted paths such as request.path are accepted
+# mode = "read"                     # read | write
+# subtree = false
+# requires_success = true
+#
+# [tools.execution_policies."local__edit"]
+# safety = "transactional"
+# transaction_backend = "workspace"
+# exclusive = false
+
 # --- MCP servers (Model Context Protocol) -----------------------------------
 # Optional. Each [mcp.servers.<name>] connects one MCP server and exposes its tools
 # to the agent as "<name>__<tool>" (e.g. fs__read_file). The MCP SDK and the official

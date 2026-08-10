@@ -33,7 +33,14 @@ from agent_core.permission_types import (
     PermissionResult,
 )
 from agent_core.sandbox import SandboxAwareMixin
-from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin, coerce_int
+from agent_core.tools.base import (
+    ConcurrencySpec,
+    ExecutionSafety,
+    ResourceLock,
+    Tool,
+    WorkspacePathMixin,
+    coerce_int,
+)
 from agent_core.tools.catalog import builtin_tool
 
 
@@ -142,6 +149,7 @@ class ListDirTool(WorkspacePathMixin, Tool):
         "required": [],
     }
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -149,7 +157,9 @@ class ListDirTool(WorkspacePathMixin, Tool):
         return ordinary_read_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
+        return ConcurrencySpec((self.workspace_lock(
+            arguments.get("path", "."), "read", subtree=True, requires_success=True
+        ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         target = self.resolve_workspace_path(arguments.get("path", "."))
@@ -181,6 +191,8 @@ class EditFileTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+    execution_safety = ExecutionSafety.TRANSACTIONAL
+    transaction_backend = "workspace"
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -239,6 +251,7 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         "required": ["pattern"],
     }
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -246,7 +259,9 @@ class SearchTextTool(WorkspacePathMixin, Tool):
         return ordinary_read_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
+        return ConcurrencySpec((self.workspace_lock(
+            arguments.get("path", "."), "read", subtree=True, requires_success=True
+        ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
@@ -493,6 +508,20 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
     }
     risk = ToolRisk.DANGEROUS
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec(
+            (
+                ResourceLock(
+                    "fs",
+                    str(self.workspace.resolve()),
+                    "read",
+                    subtree=True,
+                    requires_success=True,
+                ),
+                ResourceLock("env", "process", "read", requires_success=True),
+            )
+        )
+
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
     ) -> PermissionResult:
@@ -609,6 +638,7 @@ class EchoTool(Tool):
         "required": ["text"],
     }
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec()
@@ -634,6 +664,7 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
         "required": ["path"],
     }
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -641,7 +672,9 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
         return ordinary_read_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        return ConcurrencySpec((self.workspace_lock(arguments["path"], "read"),))
+        return ConcurrencySpec((self.workspace_lock(
+            arguments["path"], "read", requires_success=True
+        ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
@@ -691,6 +724,8 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+    execution_safety = ExecutionSafety.TRANSACTIONAL
+    transaction_backend = "workspace"
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext

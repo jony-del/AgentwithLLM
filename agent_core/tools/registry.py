@@ -4,10 +4,20 @@ import builtins
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_core.tools.adapters import ToolAdapter
-from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.base import (
+    ConcurrencySpec,
+    ExecutionSafety,
+    ResourceLock,
+    Tool,
+    ToolExecutionPolicy,
+    WorkspacePathMixin,
+)
+
+if TYPE_CHECKING:
+    from agent_core.tool_config import ToolPolicyConfig
 
 
 @dataclass(slots=True)
@@ -34,6 +44,8 @@ class ToolRegistry:
         self._deferred: dict[str, DeferredTool] = {}
         self._runtime: dict[str, Any] = {}
         self._workspace: str | None = None
+        self._policy_overrides: dict[str, ToolPolicyConfig] = {}
+        self._policy_overrides_trusted = False
         self._lock = threading.RLock()
 
     def register(self, tool: Tool) -> None:
@@ -193,6 +205,88 @@ class ToolRegistry:
     def schemas_for_llm(self) -> builtins.list[dict[str, object]]:
         return [tool.schema_for_llm() for tool in self.list()]
 
+    def set_policy_overrides(
+        self,
+        policies: dict[str, ToolPolicyConfig],
+        *,
+        trusted: bool = True,
+    ) -> None:
+        """Install local execution policies.
+
+        Untrusted configuration may still make a policy more conservative, but it
+        cannot upgrade a tool into speculative or transactional execution.
+        """
+
+        self._policy_overrides = dict(policies)
+        self._policy_overrides_trusted = bool(trusted)
+
+    @staticmethod
+    def _argument_value(arguments: dict[str, Any], dotted: str) -> object:
+        value: object = arguments
+        for part in dotted.split("."):
+            if not isinstance(value, dict) or part not in value:
+                raise KeyError(dotted)
+            value = value[part]
+        if isinstance(value, (dict, list)) or value is None:
+            raise ValueError(f"resource argument {dotted!r} must be a scalar")
+        return value
+
+    def execution_policy(self, tool: Tool, arguments: dict[str, Any]) -> ToolExecutionPolicy:
+        declared = tool.execution_policy(arguments)
+        override = self._policy_overrides.get(tool.name)
+        if override is None:
+            return declared
+        if not self._policy_overrides_trusted:
+            rank = {
+                ExecutionSafety.SPECULATIVE_SAFE: 0,
+                ExecutionSafety.TRANSACTIONAL: 1,
+                ExecutionSafety.FINAL_ONLY: 2,
+            }
+            if rank[override.safety] <= rank[declared.safety]:
+                return declared
+            return ToolExecutionPolicy(safety=override.safety)
+        try:
+            locks: list[ResourceLock] = []
+            for template in override.resources:
+                raw_key = (
+                    template.key
+                    if template.key is not None
+                    else self._argument_value(arguments, str(template.argument))
+                )
+                key = str(raw_key)
+                if template.namespace == "fs" and self._workspace is not None:
+                    from pathlib import Path
+
+                    path = Path(key)
+                    key = str((Path(self._workspace) / path).resolve() if not path.is_absolute() else path.resolve())
+                locks.append(
+                    ResourceLock(
+                        template.namespace,
+                        key,
+                        template.mode,
+                        subtree=template.subtree,
+                        requires_success=template.requires_success,
+                    )
+                )
+            idempotency_key = None
+            if override.idempotency_argument:
+                idempotency_key = str(
+                    self._argument_value(arguments, override.idempotency_argument)
+                )
+            if override.safety is ExecutionSafety.TRANSACTIONAL and not override.transaction_backend:
+                raise ValueError("transactional policy has no backend")
+            return ToolExecutionPolicy(
+                safety=override.safety,
+                concurrency=ConcurrencySpec(tuple(locks), exclusive=override.exclusive),
+                transaction_backend=override.transaction_backend,
+                idempotency_key=idempotency_key,
+                safely_cancellable=override.safely_cancellable,
+                execution_timeout=override.execution_timeout,
+            )
+        except (KeyError, TypeError, ValueError):
+            # A malformed/missing template must never make a call less constrained.
+            return ToolExecutionPolicy()
+
     def deferred(self) -> builtins.list[DeferredTool]:
         return list(self._deferred.values())
 
@@ -229,3 +323,7 @@ class ToolRegistry:
         for tool in self._tools.values():
             if isinstance(tool, WorkspacePathMixin):
                 tool.bind_workspace(workspace)
+
+    @property
+    def workspace(self) -> str | None:
+        return self._workspace

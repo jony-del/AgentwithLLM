@@ -7,6 +7,80 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+from agent_core.tools.base import ExecutionSafety, LockMode
+
+
+@dataclass(frozen=True, slots=True)
+class ResourcePolicyConfig:
+    namespace: str
+    mode: LockMode
+    key: str | None = None
+    argument: str | None = None
+    subtree: bool = False
+    requires_success: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ToolPolicyConfig:
+    safety: ExecutionSafety
+    exclusive: bool = True
+    transaction_backend: str | None = None
+    resources: tuple[ResourcePolicyConfig, ...] = ()
+    idempotency_argument: str | None = None
+    safely_cancellable: bool = False
+    execution_timeout: float = 30.0
+
+
+def _parse_tool_policies(raw: object) -> dict[str, ToolPolicyConfig]:
+    if not isinstance(raw, dict):
+        return {}
+    policies: dict[str, ToolPolicyConfig] = {}
+    for qualified_name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            safety = ExecutionSafety(str(value.get("safety", "final_only")).casefold())
+        except ValueError:
+            continue
+        resources: list[ResourcePolicyConfig] = []
+        raw_resources = value.get("resources", [])
+        if isinstance(raw_resources, list):
+            for resource in raw_resources:
+                if not isinstance(resource, dict):
+                    continue
+                namespace = str(resource.get("namespace", "")).strip()
+                mode = str(resource.get("mode", "")).casefold()
+                key = resource.get("key")
+                argument = resource.get("argument")
+                if not namespace or mode not in {"read", "write"}:
+                    continue
+                if (key is None) == (argument is None):
+                    continue
+                resources.append(
+                    ResourcePolicyConfig(
+                        namespace=namespace,
+                        mode=mode,  # type: ignore[arg-type]
+                        key=str(key) if key is not None else None,
+                        argument=str(argument) if argument is not None else None,
+                        subtree=bool(resource.get("subtree", False)),
+                        requires_success=bool(resource.get("requires_success", False)),
+                    )
+                )
+        policies[str(qualified_name)] = ToolPolicyConfig(
+            safety=safety,
+            exclusive=bool(value.get("exclusive", True)),
+            transaction_backend=(
+                str(value["transaction_backend"]) if value.get("transaction_backend") else None
+            ),
+            resources=tuple(resources),
+            idempotency_argument=(
+                str(value["idempotency_argument"]) if value.get("idempotency_argument") else None
+            ),
+            safely_cancellable=bool(value.get("safely_cancellable", False)),
+            execution_timeout=max(0.1, float(value.get("execution_timeout", 30.0))),
+        )
+    return policies
+
 
 @dataclass(slots=True)
 class BashConfig:
@@ -119,6 +193,7 @@ class ToolSuiteConfig:
     notebook: NotebookToolConfig = field(default_factory=NotebookToolConfig)
     worktree: WorktreeToolConfig = field(default_factory=WorktreeToolConfig)
     scheduler: SchedulerToolConfig = field(default_factory=SchedulerToolConfig)
+    execution_policies: dict[str, ToolPolicyConfig] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "ToolSuiteConfig":
@@ -185,4 +260,14 @@ class ToolSuiteConfig:
             key: value for key, value in dict(raw.get("scheduler", {}) or {}).items()
             if key in {"enabled", "max_jobs", "max_prompt_chars", "database"}
         })
-        return cls(shell=shell, lsp=lsp, notebook=notebook, worktree=worktree, scheduler=scheduler)
+        policies = _parse_tool_policies(
+            raw.get("execution_policies", raw.get("policies", {}))
+        )
+        return cls(
+            shell=shell,
+            lsp=lsp,
+            notebook=notebook,
+            worktree=worktree,
+            scheduler=scheduler,
+            execution_policies=policies,
+        )

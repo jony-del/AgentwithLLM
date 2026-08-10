@@ -15,7 +15,7 @@ from agent_core.config import load_agent_toml, user_settings_path
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_types import DecisionSource, PermissionContext, PermissionMode, PermissionResult
 from agent_core.session import SessionAwareMixin
-from agent_core.tools.base import Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.catalog import builtin_tool
 from agent_core.tools.registry import RegistryAwareMixin
 from agent_core.tools.team import _render, _store, _team_error
@@ -203,6 +203,12 @@ class EnterPlanTool(SessionAwareMixin, Tool):
 
 class _TeamReadTool(SessionAwareMixin, Tool):
     risk = ToolRisk.READ
+
+    def concurrency_spec(self, arguments: dict[str, Any]) -> ConcurrencySpec:
+        team_id = str(arguments.get("team_id", "") or "_")
+        task_id = arguments.get("task_id")
+        key = f"{team_id}/tasks/{task_id}" if task_id else f"{team_id}/tasks"
+        return ConcurrencySpec((ResourceLock("team", key, "read", subtree=task_id is None),))
 
     async def check_permissions(self, arguments: dict[str, Any], context: PermissionContext) -> PermissionResult:
         return PermissionResult.allow("internal team state read", decision_source=DecisionSource.TOOL)

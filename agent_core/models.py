@@ -131,6 +131,12 @@ class LLMResult:
     # never interprets it. Prefer this for new provider state; ``thinking_blocks`` stays
     # for the established Anthropic thinking invariant.
     provider_state: dict[str, Any] = field(default_factory=dict)
+    # Proof that the provider reached an authoritative protocol boundary.  The
+    # compatibility default is true because legacy/non-streaming providers return
+    # only after their terminal response has arrived.  Streaming providers must set
+    # this false until their protocol-specific terminal event is observed.
+    termination_proven: bool = True
+    termination_event: str | None = None
 
 
 class LLMContextTooLongError(RuntimeError):

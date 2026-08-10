@@ -27,7 +27,9 @@ re-linked uuids, leaving the source file untouched.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -46,7 +48,7 @@ _RELINK = "relink"
 
 # Schema version stamped on every transcript entry (the "v" field). Bump on breaking
 # changes to the entry shape; loaders stay tolerant of records without it (pre-v1).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Above this file size, the resume load skips everything before the last compaction
 # boundary (reading only post-boundary bytes + a cheap pre-boundary metadata rescue),
@@ -152,6 +154,107 @@ class TranscriptStore:
         }
         await asyncio.to_thread(self._write_sync, record)
 
+    async def append_tool_round(
+        self,
+        assistant: Message,
+        tool_results: list[Message],
+        execution_manifest: dict[str, object],
+    ) -> bool:
+        """Persist an assistant tool request and every result as one checksummed line."""
+
+        record = self._tool_round_record(assistant, tool_results, execution_manifest)
+        return await asyncio.to_thread(self._write_tool_round_once_sync, record)
+
+    def _tool_round_record(
+        self,
+        assistant: Message,
+        tool_results: list[Message],
+        execution_manifest: dict[str, object],
+    ) -> dict[str, object]:
+        messages: list[dict[str, object]] = []
+        for message in [assistant, *tool_results]:
+            value = message.to_dict()
+            if message.metadata.get("sensitive"):
+                value["content"] = "<redacted-sensitive-tool-output>"
+            messages.append(sanitize_log_payload(value))
+        body = {
+            "messages": messages,
+            "execution_manifest": sanitize_log_payload(execution_manifest),
+        }
+        canonical = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return {
+            "type": "tool_round",
+            "v": SCHEMA_VERSION,
+            **body,
+            "checksum": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "session_id": self.session_id,
+            "cwd": self.workspace,
+            "git_branch": self._cwd_branch,
+            "ts": time.time(),
+        }
+
+    def recover_tool_round(self, payload: dict[str, object]) -> bool:
+        """Recovery callback used for committed rounds missing transcript history."""
+
+        if payload.get("session_id") not in {None, self.session_id}:
+            return False
+        expected_path = str(payload.get("transcript_path") or "")
+        if expected_path and Path(expected_path).resolve() != self.path.resolve():
+            return False
+        assistant_raw = payload.get("assistant")
+        results_raw = payload.get("tool_results")
+        manifest = payload.get("execution_manifest")
+        if (
+            not isinstance(assistant_raw, dict)
+            or not isinstance(results_raw, list)
+            or not isinstance(manifest, dict)
+        ):
+            return False
+        try:
+            assistant = Message.from_dict(assistant_raw)
+            tool_results = [
+                Message.from_dict(item) for item in results_raw if isinstance(item, dict)
+            ]
+            if len(tool_results) != len(results_raw):
+                return False
+            record = self._tool_round_record(assistant, tool_results, manifest)
+            return self._write_tool_round_once_sync(record)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _write_tool_round_once_sync(self, record: dict[str, object]) -> bool:
+        """Idempotently append a checksummed round under the transcript lock."""
+
+        checksum = str(record.get("checksum") or "")
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        try:
+            with self._lock:
+                if checksum and self.path.exists():
+                    marker = f'"checksum": "{checksum}"'
+                    if marker in self.path.read_text(
+                        encoding="utf-8", errors="replace"
+                    ):
+                        return True
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8", errors="replace") as file:
+                    file.write(line)
+                    file.flush()
+                    try:
+                        os.fsync(file.fileno())
+                    except OSError:
+                        pass
+            return True
+        except OSError as exc:
+            if not self._warned:
+                print(
+                    f"[transcript] write failed ({exc}); resume disabled this run",
+                    file=sys.stderr,
+                )
+                self._warned = True
+            return False
+
     async def append_relink(self, uuid: str, parent_uuid: str | None) -> None:
         """Record that ``uuid``'s parent should be re-pointed to ``parent_uuid`` on load.
 
@@ -161,19 +264,26 @@ class TranscriptStore:
         """
         await self.append_meta(_RELINK, {"uuid": uuid, "parent_uuid": parent_uuid})
 
-    def _write_sync(self, record: dict) -> None:
+    def _write_sync(self, record: dict) -> bool:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8", errors="replace") as file:
                     file.write(line)
+                    file.flush()
+                    try:
+                        os.fsync(file.fileno())
+                    except OSError:
+                        pass
+            return True
         except OSError as exc:
             # Persistence is best-effort: a transcript write must never crash an
             # otherwise healthy run. Warn once, then stay quiet.
             if not self._warned:
                 print(f"[transcript] write failed ({exc}); resume disabled this run", file=sys.stderr)
                 self._warned = True
+            return False
 
 
 # --------------------------------------------------------------------------- read side
@@ -245,12 +355,22 @@ class _Accumulator:
             return
         etype = entry.get("type")
         if etype == "message":
-            msg = Message.from_dict(entry)
-            self.session_id = entry.get("session_id", self.session_id)
-            self.branch = entry.get("git_branch") or self.branch
-            if msg.uuid not in self.messages:
-                self.order.append(msg.uuid)
-            self.messages[msg.uuid] = msg
+            self._feed_message(entry, entry)
+        elif etype == "tool_round":
+            messages = entry.get("messages")
+            manifest = entry.get("execution_manifest")
+            checksum = entry.get("checksum")
+            if not isinstance(messages, list) or not isinstance(manifest, dict):
+                return
+            body = {"messages": messages, "execution_manifest": manifest}
+            canonical = json.dumps(
+                body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+            )
+            if checksum != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+                return
+            for raw_message in messages:
+                if isinstance(raw_message, dict):
+                    self._feed_message(raw_message, entry)
         elif etype == _RELINK:
             self.relinks[entry["uuid"]] = entry.get("parent_uuid")
         elif etype == _TITLE:
@@ -258,6 +378,14 @@ class _Accumulator:
         elif etype == _TAG:
             self.tag = entry.get("tag", self.tag)
         # Unknown entry types are ignored, keeping the format forward-compatible.
+
+    def _feed_message(self, value: dict, envelope: dict) -> None:
+        msg = Message.from_dict(value)
+        self.session_id = envelope.get("session_id", self.session_id)
+        self.branch = envelope.get("git_branch") or self.branch
+        if msg.uuid not in self.messages:
+            self.order.append(msg.uuid)
+        self.messages[msg.uuid] = msg
 
     def finish(self, path: Path) -> "LoadedTranscript":
         # Apply relinks: a compaction boundary re-points the kept tail's head at the

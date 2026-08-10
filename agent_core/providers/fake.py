@@ -7,11 +7,20 @@ from typing import Any
 
 from agent_core import tokens
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, TokenUsage, ToolCall
-from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.base import (
+    LLMProvider,
+    ProviderCapabilities,
+    ProviderConfig,
+    StreamedToolCall,
+    StreamHandler,
+    notify_streamed_tool_call,
+)
 
 
 class FakeProvider(LLMProvider):
     """Deterministic provider for local demos and tests."""
+
+    capabilities = ProviderCapabilities("explicit")
 
     def __init__(self, fail_once_context: bool = False, stream_delay: float = 0.0) -> None:
         self.fail_once_context = fail_once_context
@@ -38,8 +47,25 @@ class FakeProvider(LLMProvider):
         result.usage = self._estimate_usage(messages)
         # Stream the answer text in whitespace chunks so the live UI can render it
         # token-by-token, mirroring a real SSE stream — without needing an API key.
-        if stream is not None and result.content and not result.tool_calls:
-            await self._stream_text(result.content, stream, should_cancel)
+        if stream is not None and config.stream:
+            if result.tool_calls:
+                for ordinal, call in enumerate(result.tool_calls):
+                    if not call.id:
+                        call.id = f"fake_{self.calls}_{ordinal}"
+                    notify_streamed_tool_call(
+                        stream,
+                        StreamedToolCall(
+                            call,
+                            str(call.id),
+                            ordinal,
+                            provider_item_id=f"fake_item_{self.calls}_{ordinal}",
+                        ),
+                    )
+                    if self.stream_delay:
+                        await asyncio.sleep(self.stream_delay)
+            elif result.content:
+                await self._stream_text(result.content, stream, should_cancel)
+        result.termination_event = "fake.complete"
         return result
 
     @staticmethod

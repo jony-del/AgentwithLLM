@@ -7,6 +7,67 @@ Notebook, LSP, Worktree, Scheduler, Config and MCP-resource tools are activated 
 `capability_search` can find them and `capability_activate` exposes an exact returned tool
 at the next model-call boundary.
 
+## Streaming execution safety
+
+Tool risk and execution timing are separate contracts. Every tool defaults to
+`final_only`: it is not authorized or run until the provider's authoritative response
+has been reconciled. Audited pure reads and `echo`
+declare `speculative_safe`; workspace-native file editors declare `transactional` and run
+against a private, path-scoped sparse overlay. Only paths named by filesystem resource
+locks are materialized, and commit rejects undeclared changes, symlinks, changed file
+types, subtree membership races, and fingerprint conflicts. The real workspace is
+unchanged during sampling. A valid turn commits the overlay with atomic replacement;
+stream failure, cancellation, schema failure, protocol mismatch, or any transactional
+failure rolls the whole overlay back.
+
+Provider capability negotiation is fail-closed. `explicit` providers may emit a
+`StreamedToolCall` with a stable call ID, contiguous zero-based tool ordinal, and provider
+item identity. `terminal_only` providers still stream display text but never start a tool
+from partial JSON; unknown third-party providers get this compatibility default.
+`unsupported` providers disable the optimization. Claude proves `message_stop` plus a
+valid stop reason, OpenAI Responses proves one `response.completed`, and their completed
+tool calls must exactly match the authoritative response. OpenAI-compatible endpoints use
+`terminal_only`; Fake emits deterministic explicit events for offline regression. A
+silent EOF or incomplete/error terminal event invalidates the round and cannot commit a
+workspace transaction or start a final-only tool.
+
+The scheduler builds resource-conflict edges by stable model-output ordinal. Independent
+ready nodes can bypass a blocked node, while write/read and write/write conflicts preserve
+model order. A consumer lock with `requires_success` propagates a structured
+`DependencyFailed` result. Exclusive calls are global barriers. Background shell tasks
+retain their resource lease after the tool returns; a conflicting same-turn call receives
+`DependencyStillRunning` until the process exits.
+
+Arguments are validated against `input_schema` before execution and again after hook or
+permission rewrites. Invalid provider JSON is never converted to executable `{}`. Direct
+same-turn `$tool_result` references are rejected with
+`ResultDependencyRequiresNextTurn`; the model must consume the observation in the next
+inference.
+
+Each tool round is recorded in a durable execution journal and persisted to the transcript
+as one checksummed record containing the assistant calls, ordered results, and execution
+manifest. Journal writes use a single-writer queue: discovery telemetry does not block the
+SSE reader, while authorization, external-effect intent, recovery history, and commit gates
+wait for durable acknowledgement. Recovery payloads are secret-redacted before commit;
+cross-process file ownership (with a per-process start token in every record) replaces PID
+guessing, and checksummed transcript recovery is idempotent. A staged result is never sent
+through PostToolUse, the UI, or the run log. After reconciliation it is observed exactly
+once as either finalized or rolled back; external PreToolUse, permission classifiers, and
+interactive prompts are also deferred until the response is authoritative. Legacy
+per-message transcript records remain readable. Trusted local
+`[tools.execution_policies."qualified_name"]` entries can provide safety and static or
+argument-derived resource templates; malformed policies fail closed. MCP annotations by
+themselves never upgrade execution timing.
+
+Cancellation follows the declared tool policy. Async-native tools are directly cancelled
+only when `safely_cancellable = true`. Other early tools must finish within
+`execution_timeout`; an unkillable worker-thread call becomes an explicit indeterminate
+cleanup state and its overlay is never committed. The JSONL timing event reports provider
+degradation, argument completion, tool start, model termination, commit time, and one
+critical-path overlap estimate (never a sum across parallel tools). Run
+`python benchmarks/streaming_tools.py --runs 9` for median/p95 end-to-end comparisons of
+read, transactional, multi-call, hook-deferred, and provider-capability fixtures.
+
 ## Shell and tasks
 
 Use `bash` for Bash syntax and `powershell` for PowerShell syntax. Both accept `command`,

@@ -10,7 +10,7 @@ from agent_core.permission_classifier import AutoPermissionVerdict
 from agent_core.permission_types import PermissionContext, PermissionResult
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.storage import JSONLRunLogger, read_events
-from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
+from agent_core.tools.base import ConcurrencySpec, ExecutionSafety, ResourceLock, Tool
 from agent_core.tools.builtin import EchoTool, ReadTextFileTool, WriteTextFileTool
 from agent_core.tools.executor import ToolExecutor
 from agent_core.tools.registry import ToolRegistry
@@ -120,6 +120,8 @@ class AsyncGateTool(Tool):
     description = "Expose deterministic start/release events for scheduler tests."
     input_schema = {"type": "object", "properties": {}}
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
+    safely_cancellable = True
 
     def __init__(self) -> None:
         self.started: dict[str, asyncio.Event] = {}
@@ -173,7 +175,7 @@ async def test_streaming_batch_starts_before_final_result_is_available() -> None
     batch = executor.begin_batch()
     call = ToolCall("async_gate", {"label": "early", "resource": "a"}, id="t1")
 
-    assert batch.submit_streamed(call)
+    assert batch.submit_streamed(call, ordinal=0)
     while "early" not in tool.started:
         await asyncio.sleep(0)
     await asyncio.wait_for(tool.started["early"].wait(), timeout=1)
@@ -199,8 +201,8 @@ async def test_streaming_batch_honors_conflicting_resource_order() -> None:
         "async_gate", {"label": "second", "resource": "same", "mode": "read"}, id="t2"
     )
 
-    batch.submit_streamed(first)
-    batch.submit_streamed(second)
+    batch.submit_streamed(first, ordinal=0)
+    batch.submit_streamed(second, ordinal=1)
     while "first" not in tool.started:
         await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -223,7 +225,7 @@ async def test_streaming_batch_abort_cancels_native_async_tool() -> None:
     batch = executor.begin_batch()
     call = ToolCall("async_gate", {"label": "cancel", "resource": "a"}, id="t1")
 
-    batch.submit_streamed(call)
+    batch.submit_streamed(call, ordinal=0)
     while "cancel" not in tool.started:
         await asyncio.sleep(0)
     await asyncio.wait_for(batch.abort("provider_error"), timeout=1)
@@ -241,7 +243,7 @@ async def test_streaming_batch_never_reexecutes_mismatched_final_call() -> None:
     streamed = ToolCall("async_gate", {"label": "old", "resource": "a"}, id="t1")
     final = ToolCall("async_gate", {"label": "new", "resource": "a"}, id="t1")
 
-    batch.submit_streamed(streamed)
+    batch.submit_streamed(streamed, ordinal=0)
     while "old" not in tool.started:
         await asyncio.sleep(0)
     tool.release["old"].set()

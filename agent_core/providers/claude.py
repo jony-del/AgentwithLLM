@@ -22,9 +22,11 @@ from agent_core.models import (
 )
 from agent_core.providers.base import (
     LLMProvider,
+    ProviderCapabilities,
     ProviderConfig,
+    StreamedToolCall,
     StreamHandler,
-    notify_tool_call_complete,
+    notify_streamed_tool_call,
 )
 
 # HTTP statuses worth retrying: request timeout / lock conflict, rate limiting, and
@@ -36,6 +38,14 @@ _RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 # buggy header can't wedge the agent for minutes.
 _MAX_RETRY_AFTER = 60.0
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
+_VALID_STREAM_STOP_REASONS = {
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "pause_turn",
+    "refusal",
+}
 
 
 class _FastModeFallback(RuntimeError):
@@ -117,11 +127,19 @@ class _StreamAccumulator:
         self.tool_calls: list[ToolCall] = []
         self.stop_reason: str | None = None
         self.blocks: dict[int, dict[str, Any]] = {}
+        self.stopped_blocks: set[int] = set()
+        self.message_stop_count = 0
         # Token accounting: input/cache counts arrive in ``message_start``, the
         # running output total in each ``message_delta``.
         self.usage: TokenUsage = TokenUsage()
 
     def result(self) -> LLMResult:
+        termination_proven = (
+            self.message_stop_count == 1
+            and self.stop_reason in _VALID_STREAM_STOP_REASONS
+            and set(self.blocks) == self.stopped_blocks
+            and (not self.tool_calls or self.stop_reason == "tool_use")
+        )
         return LLMResult(
             content="\n".join(part for part in self.text_parts if part),
             tool_calls=self.tool_calls,
@@ -130,6 +148,8 @@ class _StreamAccumulator:
             thinking="\n".join(part for part in self.thinking_parts if part),
             thinking_blocks=self.thinking_blocks,
             usage=self.usage,
+            termination_proven=termination_proven,
+            termination_event="message_stop" if termination_proven else None,
         )
 
 
@@ -140,6 +160,8 @@ def _default_retry_notice(message: str) -> None:
 
 
 class ClaudeProvider(LLMProvider):
+    capabilities = ProviderCapabilities("explicit")
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -582,14 +604,21 @@ class ClaudeProvider(LLMProvider):
                         arguments=block.get("input") or {},
                     )
                 )
+        stop_reason = payload.get("stop_reason")
+        termination_proven = (
+            stop_reason in _VALID_STREAM_STOP_REASONS
+            and (not tool_calls or stop_reason == "tool_use")
+        )
         return LLMResult(
             content="\n".join(part for part in text_parts if part),
             tool_calls=tool_calls,
-            stop_reason=payload.get("stop_reason"),
+            stop_reason=stop_reason,
             raw=payload,
             thinking="\n".join(part for part in thinking_parts if part),
             thinking_blocks=thinking_blocks,
             usage=self._parse_usage(payload.get("usage")),
+            termination_proven=termination_proven,
+            termination_event="http_response" if termination_proven else None,
         )
 
     @staticmethod
@@ -646,7 +675,12 @@ class ClaudeProvider(LLMProvider):
         elif etype == "content_block_start":
             index = event.get("index")
             if isinstance(index, int):
-                acc.blocks[index] = self._start_block(event.get("content_block", {}))
+                block = event.get("content_block", {})
+                ordinal = sum(
+                    1 for existing in acc.blocks.values()
+                    if existing.get("kind") == "tool_use"
+                )
+                acc.blocks[index] = self._start_block(block, tool_ordinal=ordinal)
         elif etype == "content_block_delta":
             index = event.get("index")
             if isinstance(index, int):
@@ -662,7 +696,19 @@ class ClaudeProvider(LLMProvider):
                     acc.tool_calls,
                 )
                 if tool_call is not None:
-                    notify_tool_call_complete(stream, tool_call)
+                    block = acc.blocks.get(index) or {}
+                    call_id = str(tool_call.id or "")
+                    if call_id:
+                        notify_streamed_tool_call(
+                            stream,
+                            StreamedToolCall(
+                                tool_call,
+                                call_id,
+                                int(block.get("ordinal", 0)),
+                                provider_item_id=call_id,
+                            ),
+                        )
+                acc.stopped_blocks.add(index)
         elif etype == "message_delta":
             acc.stop_reason = event.get("delta", {}).get("stop_reason") or acc.stop_reason
             # message_delta carries the running output token total at top level.
@@ -674,12 +720,22 @@ class ClaudeProvider(LLMProvider):
             raise LLMTransientError(
                 f"Claude streaming error {err.get('type', 'unknown')}: {err.get('message', '')}"
             )
+        elif etype == "message_stop":
+            acc.message_stop_count += 1
 
     @staticmethod
-    def _start_block(content_block: dict[str, Any]) -> dict[str, Any]:
+    def _start_block(
+        content_block: dict[str, Any], *, tool_ordinal: int = 0
+    ) -> dict[str, Any]:
         kind = content_block.get("type")
         if kind == "tool_use":
-            return {"kind": "tool_use", "id": content_block.get("id"), "name": content_block.get("name", ""), "json": ""}
+            return {
+                "kind": "tool_use",
+                "id": content_block.get("id"),
+                "name": content_block.get("name", ""),
+                "json": "",
+                "ordinal": tool_ordinal,
+            }
         if kind == "thinking":
             return {"kind": "thinking", "thinking": content_block.get("thinking", ""), "signature": content_block.get("signature", "")}
         if kind == "redacted_thinking":
@@ -732,13 +788,14 @@ class ClaudeProvider(LLMProvider):
             try:
                 arguments = json.loads(raw_json) if raw_json else {}
             except json.JSONDecodeError:
-                arguments = {}
+                arguments = {"_raw_arguments": raw_json}
             if not isinstance(arguments, dict):
-                arguments = {}
+                arguments = {"_raw_arguments": raw_json}
             tool_call = ToolCall(
                 id=block.get("id"), name=block.get("name", ""), arguments=arguments
             )
-            tool_calls.append(tool_call)
+            ordinal = max(0, int(block.get("ordinal", len(tool_calls))))
+            tool_calls.insert(min(ordinal, len(tool_calls)), tool_call)
             return tool_call
         return None
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from agent_core.memory import MemoryConfig
@@ -102,6 +103,21 @@ async def test_run_persists_faithful_chain(tmp_path: Path) -> None:
     assert chain[1].metadata["provider_state"] == {"output": [{"type": "reasoning", "id": "rs_1"}]}
     assert chain[2].metadata["tool_call_id"] == "toolu_1"
     assert result.answer == "all done"
+
+
+async def test_tool_round_is_one_checksummed_transcript_record(tmp_path: Path) -> None:
+    agent = ReActAgent(provider=ToolThenDoneProvider(), config=_config(tmp_path))
+    await agent.run("please echo")
+
+    records = [
+        json.loads(line)
+        for line in agent.transcript.path.read_text(encoding="utf-8").splitlines()
+    ]
+    rounds = [record for record in records if record.get("type") == "tool_round"]
+    assert len(rounds) == 1
+    assert rounds[0]["checksum"]
+    assert [message["role"] for message in rounds[0]["messages"]] == ["assistant", "tool"]
+    assert rounds[0]["execution_manifest"]["calls"][0]["tool"] == "echo"
 
 
 async def test_disabled_persistence_writes_nothing(tmp_path: Path) -> None:

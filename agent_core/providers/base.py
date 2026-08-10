@@ -1,16 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from agent_core.models import LLMResult, Message, ToolCall
 
 logger = logging.getLogger(__name__)
+
+ToolStreamBoundary = Literal["explicit", "terminal_only", "unsupported"]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Optional provider contract for safe incremental tool execution.
+
+    Providers that do not expose this contract are treated as ``terminal_only``.
+    That preserves third-party compatibility while preventing the core from
+    interpreting a syntactically closed JSON fragment as an execution boundary.
+    """
+
+    tool_stream_boundary: ToolStreamBoundary = "terminal_only"
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamedToolCall:
+    """One immutable streamed tool call with provider and turn identities."""
+
+    tool_call: ToolCall
+    call_id: str
+    ordinal: int
+    provider_item_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,14 +111,79 @@ class ToolCallStreamHandler(StreamHandler, Protocol):
     a structural, best-effort lookup instead of assuming the extension is present.
     """
 
-    def on_tool_call_complete(self, tool_call: ToolCall) -> None: ...
+    def on_tool_call_complete(self, tool_call: ToolCall, ordinal: int | None = None) -> None: ...
 
 
-def notify_tool_call_complete(stream: StreamHandler | None, tool_call: ToolCall) -> None:
-    """Publish a completed streamed tool call without making the callback mandatory."""
+@runtime_checkable
+class StreamedToolCallHandler(StreamHandler, Protocol):
+    """Preferred extension carrying the complete stable event identity."""
+
+    def on_streamed_tool_call(self, event: StreamedToolCall) -> None: ...
+
+
+def provider_capabilities(provider: "LLMProvider") -> ProviderCapabilities:
+    """Read optional capabilities, unwrapping gates and failing closed."""
+
+    candidate: object = provider
+    seen: set[int] = set()
+    while id(candidate) not in seen:
+        seen.add(id(candidate))
+        raw = getattr(candidate, "capabilities", None)
+        if callable(raw):
+            try:
+                value = raw()
+            except Exception:  # pragma: no cover - defensive third-party boundary
+                value = None
+        else:
+            value = raw
+        if isinstance(value, ProviderCapabilities):
+            return value
+        inner = getattr(candidate, "inner", None)
+        if inner is None:
+            break
+        candidate = inner
+    return ProviderCapabilities(
+        "terminal_only", "provider does not declare an explicit tool-call boundary"
+    )
+
+
+def notify_streamed_tool_call(
+    stream: StreamHandler | None,
+    event: StreamedToolCall,
+) -> None:
+    """Publish the rich event, adapting to the legacy callback when necessary."""
+
+    callback = getattr(stream, "on_streamed_tool_call", None)
+    if callable(callback):
+        callback(event)
+        return
+    notify_tool_call_complete(stream, event.tool_call, event.ordinal)
+
+
+def notify_tool_call_complete(
+    stream: StreamHandler | None,
+    tool_call: ToolCall,
+    ordinal: int | None = None,
+) -> None:
+    """Publish a finalized call and its stable model-output ordinal.
+
+    The optional-argument compatibility path keeps third-party display sinks working;
+    the core scheduler only grants speculative admission when an ordinal is present.
+    """
     callback = getattr(stream, "on_tool_call_complete", None)
     if callable(callback):
-        callback(tool_call)
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+            accepts_ordinal = any(
+                item.name == "ordinal" or item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_ordinal = False
+        if accepts_ordinal:
+            callback(tool_call, ordinal=ordinal)
+        else:
+            callback(tool_call)
 
 
 class LLMProvider(ABC):

@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from agent_core.models import LLMContextTooLongError, LLMTransientError, Message
-from agent_core.providers.base import ProviderConfig
+from agent_core.providers.base import ProviderConfig, provider_capabilities
 from agent_core.providers.openai_compat import OpenAICompatProvider
 
 
@@ -298,6 +298,23 @@ async def test_streaming_assembles_tool_calls() -> None:
     (call,) = result.tool_calls
     assert call.name == "echo" and call.arguments == {"text": "hi"} and call.id == "call_z"
     assert recorder.tool_args == '{"text": "hi"}'
+
+
+async def test_compat_stream_is_terminal_only_and_requires_done_marker() -> None:
+    body = _sse(
+        {"choices": [{"delta": {"content": "partial"}, "finish_reason": "stop"}]},
+    )
+    provider = _provider(lambda _request: httpx.Response(200, content=body))
+
+    result = await provider.complete(
+        [Message("user", "go")],
+        [],
+        ProviderConfig(model="test-model", stream=True),
+        stream=_Recorder(),
+    )
+
+    assert provider_capabilities(provider).tool_stream_boundary == "terminal_only"
+    assert result.termination_proven is False
 
 
 async def test_provider_drives_the_react_loop_end_to_end(tmp_path) -> None:

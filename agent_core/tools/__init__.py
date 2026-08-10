@@ -1,5 +1,13 @@
 from agent_core.tools.adapters import LCPAdapter, MCPAdapter
-from agent_core.tools.base import Tool, WorkspacePathMixin
+from agent_core.tools.base import (
+    ConcurrencySpec,
+    ExecutionSafety,
+    ResourceLock,
+    Tool,
+    ToolExecutionContext,
+    ToolExecutionPolicy,
+    WorkspacePathMixin,
+)
 from agent_core.tools.catalog import builtin_tool, builtin_tool_classes, default_tools
 from agent_core.tools.builtin import (
     EchoTool,
@@ -25,13 +33,16 @@ from agent_core.tools.team import (
 
 __all__ = [
     "EchoTool",
+    "ConcurrencySpec",
     "EditFileTool",
     "GitDiffTool",
     "LCPAdapter",
     "ListDirTool",
     "MCPAdapter",
+    "ExecutionSafety",
     "ReadTextFileTool",
     "RunTestsTool",
+    "ResourceLock",
     "SearchTextTool",
     "TaskCreateTool",
     "TaskUpdateTool",
@@ -41,6 +52,8 @@ __all__ = [
     "TeamStatusTool",
     "TeammateSpawnTool",
     "Tool",
+    "ToolExecutionContext",
+    "ToolExecutionPolicy",
     "ToolExecutor",
     "ToolRegistry",
     "WorkspacePathMixin",

@@ -27,9 +27,11 @@ from agent_core.models import (
 )
 from agent_core.providers.base import (
     LLMProvider,
+    ProviderCapabilities,
     ProviderConfig,
+    StreamedToolCall,
     StreamHandler,
-    notify_tool_call_complete,
+    notify_streamed_tool_call,
 )
 from agent_core.providers.openai_capabilities import (
     capabilities_for_responses_model,
@@ -65,9 +67,14 @@ class _ResponsesStreamAccumulator:
         self.thinking_parts: list[str] = []
         self.output_items: dict[str, dict[str, Any]] = {}
         self.output_order: list[str] = []
+        self.identity_aliases: dict[str, str] = {}
+        self.provider_item_ids: dict[str, str] = {}
         self.function_args: dict[str, list[str]] = {}
         self.completed_function_args: set[str] = set()
         self.emitted_function_calls: set[str] = set()
+        self.function_ordinals: dict[str, int] = {}
+        self.completed_count = 0
+        self.protocol_invalid = False
         self.stop_reason: str | None = None
         self.usage: TokenUsage | None = None
 
@@ -76,6 +83,14 @@ class _ResponsesStreamAccumulator:
             parsed = OpenAIResponsesProvider._parse_response(self.completed_response)
             if not parsed.thinking and self.thinking_parts:
                 parsed.thinking = "".join(self.thinking_parts)
+            parsed.termination_proven = (
+                self.completed_count == 1
+                and not self.protocol_invalid
+                and self.completed_response.get("status") == "completed"
+            )
+            parsed.termination_event = (
+                "response.completed" if parsed.termination_proven else None
+            )
             return parsed
         output = [self.output_items[key] for key in self.output_order if key in self.output_items]
         text = "".join(self.text_parts)
@@ -89,11 +104,14 @@ class _ResponsesStreamAccumulator:
             thinking="".join(thinking_parts),
             usage=self.usage,
             provider_state={"output": _json_clone(output)} if output else {},
+            termination_proven=False,
         )
 
 
 class OpenAIResponsesProvider(LLMProvider):
     """OpenAI Responses API over httpx: state replay, streaming, retries, tools."""
+
+    capabilities = ProviderCapabilities("explicit")
 
     def __init__(
         self,
@@ -287,6 +305,10 @@ class OpenAIResponsesProvider(LLMProvider):
             thinking="".join(OpenAIResponsesProvider._parse_reasoning_display_parts(output)),
             usage=OpenAIResponsesProvider._parse_usage(payload.get("usage")),
             provider_state={"output": _json_clone(output)} if output else {},
+            termination_proven=payload.get("status") == "completed",
+            termination_event=(
+                "http_response" if payload.get("status") == "completed" else None
+            ),
         )
 
     @staticmethod
@@ -410,15 +432,53 @@ class OpenAIResponsesProvider(LLMProvider):
         return acc.result()
 
     @staticmethod
-    def _item_key(event: dict[str, Any], item: dict[str, Any] | None = None) -> str:
-        for key in ("item_id", "output_index", "index"):
-            if event.get(key) is not None:
-                return str(event[key])
-        if item is not None:
-            for key in ("id", "call_id"):
-                if item.get(key) is not None:
-                    return str(item[key])
-        return "0"
+    def _identity_candidates(
+        event: dict[str, Any], item: dict[str, Any] | None = None
+    ) -> list[str]:
+        """Return typed aliases so item ids and numeric indexes cannot collide."""
+
+        candidates: list[str] = []
+        item_id = event.get("item_id")
+        if item_id is not None:
+            candidates.append(f"item:{item_id}")
+        if item is not None and item.get("id") is not None:
+            candidates.append(f"item:{item['id']}")
+        output_index = event.get("output_index")
+        if output_index is not None:
+            candidates.append(f"output:{output_index}")
+        legacy_index = event.get("index")
+        if legacy_index is not None:
+            candidates.append(f"output:{legacy_index}")
+        if item is not None and item.get("call_id") is not None:
+            candidates.append(f"call:{item['call_id']}")
+        return candidates or ["output:0"]
+
+    @classmethod
+    def _item_key(
+        cls,
+        event: dict[str, Any],
+        acc: _ResponsesStreamAccumulator,
+        item: dict[str, Any] | None = None,
+    ) -> str:
+        candidates = cls._identity_candidates(event, item)
+        existing = {
+            acc.identity_aliases[candidate]
+            for candidate in candidates
+            if candidate in acc.identity_aliases
+        }
+        if len(existing) > 1:
+            acc.protocol_invalid = True
+        canonical = next(iter(existing), candidates[0])
+        for candidate in candidates:
+            previous = acc.identity_aliases.get(candidate)
+            if previous is not None and previous != canonical:
+                acc.protocol_invalid = True
+            acc.identity_aliases[candidate] = canonical
+        if item is not None and item.get("id") is not None:
+            acc.provider_item_ids[canonical] = str(item["id"])
+        elif event.get("item_id") is not None:
+            acc.provider_item_ids[canonical] = str(event["item_id"])
+        return canonical
 
     def _handle_sse_event(
         self,
@@ -438,8 +498,10 @@ class OpenAIResponsesProvider(LLMProvider):
         if etype in {"response.output_item.added", "response.output_item.done"}:
             item = event.get("item")
             if isinstance(item, dict):
-                key = self._item_key(event, item)
+                key = self._item_key(event, acc, item)
                 clean = _json_clone(item)
+                if clean.get("type") == "function_call" and key not in acc.function_ordinals:
+                    acc.function_ordinals[key] = len(acc.function_ordinals)
                 if clean.get("type") in _REPLAY_OUTPUT_TYPES:
                     if key not in acc.output_items:
                         acc.output_order.append(key)
@@ -457,7 +519,7 @@ class OpenAIResponsesProvider(LLMProvider):
                     self._maybe_emit_function_call(key, acc, sink, item_done=True)
             return
         if etype in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
-            key = self._item_key(event)
+            key = self._item_key(event, acc)
             slot = acc.function_args.setdefault(key, [])
             delta = event.get("delta")
             if delta:
@@ -483,9 +545,15 @@ class OpenAIResponsesProvider(LLMProvider):
                     sink.on_thinking_delta(chunk)
             return
         if etype == "response.completed":
+            acc.completed_count += 1
             response_payload = event.get("response")
             if isinstance(response_payload, dict):
-                acc.completed_response = response_payload
+                if acc.completed_response is None:
+                    acc.completed_response = response_payload
+                else:
+                    acc.protocol_invalid = True
+            else:
+                acc.protocol_invalid = True
             return
         if etype in {"response.failed", "response.incomplete", "error"}:
             error = event.get("error") or event.get("response") or event
@@ -514,7 +582,20 @@ class OpenAIResponsesProvider(LLMProvider):
         if not calls:
             return
         acc.emitted_function_calls.add(key)
-        notify_tool_call_complete(sink, calls[0])
+        ordinal = acc.function_ordinals.get(key)
+        call_id = str(calls[0].id or "")
+        if ordinal is None or not call_id:
+            acc.protocol_invalid = True
+            return
+        notify_streamed_tool_call(
+            sink,
+            StreamedToolCall(
+                calls[0],
+                call_id,
+                ordinal,
+                provider_item_id=acc.provider_item_ids.get(key),
+            ),
+        )
 
     @classmethod
     async def _iter_sse_events(cls, raw_lines):

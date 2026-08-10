@@ -56,7 +56,13 @@ from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.lifecycle import MemoryLifecycle
 from agent_core.file_lock import FileLock
 from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
-from agent_core.models import LLMContextTooLongError, Message, ToolCall, ToolResult
+from agent_core.models import (
+    LLMContextTooLongError,
+    LLMTransientError,
+    Message,
+    ToolCall,
+    ToolResult,
+)
 from agent_core.model_validation import is_model_allowed, unsupported_model_message
 from agent_core.permission_classifier import (
     AutoPermissionClassifier,
@@ -65,7 +71,14 @@ from agent_core.permission_classifier import (
 from agent_core.permission_rules import RuleSet
 from agent_core.permission_types import PermissionRuleSource, ToolCallSource
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler, gated_provider
+from agent_core.providers.base import (
+    LLMProvider,
+    ProviderConfig,
+    StreamedToolCall,
+    StreamHandler,
+    gated_provider,
+    provider_capabilities,
+)
 from agent_core.sandbox import (
     SandboxAwareMixin,
     SandboxConfig,
@@ -101,6 +114,7 @@ from agent_core.transcript import TranscriptStore, new_session_id
 from agent_core.tools.catalog import default_tools, populate_registry
 from agent_core.tools.executor import StreamingToolBatch, ToolExecutor
 from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.transaction import TurnExecutionJournal
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.tools.web import WebPolicyAwareMixin, WebPolicyConfig
 from agent_core.ui import AgentUI, NullUI
@@ -351,9 +365,20 @@ class _TurnStreamHandler(StreamHandler):
         if self.display:
             self.ui.on_tool_args_delta(tool_name, partial_json)
 
-    def on_tool_call_complete(self, tool_call: ToolCall) -> None:
+    def on_tool_call_complete(self, tool_call: ToolCall, ordinal: int | None = None) -> None:
         if self.batch is not None:
-            self.batch.submit_streamed(tool_call, assistant_content="".join(self._text_parts))
+            self.batch.submit_streamed(
+                tool_call,
+                assistant_content="".join(self._text_parts),
+                ordinal=ordinal,
+            )
+
+    def on_streamed_tool_call(self, event: StreamedToolCall) -> None:
+        if self.batch is not None:
+            self.batch.submit_streamed_event(
+                event,
+                assistant_content="".join(self._text_parts),
+            )
 
 
 class ReActAgent:
@@ -419,6 +444,7 @@ class ReActAgent:
         self._plugin_notifications: deque[dict[str, str]] = deque(maxlen=100)
         self.registry = tools or self.default_registry()
         self.registry.rebind_workspace(str(self._initial_workspace))
+        self.registry.set_policy_overrides(self.config.tools.execution_policies, trusted=True)
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
         # Resumable session transcript (distinct from the event logger above). An injected
         # store wins; otherwise build one from config unless ``session_dir`` is disabled
@@ -631,6 +657,14 @@ class ReActAgent:
             parallel_tools=self.config.parallel_tools,
             max_workers=self.config.max_tool_workers,
         )
+        recovery_outcomes = TurnExecutionJournal.recover_all(
+            self.executor.journal_dir,
+            history_writer=(
+                self.transcript.recover_tool_round if self.transcript is not None else None
+            ),
+        )
+        for recovery_outcome in recovery_outcomes:
+            self.logger.write_nowait("turn_recovery", recovery_outcome)
         # Strong refs to in-flight fire-and-forget PostSampling hook tasks, so they
         # aren't garbage-collected mid-run; reaped best-effort at terminal returns.
         self._background_hook_tasks: set[asyncio.Task[None]] = set()
@@ -1210,9 +1244,27 @@ class ReActAgent:
             tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
             sink: StreamHandler | None = None
             if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
+                capabilities = provider_capabilities(self.provider)
+                if (
+                    self.config.streaming_tool_execution
+                    and capabilities.tool_stream_boundary != "explicit"
+                ):
+                    await self.logger.write(
+                        "provider_capability",
+                        {
+                            "tool_stream_boundary": capabilities.tool_stream_boundary,
+                            "streaming_tool_execution": "degraded",
+                            "reason": capabilities.reason,
+                        },
+                    )
                 sink = _TurnStreamHandler(
                     self.ui,
-                    tool_batch if self.config.streaming_tool_execution else None,
+                    (
+                        tool_batch
+                        if self.config.streaming_tool_execution
+                        and capabilities.tool_stream_boundary == "explicit"
+                        else None
+                    ),
                     display=self.ui.is_live,
                 )
             self.ui.on_turn_start()
@@ -1258,9 +1310,27 @@ class ReActAgent:
                     tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
                     sink = None
                     if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
+                        capabilities = provider_capabilities(self.provider)
+                        if (
+                            self.config.streaming_tool_execution
+                            and capabilities.tool_stream_boundary != "explicit"
+                        ):
+                            await self.logger.write(
+                                "provider_capability",
+                                {
+                                    "tool_stream_boundary": capabilities.tool_stream_boundary,
+                                    "streaming_tool_execution": "degraded",
+                                    "reason": capabilities.reason,
+                                },
+                            )
                         sink = _TurnStreamHandler(
                             self.ui,
-                            tool_batch if self.config.streaming_tool_execution else None,
+                            (
+                                tool_batch
+                                if self.config.streaming_tool_execution
+                                and capabilities.tool_stream_boundary == "explicit"
+                                else None
+                            ),
                             display=self.ui.is_live,
                         )
                     self.ui.on_turn_start()
@@ -1331,6 +1401,16 @@ class ReActAgent:
             # ``/status`` commands (cheap counters; not part of any contract).
             if result is None:
                 raise RuntimeError("provider returned no result after context recovery")
+            if not result.termination_proven:
+                await tool_batch.finish(
+                    result.tool_calls,
+                    messages=messages,
+                    termination_proven=False,
+                    termination_event=result.termination_event,
+                )
+                raise LLMTransientError(
+                    "provider stream ended without a valid terminal protocol event"
+                )
             self._consume_fast_mode_fallback()
             if result.usage is not None:
                 # ``total_tokens`` (prompt incl. cache + this turn's output) is the anchor
@@ -1385,7 +1465,15 @@ class ReActAgent:
             # since (ports the reference's per-message ``tokenCountWithEstimation``).
             if result.usage is not None:
                 assistant_metadata["usage_tokens"] = result.usage.total_tokens
-            await self._emit(messages, Message("assistant", result.content, metadata=assistant_metadata))
+            assistant_message = Message("assistant", result.content, metadata=assistant_metadata)
+            if result.tool_calls:
+                # Tool-use assistant messages are committed to the transcript only
+                # together with all of their ordered observations.
+                assistant_message.parent_uuid = self._last_message_uuid
+                messages.append(assistant_message)
+                self._last_message_uuid = assistant_message.uuid
+            else:
+                await self._emit(messages, assistant_message)
 
             # Surface the running token usage to a live UI, once per turn (the only
             # granularity available — usage is known only after the response). Lands right
@@ -1416,7 +1504,12 @@ class ReActAgent:
             if not result.tool_calls:
                 # Usually empty and immediate. This also drains/logs a provider anomaly
                 # where a streamed tool block disappeared from the authoritative result.
-                await tool_batch.finish([], messages=messages)
+                await tool_batch.finish(
+                    [],
+                    messages=messages,
+                    termination_proven=result.termination_proven,
+                    termination_event=result.termination_event,
+                )
                 # Stop hook: a hook may BLOCK this stop and force the loop to keep running
                 # ("可阻断/可续跑"), bounded by config.max_stop_blocks so it can't loop
                 # forever. A block injects the continuation directive and re-enters the loop.
@@ -1453,12 +1546,27 @@ class ReActAgent:
             # Intermediate turn: show the reasoning that precedes the tool calls.
             self.ui.on_reasoning(result.content)
 
+            tool_batch.prime_history_payload(
+                {
+                    "assistant": assistant_message.to_dict(),
+                    "session_id": self.session_id,
+                    "transcript_path": (
+                        str(self.transcript.path) if self.transcript is not None else ""
+                    ),
+                }
+            )
+
             if cancelled():
                 await tool_batch.abort("cancelled_before_tool_join")
                 return await self._stopped(messages, step, "interrupted", "being interrupted by the user (Esc)")
             # Calls already completed during model sampling resolve immediately here;
             # only the unhidden tail remains on the critical path.
-            tool_results = await tool_batch.finish(result.tool_calls, messages=messages)
+            tool_results = await tool_batch.finish(
+                result.tool_calls,
+                messages=messages,
+                termination_proven=result.termination_proven,
+                termination_event=result.termination_event,
+            )
             if any(item.metadata.get("activation_pending") for item in tool_results):
                 activation_outcomes = await asyncio.to_thread(
                     self.capability_manager.commit_pending
@@ -1473,22 +1581,64 @@ class ReActAgent:
                     item.metadata["activation_pending"] = False
                     item.metadata["activation_status"] = outcome.get("status")
                     await self.logger.write("capability_activation", outcome)
+            tool_messages: list[Message] = []
             for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
                 observation = f"{tool_result.name}: {tool_result.content}"
-                await self._emit(
-                    messages,
-                    Message(
-                        "tool",
-                        observation,
-                        name=tool_result.name,
-                        metadata={**tool_result.metadata, "ok": tool_result.ok, "tool_call_id": tool_call.id},
-                    ),
+                tool_message = Message(
+                    "tool",
+                    observation,
+                    name=tool_result.name,
+                    metadata={
+                        **tool_result.metadata,
+                        "ok": tool_result.ok,
+                        "tool_call_id": tool_call.id,
+                    },
                 )
+                tool_message.parent_uuid = self._last_message_uuid
+                messages.append(tool_message)
+                self._last_message_uuid = tool_message.uuid
+                tool_messages.append(tool_message)
                 # Record read-file state HERE (not in the read tool — its mixin shape
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
                 # post-compaction fold. Defensive: odd/missing args just skip.
                 self._record_read_result(tool_call, tool_result)
                 await self._notify_lsp_edit(tool_call, tool_result)
+
+            manifest = tool_batch.execution_manifest()
+            history_payload: dict[str, object] = {
+                "assistant": assistant_message.to_dict(),
+                "tool_results": [message.to_dict() for message in tool_messages],
+                "execution_manifest": manifest,
+                "session_id": self.session_id,
+                "transcript_path": str(self.transcript.path) if self.transcript is not None else "",
+            }
+            try:
+                await tool_batch.record_history_payload_async(history_payload)
+            except Exception as exc:
+                await self.logger.write(
+                    "tool_round_history",
+                    {"status": "journal_failed", "error": f"{type(exc).__name__}: {exc}"},
+                )
+            if self.transcript is not None:
+                persisted = await self.transcript.append_tool_round(
+                    assistant_message, tool_messages, manifest
+                )
+                if persisted:
+                    try:
+                        await tool_batch.mark_history_persisted_async()
+                    except Exception as exc:
+                        await self.logger.write(
+                            "tool_round_history",
+                            {
+                                "status": "journal_finalize_failed",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
+            else:
+                try:
+                    await tool_batch.mark_history_persisted_async()
+                except Exception:
+                    pass
 
             # Interactive input entered while tools were running is inserted only after
             # the complete tool-result batch, immediately before the next provider call.

@@ -79,7 +79,12 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
         )
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        return ConcurrencySpec((ResourceLock("fs", str(self.session.workspace.resolve()), "write", subtree=True),))
+        return ConcurrencySpec(
+            (
+                ResourceLock("fs", str(self.session.workspace.resolve()), "write", subtree=True),
+                ResourceLock("env", "process", "write"),
+            )
+        )
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         command = str(arguments.get("command", ""))
@@ -203,6 +208,11 @@ class TaskOutputTool(SessionAwareMixin, Tool):
     }
     risk = ToolRisk.READ
 
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec(
+            (ResourceLock("process", str(arguments.get("task_id", "")), "read"),)
+        )
+
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         supervisor = _supervisor(self.name, self.session)
         if isinstance(supervisor, ToolResult):
@@ -230,6 +240,11 @@ class TaskStopTool(SessionAwareMixin, Tool):
         "required": ["task_id"],
     }
     risk = ToolRisk.WRITE
+
+    def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
+        return ConcurrencySpec(
+            (ResourceLock("process", str(arguments.get("task_id", "")), "write"),)
+        )
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         supervisor = _supervisor(self.name, self.session)

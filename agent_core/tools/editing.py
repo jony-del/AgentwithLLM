@@ -18,7 +18,7 @@ from typing import Any
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_safety import ordinary_read_permission, ordinary_write_permission
 from agent_core.permission_types import PermissionContext, PermissionResult
-from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin, coerce_int
+from agent_core.tools.base import ConcurrencySpec, ExecutionSafety, Tool, WorkspacePathMixin, coerce_int
 from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
@@ -48,6 +48,7 @@ class GlobTool(WorkspacePathMixin, Tool):
         "required": ["pattern"],
     }
     risk = ToolRisk.READ
+    execution_safety = ExecutionSafety.SPECULATIVE_SAFE
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -55,7 +56,9 @@ class GlobTool(WorkspacePathMixin, Tool):
         return ordinary_read_permission(self.name, arguments, context)
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        return ConcurrencySpec((self.workspace_lock(arguments.get("path", "."), "read", subtree=True),))
+        return ConcurrencySpec((self.workspace_lock(
+            arguments.get("path", "."), "read", subtree=True, requires_success=True
+        ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         pattern = str(arguments["pattern"])
@@ -118,6 +121,8 @@ class MultiEditTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+    execution_safety = ExecutionSafety.TRANSACTIONAL
+    transaction_backend = "workspace"
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext
@@ -192,6 +197,8 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
     }
     risk = ToolRisk.WRITE
     accept_edits_safe = True
+    execution_safety = ExecutionSafety.TRANSACTIONAL
+    transaction_backend = "workspace"
 
     async def check_permissions(
         self, arguments: dict[str, Any], context: PermissionContext

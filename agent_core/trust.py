@@ -81,6 +81,9 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
 
     tools = raw.get("tools")
     if isinstance(tools, dict):
+        policies = tools.get("execution_policies", tools.get("policies"))
+        if policies:
+            subset["tools.execution_policies"] = policies
         shell = tools.get("shell")
         if isinstance(shell, dict):
             for dialect in ("bash", "powershell"):
@@ -130,6 +133,8 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
         out.pop("capabilities", None)
     tools = out.get("tools")
     if isinstance(tools, dict):
+        tools.pop("execution_policies", None)
+        tools.pop("policies", None)
         shell = tools.get("shell")
         if isinstance(shell, dict):
             for dialect in ("bash", "powershell"):

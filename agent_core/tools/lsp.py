@@ -32,8 +32,9 @@ class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
     risk = ToolRisk.READ
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        path = str(arguments.get("path", self.session.workspace))
-        return ConcurrencySpec((ResourceLock("lsp", path, "read"),))
+        raw = str(arguments.get("path", ""))
+        path = (self.session.workspace / raw).resolve() if raw else self.session.workspace.resolve()
+        return ConcurrencySpec((ResourceLock("fs", str(path), "read"),))
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         config = self.session.tool_suite.lsp if self.session.tool_suite is not None else None

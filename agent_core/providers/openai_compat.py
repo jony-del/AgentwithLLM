@@ -34,7 +34,12 @@ from agent_core.models import (
     TokenUsage,
     ToolCall,
 )
-from agent_core.providers.base import LLMProvider, ProviderConfig, StreamHandler
+from agent_core.providers.base import (
+    LLMProvider,
+    ProviderCapabilities,
+    ProviderConfig,
+    StreamHandler,
+)
 from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
@@ -60,6 +65,11 @@ def _default_retry_notice(message: str) -> None:
 
 class OpenAICompatProvider(LLMProvider):
     """Chat-completions over httpx: streaming + non-streaming, retries, tool calls."""
+
+    capabilities = ProviderCapabilities(
+        "terminal_only",
+        "chat-completions has no reliable per-call completion boundary",
+    )
 
     def __init__(
         self,
@@ -271,6 +281,7 @@ class OpenAICompatProvider(LLMProvider):
     def _parse_response(self, payload: dict[str, Any]) -> LLMResult:
         choices = payload.get("choices") or [{}]
         message = choices[0].get("message") or {}
+        finish_reason = choices[0].get("finish_reason")
         usage_raw = payload.get("usage") or {}
         usage = None
         if usage_raw:
@@ -281,9 +292,11 @@ class OpenAICompatProvider(LLMProvider):
         return LLMResult(
             content=message.get("content") or "",
             tool_calls=self._parse_tool_calls(message.get("tool_calls")),
-            stop_reason=choices[0].get("finish_reason"),
+            stop_reason=finish_reason,
             raw=payload,
             usage=usage,
+            termination_proven=finish_reason is not None,
+            termination_event="http_response" if finish_reason is not None else None,
         )
 
     async def _consume_stream(
@@ -298,6 +311,7 @@ class OpenAICompatProvider(LLMProvider):
         usage: TokenUsage | None = None
         # index → accumulating {"id", "name", "arguments"(str parts)}
         pending_calls: dict[int, dict[str, Any]] = {}
+        saw_done = False
 
         async for line in response.aiter_lines():
             if should_cancel is not None and should_cancel():
@@ -307,6 +321,7 @@ class OpenAICompatProvider(LLMProvider):
                 continue
             data = line[len("data:"):].strip()
             if data == "[DONE]":
+                saw_done = True
                 break
             try:
                 chunk = json.loads(data)
@@ -367,6 +382,8 @@ class OpenAICompatProvider(LLMProvider):
             stop_reason=finish_reason,
             raw={},
             usage=usage,
+            termination_proven=saw_done and finish_reason is not None,
+            termination_event="[DONE]" if saw_done and finish_reason is not None else None,
         )
 
     # --- transport plumbing (mirrors ClaudeProvider's shape, provider-local) ---------
