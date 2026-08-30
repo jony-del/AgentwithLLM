@@ -7,8 +7,8 @@
 # SECURITY — repo-config trust (D2): when THIS file lives inside a repository you cloned,
 # it is treated as repo-controlled input. It may freely TIGHTEN policy (deny/ask rules and
 # every ordinary table apply immediately), but PRIVILEGE-WIDENING settings —
-# [permissions].allow, [[hooks.external]], [sandbox].excluded_commands /
-# .auto_allow_command_if_sandboxed / .allow_unattended_unsandboxed, [mcp.servers],
+# [permissions].allow, [[hooks.external]], sandbox escapes/custom images/extra mounts/
+# network or hardening relaxations, [mcp.servers],
 # and [web].allowed_domains —
 # are inert until you approve them once (trust-on-first-use, recorded per project in
 # ~/.polaris/trusted.json; you are re-asked if they later change). Unattended/CI runs drop
@@ -255,7 +255,7 @@ neutralize_framing = true      # wrap+escape spoofed control framing instead of 
 [[hooks.external]]
 event = "UserPromptSubmit"
 type = "command"
-command = "python3 ./.polaris/hooks/validate_prompt.py"
+command = "python ./.polaris/hooks/validate_prompt.py"
 timeout = 5
 # fail_mode = "closed"        # block the prompt if this validator can't run
 #
@@ -403,7 +403,6 @@ risk = "write"
 transport = "stdio"
 command = "python"
 args = ["-m", "mcp_server_fetch"]
-env = { PYTHONIOENCODING = "utf-8" }
 risk = "read"
 
 [mcp.servers.time]
@@ -519,49 +518,44 @@ deny  = ["bash(rm *)", "bash(curl *)", "web_fetch(domain:evil.example)"]
 ask   = ["bash", "powershell"]
 
 # --- OS sandbox (enforcement layer) -----------------------------------------
-# Wraps dangerous command execution (bash / powershell / run_tests) in an OS sandbox:
-# bwrap+seccomp on Linux, sandbox-exec on macOS. On Windows (this project's primary
-# environment) it is UNSUPPORTED and degrades to a no-op — commands run normally and
-# the permission rules above are the boundary. The built-in default is disabled;
-# this shipped example enables it explicitly.
+# Wraps Shell, run_tests, LSP, Workflow, command Hook and stdio MCP processes in an OS sandbox:
+# bwrap+seccomp on Linux, sandbox-exec on macOS, or a probed OCI Linux guest. Windows
+# formally uses Podman Machine + WSL2. Configured-but-unprepared sandboxing fails closed;
+# it never falls back to executing the command on the host.
 # Toggle via AGENT_SANDBOX env or --sandbox/--no-sandbox.
 [sandbox]
 enabled = true                        # master switch
-backend = "auto"                       # isolation tier: "auto" (container→native→noop),
+backend = "auto"                       # isolation tier: "auto" (container→native),
                                        #   "native" (bwrap/sandbox-exec), "container"
                                        #   (podman/docker), or "vm" (Hyper-V/Kata/Lima).
-                                       #   An explicit tier degrades to the next weaker
-                                       #   available one; "auto" never auto-selects "vm".
-fail_if_unavailable = false            # true = hard-fail at startup if sandbox can't run
-                                       #   (instead of silently running unsandboxed)
+                                       #   "auto" never auto-selects "vm".
+fail_if_unavailable = true             # failed probes refuse startup (fail-closed)
 auto_allow_command_if_sandboxed = false # skip the permission prompt when a command WILL be
                                        #   sandboxed. Default false (decision D4): the sandbox
                                        #   is one layer, not a substitute for confirmation.
                                        #   Set true only in a trusted dev/lax profile.
-allow_unsandboxed_commands = true      # honor a per-call request to run outside the sandbox
-excluded_commands = []                 # commands that run OUTSIDE the sandbox, e.g. ["bazel:*"]
-                                       #   (NOT a security boundary — still hits permissions)
+allow_unsandboxed_commands = false     # per-command host fallback is forbidden
 
 [sandbox.filesystem]
-# The workspace is always writable; everything else is read-only under the sandbox.
+# The workspace is writable; other host paths are invisible unless explicitly mounted.
 allow_write = []                       # extra writable paths, e.g. ["~/.cache"]
 deny_write  = []                       # carve read-only holes inside a writable region
 deny_read   = []                       # hide sensitive regions, e.g. ["~/.ssh", "~/.aws"]
 allow_read  = []                       # re-allow specific paths inside a deny_read region
 
 [sandbox.network]
-# Network is default-deny under the sandbox. Allowing any domain (or local binding)
-# currently shares the host network (no proxy is shipped); leave empty to isolate.
-allowed_domains = []                   # e.g. ["api.example.com"]
-allow_local_binding = false            # permit binding local ports (servers/tests)
+# Container v1 is network-deny only. Non-empty domains or local binding are rejected.
+allowed_domains = []
+allow_local_binding = false
 
 [sandbox.container]
 # Used when backend = "container" (or "auto" resolves to it). Runs each command inside a
 # hardened, ephemeral (--rm) container. On Windows this targets WSL2 Linux containers; the
 # workspace is bind-mounted (drive path E:\proj → /mnt/e/proj inside the container).
 runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
-image = "docker.io/library/debian:stable-slim"   # image the command runs inside
-auto_pull = true                      # pull the image at startup if missing
+# Default image comes from sandbox-image.lock.json and is pinned by an OCI index digest.
+# image = "ghcr.io/acme/polaris-sandbox@sha256:<64-hex>" # trusted derived image only
+auto_pull = false                     # ordinary startup never pulls or starts Podman Machine
 oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
 read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
 drop_all_capabilities = true           # --cap-drop ALL
@@ -569,8 +563,7 @@ no_new_privileges = true               # --security-opt no-new-privileges
 memory = ""                            # e.g. "512m" (empty = no limit)
 cpus = ""                              # e.g. "1.5"
 pids_limit = ""                        # e.g. "256"
-windows_isolation = "wsl2"             # "wsl2" (Linux containers) or "hyperv" (Windows containers)
-extra_run_args = []                    # raw flags appended to `run`, e.g. ["--dns", "1.1.1.1"]
+windows_isolation = "wsl2"             # Hyper-V is available only via backend = "vm"
 
 [sandbox.vm]
 # Used when backend = "vm" — the strongest, strict-mode tier: a dedicated VM with
@@ -578,7 +571,7 @@ extra_run_args = []                    # raw flags appended to `run`, e.g. ["--d
 # provider is unavailable.
 provider = "auto"                      # "auto" (Kata on Linux, Hyper-V on Windows, Lima on
                                        #   macOS), or "kata" / "hyperv" / "lima"
-base_image = "docker.io/library/debian:stable-slim"   # image/template the VM runs
+# base_image defaults to the bundled immutable sandbox image
 vm_name = "polaris-sandbox"            # managed guest VM name (Hyper-V/Lima)
 snapshot_name = "polaris-base"         # snapshot restored on reset (Hyper-V checkpoint / Lima)
 guest_host = ""                        # SSH target for command exec (required for Hyper-V)

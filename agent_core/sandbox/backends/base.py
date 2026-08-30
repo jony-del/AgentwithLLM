@@ -30,6 +30,7 @@ from enum import Enum
 from pathlib import Path
 
 from agent_core.sandbox.config import SandboxConfig
+from agent_core.sandbox.invocation import GuestRuntimeManifest
 
 # A command spec is either a shell string (shell=True) or an argv list (shell=False).
 Spec = "str | list[str]"
@@ -55,6 +56,7 @@ class SandboxBackend:
     tier: SandboxTier = SandboxTier.NATIVE
     #: External executables this backend needs on PATH to function.
     required_binaries: tuple[str, ...] = ()
+    uses_guest: bool = False
 
     def missing_dependencies(self) -> list[str]:
         """Names of required binaries that are not on PATH."""
@@ -76,6 +78,10 @@ class SandboxBackend:
         """Return the path spelling visible to commands inside this backend."""
 
         return str(path)
+
+    @property
+    def guest_manifest(self) -> GuestRuntimeManifest | None:
+        return None
 
     # -- lifecycle (eager per the eager-loading invariant; no-op for native) ----------
 

@@ -80,13 +80,16 @@ from agent_core.providers.base import (
     provider_capabilities,
 )
 from agent_core.sandbox import (
+    GuestCapabilityUnavailable,
     SandboxAwareMixin,
     SandboxConfig,
     SandboxManager,
+    SandboxInvocation,
     SandboxRequiredError,
     get_shared_manager,
 )
 from agent_core.scheduler import SchedulerStore
+from agent_core.tools.base import ExecutionScope
 from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.skills import (
     SkillRegistry,
@@ -563,7 +566,14 @@ class ReActAgent:
         ):
             if enabled:
                 try:
-                    resolver(configured)
+                    if self.sandbox.uses_guest:
+                        capability = "bash" if name == "bash" else "pwsh"
+                        if capability not in self.sandbox.capabilities:
+                            raise ShellUnavailableError(
+                                f"guest image does not declare {capability}"
+                            )
+                    else:
+                        resolver(configured)
                 except ShellUnavailableError:
                     self.registry.unregister(name)
                 else:
@@ -2698,14 +2708,44 @@ class ReActAgent:
             if attr is None:
                 continue  # non-lifecycle event (e.g. a tool event) — not handled here.
             try:
+                effective_spec = spec
+                if spec.type == "http" and self.config.sandbox.enabled:
+                    raise GuestCapabilityUnavailable(
+                        "guest_capability_unavailable: external HTTP hooks are unavailable "
+                        "while the guest sandbox enforces network=deny"
+                    )
+                if spec.type == "command" and self.config.sandbox.enabled:
+                    if not spec.command:
+                        raise RuntimeError("sandboxed command hook requires command text")
+                    scope = ExecutionScope.for_workspace(
+                        self.session.workspace, network="deny"
+                    )
+                    invocation = SandboxInvocation.create(
+                        ["/bin/sh", "-c", spec.command],
+                        guest_argv=["@bash", "-lc", spec.command],
+                        required_guest_capabilities=("bash",),
+                        scope=scope,
+                    )
+                    wrapped, shell = self.sandbox.wrap_invocation(
+                        invocation, command=spec.command
+                    )
+                    if shell or not isinstance(wrapped, list) or not wrapped:
+                        raise RuntimeError("sandbox did not return explicit hook argv")
+                    effective_spec = replace(
+                        spec, command_argv=[str(item) for item in wrapped]
+                    )
                 adapter = build_external_adapter(
-                    spec,
+                    effective_spec,
                     logger=self.logger,
                     provider=self.provider,
                     base_config=self._provider_config(),
                     subagent_factory=self.session.subagent_factory,
                 )
-            except Exception as exc:  # noqa: BLE001 - a bad spec must not sink construction.
+            except Exception as exc:
+                if self.config.sandbox.enabled and spec.type in {"command", "http"}:
+                    # An enabled sandbox is an execution boundary, not a best-effort
+                    # wrapper. Unsupported external transports must block construction.
+                    raise
                 logger.warning(
                     "dropping external hook %s/%s (failed to build): %s: %s",
                     spec.event, spec.type, type(exc).__name__, exc,

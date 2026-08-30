@@ -16,6 +16,7 @@ import json
 import locale
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,9 @@ NODE_VERSION = str(_MANIFEST["node_version"])
 NODE_MAJOR = int(NODE_VERSION.removeprefix("v").split(".", 1)[0])
 MIN_NODE_MAJOR = int(_MANIFEST["minimum_node_major"])
 DEFAULT_IMAGE = str(_MANIFEST["sandbox_image"])
+SANDBOX_PROTOCOL_VERSION = int(_MANIFEST["sandbox_protocol_version"])
+if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-fA-F]{64}", DEFAULT_IMAGE):
+    raise RuntimeError("installer manifest sandbox_image must be pinned by SHA-256 digest")
 RUNTIME_COMMANDS = ("git", "rg", "node", "npm", "npx")
 CONTAINER_RUNTIMES = ("podman", "docker", "nerdctl")
 
@@ -273,9 +277,9 @@ class Installer:
             detail = runtime or "no usable podman/docker/nerdctl runtime"
             results.append(Check("container-runtime", runtime is not None, detail))
             if runtime:
-                present = self._image_present(runtime)
+                present, detail = self._sandbox_canary(runtime)
                 results.append(
-                    Check("sandbox-image", present, DEFAULT_IMAGE if present else "image missing")
+                    Check("sandbox-canary", present, detail)
                 )
         if include_project:
             project_command = self._project_command()
@@ -595,7 +599,18 @@ class Installer:
         if not self.options.dry_run and not self._image_present(runtime):
             raise InstallError(f"{runtime} could not prepare sandbox image {DEFAULT_IMAGE}")
         if not self.options.dry_run:
-            self.state.mark("sandbox:image", component="sandbox-image", source=runtime)
+            canary_ok, canary_detail = self._sandbox_canary(runtime)
+            if not canary_ok:
+                raise InstallError(
+                    f"sandbox image failed runtime/mount/capability/network verification: "
+                    f"{canary_detail}"
+                )
+            self.state.mark(
+                "sandbox:image",
+                component="sandbox-image",
+                source=runtime,
+                details={"image": DEFAULT_IMAGE, "protocol": SANDBOX_PROTOCOL_VERSION},
+            )
         return runtime
 
     def _select_usable_runtime(self) -> str | None:
@@ -827,6 +842,101 @@ class Installer:
 
     def _image_present(self, runtime: str) -> bool:
         return self.runner.run([runtime, "image", "inspect", DEFAULT_IMAGE], capture=True).returncode == 0
+
+    def _sandbox_canary(self, runtime: str) -> tuple[bool, str]:
+        """Verify the exact image contract before recording a successful install."""
+
+        if not self._image_present(runtime):
+            return False, f"immutable image is missing: {DEFAULT_IMAGE}"
+        user = "65532:65532"
+        getuid, getgid = getattr(os, "getuid", None), getattr(os, "getgid", None)
+        if self.system != "windows" and getuid is not None and getgid is not None:
+            uid, gid = int(getuid()), int(getgid())
+            if uid != 0:
+                user = f"{uid}:{gid}"
+        prefix = [
+            runtime, "run", "--rm", "--init", "--network", "none",
+            "--user", user, "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--env", "HOME=/tmp/polaris-home",
+            "--env", "XDG_CACHE_HOME=/tmp/polaris-cache",
+        ]
+        if user != "65532:65532" and Path(runtime).name.casefold() in {"podman", "podman.exe"}:
+            prefix += ["--userns", "keep-id"]
+        manifest_result = self.runner.run(
+            [*prefix, DEFAULT_IMAGE, "/opt/polaris/bin/sandbox-probe", "manifest"],
+            capture=True,
+        )
+        if manifest_result.returncode:
+            return False, (manifest_result.stderr or "guest manifest probe failed").strip()
+        try:
+            manifest = json.loads(manifest_result.stdout or "")
+            protocol = int(manifest.get("protocol_version", 0))
+            guest_os = str(manifest.get("guest_os", "")).casefold()
+            tools = manifest.get("tools")
+        except (AttributeError, TypeError, ValueError):
+            return False, "guest manifest is invalid JSON"
+        required = {"bash", "pwsh", "python", "node", "npm", "npx", "pyright-langserver"}
+        if protocol != SANDBOX_PROTOCOL_VERSION or guest_os != "linux" or not isinstance(tools, dict):
+            return False, "guest manifest protocol/OS/tool table mismatch"
+        missing = sorted(required - set(tools))
+        invalid = sorted(
+            name for name, path in tools.items()
+            if not isinstance(path, str) or not path.startswith("/")
+        )
+        if missing or invalid:
+            return False, (
+                f"missing tools={','.join(missing) or '(none)'}; "
+                f"invalid paths={','.join(invalid) or '(none)'}"
+            )
+        try:
+            host_workspace, guest_workspace = self._sandbox_workspace_paths()
+        except InstallError as exc:
+            return False, str(exc)
+        mount_result = self.runner.run(
+            [
+                *prefix, "-v", f"{host_workspace}:{guest_workspace}",
+                "-w", guest_workspace, DEFAULT_IMAGE,
+                "/opt/polaris/bin/sandbox-probe", "mount", guest_workspace,
+            ],
+            capture=True,
+        )
+        if mount_result.returncode:
+            return False, (mount_result.stderr or "read/write bind-mount probe failed").strip()
+        security_result = self.runner.run(
+            [*prefix, DEFAULT_IMAGE, "/opt/polaris/bin/sandbox-probe", "security"],
+            capture=True,
+        )
+        if security_result.returncode:
+            return False, (
+                security_result.stderr or "read-only/non-root security canary failed"
+            ).strip()
+        network_result = self.runner.run(
+            [
+                *prefix, DEFAULT_IMAGE, "/opt/polaris/bin/sandbox-probe",
+                "network-denied",
+            ],
+            capture=True,
+        )
+        if network_result.returncode:
+            return False, (network_result.stderr or "network-deny canary failed").strip()
+        return True, (
+            f"image={DEFAULT_IMAGE} guest=linux/{manifest.get('architecture', '')} "
+            f"protocol={protocol} capabilities={','.join(sorted(required))}"
+        )
+
+    def _sandbox_workspace_paths(self) -> tuple[str, str]:
+        workspace = self.options.source.resolve()
+        if self.system != "windows":
+            return str(workspace), str(workspace)
+        raw = str(workspace).replace("\\", "/")
+        if raw.startswith("//"):
+            raise InstallError("UNC/network workspaces are not supported by the WSL2 sandbox")
+        if len(raw) < 3 or raw[1] != ":" or not raw[0].isalpha():
+            raise InstallError("Windows sandbox workspace must be on a local drive")
+        guest = f"/mnt/{raw[0].casefold()}/{raw[2:].lstrip('/')}"
+        return guest, guest
 
     def _install_project(self) -> None:
         source = self.options.source.resolve()

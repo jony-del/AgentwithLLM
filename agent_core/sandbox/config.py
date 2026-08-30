@@ -9,7 +9,36 @@ here touches the OS (that's :mod:`agent_core.sandbox.manager`).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import re
 from typing import Any
+
+
+_DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-fA-F]{64}$")
+
+
+def locked_sandbox_image() -> str:
+    """Read the release-injected immutable sandbox image reference."""
+
+    path = Path(__file__).with_name("sandbox-image.lock.json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        image = str(value["image"])
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid bundled sandbox image lock: {path}") from exc
+    validate_image_reference(image)
+    return image
+
+
+def validate_image_reference(image: str) -> str:
+    """Require an OCI reference pinned to one complete SHA-256 digest."""
+
+    if not _DIGEST_IMAGE.fullmatch(image.strip()):
+        raise ValueError(
+            "sandbox container image must be immutable and include @sha256:<64 hex digest>"
+        )
+    return image.strip()
 
 
 @dataclass(slots=True)
@@ -72,7 +101,7 @@ class SandboxContainerConfig:
     # Runtime binary: "auto" probes podman → docker → nerdctl in order.
     runtime: str = "auto"
     # Image the command runs inside. Must be present (or auto_pull) at prepare() time.
-    image: str = "docker.io/library/debian:stable-slim"
+    image: str = field(default_factory=locked_sandbox_image)
     # Pull the image at startup if it is missing.
     auto_pull: bool = False
     # OCI runtime override for VM-grade isolation reused by the container launcher
@@ -85,10 +114,8 @@ class SandboxContainerConfig:
     memory: str = ""
     cpus: str = ""
     pids_limit: str = ""
-    # Windows only: "wsl2" (Linux containers, default) or "hyperv" (Windows containers).
+    # Container mode always uses a Linux guest. Hyper-V is the separate ``vm`` backend.
     windows_isolation: str = "wsl2"
-    # Extra raw flags appended verbatim to the `run` invocation (escape hatch).
-    extra_run_args: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SandboxContainerConfig":
@@ -103,8 +130,6 @@ class SandboxContainerConfig:
                     "no_new_privileges"):
             if key in data:
                 setattr(config, key, _as_bool(data[key]))
-        if isinstance(data.get("extra_run_args"), list):
-            config.extra_run_args = [str(a) for a in data["extra_run_args"]]
         return config
 
 
@@ -118,7 +143,7 @@ class SandboxVmConfig:
 
     provider: str = "auto"
     # Base image / VM template the strategy boots or runs.
-    base_image: str = "docker.io/library/debian:stable-slim"
+    base_image: str = field(default_factory=locked_sandbox_image)
     # Long-lived guest VM name (Hyper-V/Lima) the strategy manages.
     vm_name: str = "polaris-sandbox"
     # Snapshot restored on reset() (Hyper-V checkpoint / Lima).
@@ -147,30 +172,29 @@ class SandboxConfig:
 
     ``enabled`` is the master switch; ``backend`` picks the isolation tier
     ("auto" | "native" | "container" | "vm"). On an unsupported platform / with missing
-    dependencies the manager degrades down the tier chain to a no-op *unless*
-    ``fail_if_unavailable`` is set, which turns "can't sandbox" into a hard startup error
-    (for managed deployments that must not run commands unsandboxed).
+    dependencies selection may try a weaker real backend, but an enabled sandbox never
+    degrades to host execution. ``fail_if_unavailable`` defaults to a hard startup gate.
     """
 
     enabled: bool = False
-    # Isolation tier: "auto" prefers container → native → noop (never auto-selects the
+    # Isolation tier: "auto" prefers container → native (never auto-selects the
     # heavyweight vm tier); an explicit tier degrades to the next weaker available one.
     backend: str = "auto"
-    fail_if_unavailable: bool = False
+    fail_if_unavailable: bool = True
     # Skip the interactive permission prompt for a command that *will* actually be
     # sandboxed. Default FALSE (decision D4): the sandbox is one protective layer,
     # not a substitute for confirmation — container escapes and writable mounts are
     # real. A dev/lax profile may opt back in explicitly.
     auto_allow_command_if_sandboxed: bool = False
-    # Honor a per-call ``dangerously_disable_sandbox`` request (run a command unsandboxed).
-    allow_unsandboxed_commands: bool = True
+    # Legacy parsed key. Per-command bypass is rejected while enabled; only the CLI's
+    # whole-session --no-sandbox path exits isolation.
+    allow_unsandboxed_commands: bool = False
     # Opt-out of the D3 rule that unattended permission modes (auto/dontask/bypass)
     # require a working sandbox. False (default) → constructing an agent in such a mode
     # with no sandbox raises SandboxRequiredError (interactive runs get a confirm
     # prompt instead). Also settable per-process via AGENT_SANDBOX_ALLOW_UNATTENDED.
     allow_unattended_unsandboxed: bool = False
-    # Commands that run OUTSIDE the sandbox (build tools that break under isolation).
-    # NOT a security boundary — excluded commands still go through normal permissions.
+    # Legacy parsed key. Non-empty exclusions are rejected while sandboxing is enabled.
     excluded_commands: list[str] = field(default_factory=list)
     network: SandboxNetworkConfig = field(default_factory=SandboxNetworkConfig)
     filesystem: SandboxFilesystemConfig = field(default_factory=SandboxFilesystemConfig)

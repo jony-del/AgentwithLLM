@@ -7,7 +7,7 @@ import os
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -61,7 +61,8 @@ from agent_core.chat_commands import (
     is_immediate_command,
 )
 from agent_core.react import ReActAgent, ReActConfig
-from agent_core.sandbox import SandboxRequiredError
+from agent_core.sandbox import SandboxManager, SandboxRequiredError, get_shared_manager
+from agent_core.tools.base import ExecutionScope
 from agent_core.tools.registry import ToolRegistry
 from agent_core.transcript import (
     build_chain,
@@ -227,7 +228,11 @@ def _connect_mcp(mcp_config):
 
 
 def _start_mcp(
-    registry: ToolRegistry, config_file: str = "agent.toml"
+    registry: ToolRegistry,
+    config_file: str = "agent.toml",
+    *,
+    sandbox: SandboxManager | None = None,
+    workspace: str | Path | None = None,
 ) -> "MCPClientManager | None":
     """Connect any configured MCP servers and register their tools, or return ``None``.
 
@@ -237,6 +242,8 @@ def _start_mcp(
     mcp_config = resolve_mcp_config(config_file)
     if not any(server.enabled for server in mcp_config.servers):
         return None
+    if sandbox is not None:
+        mcp_config = _sandbox_mcp_config(mcp_config, sandbox, workspace)
     from agent_core.mcp import MCPAdapter
 
     manager = _connect_mcp(mcp_config)
@@ -257,6 +264,72 @@ def _start_mcp(
                 },
             )
     return manager
+
+
+def _sandbox_mcp_config(mcp_config, sandbox: SandboxManager, workspace=None):
+    """Translate configured stdio MCP servers into prepared Linux-guest processes."""
+
+    if not sandbox.config.enabled:
+        return mcp_config
+    from agent_core.mcp import MCPConfig
+    from agent_core.lsp import guest_path_to_uri
+    from agent_core.plugins import sandbox_runtime_environment, sandboxed_guest_invocation
+
+    root = Path(workspace or Path.cwd()).resolve()
+    runtime_env = sandbox_runtime_environment()
+    prepared = []
+    for server in mcp_config.servers:
+        if not server.enabled:
+            prepared.append(server)
+            continue
+        if (server.transport or "stdio").casefold() != "stdio":
+            raise RuntimeError(
+                f"MCP server {server.name!r} uses a remote transport, but the "
+                "container sandbox supports network=deny only"
+            )
+        if server.env:
+            raise RuntimeError(
+                f"MCP server {server.name!r} cannot inject host environment into a guest"
+            )
+        if server.cwd:
+            cwd = (
+                (root / server.cwd).resolve()
+                if not Path(server.cwd).is_absolute()
+                else Path(server.cwd).resolve()
+            )
+            if cwd != root and root not in cwd.parents:
+                raise RuntimeError(
+                    f"MCP server {server.name!r} cwd is outside the mounted workspace"
+                )
+        guest_roots: list[str] = []
+        for raw in server.roots:
+            path = (root / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+            if path != root and root not in path.parents:
+                raise RuntimeError(
+                    f"MCP server {server.name!r} root is outside the mounted workspace"
+                )
+            guest_roots.append(guest_path_to_uri(sandbox.translate_path(path)))
+        scope = ExecutionScope.for_workspace(root, network="deny")
+        invocation = sandboxed_guest_invocation(
+            sandbox,
+            [server.command, *server.args],
+            mounted_roots=(root,),
+            scope=scope,
+        )
+        wrapped, shell = sandbox.wrap_invocation(invocation)
+        if shell or not isinstance(wrapped, list) or not wrapped:
+            raise RuntimeError(f"sandbox could not wrap MCP server {server.name!r}")
+        prepared.append(
+            replace(
+                server,
+                command=str(wrapped[0]),
+                args=[str(item) for item in wrapped[1:]],
+                cwd="",
+                env=runtime_env,
+                roots=guest_roots,
+            )
+        )
+    return MCPConfig(prepared)
 
 
 def _constant_factory(value: Any) -> Callable[[], Any]:
@@ -333,7 +406,11 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         tools=tool_suite,
     )
     registry = ReActAgent.default_registry()
-    manager = _start_mcp(registry, config_file)
+    sandbox = get_shared_manager(config.sandbox, workspace=Path.cwd())
+    sandbox.prepare()
+    manager = _start_mcp(
+        registry, config_file, sandbox=sandbox, workspace=Path.cwd()
+    )
     # Resolve which session this run writes to (new / resumed / continued / forked) and
     # load any prior conversation to seed it. ``seed`` is the fork's cloned chain that
     # must be written into the fresh transcript before the run; for plain resume it is
@@ -341,7 +418,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     session_id, history, seed = _resolve_session(args, config.session_dir)
     agent = ReActAgent(
         provider=provider, config=config, tools=registry, ui=ui, session_id=session_id,
-        mcp_manager=manager,
+        mcp_manager=manager, sandbox=sandbox,
     )
     agent._sandbox_cli_locked = (
         getattr(args, "sandbox", None) is not None
@@ -1492,9 +1569,15 @@ def mcp_command(args: argparse.Namespace) -> int:
         return 0
     from agent_core.mcp import MCPAdapter
 
+    sandbox: SandboxManager | None = None
     try:
+        sandbox = get_shared_manager(_sandbox_config(args), workspace=Path.cwd())
+        sandbox.prepare()
+        mcp_config = _sandbox_mcp_config(mcp_config, sandbox, Path.cwd())
         manager = _connect_mcp(mcp_config)
     except RuntimeError as exc:
+        if sandbox is not None:
+            sandbox.teardown()
         print(f"[error] {exc}", file=sys.stderr)
         return 1
     try:
@@ -1508,6 +1591,8 @@ def mcp_command(args: argparse.Namespace) -> int:
         return 0
     finally:
         manager.close()
+        if sandbox is not None:
+            sandbox.teardown()
 
 
 def capabilities_command(args: argparse.Namespace) -> int:
@@ -1634,15 +1719,7 @@ def main(argv: list[str] | None = None) -> int:
             "path is user-chosen config: the repo-config trust filter (TOFU) does not apply.",
         )
 
-    def add_common(subparser: argparse.ArgumentParser) -> None:
-        add_config_flag(subparser)
-        subparser.add_argument("--model", default=None)
-        subparser.add_argument(
-            "--permission",
-            type=lambda value: PermissionMode(value).value,
-            metavar="MODE",
-            default=None,
-        )
+    def add_sandbox_flags(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument(
             "--sandbox",
             action=argparse.BooleanOptionalAction,
@@ -1654,8 +1731,19 @@ def main(argv: list[str] | None = None) -> int:
             choices=["auto", "native", "container", "vm"],
             default=None,
             help="Isolation tier: native (bwrap/sandbox-exec), container (podman/docker), "
-            "vm (Hyper-V/Kata/Lima), or auto (container→native→noop). "
+            "vm (Hyper-V/Kata/Lima), or auto (container→native; fail closed if unavailable). "
             "Overrides [sandbox].backend.",
+        )
+
+    def add_common(subparser: argparse.ArgumentParser) -> None:
+        add_config_flag(subparser)
+        add_sandbox_flags(subparser)
+        subparser.add_argument("--model", default=None)
+        subparser.add_argument(
+            "--permission",
+            type=lambda value: PermissionMode(value).value,
+            metavar="MODE",
+            default=None,
         )
         subparser.add_argument(
             "--allow",
@@ -1830,6 +1918,7 @@ def main(argv: list[str] | None = None) -> int:
     mcp_parser = subparsers.add_parser("mcp", help="Inspect configured MCP servers and their tools.")
     mcp_parser.add_argument("action", choices=["list"], help="list: show tools from configured servers.")
     add_config_flag(mcp_parser)
+    add_sandbox_flags(mcp_parser)
     mcp_parser.set_defaults(func=mcp_command)
 
     capabilities_parser = subparsers.add_parser(

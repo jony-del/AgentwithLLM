@@ -4,5 +4,6 @@
   "uv_version": "0.11.28",
   "node_version": "v24.14.1",
   "minimum_node_major": 24,
-  "sandbox_image": "docker.io/library/debian:stable-slim"
+  "sandbox_image": "ghcr.io/jony-del/agentwithllm-sandbox@sha256:6f3cd8b86a95158457b482cf6ba09d2d0d5f2f2fa50316dc0553a2e5c8a6f35e",
+  "sandbox_protocol_version": 1
 }

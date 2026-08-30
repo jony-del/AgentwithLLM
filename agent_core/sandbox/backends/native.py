@@ -5,8 +5,8 @@ strategies (``bwrap`` on Linux, ``sandbox-exec`` on macOS, no-op elsewhere). It 
 no lifecycle of its own — the strategies just prefix a launcher onto each command.
 
 Per the project's research this tier is a *fast path*, not a mature security boundary on
-its own: prefer the Container/VM tiers for real containment, keep this for low-risk work
-and for graceful degradation on Windows.
+its own.  Windows has no native isolation strategy; an enabled sandbox therefore never
+selects this backend there and fails closed if a prepared Container/VM is unavailable.
 """
 
 from __future__ import annotations

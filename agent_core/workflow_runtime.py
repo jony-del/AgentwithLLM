@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from jsonschema import Draft202012Validator
 from agent_core.tools.base import ExecutionScope
+from agent_core.sandbox import SandboxInvocation
 
 
 class WorkflowError(RuntimeError):
@@ -84,24 +85,27 @@ class WorkflowRuntime:
         workspace: str | Path | None = None,
         require_sandbox: bool = False,
     ) -> Any:
-        node = shutil.which("node")
-        if node is None:
-            raise WorkflowError("Node 24 or newer is required for plugin workflows")
-        version = await asyncio.create_subprocess_exec(
-            node, "--version", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await version.communicate()
-        match = re.match(rb"v(\d+)", stdout.strip())
-        if match is None or int(match.group(1)) < 24:
-            raise WorkflowError("Node 24 or newer is required for plugin workflows")
         if require_sandbox and (sandbox is None or not sandbox.is_enabled()):
             raise WorkflowError("plugin workflows require an enforcing sandbox backend")
+        guest_mode = bool(sandbox is not None and sandbox.uses_guest)
+        node = "node" if guest_mode else shutil.which("node")
+        if node is None:
+            raise WorkflowError("Node 24 or newer is required for plugin workflows")
+        if not guest_mode:
+            version = await asyncio.create_subprocess_exec(
+                node, "--version", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await version.communicate()
+            match = re.match(rb"v(\d+)", stdout.strip())
+            if match is None or int(match.group(1)) < 24:
+                raise WorkflowError("Node 24 or newer is required for plugin workflows")
         private_temp = Path(tempfile.mkdtemp(prefix="polaris-workflow-"))
         argv: list[str] = [node, "--permission", "-e", _RUNNER]
         if sandbox is not None and sandbox.is_enabled():
-            wrapped, shell = sandbox.wrap(
+            invocation = SandboxInvocation.create(
                 argv,
-                False,
+                guest_argv=["@node", "--permission", "-e", _RUNNER],
+                required_guest_capabilities=("node",),
                 scope=ExecutionScope.for_workspace(
                     Path(workspace or Path.cwd()).resolve(),
                     private_temp=private_temp,
@@ -109,13 +113,21 @@ class WorkflowRuntime:
                     workspace_writable=False,
                 ),
             )
+            wrapped, shell = sandbox.wrap_invocation(invocation)
             if shell or not isinstance(wrapped, list) or not wrapped:
                 shutil.rmtree(private_temp, ignore_errors=True)
                 raise WorkflowError("workflow sandbox did not return explicit argv")
             argv = [str(item) for item in wrapped]
         minimal_env = {
             key: value
-            for key in ("PATH", "PATHEXT", "SystemRoot", "COMSPEC", "WINDIR", "TMP", "TEMP")
+            for key in (
+                "PATH", "PATHEXT", "SystemRoot", "COMSPEC", "WINDIR", "TMP", "TEMP",
+                # OCI client configuration only; none of these are forwarded into
+                # the Linux guest because the wrapped argv has no --env flags.
+                "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINERS_CONF",
+                "CONTAINERS_STORAGE_CONF", "DOCKER_HOST", "DOCKER_CONTEXT",
+            )
             if (value := os.environ.get(key)) is not None
         }
         try:

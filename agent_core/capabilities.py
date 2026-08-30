@@ -39,6 +39,7 @@ from agent_core.plugins import (
     is_safe_plugin_name,
     is_sha256_pin,
     plugin_tree_digest,
+    sandboxed_guest_invocation,
 )
 from agent_core.tools.base import ExecutionScope, Tool
 from agent_core.tools.registry import DeferredTool
@@ -1265,9 +1266,13 @@ class CapabilityManager:
                 read_only_roots=(root, self._packages.installs),
                 network="deny",
             )
-            wrapped, shell = self.agent.sandbox.wrap(
-                [server.command, *server.args], False, scope=scope
+            invocation = sandboxed_guest_invocation(
+                self.agent.sandbox,
+                [server.command, *server.args],
+                mounted_roots=(root, self._packages.installs, self.agent.session.workspace),
+                scope=scope,
             )
+            wrapped, shell = self.agent.sandbox.wrap_invocation(invocation)
             if shell or not isinstance(wrapped, list) or not wrapped:
                 raise PluginError("sandbox could not wrap Registry MCP server")
             server = replace(

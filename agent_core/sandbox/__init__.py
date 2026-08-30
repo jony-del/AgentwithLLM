@@ -5,7 +5,7 @@ Two-layer design:
 - the cross-platform *policy layer* lives in :mod:`agent_core.permission_rules` and
   :mod:`agent_core.permissions` (fine-grained allow/deny/ask rules);
 - this package is the OS *enforcement layer* — it wraps dangerous command execution in
-  ``bwrap`` (Linux) / ``sandbox-exec`` (macOS), degrading to a no-op on Windows.
+``bwrap`` (Linux), ``sandbox-exec`` (macOS), or a probed OCI/WSL2 Linux guest.
 
 Command tools reach the active manager via :class:`SandboxAwareMixin`, which
 ``ReActAgent`` rebinds at startup (parallel to ``SessionAwareMixin``).
@@ -28,6 +28,12 @@ from agent_core.sandbox.manager import (
     SandboxUnavailableError,
     get_shared_manager,
     reset_shared_managers,
+    SandboxPreparationState,
+)
+from agent_core.sandbox.invocation import (
+    GuestCapabilityUnavailable,
+    GuestRuntimeManifest,
+    SandboxInvocation,
 )
 
 
@@ -58,6 +64,10 @@ __all__ = [
     "SandboxManager",
     "SandboxRequiredError",
     "SandboxUnavailableError",
+    "SandboxPreparationState",
+    "SandboxInvocation",
+    "GuestRuntimeManifest",
+    "GuestCapabilityUnavailable",
     "SandboxAwareMixin",
     "NOOP_SANDBOX",
     "get_shared_manager",

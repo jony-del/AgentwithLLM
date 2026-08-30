@@ -49,11 +49,11 @@ deny = [
 allowed_domains = ["github.com", "docs.python.org", "pypi.org", "duckduckgo.com"]
 blocked_domains = []
 
-# --- OS sandbox: on, and trusted to relax prompts (dev-only) -------------------
+# --- OS sandbox: on; only the permission prompt posture is relaxed ------------
 [sandbox]
 enabled = true
 backend = "auto"
-fail_if_unavailable = false            # no sandbox on this host? run anyway (dev box)
+fail_if_unavailable = true             # isolation failure still refuses startup
 auto_allow_command_if_sandboxed = true # D4: lax profile explicitly opts back in —
                                        #   a command that WILL be sandboxed skips the prompt
-allow_unsandboxed_commands = true
+allow_unsandboxed_commands = false     # use explicit --no-sandbox for a whole session

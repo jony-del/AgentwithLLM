@@ -96,6 +96,37 @@ def test_autonomous_capability_sources_are_tofu_gated() -> None:
     assert stripped["skills"] == {"enabled": True}
 
 
+def test_sandbox_image_mount_network_and_hardening_relaxations_are_tofu_gated() -> None:
+    raw = {
+        "sandbox": {
+            "allow_unsandboxed_commands": True,
+            "fail_if_unavailable": False,
+            "network": {"allowed_domains": ["example.com"], "allow_local_binding": True},
+            "filesystem": {"allow_read": ["C:/outside"], "allow_write": ["C:/cache"]},
+            "container": {
+                "image": "ghcr.io/acme/custom@sha256:" + "a" * 64,
+                "read_only_rootfs": False,
+                "drop_all_capabilities": False,
+                "no_new_privileges": False,
+                "windows_isolation": "hyperv",
+            },
+            "vm": {"base_image": "ghcr.io/acme/vm@sha256:" + "b" * 64},
+        }
+    }
+    subset = trust.widening_subset(raw)
+    assert "sandbox.container.image" in subset
+    assert "sandbox.vm.base_image" in subset
+    assert "sandbox.filesystem.allow_write" in subset
+    assert "sandbox.network.allowed_domains" in subset
+    stripped = trust.strip_widening(raw)["sandbox"]
+    assert "allow_unsandboxed_commands" not in stripped
+    assert "fail_if_unavailable" not in stripped
+    assert stripped["network"] == {}
+    assert stripped["filesystem"] == {}
+    assert stripped["container"] == {}
+    assert stripped["vm"] == {}
+
+
 def test_strip_widening_keeps_tightening(tmp_path: Path) -> None:
     raw = load_agent_toml(_write_repo(tmp_path) / "agent.toml")
     stripped = trust.strip_widening(raw)

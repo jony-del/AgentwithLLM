@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "image": "ghcr.io/jony-del/agentwithllm-sandbox@sha256:6f3cd8b86a95158457b482cf6ba09d2d0d5f2f2fa50316dc0553a2e5c8a6f35e",
+  "guest_protocol_version": 1,
+  "platforms": ["linux/amd64", "linux/arm64"]
+}

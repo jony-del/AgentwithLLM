@@ -20,8 +20,8 @@ curl -fsSL https://github.com/jony-del/AgentwithLLM/releases/latest/download/ins
 普通安装由 uv tool 提供用户级 `polaris` 命令，不需要激活虚拟环境；安装完成后重新打开终端或直接
 运行 `polaris` 即可。只有源码开发流程需要激活仓库中的 `.venv`。
 
-安装器会复用已可用的 Podman、Docker 或 nerdctl；三者都不可用时安装 Podman，并预拉取默认
-沙箱镜像。Windows 首次启用 WSL2 后可能返回退出码 `20` 并要求重启；重启后重新运行同一条命令
+安装器会复用已通过完整挂载探针的 Podman、Docker 或 nerdctl；三者都不可用时安装 Podman，并
+拉取带 OCI index 摘要的 GHCR 工具链镜像。Windows 首次启用 WSL2 后可能返回退出码 `20` 并要求重启；重启后重新运行同一条命令
 即可从已完成步骤继续。
 
 WSL 尚未安装时，安装器先使用标准 `wsl --install --no-distribution`；若该路径失败且 WSL 仍
@@ -40,7 +40,8 @@ polaris run "Say hello without tools" --provider fake
 ```
 
 安装器只准备沙箱能力，不会擅自修改项目的 `agent.toml`。需要使用沙箱时传入 `--sandbox`，或在
-配置中设置 `[sandbox] enabled = true`。
+配置中设置 `[sandbox] enabled = true`。Windows Guest 协议、路径映射、fail-closed 状态和安全
+边界见 [WSL2 OCI sandbox](docs/sandbox-wsl2.md)。
 
 ## 卸载
 
@@ -133,9 +134,9 @@ Agent 运行时仍可继续输入：Enter 会把消息放入无限内存队列�
 - `Ctrl+T`：查看 todos 和输入队列。
 - `Ctrl+R`：搜索输入历史；`Ctrl+L`：重绘终端。
 
-常用会话命令包括 `/rename`、`/effort`、`/fast`、`/sandbox`、`/model` 和 `/status`。模型、
-effort 与 fast mode 只在当前会话生效；sandbox 变更原子应用并写入 gitignored
-`agent.local.toml`。
+常用会话命令包括 `/rename`、`/effort`、`/fast`、`/sandbox`、`/model` 和 `/status`。`/sandbox`
+会显示 requested/effective/prepared、Runtime、完整镜像摘要、Guest OS、能力表和失败原因；退出隔离
+只允许在启动新会话时显式传入 `--no-sandbox`。
 
 ## 长期记忆
 

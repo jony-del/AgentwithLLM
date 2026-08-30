@@ -221,21 +221,25 @@ class ProcessSupervisor:
         argv: list[str] | None = None,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        skip_syntax_check: bool = False,
     ) -> ProcessTask:
         if self._closed:
             raise RuntimeError("process supervisor is closed")
         if len(self.running()) >= self.config.max_tasks:
             raise RuntimeError(f"background task limit reached ({self.config.max_tasks})")
         deadline = time.monotonic() + timeout if timeout is not None else None
-        executable = (
-            resolve_bash_executable(self.config.bash.executable or os.getenv("POLARIS_BASH_PATH"))
-            if dialect == "bash"
-            else resolve_powershell_executable(self.config.powershell.executable)
-        )
-        await self.syntax_check(
-            dialect, command, executable,
-            timeout=(max(0.1, deadline - time.monotonic()) if deadline is not None else 10),
-        )
+        executable = ""
+        if not skip_syntax_check or argv is None:
+            executable = (
+                resolve_bash_executable(self.config.bash.executable or os.getenv("POLARIS_BASH_PATH"))
+                if dialect == "bash"
+                else resolve_powershell_executable(self.config.powershell.executable)
+            )
+        if not skip_syntax_check:
+            await self.syntax_check(
+                dialect, command, executable,
+                timeout=(max(0.1, deadline - time.monotonic()) if deadline is not None else 10),
+            )
         remaining_timeout = deadline - time.monotonic() if deadline is not None else None
         if remaining_timeout is not None and remaining_timeout <= 0:
             raise TimeoutError(f"{dialect} command deadline expired during syntax analysis")

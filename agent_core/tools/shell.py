@@ -18,6 +18,7 @@ from agent_core.process_supervisor import (
     resolve_bash_executable,
     resolve_powershell_executable,
 )
+from agent_core.sandbox import SandboxInvocation
 from agent_core.sandbox import SandboxAwareMixin
 from agent_core.session import SessionAwareMixin
 from agent_core.tools.base import ConcurrencySpec, ExecutionScope, ResourceLock, Tool
@@ -50,9 +51,10 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
     async def check_permissions(self, arguments: dict[str, Any], context: PermissionContext) -> PermissionResult:
         command = str(arguments.get("command", ""))
         if arguments.get("dangerously_disable_sandbox"):
-            if not self.sandbox.config.allow_unsandboxed_commands:
+            if self.sandbox.config.enabled:
                 return PermissionResult.deny(
-                    "managed sandbox configuration forbids unsandboxed commands",
+                    "per-command sandbox bypass is forbidden; use the explicit "
+                    "--no-sandbox option for the whole session",
                     metadata={"dialect": self.dialect, "sandbox_override": True},
                 )
             return PermissionResult.ask(
@@ -98,27 +100,57 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             1, min(int(str(arguments.get("timeout", config.timeout))), config.max_timeout)
         )
         try:
+            if bool(arguments.get("dangerously_disable_sandbox", False)) and self.sandbox.config.enabled:
+                raise RuntimeError(
+                    "per-command sandbox bypass is forbidden while sandboxing is enabled"
+                )
             if self.dialect == "bash":
-                executable = resolve_bash_executable(config.bash.executable or os.getenv("POLARIS_BASH_PATH"))
-                argv: object = [executable, "-lc", command]
+                executable = (
+                    config.bash.executable or os.getenv("POLARIS_BASH_PATH") or "bash"
+                    if self.sandbox.uses_guest
+                    else resolve_bash_executable(
+                        config.bash.executable or os.getenv("POLARIS_BASH_PATH")
+                    )
+                )
+                host_argv = [executable, "-lc", command]
+                guest_argv = ["@bash", "-lc", command]
+                capability = "bash"
             else:
-                executable = resolve_powershell_executable(config.powershell.executable)
-                argv = [
+                executable = (
+                    config.powershell.executable or "pwsh"
+                    if self.sandbox.uses_guest
+                    else resolve_powershell_executable(config.powershell.executable)
+                )
+                powershell_args = [
+                    "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-OutputFormat", "Text", "-EncodedCommand",
+                    encoded_powershell(powershell_utf8_command(command)),
+                ]
+                host_argv = [
                     executable, "-NoLogo", "-NoProfile", "-NonInteractive",
                     "-OutputFormat", "Text", "-EncodedCommand",
                     encoded_powershell(powershell_utf8_command(command)),
                 ]
+                guest_argv = ["@pwsh", *powershell_args]
+                capability = "pwsh"
             if not bool(arguments.get("dangerously_disable_sandbox", False)):
-                argv, shell = self.sandbox.wrap(
-                    argv, False, command=command,
-                    scope=ExecutionScope.for_workspace(self.session.workspace, network="deny"),
+                invocation = SandboxInvocation.create(
+                    host_argv,
+                    guest_argv=guest_argv,
+                    required_guest_capabilities=(capability,),
+                    scope=ExecutionScope.for_workspace(
+                        self.session.workspace, network="deny"
+                    ),
                 )
+                argv, shell = self.sandbox.wrap_invocation(invocation, command=command)
                 if shell or isinstance(argv, str):
                     raise RuntimeError("sandbox returned a shell-string command; explicit argv is required")
+            else:
+                argv = host_argv
             if not isinstance(argv, (list, tuple)):
                 raise RuntimeError("sandbox returned invalid argv")
             child_env = None
-            if self.session.plugin_bin_paths:
+            if self.session.plugin_bin_paths and not self.sandbox.uses_guest:
                 child_env = dict(os.environ)
                 child_env["PATH"] = os.pathsep.join(
                     [*self.session.plugin_bin_paths, child_env.get("PATH", "")]
@@ -126,6 +158,7 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             task = await supervisor.start(
                 self.dialect, command, self.session.workspace,
                 argv=[str(item) for item in argv], timeout=timeout, env=child_env,
+                skip_syntax_check=self.sandbox.uses_guest,
             )
         except (ValueError, RuntimeError, OSError) as exc:
             return ToolResult(self.name, f"{self.dialect} failed to start: {exc}", ok=False)

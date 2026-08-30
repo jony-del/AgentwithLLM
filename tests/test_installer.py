@@ -59,6 +59,19 @@ class FakeRunner(Runner):
             stdout = self.versions.get(command, f"{command} 1.0")
         if rendered[-4:] == ["machine", "list", "--format", "json"]:
             stdout = "[]"
+        if rendered[-1:] == ["manifest"] and "sandbox-probe" in " ".join(rendered):
+            stdout = json.dumps({
+                "protocol_version": 1,
+                "guest_os": "linux",
+                "architecture": "amd64",
+                "tools": {
+                    name: f"/usr/bin/{name}"
+                    for name in (
+                        "bash", "pwsh", "python", "node", "npm", "npx",
+                        "pyright-langserver",
+                    )
+                },
+            })
         return subprocess.CompletedProcess(rendered, returncode, stdout, stderr)
 
 

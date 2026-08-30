@@ -35,6 +35,7 @@ from agent_core.permission_types import (
 from agent_core.sandbox import SandboxAwareMixin
 from agent_core.tools.base import (
     ConcurrencySpec,
+    ExecutionScope,
     ExecutionSafety,
     ResourceLock,
     Tool,
@@ -548,9 +549,9 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
         )
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
-        # pytest is a [dev] extra, not a runtime dependency — probe for it and fail
-        # with an actionable install hint instead of a raw ModuleNotFoundError.
-        if importlib.util.find_spec("pytest") is None:
+        # Host pytest is irrelevant for a Linux guest; the prepared image manifest is
+        # the authority in that mode.
+        if not self.sandbox.uses_guest and importlib.util.find_spec("pytest") is None:
             return ToolResult(
                 self.name,
                 "pytest is not installed in this environment. Install the dev extras "
@@ -559,14 +560,42 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
                 metadata={"error_type": "MissingDependency"},
             )
         cmd = [sys.executable, "-m", "pytest"]
+        guest_cmd = ["@python", "-m", "pytest"]
         if arguments.get("target"):
-            cmd.append(str(arguments["target"]))
+            target = str(arguments["target"])
+            cmd.append(target)
+            target_path = Path(target.split("::", 1)[0])
+            if target_path.is_absolute():
+                resolved = target_path.resolve()
+                if resolved != self.workspace and self.workspace not in resolved.parents:
+                    return ToolResult(
+                        self.name, "test target escapes workspace", ok=False,
+                        metadata={"error_type": "guest_capability_unavailable"},
+                    )
+                suffix = target[len(str(target_path)):]
+                target = self.sandbox.translate_path(resolved) + suffix
+            guest_cmd.append(target)
         extra = arguments.get("args") or []
         if isinstance(extra, list):
             cmd += [str(a) for a in extra]
+            guest_cmd += [str(a) for a in extra]
         timeout = min(coerce_int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT)
         # Sandbox the (argv) test invocation when active; no command string to exclude on.
-        spec, shell = self.sandbox.wrap(cmd, False, command=None)
+        from agent_core.sandbox import SandboxInvocation
+
+        invocation = SandboxInvocation.create(
+            cmd,
+            guest_argv=guest_cmd,
+            required_guest_capabilities=("python",),
+            scope=ExecutionScope.for_workspace(self.workspace, network="deny"),
+        )
+        try:
+            spec, shell = self.sandbox.wrap_invocation(invocation)
+        except RuntimeError as exc:
+            return ToolResult(
+                self.name, str(exc), ok=False,
+                metadata={"error_type": getattr(exc, "error_type", "SandboxUnavailable")},
+            )
         return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
 
 

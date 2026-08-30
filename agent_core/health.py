@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from agent_core.sandbox import SandboxConfig, SandboxManager
 from agent_core.sandbox.config import SandboxContainerConfig
 
 _RUNTIME_DISTRIBUTIONS = (
@@ -140,13 +141,40 @@ def collect_dependency_checks(
         )
     )
     image = SandboxContainerConfig().image
-    image_ok = bool(runtime and _probe([runtime, "image", "inspect", image]))
+    canary_ok = False
+    canary_detail = f"{image} cannot be probed without a usable runtime"
+    if runtime:
+        config = SandboxConfig.from_dict(
+            {
+                "enabled": True,
+                "backend": "container",
+                "container": {"runtime": runtime, "image": image},
+            }
+        )
+        try:
+            manager = SandboxManager(config, workspace=Path.cwd())
+            manager.prepare()
+        except RuntimeError as exc:
+            canary_detail = str(exc)
+        else:
+            canary_ok = manager.is_enabled() and manager.prepared
+            manifest = manager.guest_manifest
+            canary_detail = (
+                f"requested={str(manager.requested).lower()} "
+                f"effective={str(manager.is_enabled()).lower()} "
+                f"prepared={str(manager.prepared).lower()} "
+                f"backend={manager.backend_name} runtime={manager.runtime} image={manager.image} "
+                f"guest={manifest.guest_os}/{manifest.architecture} "
+                f"capabilities={','.join(sorted(manager.capabilities))}"
+                if manifest is not None
+                else "guest manifest missing"
+            )
     checks.append(
         HealthCheck(
-            name="sandbox-image",
+            name="sandbox-canary",
             required=True,
-            status="ok" if image_ok else "error",
-            detail=image if image_ok else f"{image} is not present",
+            status="ok" if canary_ok else "error",
+            detail=canary_detail,
         )
     )
     return checks

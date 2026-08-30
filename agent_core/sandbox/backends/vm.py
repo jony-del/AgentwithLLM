@@ -24,12 +24,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 from agent_core.sandbox.backends.base import SandboxBackend, SandboxTier, to_argv
 from agent_core.sandbox.backends.container import ContainerBackend, _map_workspace_path
 from agent_core.sandbox.config import SandboxConfig
+from agent_core.sandbox.invocation import GuestCapabilityUnavailable, GuestRuntimeManifest
 
 # Single, non-stacked timeout for every VM lifecycle call (checkpoint/restore/boot).
 _VM_TIMEOUT = 600
@@ -44,6 +46,7 @@ class VmStrategy:
 
     name = "vm"
     required_binaries: tuple[str, ...] = ()
+    guest_manifest: GuestRuntimeManifest | None = None
 
     def missing_dependencies(self) -> list[str]:
         return [b for b in self.required_binaries if shutil.which(b) is None]
@@ -63,18 +66,29 @@ class VmStrategy:
     def wrap(self, argv: list[str], *, config: SandboxConfig, workspace: Path) -> list[str]:
         raise NotImplementedError
 
+    def translate_path(self, path: Path) -> str:
+        return str(path)
+
 
 class VmBackend(SandboxBackend):
     name = "vm"
     tier = SandboxTier.VM
+    uses_guest = True
 
-    def __init__(self, config: SandboxConfig | None = None) -> None:
+    def __init__(
+        self, config: SandboxConfig | None = None, *, workspace: str | Path | None = None
+    ) -> None:
         self._config = config or SandboxConfig()
-        self._strategy = _select_vm_strategy(self._config)
+        self._workspace = Path(workspace or Path.cwd()).resolve()
+        self._strategy = _select_vm_strategy(self._config, self._workspace)
 
     @property
     def strategy_name(self) -> str:
         return self._strategy.name
+
+    @property
+    def guest_manifest(self) -> GuestRuntimeManifest | None:
+        return self._strategy.guest_manifest
 
     def missing_dependencies(self) -> list[str]:
         return self._strategy.missing_dependencies()
@@ -90,6 +104,9 @@ class VmBackend(SandboxBackend):
 
     def teardown(self) -> None:
         self._strategy.teardown(self._config)
+
+    def translate_path(self, path: Path) -> str:
+        return self._strategy.translate_path(path)
 
     def wrap(
         self, spec, shell: bool, *, config: SandboxConfig, workspace: Path
@@ -107,10 +124,12 @@ class KataStrategy(VmStrategy):
 
     name = "kata"
 
-    def __init__(self, config: SandboxConfig) -> None:
+    def __init__(self, config: SandboxConfig, workspace: Path) -> None:
         self._config = config
         self._kata_runtime = config.vm.provider if config.vm.provider not in {"auto", "kata"} else "kata-runtime"
-        self._container = ContainerBackend(config)
+        guest_container = replace(config.container, image=config.vm.base_image)
+        self._guest_config = replace(config, container=guest_container)
+        self._container = ContainerBackend(self._guest_config, workspace=workspace)
 
     def missing_dependencies(self) -> list[str]:
         missing = self._container.missing_dependencies()
@@ -120,14 +139,19 @@ class KataStrategy(VmStrategy):
 
     def prepare(self, config: SandboxConfig) -> None:
         self._container.prepare()
+        self.guest_manifest = self._container.guest_manifest
 
     def wrap(self, argv: list[str], *, config: SandboxConfig, workspace: Path) -> list[str]:
         # Force the container to run under the Kata OCI runtime for microVM isolation.
-        forced = _with_oci_runtime(config, self._kata_runtime)
+        guest_container = replace(config.container, image=config.vm.base_image)
+        forced = _with_oci_runtime(replace(config, container=guest_container), self._kata_runtime)
         wrapped, _ = self._container.wrap(argv, False, config=forced, workspace=workspace)
         if not isinstance(wrapped, list):
             raise TypeError("container backend returned a non-argv command")
         return cast(list[str], wrapped)
+
+    def translate_path(self, path: Path) -> str:
+        return self._container.translate_path(path)
 
 
 class HyperVStrategy(VmStrategy):
@@ -136,23 +160,31 @@ class HyperVStrategy(VmStrategy):
     name = "hyperv"
     required_binaries = ("powershell", "ssh")
 
-    def __init__(self, config: SandboxConfig) -> None:
+    def __init__(self, config: SandboxConfig, workspace: Path) -> None:
         self._config = config
+        self._workspace = workspace
 
     def prepare(self, config: SandboxConfig) -> None:
         vm = config.vm
         if not vm.guest_host:
             raise VmUnavailable("[sandbox.vm].guest_host is required for the Hyper-V provider")
         # Ensure a base checkpoint exists to roll back to (idempotent create).
-        _powershell(
+        if not _powershell(
             f"if (-not (Get-VMSnapshot -VMName '{vm.vm_name}' "
             f"-Name '{vm.snapshot_name}' -ErrorAction SilentlyContinue)) "
             f"{{ Checkpoint-VM -Name '{vm.vm_name}' -SnapshotName '{vm.snapshot_name}' }}"
+        ):
+            raise VmUnavailable(f"could not verify Hyper-V checkpoint for {vm.vm_name!r}")
+        self.guest_manifest = _remote_manifest(["ssh", vm.guest_host])
+        guest_workspace = _map_workspace_path(self._workspace, "wsl2")
+        _require_remote_canaries(
+            lambda command: ["ssh", vm.guest_host, command], guest_workspace
         )
 
     def reset(self, config: SandboxConfig) -> None:
         vm = config.vm
-        _powershell(f"Restore-VMSnapshot -VMName '{vm.vm_name}' -Name '{vm.snapshot_name}' -Confirm:$false")
+        if not _powershell(f"Restore-VMSnapshot -VMName '{vm.vm_name}' -Name '{vm.snapshot_name}' -Confirm:$false"):
+            raise VmUnavailable(f"could not restore Hyper-V snapshot {vm.snapshot_name!r}")
 
     def wrap(self, argv: list[str], *, config: SandboxConfig, workspace: Path) -> list[str]:
         vm = config.vm
@@ -161,6 +193,9 @@ class HyperVStrategy(VmStrategy):
         remote = f"cd {shlex.quote(guest_ws)} && {shlex.join(argv)}"
         return ["ssh", vm.guest_host, remote]
 
+    def translate_path(self, path: Path) -> str:
+        return _map_workspace_path(path, "wsl2")
+
 
 class LimaStrategy(VmStrategy):
     """macOS: a limactl-managed Linux VM."""
@@ -168,14 +203,20 @@ class LimaStrategy(VmStrategy):
     name = "lima"
     required_binaries = ("limactl",)
 
-    def __init__(self, config: SandboxConfig) -> None:
+    def __init__(self, config: SandboxConfig, workspace: Path) -> None:
         self._config = config
+        self._workspace = workspace
 
     def prepare(self, config: SandboxConfig) -> None:
         vm = config.vm
         # Start the VM if it is not already running (idempotent, bounded by the VM timeout).
         if not _run_vm_command(["limactl", "start", "--tty=false", vm.vm_name]):
             raise VmUnavailable(f"could not start lima VM {vm.vm_name!r}")
+        self.guest_manifest = _remote_manifest(["limactl", "shell", vm.vm_name])
+        _require_remote_canaries(
+            lambda command: ["limactl", "shell", vm.vm_name, "sh", "-lc", command],
+            str(self._workspace),
+        )
 
     def wrap(self, argv: list[str], *, config: SandboxConfig, workspace: Path) -> list[str]:
         vm = config.vm
@@ -183,14 +224,14 @@ class LimaStrategy(VmStrategy):
         return ["limactl", "shell", vm.vm_name, "sh", "-c", remote]
 
 
-def _select_vm_strategy(config: SandboxConfig) -> VmStrategy:
+def _select_vm_strategy(config: SandboxConfig, workspace: Path | None = None) -> VmStrategy:
     provider = config.vm.provider
     if provider == "hyperv" or (provider == "auto" and sys.platform == "win32"):
-        return HyperVStrategy(config)
+        return HyperVStrategy(config, workspace or Path.cwd().resolve())
     if provider == "lima" or (provider == "auto" and sys.platform == "darwin"):
-        return LimaStrategy(config)
+        return LimaStrategy(config, workspace or Path.cwd().resolve())
     # Default / "kata" / Linux-auto → Kata microVMs.
-    return KataStrategy(config)
+    return KataStrategy(config, workspace or Path.cwd().resolve())
 
 
 # -- helpers -------------------------------------------------------------------------
@@ -198,8 +239,6 @@ def _select_vm_strategy(config: SandboxConfig) -> VmStrategy:
 
 def _with_oci_runtime(config: SandboxConfig, runtime: str) -> SandboxConfig:
     """Return a shallow copy of config whose container.oci_runtime is forced to *runtime*."""
-    from dataclasses import replace
-
     container = replace(config.container, oci_runtime=runtime)
     return replace(config, container=container)
 
@@ -222,3 +261,33 @@ def _run_vm_command(argv: list[str]) -> bool:
     except OSError:
         return False
     return proc.returncode == 0
+
+
+def _remote_manifest(prefix: list[str]) -> GuestRuntimeManifest:
+    try:
+        proc = subprocess.run(
+            [*prefix, "/opt/polaris/bin/sandbox-probe", "manifest"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_VM_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VmUnavailable("Linux guest protocol probe failed") from exc
+    if proc.returncode:
+        raise VmUnavailable("Linux guest protocol probe failed")
+    try:
+        return GuestRuntimeManifest.from_json(proc.stdout)
+    except GuestCapabilityUnavailable as exc:
+        raise VmUnavailable(str(exc)) from exc
+
+
+def _require_remote_canaries(builder, guest_workspace: str) -> None:
+    quoted = shlex.quote(guest_workspace)
+    commands = (
+        f"cd {quoted} && /opt/polaris/bin/sandbox-probe mount {quoted}",
+        "/opt/polaris/bin/sandbox-probe security",
+        "/opt/polaris/bin/sandbox-probe network-denied",
+    )
+    if not all(_run_vm_command(builder(command)) for command in commands):
+        raise VmUnavailable("Linux guest mount/security/network canary failed")

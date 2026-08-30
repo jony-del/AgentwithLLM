@@ -21,7 +21,12 @@ from agent_core.tools.local import AskUserQuestionTool
 from agent_core.tools.registry import ToolRegistry
 from agent_core.session import SessionContext
 from agent_core.worktree import WorktreeManager
-from agent_core.lsp import LSPManager
+from agent_core.lsp import (
+    LSPManager,
+    guest_path_to_uri,
+    guest_uri_to_host_path,
+    translate_lsp_uris_to_host,
+)
 
 
 class _Deferred(Tool):
@@ -378,3 +383,23 @@ while True:
     diagnostics = await manager.request("diagnostics", path="demo.py")
     assert diagnostics == [{"message": "demo"}]
     await manager.close()
+
+
+def test_lsp_guest_uri_roundtrip_preserves_spaces_and_unicode(tmp_path: Path) -> None:
+    host_root = tmp_path / "repo with spaces 中文"
+    target = host_root / "pkg" / "模块.py"
+    guest_root = "/mnt/e/repo with spaces 中文"
+    uri = guest_path_to_uri("/mnt/e/repo with spaces 中文/pkg/模块.py")
+    assert "%E6%A8%A1%E5%9D%97.py" in uri and "%20" in uri
+    assert guest_uri_to_host_path(uri, host_root, guest_root) == target.resolve()
+    payload = {
+        "uri": uri,
+        "location": {"targetUri": uri},
+        "items": [{"uri": "file:///usr/lib/python/typeshed.pyi"}],
+    }
+    translated = translate_lsp_uris_to_host(
+        payload, host_root=host_root, guest_root=guest_root
+    )
+    assert translated["uri"] == target.resolve().as_uri()
+    assert translated["location"]["targetUri"] == target.resolve().as_uri()
+    assert translated["items"][0]["uri"] == "file:///usr/lib/python/typeshed.pyi"

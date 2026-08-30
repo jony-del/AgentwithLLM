@@ -1,0 +1,9 @@
+**
+!pyproject.toml
+!README.md
+!agent_core/
+!agent_core/**
+!sandbox/
+!sandbox/**
+**/__pycache__/
+**/*.py[cod]

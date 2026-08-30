@@ -63,9 +63,39 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(sandbox, dict):
         if sandbox.get("excluded_commands"):
             subset["sandbox.excluded_commands"] = sandbox["excluded_commands"]
-        for flag in ("auto_allow_command_if_sandboxed", "allow_unattended_unsandboxed"):
+        for flag in (
+            "auto_allow_command_if_sandboxed",
+            "allow_unattended_unsandboxed",
+            "allow_unsandboxed_commands",
+        ):
             if _truthy(sandbox.get(flag)):
                 subset[f"sandbox.{flag}"] = True
+        if "fail_if_unavailable" in sandbox and not _truthy(sandbox.get("fail_if_unavailable")):
+            subset["sandbox.fail_if_unavailable"] = False
+        network = sandbox.get("network")
+        if isinstance(network, dict):
+            if network.get("allowed_domains"):
+                subset["sandbox.network.allowed_domains"] = network["allowed_domains"]
+            if _truthy(network.get("allow_local_binding")):
+                subset["sandbox.network.allow_local_binding"] = True
+        filesystem = sandbox.get("filesystem")
+        if isinstance(filesystem, dict):
+            for key in ("allow_read", "allow_write"):
+                if filesystem.get(key):
+                    subset[f"sandbox.filesystem.{key}"] = filesystem[key]
+        container = sandbox.get("container")
+        if isinstance(container, dict):
+            for key in ("image", "oci_runtime"):
+                if container.get(key):
+                    subset[f"sandbox.container.{key}"] = container[key]
+            for key in ("read_only_rootfs", "drop_all_capabilities", "no_new_privileges"):
+                if key in container and not _truthy(container.get(key)):
+                    subset[f"sandbox.container.{key}"] = False
+            if str(container.get("windows_isolation", "wsl2")).casefold() != "wsl2":
+                subset["sandbox.container.windows_isolation"] = container["windows_isolation"]
+        vm = sandbox.get("vm")
+        if isinstance(vm, dict) and vm.get("base_image"):
+            subset["sandbox.vm.base_image"] = vm["base_image"]
 
     mcp = raw.get("mcp")
     if isinstance(mcp, dict) and mcp.get("servers"):
@@ -121,6 +151,26 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
         sandbox.pop("excluded_commands", None)
         sandbox.pop("auto_allow_command_if_sandboxed", None)
         sandbox.pop("allow_unattended_unsandboxed", None)
+        sandbox.pop("allow_unsandboxed_commands", None)
+        sandbox.pop("fail_if_unavailable", None)
+        network = sandbox.get("network")
+        if isinstance(network, dict):
+            network.pop("allowed_domains", None)
+            network.pop("allow_local_binding", None)
+        filesystem = sandbox.get("filesystem")
+        if isinstance(filesystem, dict):
+            filesystem.pop("allow_read", None)
+            filesystem.pop("allow_write", None)
+        container = sandbox.get("container")
+        if isinstance(container, dict):
+            for key in (
+                "image", "oci_runtime", "read_only_rootfs", "drop_all_capabilities",
+                "no_new_privileges", "windows_isolation",
+            ):
+                container.pop(key, None)
+        vm = sandbox.get("vm")
+        if isinstance(vm, dict):
+            vm.pop("base_image", None)
     mcp = out.get("mcp")
     if isinstance(mcp, dict):
         mcp.pop("servers", None)

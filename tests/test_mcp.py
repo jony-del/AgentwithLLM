@@ -2,6 +2,9 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from agent_core.config import resolve_mcp_config
 from agent_core.mcp.adapter import MCPAdapter, MCPTool, _flatten_content
@@ -226,6 +229,64 @@ def test_describe_mcp_error_unwraps_nested_exception_groups() -> None:
 
     # A plain exception is described as-is.
     assert _describe_mcp_error(ValueError("nope")) == "ValueError: nope"
+
+
+def test_configured_stdio_mcp_is_converted_to_guest_invocation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from agent_core.cli import _start_mcp
+
+    config_path = tmp_path / "mcp.toml"
+    config_path.write_text(
+        '[mcp.servers.demo]\ntransport="stdio"\ncommand="python"\n'
+        'args=["-m","demo_server"]\nroots=["."]\n',
+        encoding="utf-8",
+    )
+    seen = {}
+
+    class GuestSandbox:
+        config = SimpleNamespace(enabled=True)
+        capabilities = frozenset({"python"})
+
+        def translate_path(self, path):
+            return "/mnt/e/workspace"
+
+        def wrap_invocation(self, invocation):
+            seen["guest"] = invocation.guest_argv
+            return ["podman", "run", "image", "/usr/bin/python3", "-m", "demo_server"], False
+
+    class Manager:
+        def tools(self):
+            return []
+
+    def connect(config):
+        seen["config"] = config
+        return Manager()
+
+    monkeypatch.setattr("agent_core.cli._connect_mcp", connect)
+    manager = _start_mcp(
+        ToolRegistry(), str(config_path), sandbox=GuestSandbox(), workspace=tmp_path
+    )
+    assert manager is not None
+    assert seen["guest"] == ("@python", "-m", "demo_server")
+    server = seen["config"].servers[0]
+    assert server.command == "podman"
+    assert server.roots == ["file:///mnt/e/workspace"]
+
+
+def test_remote_mcp_is_rejected_when_container_sandbox_is_enabled(
+    tmp_path: Path,
+) -> None:
+    from agent_core.cli import _start_mcp
+
+    config_path = tmp_path / "mcp.toml"
+    config_path.write_text(
+        '[mcp.servers.remote]\ntransport="streamable-http"\nurl="https://example.com/mcp"\n',
+        encoding="utf-8",
+    )
+    sandbox = SimpleNamespace(config=SimpleNamespace(enabled=True))
+    with pytest.raises(RuntimeError, match="network=deny"):
+        _start_mcp(ToolRegistry(), str(config_path), sandbox=sandbox, workspace=tmp_path)
 
 
 # --- integration (requires the optional `mcp` SDK and a real subprocess) --------

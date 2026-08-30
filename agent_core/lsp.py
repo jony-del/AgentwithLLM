@@ -7,11 +7,13 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 import shutil
 import tempfile
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
+from agent_core.sandbox import GuestCapabilityUnavailable, SandboxInvocation
 from agent_core.tool_config import LSPServerConfig, LSPToolConfig
 from agent_core.tools.base import ExecutionScope
 
@@ -28,6 +30,63 @@ def uri_to_path(uri: str) -> Path:
     if os.name == "nt" and path.startswith("/"):
         path = path[1:]
     return Path(path)
+
+
+def guest_path_to_uri(path: str) -> str:
+    """Encode an already-absolute Linux guest path without host ``Path.resolve``."""
+
+    if not path.startswith("/"):
+        raise ValueError(f"guest path must be absolute: {path!r}")
+    return "file://" + quote(path, safe="/:")
+
+
+def host_path_to_guest_uri(path: Path, sandbox: Any) -> str:
+    return guest_path_to_uri(sandbox.translate_path(path.resolve()))
+
+
+def guest_uri_to_host_path(uri: str, host_root: Path, guest_root: str) -> Path:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise ValueError(f"unsupported LSP URI: {uri}")
+    guest_path = PurePosixPath(unquote(parsed.path))
+    try:
+        relative = guest_path.relative_to(PurePosixPath(guest_root))
+    except ValueError as exc:
+        raise ValueError(f"guest LSP URI escapes mounted root: {uri}") from exc
+    return host_root.resolve().joinpath(*relative.parts)
+
+
+def translate_lsp_uris_to_host(
+    value: Any, *, host_root: Path, guest_root: str
+) -> Any:
+    """Recursively translate URI-valued LSP response fields back to host spelling."""
+
+    if isinstance(value, list):
+        return [
+            translate_lsp_uris_to_host(item, host_root=host_root, guest_root=guest_root)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    translated: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"uri", "targetUri"} and isinstance(item, str) and item.startswith("file:"):
+            try:
+                item = path_to_uri(guest_uri_to_host_path(item, host_root, guest_root))
+            except ValueError:
+                # A server may legitimately return a library URI outside the mounted
+                # project. Keep it opaque; never reinterpret it as a host path.
+                pass
+        translated[str(key)] = translate_lsp_uris_to_host(
+            item, host_root=host_root, guest_root=guest_root
+        )
+    return translated
+
+
+def _command_basename(command: str) -> str:
+    return max(
+        (Path(command).name, PureWindowsPath(command).name), key=len
+    ).casefold()
 
 
 @dataclass(slots=True)
@@ -48,6 +107,30 @@ class _Server:
     sandbox: Any = None
     private_temp: Path | None = None
 
+    @property
+    def guest_mode(self) -> bool:
+        return bool(self.sandbox is not None and self.sandbox.uses_guest)
+
+    @property
+    def guest_workspace(self) -> str:
+        if not self.guest_mode:
+            return ""
+        return self.sandbox.translate_path(self.workspace)
+
+    def server_uri(self, path: Path) -> str:
+        return (
+            host_path_to_guest_uri(path, self.sandbox)
+            if self.guest_mode
+            else path_to_uri(path)
+        )
+
+    def host_payload(self, value: Any) -> Any:
+        if not self.guest_mode:
+            return value
+        return translate_lsp_uris_to_host(
+            value, host_root=self.workspace, guest_root=self.guest_workspace
+        )
+
     async def start(self) -> None:
         if self.config.transport not in {"stdio", "socket"}:
             raise RuntimeError(f"unsupported LSP transport: {self.config.transport}")
@@ -56,11 +139,13 @@ class _Server:
                 "socket LSP transport requires a server-specific socket endpoint; "
                 "configure the server through stdio in this runtime"
             )
-        executable = shutil.which(self.config.command)
-        if executable is None and Path(self.config.command).is_file():
-            executable = str(Path(self.config.command).resolve())
-        if executable is None:
-            raise RuntimeError(f"LSP server executable not found: {self.config.command}")
+        executable = self.config.command
+        if not self.guest_mode:
+            executable = shutil.which(self.config.command) or ""
+            if not executable and Path(self.config.command).is_file():
+                executable = str(Path(self.config.command).resolve())
+            if not executable:
+                raise RuntimeError(f"LSP server executable not found: {self.config.command}")
         env = {**os.environ, **self.config.env}
         for key in list(env):
             if key.casefold() in {"http_proxy", "https_proxy", "all_proxy"}:
@@ -71,28 +156,25 @@ class _Server:
             if self.private_temp is None:
                 self.private_temp = Path(tempfile.mkdtemp(prefix=f"polaris-lsp-{self.config.name}-"))
             read_only_roots: tuple[Path, ...] = ()
+            mounted_roots: tuple[Path, ...] = (self.workspace,)
             if self.config.plugin_root:
                 plugin_root = Path(self.config.plugin_root).resolve()
                 read_only_roots = (plugin_root,)
-                guest_root = self.sandbox.translate_path(plugin_root)
-                translated: list[str] = []
-                for item in argv:
-                    value = str(item)
-                    try:
-                        relative = Path(value).resolve().relative_to(plugin_root)
-                    except (OSError, ValueError):
-                        translated.append(value)
-                    else:
-                        translated.append(str(Path(guest_root) / relative).replace("\\", "/"))
-                argv = translated
-            argv, shell = self.sandbox.wrap(
-                argv, False,
+                mounted_roots = (*mounted_roots, plugin_root)
+            guest_argv = self._guest_argv(argv, mounted_roots)
+            capability = _command_basename(self.config.command)
+            required = (capability,) if guest_argv[0].startswith("@") else ()
+            invocation = SandboxInvocation.create(
+                argv,
+                guest_argv=guest_argv,
+                required_guest_capabilities=required,
                 scope=ExecutionScope.for_workspace(
                     self.workspace, private_temp=self.private_temp, network="deny",
                     read_only_roots=read_only_roots,
                     workspace_writable=False,
                 ),
             )
+            argv, shell = self.sandbox.wrap_invocation(invocation)
             if shell or isinstance(argv, str):
                 raise RuntimeError("LSP sandbox returned a shell command; explicit argv is required")
         if not isinstance(argv, (list, tuple)):
@@ -113,11 +195,11 @@ class _Server:
             else Path(self.config.workspace_folder).resolve()
             if self.config.workspace_folder else self.workspace
         )
-        root_uri = path_to_uri(workspace)
+        root_uri = self.server_uri(workspace)
         await asyncio.wait_for(self.request(
             "initialize",
             {
-                "processId": os.getpid(),
+                "processId": None if self.guest_mode else os.getpid(),
                 "rootUri": root_uri,
                 "workspaceFolders": [{"uri": root_uri, "name": self.workspace.name}],
                 "capabilities": {"textDocument": {"publishDiagnostics": {"relatedInformation": True}}},
@@ -131,6 +213,39 @@ class _Server:
                 "workspace/didChangeConfiguration", {"settings": self.config.settings}
             )
         self.initialized = True
+
+    def _guest_argv(self, host_argv: list[str], mounted_roots: tuple[Path, ...]) -> list[str]:
+        command = host_argv[0]
+        capability = _command_basename(command)
+        if capability in self.sandbox.capabilities:
+            guest_command = f"@{capability}"
+        else:
+            guest_command = self._translate_mounted_path(command, mounted_roots)
+            if guest_command == command:
+                raise GuestCapabilityUnavailable(
+                    "guest_capability_unavailable: LSP command is neither an image alias "
+                    f"nor a mounted script: {command!r}"
+                )
+        return [
+            guest_command,
+            *(self._translate_mounted_path(str(item), mounted_roots) for item in host_argv[1:]),
+        ]
+
+    def _translate_mounted_path(self, value: str, roots: tuple[Path, ...]) -> str:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            return value
+        resolved = candidate.resolve()
+        for root in roots:
+            try:
+                relative = resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            guest_root = self.sandbox.translate_path(root)
+            return str(PurePosixPath(guest_root, *relative.parts))
+        raise GuestCapabilityUnavailable(
+            f"guest_capability_unavailable: absolute LSP path is not mounted: {value!r}"
+        )
 
     async def _read_loop(self) -> None:
         assert self.process is not None and self.process.stdout is not None
@@ -187,7 +302,9 @@ class _Server:
                 return
             params = message.get("params", {})
             if isinstance(params, dict):
-                self.diagnostics[str(params.get("uri", ""))] = list(params.get("diagnostics", []))
+                self.diagnostics[str(params.get("uri", ""))] = list(
+                    self.host_payload(params.get("diagnostics", []))
+                )
 
     async def _write(self, message: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None or self.process.returncode is not None:
@@ -309,7 +426,7 @@ class LSPManager:
     async def open_document(self, path: str | Path) -> tuple[_Server, Path]:
         resolved = self._resolve(path)
         server = await self._server_for(resolved)
-        uri = path_to_uri(resolved)
+        uri = server.server_uri(resolved)
         text = resolved.read_text(encoding="utf-8")
         if uri not in server.documents:
             language = server.config.extensions.get(resolved.suffix.lower(), resolved.suffix.lstrip("."))
@@ -325,7 +442,7 @@ class LSPManager:
             server = await self._server_for(resolved)
         except ValueError:
             return
-        uri = path_to_uri(resolved)
+        uri = server.server_uri(resolved)
         if uri not in server.documents:
             await self.open_document(resolved)
             return
@@ -344,14 +461,14 @@ class LSPManager:
             config = self.config.servers[0]
             server = self._servers.get(config.name)
             if server is None:
-                server = _Server(config, self.workspace)
+                server = _Server(config, self.workspace, sandbox=self.sandbox)
                 self._servers[config.name] = server
                 await server.start()
-            return await server.request("workspace/symbol", {"query": query})
+            return server.host_payload(await server.request("workspace/symbol", {"query": query}))
         if path is None:
             raise ValueError(f"path is required for {operation}")
         server, resolved = await self.open_document(path)
-        uri = path_to_uri(resolved)
+        uri = server.server_uri(resolved)
         text_document = {"uri": uri}
         position = {"line": max(0, line), "character": max(0, character)}
         methods = {
@@ -381,7 +498,7 @@ class LSPManager:
             params = {"item": item}
         else:
             params = {"textDocument": text_document, "position": position}
-        return await server.request(method, params)
+        return server.host_payload(await server.request(method, params))
 
     async def close(self) -> None:
         await asyncio.gather(*(server.close() for server in self._servers.values()), return_exceptions=True)

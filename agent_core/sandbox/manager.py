@@ -5,23 +5,23 @@ Open-ClaudeCode's ``sandbox-adapter.ts`` + ``shouldUseSandbox.ts``. It answers t
 questions the rest of the system asks:
 
 - :meth:`is_enabled` — is sandboxing actually active here (enabled + a real backend)?
-- :meth:`should_sandbox` — should *this* command run sandboxed (not excluded)?
-- :meth:`wrap` — return the (possibly) wrapped command spec.
+- :meth:`should_sandbox` — is the requested backend prepared for this command?
+- :meth:`wrap_invocation` — choose the kernel-specific argv and wrap it.
 - :meth:`prepare` / :meth:`reset` / :meth:`teardown` — backend lifecycle (eager per the
   eager-loading invariant; ``reset`` runs per task for the VM tier).
 
 Backend selection is by **tier** (``config.backend``): an explicit ``native``/``container``
-/``vm`` starts at that tier and **degrades to the next weaker available** one; ``auto``
-prefers ``container → native → noop`` (never auto-selecting the heavyweight VM tier). On
-an unsupported environment it degrades to a no-op — commands run exactly as before —
-unless ``fail_if_unavailable`` is set, which raises :class:`SandboxUnavailableError` (a
-hard gate for deployments that must never run commands unsandboxed).
+/``vm`` may select a weaker *real* backend; ``auto`` prefers ``container → native`` and
+never auto-selects the heavyweight VM tier. An enabled sandbox never degrades to host
+execution. Selection is not effectiveness: only a successfully prepared backend makes
+:meth:`is_enabled` true.
 """
 
 from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from enum import Enum
 import sys
 import threading
 from pathlib import Path
@@ -38,6 +38,12 @@ from agent_core.sandbox.backends import (
 from agent_core.sandbox.backends.container import ContainerUnavailable
 from agent_core.sandbox.backends.vm import VmUnavailable
 from agent_core.sandbox.config import SandboxConfig
+from agent_core.sandbox.invocation import (
+    GuestCapabilityUnavailable,
+    GuestRuntimeManifest,
+    REQUIRED_GUEST_TOOLS,
+    SandboxInvocation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,23 +66,39 @@ class SandboxRequiredError(SandboxUnavailableError):
     """
 
 
+class SandboxPreparationState(str, Enum):
+    SELECTED = "selected"
+    PREPARED = "prepared"
+    UNAVAILABLE = "unavailable"
+
+
 class SandboxManager:
     def __init__(self, config: SandboxConfig | None = None, workspace: str | Path | None = None) -> None:
         self.config = config or SandboxConfig()
         self.workspace = Path(workspace or Path.cwd()).resolve()
-        # (backend name, missing deps) for each candidate tried — powers a still-actionable
-        # unavailable_reason() after a degrade-to-noop.
+        # (backend name, missing deps) for each candidate tried — powers an actionable
+        # unavailable_reason() when no real backend can be selected.
         self._selection_diagnostics: list[tuple[str, list[str]]] = []
         self._reconfigure_lock = threading.RLock()
         self._retired_backends: list[SandboxBackend] = []
         # prepare() is idempotent (heavyweight readying runs once per manager); teardown
         # resets this so a torn-down manager could be re-readied.
         self._prepared = False
+        self._preparation_error = ""
         self._backend = self._select_backend()
+        self._state = (
+            SandboxPreparationState.SELECTED
+            if self.config.enabled and self._backend.isolates()
+            else SandboxPreparationState.UNAVAILABLE
+        )
         # Fail-fast gate: an operator asked for sandboxing AND declared it mandatory,
         # but this environment can't provide it — refuse to start rather than silently
         # running commands unsandboxed. (Actionable-error invariant.)
-        if self.config.enabled and self.config.fail_if_unavailable and not self.is_enabled():
+        if (
+            self.config.enabled
+            and self.config.fail_if_unavailable
+            and not self.is_supported_platform()
+        ):
             reason = self.unavailable_reason() or "sandbox is unavailable"
             raise SandboxUnavailableError(
                 f"sandbox.enabled + fail_if_unavailable set, but {reason}"
@@ -88,9 +110,10 @@ class SandboxManager:
         """Pick the strongest *available* backend at-or-below the requested tier.
 
         Disabled config short-circuits to a no-op. For ``auto`` the candidate chain is
-        ``container → native → noop`` (VM is opt-in only); for an explicit tier it is that
+        ``container → native → unavailable`` (VM is opt-in only); for an explicit tier it is that
         tier then every weaker one. The first candidate whose backend reports
-        :meth:`available` wins; if none do, a :class:`NoopBackend` (passthrough).
+        :meth:`available` wins; if none do, an internal :class:`NoopBackend` records
+        the unavailable state but is never used to execute an enabled invocation.
         """
         if not self.config.enabled:
             return NoopBackend()
@@ -108,8 +131,10 @@ class SandboxManager:
         requested = self.config.backend
         builders = {
             SandboxTier.NATIVE: NativeBackend,
-            SandboxTier.CONTAINER: lambda: ContainerBackend(self.config),
-            SandboxTier.VM: lambda: VmBackend(self.config),
+            SandboxTier.CONTAINER: lambda: ContainerBackend(
+                self.config, workspace=self.workspace
+            ),
+            SandboxTier.VM: lambda: VmBackend(self.config, workspace=self.workspace),
         }
         if requested == "auto":
             # Container preferred; native fallback. VM is never auto-selected (too heavy).
@@ -129,13 +154,53 @@ class SandboxManager:
     def backend_tier(self) -> SandboxTier:
         return self._backend.tier
 
+    @property
+    def preparation_state(self) -> SandboxPreparationState:
+        return self._state
+
+    @property
+    def prepared(self) -> bool:
+        return self._state is SandboxPreparationState.PREPARED
+
+    @property
+    def requested(self) -> bool:
+        return self.config.enabled
+
+    @property
+    def uses_guest(self) -> bool:
+        return self.config.enabled and self._backend.uses_guest
+
+    @property
+    def guest_manifest(self) -> GuestRuntimeManifest | None:
+        return self._backend.guest_manifest
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        manifest = self.guest_manifest
+        return manifest.capabilities if manifest is not None else frozenset()
+
+    @property
+    def runtime(self) -> str | None:
+        return getattr(self._backend, "runtime", None)
+
+    @property
+    def image(self) -> str:
+        if self.backend_tier is SandboxTier.VM:
+            return self.config.vm.base_image
+        return self.config.container.image if self._backend.uses_guest else ""
+
     def is_supported_platform(self) -> bool:
         """True when the selected backend does real isolation (i.e. is not the no-op)."""
         return self._backend.isolates()
 
     def is_enabled(self) -> bool:
         """True when sandboxing is switched on AND a real backend is active here."""
-        return self.config.enabled and self.is_supported_platform() and self._backend.available()
+        return (
+            self.config.enabled
+            and self.is_supported_platform()
+            and self._backend.available()
+            and self._state is SandboxPreparationState.PREPARED
+        )
 
     def should_sandbox(self, command: str | None) -> bool:
         """Whether *this* command should be wrapped: enabled and not excluded."""
@@ -162,30 +227,53 @@ class SandboxManager:
         """Ready the active backend (verify runtime, pull image, boot VM + base snapshot).
 
         Idempotent: the heavyweight readying runs at most once per manager, so agents
-        (and sub-agents) sharing one manager can all call ``prepare()`` cheaply. Degrades
-        gracefully: a backend that cannot ready itself becomes a no-op passthrough
-        (so the run continues unsandboxed) unless ``fail_if_unavailable`` is set, in which
-        case the failure is escalated to :class:`SandboxUnavailableError`.
+        (and sub-agents) sharing one manager can all call ``prepare()`` cheaply. A backend
+        that cannot ready itself becomes unavailable and raises
+        :class:`SandboxUnavailableError`; host execution is never a fallback.
         """
-        if self._prepared or not self.is_enabled():
+        if self._prepared or not self.config.enabled:
             return
+        if not self.is_supported_platform() or not self._backend.available():
+            self._state = SandboxPreparationState.UNAVAILABLE
+            reason = self.unavailable_reason() or "sandbox is unavailable"
+            raise SandboxUnavailableError(reason)
+        if self.config.excluded_commands:
+            self._state = SandboxPreparationState.UNAVAILABLE
+            self._preparation_error = (
+                "excluded_commands are forbidden while sandbox.enabled=true; use the "
+                "explicit --no-sandbox session option instead"
+            )
+            raise SandboxUnavailableError(self._preparation_error)
         try:
             self._backend.prepare()
-        except (ContainerUnavailable, VmUnavailable) as exc:
-            if self.config.fail_if_unavailable:
-                raise SandboxUnavailableError(
-                    f"sandbox backend {self._backend.name!r} could not start: {exc}"
-                ) from exc
-            # Fall back to passthrough — never sink a run on a prepare failure.
-            self._backend = NoopBackend()
+            if self._backend.uses_guest and self._backend.guest_manifest is None:
+                raise GuestCapabilityUnavailable(
+                    "guest_capability_unavailable: backend did not provide a guest manifest"
+                )
+            if self._backend.uses_guest:
+                assert self._backend.guest_manifest is not None
+                missing = REQUIRED_GUEST_TOOLS - self._backend.guest_manifest.capabilities
+                if missing:
+                    raise GuestCapabilityUnavailable(
+                        "guest_capability_unavailable: backend is missing required tools: "
+                        + ", ".join(sorted(missing))
+                    )
+        except (ContainerUnavailable, VmUnavailable, GuestCapabilityUnavailable) as exc:
+            self._state = SandboxPreparationState.UNAVAILABLE
+            self._preparation_error = str(exc)
+            raise SandboxUnavailableError(
+                f"sandbox backend {self._backend.name!r} could not prepare: {exc}"
+            ) from exc
         self._prepared = True
+        self._state = SandboxPreparationState.PREPARED
+        self._preparation_error = ""
 
     def reset(self) -> None:
         """Restore the VM to its base snapshot before a task.
 
         Self-gating so the call site (``react.run``) stays trivial: only the VM tier with
         ``[sandbox.vm].reset_each_task`` set actually does anything; native/container are
-        no-ops. Failures degrade silently (never sink a run on a snapshot restore).
+        no-ops. A reset failure makes the backend unavailable and aborts the run.
         """
         if not self.is_enabled():
             return
@@ -193,11 +281,11 @@ class SandboxManager:
             return
         try:
             self._backend.reset()
-        except Exception as exc:  # noqa: BLE001 - a failed snapshot restore must not sink the run
-            logger.warning(
-                "sandbox VM reset failed; run continues on the previous guest state: %s: %s",
-                type(exc).__name__, exc,
-            )
+        except Exception as exc:
+            self._state = SandboxPreparationState.UNAVAILABLE
+            self._prepared = False
+            self._preparation_error = f"VM reset failed: {type(exc).__name__}: {exc}"
+            raise SandboxUnavailableError(self._preparation_error) from exc
 
     def reconfigure(self, config: SandboxConfig) -> None:
         """Prepare a replacement backend, then atomically publish it.
@@ -215,6 +303,8 @@ class SandboxManager:
             self._backend = candidate._backend
             self._selection_diagnostics = candidate._selection_diagnostics
             self._prepared = candidate._prepared
+            self._state = candidate._state
+            self._preparation_error = candidate._preparation_error
 
     def teardown(self) -> None:
         """Release backend resources (stop/remove container, power off VM)."""
@@ -232,9 +322,40 @@ class SandboxManager:
             )
         finally:
             self._prepared = False
+            self._state = (
+                SandboxPreparationState.SELECTED
+                if self.config.enabled and self._backend.isolates()
+                else SandboxPreparationState.UNAVAILABLE
+            )
             self._retired_backends.clear()
 
     # -- the wrap seam called by command tools ---------------------------------------
+
+    def wrap_invocation(
+        self, invocation: SandboxInvocation, *, command: str | None = None
+    ) -> tuple[object, bool]:
+        """Select the host or Linux-guest argv and apply the active backend."""
+
+        if not self.config.enabled:
+            return list(invocation.host_argv), False
+        if not self.is_enabled():
+            reason = self.unavailable_reason() or "sandbox has not completed preparation"
+            raise SandboxUnavailableError(reason)
+        if command is not None and self._is_excluded(command):
+            raise SandboxUnavailableError(
+                "excluded commands are forbidden while sandboxing is enabled"
+            )
+        config, workspace = self._config_for_scope(invocation.scope)
+        if self._backend.uses_guest:
+            manifest = self.guest_manifest
+            if manifest is None:
+                raise GuestCapabilityUnavailable(
+                    "guest_capability_unavailable: prepared backend has no guest manifest"
+                )
+            argv = invocation.guest_command(manifest)
+        else:
+            argv = list(invocation.host_argv)
+        return self._backend.wrap(argv, False, config=config, workspace=workspace)
 
     def wrap(self, spec, shell: bool, *, command: str | None = None, scope=None) -> tuple[object, bool]:
         """Return ``(spec, shell)`` wrapped for isolation, or unchanged if not sandboxing.
@@ -242,11 +363,25 @@ class SandboxManager:
         ``command`` is the raw shell command line (for the exclusion check); pass ``None``
         for argv-based tools (e.g. the test runner) to sandbox purely on ``is_enabled``.
         """
-        if command is not None:
-            if not self.should_sandbox(command):
-                return spec, shell
-        elif not self.is_enabled():
+        if isinstance(spec, SandboxInvocation):
+            return self.wrap_invocation(spec, command=command)
+        if not self.config.enabled:
             return spec, shell
+        if self._backend.uses_guest:
+            raise GuestCapabilityUnavailable(
+                "guest_capability_unavailable: cross-kernel execution requires a SandboxInvocation"
+            )
+        if not self.is_enabled():
+            reason = self.unavailable_reason() or "sandbox has not completed preparation"
+            raise SandboxUnavailableError(reason)
+        if command is not None and self._is_excluded(command):
+            raise SandboxUnavailableError(
+                "excluded commands are forbidden while sandboxing is enabled"
+            )
+        config, workspace = self._config_for_scope(scope)
+        return self._backend.wrap(spec, shell, config=config, workspace=workspace)
+
+    def _config_for_scope(self, scope) -> tuple[SandboxConfig, Path]:
         workspace = getattr(scope, "workspace", self.workspace)
         config = self.config
         if scope is not None:
@@ -267,31 +402,42 @@ class SandboxManager:
             if getattr(scope, "network", "deny") == "deny":
                 config.network.allowed_domains.clear()
                 config.network.allow_local_binding = False
-            else:
+            elif not self._backend.uses_guest:
                 config.network.allow_local_binding = True
-        return self._backend.wrap(spec, shell, config=config, workspace=workspace)
+            else:
+                raise GuestCapabilityUnavailable(
+                    "guest_capability_unavailable: sandbox execution only supports network=deny"
+                )
+        return config, Path(workspace).resolve()
 
     # -- diagnostics -----------------------------------------------------------------
 
     def unavailable_reason(self) -> str | None:
         """A user-facing reason when ``enabled`` is set but sandboxing can't run; else None.
 
-        Actionable even after a degrade-to-noop: it surfaces the missing dependencies of the
-        backend(s) that were tried (recorded during selection), so an explicit
+        It surfaces the missing dependencies of the backend(s) that were tried during
+        selection, so an explicit
         ``backend = "container"`` with no runtime says *which* runtime to install.
         """
         if not self.config.enabled or self.is_enabled():
             return None
+        if self._preparation_error:
+            return self._preparation_error
+        if self._state is SandboxPreparationState.SELECTED:
+            return (
+                f"sandbox backend {self._backend.name!r} is selected but preparation "
+                "probes have not completed"
+            )
         # Prefer the most-capable candidate we tried that had missing deps.
         for name, missing in self._selection_diagnostics:
             if missing:
                 return (
                     f"missing sandbox dependencies for backend {name!r}: "
-                    f"{', '.join(missing)}; commands run unsandboxed"
+                    f"{', '.join(missing)}"
                 )
         return (
             f"no sandbox backend is available for {self.config.backend!r} on "
-            f"{sys.platform} (unsupported platform or no runtime); commands run unsandboxed"
+            f"{sys.platform} (unsupported platform or no runtime)"
         )
 
 

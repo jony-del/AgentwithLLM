@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+# Multi-arch index digest for the official Python 3.12 slim-bookworm image.
+FROM docker.io/library/python:3.12-slim-bookworm@sha256:77d09d2d4b67b10199ac27ca3bdf23c4ba8e7951e67cc808a174c65507e9e52c
+
+ARG TARGETARCH
+ARG NODE_VERSION=v24.14.1
+ARG POWERSHELL_VERSION=7.5.7
+ARG PYRIGHT_VERSION=1.1.405
+ARG SETUPTOOLS_VERSION=84.0.0
+ARG DEBIAN_SNAPSHOT=20260809T000000Z
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN sed -ri \
+      "s!URIs: http://deb.debian.org/debian-security!URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}!; s!URIs: http://deb.debian.org/debian!URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}!" \
+      /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99snapshot \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       bash ca-certificates curl git libgssapi-krb5-2 libicu72 libssl3 libunwind8 \
+       ripgrep xz-utils zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node and PowerShell are version-pinned and checked against their publishers'
+# release checksum manifests. TARGETARCH is supplied by buildx (amd64/arm64).
+RUN set -eux; \
+    case "$TARGETARCH" in amd64) node_arch=x64; pwsh_arch=x64 ;; arm64) node_arch=arm64; pwsh_arch=arm64 ;; *) exit 2 ;; esac; \
+    node_file="node-${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/${node_file}"; \
+    curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt"; \
+    grep "  ${node_file}$" SHASUMS256.txt | sha256sum -c -; \
+    tar -xJf "$node_file" -C /usr/local --strip-components=1; \
+    rm -f "$node_file" SHASUMS256.txt; \
+    pwsh_file="powershell-${POWERSHELL_VERSION}-linux-${pwsh_arch}.tar.gz"; \
+    curl -fsSLO "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/${pwsh_file}"; \
+    curl -fsSLO "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/hashes.sha256"; \
+    grep -i "  ${pwsh_file}$" hashes.sha256 | sha256sum -c -; \
+    mkdir -p /opt/microsoft/powershell/7; \
+    tar -xzf "$pwsh_file" -C /opt/microsoft/powershell/7; \
+    chmod 0755 /opt/microsoft/powershell/7/pwsh; \
+    ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh; \
+    rm -f "$pwsh_file" hashes.sha256
+
+COPY . /opt/polaris/src
+RUN python -m pip install "setuptools==${SETUPTOOLS_VERSION}" \
+    && python -m pip install --no-build-isolation \
+        --constraint /opt/polaris/src/sandbox/constraints.txt \
+        "/opt/polaris/src[all,dev]" \
+    && npm install --global --omit=dev "pyright@${PYRIGHT_VERSION}" \
+    && install -D -m 0755 /opt/polaris/src/sandbox/sandbox_probe.py /opt/polaris/bin/sandbox-probe \
+    && install -d -m 0777 /opt/polaris/rootfs-canary \
+    && rm -rf /opt/polaris/src /root/.cache /root/.npm
+
+USER 65532:65532
+ENV HOME=/tmp/polaris-home \
+    XDG_CACHE_HOME=/tmp/polaris-cache \
+    TMPDIR=/tmp
+WORKDIR /workspace

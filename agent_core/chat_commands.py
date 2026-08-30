@@ -361,11 +361,25 @@ async def _cmd_sandbox(
     if not raw:
         config = agent.sandbox.config
         print("Sandbox:")
-        print(f"  enabled     {config.enabled}")
+        print(f"  requested   {agent.sandbox.requested}")
+        print(f"  effective   {agent.sandbox.is_enabled()}")
+        print(f"  prepared    {agent.sandbox.prepared}")
+        print(f"  state       {agent.sandbox.preparation_state.value}")
         print(f"  backend     {agent.sandbox.backend_name}")
+        print(f"  runtime     {agent.sandbox.runtime or '(host native)'}")
+        print(f"  image       {agent.sandbox.image or '(not applicable)'}")
+        manifest = agent.sandbox.guest_manifest
+        print(
+            "  guest       "
+            + (
+                f"{manifest.guest_os}/{manifest.architecture} protocol={manifest.protocol_version}"
+                if manifest is not None else "(none)"
+            )
+        )
+        print(f"  capabilities {', '.join(sorted(agent.sandbox.capabilities)) or '(none)'}")
+        print(f"  failure      {agent.sandbox.unavailable_reason() or '(none)'}")
         print(f"  auto-allow  {config.auto_allow_command_if_sandboxed}")
-        print(f"  excluded    {', '.join(config.excluded_commands) or '(none)'}")
-        print("Change with: /sandbox <auto-allow|regular|disabled|exclude COMMAND>")
+        print("Change with: /sandbox <auto-allow|regular>; use --no-sandbox at startup to disable")
         return ChatTurn()
     if getattr(agent, "_sandbox_cli_locked", False):
         print("Sandbox settings are locked by CLI flags for this session.")
@@ -382,24 +396,13 @@ async def _cmd_sandbox(
         new_config.enabled = True
         new_config.auto_allow_command_if_sandboxed = False
     elif action == "disabled":
-        if (
-            agent.permissions.managed_policy.require_sandbox_for_unattended
-            and PermissionMode(agent.config.permission)
-            in {PermissionMode.AUTO, PermissionMode.DONTASK, PermissionMode.BYPASS}
-        ):
-            print("Managed policy requires sandboxing in the current permission mode.")
-            return ChatTurn()
-        new_config.enabled = False
-        new_config.auto_allow_command_if_sandboxed = False
+        print("Sandbox can only be disabled for a whole session with explicit --no-sandbox.")
+        return ChatTurn()
     elif action == "exclude":
-        command = value.strip()
-        if not command:
-            print("Usage: /sandbox exclude <command-pattern>")
-            return ChatTurn()
-        if command not in new_config.excluded_commands:
-            new_config.excluded_commands.append(command)
+        print("Per-command sandbox exclusions are not supported.")
+        return ChatTurn()
     else:
-        print("Usage: /sandbox <auto-allow|regular|disabled|exclude COMMAND>")
+        print("Usage: /sandbox <auto-allow|regular>")
         return ChatTurn()
 
     try:

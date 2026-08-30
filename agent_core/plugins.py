@@ -46,6 +46,7 @@ from agent_core.plugin_spec import (
     resolve_plugin_manifest,
 )
 from agent_core import secret_store
+from agent_core.sandbox import GuestCapabilityUnavailable, SandboxInvocation
 from agent_core.skills import Skill, SkillContext, SkillRegistry, load_skill_file, parse_frontmatter
 from agent_core.tools.base import ExecutionScope, Tool
 from agent_core.tools.registry import DeferredTool
@@ -2825,11 +2826,22 @@ def _restrict_autonomous_hook(
             read_only_roots=(root,),
             network="deny",
         )
-        wrapped, shell = agent.sandbox.wrap(command, True, command=command, scope=scope)
+        invocation = SandboxInvocation.create(
+            ["/bin/sh", "-c", spec.command],
+            guest_argv=["@bash", "-lc", command],
+            required_guest_capabilities=("bash",),
+            scope=scope,
+        )
+        wrapped, shell = agent.sandbox.wrap_invocation(invocation, command=command)
         if shell or not isinstance(wrapped, list) or not wrapped:
             raise PluginError(f"sandbox could not wrap autonomous hook from {plugin_id}")
         return replace(spec, command_argv=[str(item) for item in wrapped])
     if spec.type == "http":
+        if agent.config.sandbox.enabled:
+            raise PluginError(
+                f"autonomous HTTP hook from {plugin_id} is unavailable while the "
+                "guest sandbox enforces network=deny"
+            )
         parsed = urlparse(spec.url or "")
         host = parsed.hostname or ""
         loopback = host in {"localhost", "127.0.0.1", "::1"}
@@ -3049,6 +3061,101 @@ def _translate_plugin_path(value: str, root: Path, guest_root: str) -> str:
     return str(Path(guest_root) / relative).replace("\\", "/")
 
 
+_GUEST_COMMAND_ALIASES = {
+    "bash": "bash",
+    "pwsh": "pwsh",
+    "powershell": "pwsh",
+    "python": "python",
+    "python3": "python",
+    "node": "node",
+    "npm": "npm",
+    "npx": "npx",
+    "pyright-langserver": "pyright-langserver",
+}
+_WINDOWS_COMMAND_SUFFIXES = {".exe", ".cmd", ".bat"}
+
+
+def sandboxed_guest_invocation(
+    sandbox: Any,
+    host_argv: list[str],
+    *,
+    mounted_roots: tuple[Path, ...],
+    scope: ExecutionScope,
+) -> SandboxInvocation:
+    """Build a fail-closed invocation for a plugin/Hook/MCP guest process."""
+
+    if not host_argv:
+        raise GuestCapabilityUnavailable(
+            "guest_capability_unavailable: empty guest process command"
+        )
+    command = host_argv[0]
+    basename = max((Path(command).name, Path(command.replace("\\", "/")).name), key=len)
+    suffix = Path(basename).suffix.casefold()
+    if suffix in _WINDOWS_COMMAND_SUFFIXES:
+        raise GuestCapabilityUnavailable(
+            f"guest_capability_unavailable: Windows command is unsupported: {command!r}"
+        )
+    alias = _GUEST_COMMAND_ALIASES.get(basename.casefold())
+    required: tuple[str, ...] = ()
+    if alias is not None:
+        if alias not in sandbox.capabilities:
+            raise GuestCapabilityUnavailable(
+                f"guest_capability_unavailable: image does not declare {alias!r}"
+            )
+        guest_command = f"@{alias}"
+        required = (alias,)
+    else:
+        guest_command = _mounted_guest_path(command, mounted_roots, sandbox)
+    guest_args = [
+        _mounted_guest_argument(value, mounted_roots, sandbox)
+        for value in host_argv[1:]
+    ]
+    return SandboxInvocation.create(
+        host_argv,
+        guest_argv=[guest_command, *guest_args],
+        required_guest_capabilities=required,
+        scope=scope,
+    )
+
+
+def sandbox_runtime_environment() -> dict[str, str]:
+    """Host environment needed by an OCI client, never forwarded into its guest."""
+
+    names = (
+        "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINERS_CONF",
+        "CONTAINERS_STORAGE_CONF", "DOCKER_HOST", "DOCKER_CONTEXT",
+    )
+    return {name: value for name in names if (value := os.environ.get(name)) is not None}
+
+
+def _mounted_guest_path(value: str, roots: tuple[Path, ...], sandbox: Any) -> str:
+    candidate = Path(value)
+    candidates = [candidate] if candidate.is_absolute() else [root / candidate for root in roots]
+    for item in candidates:
+        try:
+            resolved = item.resolve()
+        except OSError:
+            continue
+        for root in roots:
+            try:
+                relative = resolved.relative_to(root.resolve())
+            except (OSError, ValueError):
+                continue
+            return str(Path(sandbox.translate_path(root.resolve())) / relative).replace("\\", "/")
+    raise GuestCapabilityUnavailable(
+        "guest_capability_unavailable: command is neither a declared image alias nor "
+        f"a script under a mounted root: {value!r}"
+    )
+
+
+def _mounted_guest_argument(value: str, roots: tuple[Path, ...], sandbox: Any) -> str:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return value
+    return _mounted_guest_path(value, roots, sandbox)
+
+
 def _restrict_autonomous_mcp(
     agent: "ReActAgent", root: Path, servers: list[MCPServerConfig]
 ) -> list[MCPServerConfig]:
@@ -3058,29 +3165,10 @@ def _restrict_autonomous_mcp(
     for server in servers:
         transport = (server.transport or "stdio").casefold()
         if transport in {"streamable-http", "streamable_http", "http", "sse", "ws", "wss", "websocket"}:
-            if "${" in server.url:
-                raise PluginError(
-                    f"autonomous remote MCP {server.name} cannot expand host environment in its URL"
-                )
-            parsed = urlparse(server.url)
-            host = parsed.hostname or ""
-            loopback = host in {"localhost", "127.0.0.1", "::1"}
-            secure = parsed.scheme in {"https", "wss"}
-            loopback_scheme = parsed.scheme in {"http", "ws"}
-            if not secure and not (loopback and loopback_scheme):
-                raise PluginError(
-                    f"autonomous remote MCP {server.name} requires HTTPS/WSS or a loopback URL"
-                )
-            if not loopback and not _domain_allowed(host, agent.config.web.allowed_domains):
-                raise PluginError(
-                    f"autonomous HTTP MCP domain {host!r} is not in web.allowed_domains"
-                )
-            if server.headers or server.headers_helper or server.oauth or server.user_config:
-                raise PluginError(
-                    f"autonomous remote MCP {server.name} requires credential configuration"
-                )
-            restricted.append(server)
-            continue
+            raise PluginError(
+                f"autonomous remote MCP {server.name} is unavailable while the "
+                "guest sandbox enforces network=deny"
+            )
 
         if transport != "stdio":
             raise PluginError(f"unsupported autonomous MCP transport: {server.transport}")
@@ -3092,17 +3180,16 @@ def _restrict_autonomous_mcp(
             raise PluginError(
                 f"autonomous stdio MCP {server.name} cannot inject host environment secrets"
             )
-        guest_root = agent.sandbox.translate_path(root)
-        argv = [
-            _translate_plugin_path(server.command, root, guest_root),
-            *[_translate_plugin_path(item, root, guest_root) for item in server.args],
-        ]
+        argv = [server.command, *server.args]
         scope = ExecutionScope.for_workspace(
             agent.session.workspace,
             read_only_roots=(root,),
             network="deny",
         )
-        wrapped, shell = agent.sandbox.wrap(argv, False, scope=scope)
+        invocation = sandboxed_guest_invocation(
+            agent.sandbox, argv, mounted_roots=(root, agent.session.workspace), scope=scope
+        )
+        wrapped, shell = agent.sandbox.wrap_invocation(invocation)
         if shell or not isinstance(wrapped, list) or not wrapped:
             raise PluginError(f"sandbox could not wrap autonomous MCP {server.name}")
         restricted.append(
@@ -3110,7 +3197,7 @@ def _restrict_autonomous_mcp(
                 server,
                 command=str(wrapped[0]),
                 args=[str(item) for item in wrapped[1:]],
-                env={},
+                env=sandbox_runtime_environment(),
                 cwd="",
             )
         )
