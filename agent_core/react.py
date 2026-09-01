@@ -117,7 +117,7 @@ from agent_core.transcript import TranscriptStore, new_session_id
 from agent_core.tools.catalog import default_tools, populate_registry
 from agent_core.tools.executor import StreamingToolBatch, ToolExecutor
 from agent_core.tools.registry import ToolRegistry
-from agent_core.tools.transaction import TurnExecutionJournal
+from agent_core.tools.transaction import JournalStorage, TurnExecutionJournal
 from agent_core.tools.team import TeamInboxReadTool, TeamMessageSendTool
 from agent_core.tools.web import WebPolicyAwareMixin, WebPolicyConfig
 from agent_core.ui import AgentUI, NullUI
@@ -666,15 +666,13 @@ class ReActAgent:
             self.permission_classifier,
             parallel_tools=self.config.parallel_tools,
             max_workers=self.config.max_tool_workers,
-        )
-        recovery_outcomes = TurnExecutionJournal.recover_all(
-            self.executor.journal_dir,
-            history_writer=(
-                self.transcript.recover_tool_round if self.transcript is not None else None
+            journal_storage=JournalStorage.user_state(
+                self.session.workspace,
+                self.session_id,
+                self.logger.run_id,
             ),
         )
-        for recovery_outcome in recovery_outcomes:
-            self.logger.write_nowait("turn_recovery", recovery_outcome)
+        self.recover_turn_journals()
         # Strong refs to in-flight fire-and-forget PostSampling hook tasks, so they
         # aren't garbage-collected mid-run; reaped best-effort at terminal returns.
         self._background_hook_tasks: set[asyncio.Task[None]] = set()
@@ -743,6 +741,35 @@ class ReActAgent:
             )
         self.capability_manager = CapabilityManager(self, self.config.capabilities)
         self.session.capability_manager = self.capability_manager
+
+    def recover_turn_journals(self, *, dry_run: bool = False) -> list[dict[str, str]]:
+        """Recover this project/session's verified journals and emit run audit events."""
+
+        outcomes = TurnExecutionJournal.recover_all(
+            self.executor.journal_storage,
+            history_writer=(
+                self.transcript.recover_tool_round if self.transcript is not None else None
+            ),
+            dry_run=dry_run,
+            audit_writer=lambda payload: self.logger.write_nowait(
+                "turn_recovery_audit",
+                {key: value for key, value in payload.items() if key != "event"},
+            ),
+        )
+        for outcome in outcomes:
+            self.logger.write_nowait("turn_recovery", outcome)
+        return outcomes
+
+    def rebind_turn_journal_session(self) -> list[dict[str, str]]:
+        """Switch journal ownership after an explicit in-process session resume."""
+
+        storage = JournalStorage.user_state(
+            self.session.workspace,
+            self.session_id,
+            self.logger.run_id,
+        )
+        self.executor.rebind_journal_storage(storage)
+        return self.recover_turn_journals()
 
     def _build_memory(
         self,

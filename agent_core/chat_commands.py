@@ -933,6 +933,7 @@ async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     agent.session_id = loaded.session_id
     agent.session.session_id = loaded.session_id
     agent.transcript = TranscriptStore(session_dir, workspace, loaded.session_id)
+    agent.rebind_turn_journal_session()
     print(f"Resumed session {loaded.session_id} ({len(resumed)} messages).")
     return ChatTurn(history=resumed)
 

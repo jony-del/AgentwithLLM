@@ -44,6 +44,7 @@ from agent_core.tools.base import (
 )
 from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.transaction import (
+    JournalStorage,
     JournalWriteError,
     TurnExecutionJournal,
     WorkspaceTransaction,
@@ -88,6 +89,7 @@ class ToolExecutor:
         parallel_tools: bool = True,
         max_workers: int = 4,
         journal_dir: str | Path | None = None,
+        journal_storage: JournalStorage | None = None,
     ) -> None:
         self.registry = registry
         if self.registry.workspace is None:
@@ -104,13 +106,29 @@ class ToolExecutor:
         self.permission_classifier = permission_classifier
         self.parallel_tools = parallel_tools
         self.max_workers = max(1, int(max_workers))
-        if journal_dir is not None:
-            self.journal_dir = Path(journal_dir)
-        elif logger is not None:
-            self.journal_dir = Path(logger.run_dir) / ".turn-journals"
+        workspace = Path(self.registry.workspace or Path.cwd()).resolve()
+        if journal_storage is not None:
+            self.journal_storage = journal_storage
+        elif journal_dir is not None:
+            self.journal_storage = JournalStorage.local(
+                journal_dir,
+                workspace=workspace,
+                run_id=logger.run_id if logger is not None else "standalone",
+            )
         else:
-            self.journal_dir = Path(tempfile.mkdtemp(prefix="polaris-turn-journals-"))
+            self.journal_storage = JournalStorage.local(
+                tempfile.mkdtemp(prefix="polaris-turn-journals-"),
+                workspace=workspace,
+                run_id=logger.run_id if logger is not None else "standalone",
+            )
+        self.journal_dir = self.journal_storage.run_root
         self._resource_leases: list[tuple[ConcurrencySpec, asyncio.Event, str]] = []
+
+    def rebind_journal_storage(self, storage: JournalStorage) -> None:
+        """Switch recovery ownership between turns (for an explicit session resume)."""
+
+        self.journal_storage = storage
+        self.journal_dir = storage.run_root
 
     async def execute_many(
         self,
@@ -917,7 +935,7 @@ class StreamingToolBatch:
         self.base_messages = list(messages or [])
         self.should_cancel = should_cancel
         self.turn_id = uuid.uuid4().hex
-        self.journal = TurnExecutionJournal(executor.journal_dir, self.turn_id)
+        self.journal = TurnExecutionJournal(executor.journal_storage, self.turn_id)
         self.created_at = time.monotonic()
         self.model_finished_at: float | None = None
         self.finished_at: float | None = None

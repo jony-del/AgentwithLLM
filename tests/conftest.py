@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault("AGENT_SANDBOX_ALLOW_UNATTENDED", "1")
+os.environ.setdefault("POLARIS_HOME", tempfile.mkdtemp(prefix="polaris-test-home-"))
 os.environ.setdefault(
     "AGENT_TRUST_STORE", os.path.join(tempfile.mkdtemp(prefix="polaris-test-trust-"), "trusted.json")
 )
