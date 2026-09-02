@@ -284,3 +284,42 @@ pip install -e ".[all,dev]"
 工业级 tool lifecycle、Bash/PowerShell 后台任务、LSP、Notebook、Git Worktree 与 Scheduler
 的配置和安全语义见 [Tool platform](docs/tool-platform.md)。从旧 shell 规则升级时见
 [Shell permission migration](docs/shell-migration.md)。
+
+## SWE-bench Lite runner
+
+The benchmark integration is isolated from the normal interactive Agent path. Install
+the optional dependencies (Docker Engine/Desktop must also be available):
+
+```powershell
+pip install -e ".[swebench]"
+```
+
+Add `,terminal` (or use `[all]`) when using the optional `--live` console trace.
+
+List safe task metadata first. The loader never writes `patch`, `test_patch`,
+`FAIL_TO_PASS`, or `PASS_TO_PASS` into the Agent workspace or prompt:
+
+```powershell
+polaris swebench list --dataset SWE-bench/SWE-bench_Lite --split dev --limit 20
+```
+
+For a manual 3-5 task smoke run, repeat `--instance-id` or provide a YAML/JSON
+selection manifest:
+
+```powershell
+polaris swebench smoke --split dev --instance-id task-id-1 --instance-id task-id-2 --provider claude --evaluate --live --keep-workspaces
+```
+
+For a complete Lite test split, selection is intentionally explicit:
+
+```powershell
+polaris swebench run --dataset SWE-bench/SWE-bench_Lite --split test --all --provider claude --evaluate --solve-workers 1 --evaluation-workers 1
+```
+
+Each run is stored below `swebench_runs/<run_id>/` with public task rows, per-instance
+state/logs, `patch.diff`, official-format `predictions.jsonl`, Harness output, and
+`summary.json`/`summary.csv`. Use `--resume --run-id <id>` to continue a stopped run
+(the prior ID-only selection manifest is reused automatically); add `--retry-failed` to
+retry failed instances. `--runtime local` is an explicit
+development/test fallback and is not an isolation substitute for the default Docker
+runtime.

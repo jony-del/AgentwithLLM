@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 /runs/
+/swebench_runs/
+/tmp/
 /memory/
 *.egg-info/
 .env

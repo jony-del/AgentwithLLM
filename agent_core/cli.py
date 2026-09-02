@@ -1705,6 +1705,144 @@ def _force_utf8_output() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def swebench_command(args: argparse.Namespace) -> int:
+    try:
+        return _swebench_command(args)
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        print(f"[error] SWE-bench: {exc}", file=sys.stderr)
+        return 2
+
+
+def _swebench_command(args: argparse.Namespace) -> int:
+    """Entry point for the isolated SWE-bench Lite runner.
+
+    This command intentionally does not call :func:`build_agent`: that path loads
+    the current project's config, MCP servers, memory and one shared workspace.
+    Benchmark instances need an independent workspace/runtime and a clean Agent
+    configuration for every task.
+    """
+    from agent_core.benchmarks.swebench.dataset import SWEbenchDataset
+    from agent_core.benchmarks.swebench.models import SWEbenchRunConfig
+    from agent_core.benchmarks.swebench.runner import SWEbenchRunner, _safe_run_id
+    from agent_core.benchmarks.swebench.selection import make_selection
+
+    action = str(getattr(args, "swebench_action", "run"))
+    dataset_name = str(args.dataset)
+    split = str(args.split)
+    if action == "list":
+        dataset = SWEbenchDataset.load(
+            dataset_name,
+            split,
+            cache_dir=getattr(args, "cache_dir", None),
+            include_gold=False,
+        )
+        if args.limit is not None and int(args.limit) <= 0:
+            raise ValueError("--limit must be positive")
+        ids = list(args.instance_id or [])
+        if ids:
+            rows = dataset.select(ids)
+        else:
+            rows = tuple(dataset)[: max(1, int(args.limit or 20))]
+        for item in rows:
+            title = item.problem_statement.strip().splitlines()[0] if item.problem_statement.strip() else ""
+            difficulty = str(item.extra.get("difficulty") or "")
+            print(f"{item.instance_id}\t{item.repo}\t{difficulty}\t{title[:180]}")
+        print(f"Listed {len(rows)} of {len(dataset)} instances ({dataset_name}, {split}).")
+        return 0
+
+    smoke = action == "smoke"
+    if smoke and args.limit is not None and int(args.limit) > 5:
+        raise ValueError("smoke mode accepts at most 5 instances")
+    if smoke and not args.instance_id and not args.selection:
+        raise ValueError("smoke mode requires explicit --instance-id values or --selection")
+    if args.evaluate and args.no_evaluate:
+        raise ValueError("--evaluate and --no-evaluate are mutually exclusive")
+    if args.resume and not args.run_id:
+        raise ValueError("--resume requires --run-id so the prior run directory is unambiguous")
+    selection_file = args.selection
+    if (
+        args.resume
+        and not smoke
+        and selection_file is None
+        and not args.instance_id
+        and not args.all
+        and args.limit is None
+    ):
+        # A run writes an ID-only selection manifest.  Reuse it when the caller
+        # supplies only ``--resume --run-id``; this keeps retries deterministic
+        # without requiring the user to repeat a long list of task IDs.
+        prior_selection = (
+            Path(args.output_dir).expanduser().resolve()
+            / _safe_run_id(str(args.run_id))
+            / "selection.yaml"
+        )
+        if prior_selection.exists():
+            selection_file = str(prior_selection)
+        else:
+            raise ValueError(
+                "resume run selection was not found; provide --selection, --instance-id, "
+                "--limit, or --all"
+            )
+    selection = make_selection(
+        dataset=dataset_name,
+        split=split,
+        instance_ids=args.instance_id,
+        selection_file=selection_file,
+        limit=args.limit,
+        all_instances=bool(args.all),
+        smoke=smoke,
+    )
+    provider_name = str(args.provider or os.getenv("AGENT_PROVIDER") or "claude")
+    model_name = str(args.model or os.getenv("AGENT_MODEL") or ("claude-opus-4-8" if provider_name == "claude" else ""))
+    if provider_name != "fake" and not model_name:
+        raise ValueError("--model is required for non-fake SWE-bench providers")
+    evaluate = bool(args.evaluate) and not bool(args.no_evaluate)
+    run_config = SWEbenchRunConfig(
+        dataset=selection.dataset,
+        split=selection.split,
+        output_dir=args.output_dir,
+        run_id=args.run_id or "",
+        model=model_name,
+        provider=provider_name,
+        image=args.image,
+        test_command=args.test_command,
+        solve_workers=max(1, int(args.solve_workers)),
+        evaluation_workers=max(1, int(args.evaluation_workers)),
+        max_wall_seconds=float(args.max_wall_seconds),
+        max_steps=(None if args.max_steps is None or int(args.max_steps) <= 0 else int(args.max_steps)),
+        keep_workspaces=bool(args.keep_workspaces),
+        evaluate=evaluate,
+        resume=bool(args.resume),
+        retry_failed=bool(args.retry_failed),
+        live=bool(args.live),
+        metadata={
+            "runtime": args.runtime,
+            "source_dir": args.source_dir,
+            "cache_dir": args.cache_dir,
+            "no_stream": bool(args.no_stream),
+            "max_api_concurrency": int(args.max_api_concurrency),
+        },
+    )
+    values = {"provider": provider_name, "model": model_name, "effort": None}
+    provider = _make_provider(values)
+
+    def ui_factory() -> AgentUI:
+        if not args.live:
+            return NullUI()
+        return ConsoleUI(verbose=bool(args.verbose))
+
+    runner = SWEbenchRunner(run_config, provider=provider, ui_factory=ui_factory)
+    summary = asyncio.run(runner.run(selection, all_instances=bool(args.all), limit=args.limit))
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary.get("resolved_rate_selected") is not None:
+        print(
+            "SWE-bench summary: "
+            f"resolved={summary['resolved']}/{summary['selected']} "
+            f"resolved_rate={summary['resolved_rate_selected']:.3f}"
+        )
+    return 0 if not any(item.get("state") == "failed" for item in summary.get("instances", [])) else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_output()
     parser = argparse.ArgumentParser(prog="polaris")
@@ -1864,6 +2002,51 @@ def main(argv: list[str] | None = None) -> int:
     add_common(run_parser)
     add_session_flags(run_parser)
     run_parser.set_defaults(func=run_task)
+
+    swebench_parser = subparsers.add_parser(
+        "swebench", help="Run SWE-bench Lite tasks with isolated workspaces and the official Harness."
+    )
+    swebench_actions = swebench_parser.add_subparsers(dest="swebench_action", required=True)
+
+    def add_swebench_flags(subparser: argparse.ArgumentParser, *, default_split: str) -> None:
+        subparser.add_argument("--dataset", default="SWE-bench/SWE-bench_Lite", help="HuggingFace dataset name or local JSON/JSONL path.")
+        subparser.add_argument("--split", default=default_split, help="Dataset split (Lite smoke commonly uses dev; full run uses test).")
+        subparser.add_argument("--cache-dir", default=None, metavar="PATH")
+        subparser.add_argument("--instance-id", action="append", default=[], metavar="ID", help="Select one instance; repeat for 3-5 task smoke runs.")
+        subparser.add_argument("--selection", default=None, metavar="PATH", help="YAML/JSON manifest containing dataset, split and instance_ids.")
+        subparser.add_argument("--limit", type=int, default=None, help="Limit selected rows; smoke mode caps this at 5.")
+        subparser.add_argument("--all", action="store_true", help="Explicitly allow running every row in the selected split.")
+        subparser.add_argument("--output-dir", default="swebench_runs", metavar="PATH")
+        subparser.add_argument("--run-id", default=None, metavar="ID")
+        subparser.add_argument("--provider", choices=list(PROVIDERS), default=None)
+        subparser.add_argument("--model", default=None)
+        subparser.add_argument("--runtime", choices=["docker", "local"], default="docker", help="Docker is the production path; local is an explicit development/test fallback.")
+        subparser.add_argument("--image", default=None, help="Override the official SWE-bench instance image.")
+        subparser.add_argument("--source-dir", default=None, help="Use a local repository source for offline development tests.")
+        subparser.add_argument("--test-command", default=None, help="Default command for swebench_test (default: pytest -q).")
+        subparser.add_argument("--solve-workers", type=int, default=1)
+        subparser.add_argument("--evaluation-workers", type=int, default=1)
+        subparser.add_argument("--max-wall-seconds", type=float, default=1800.0)
+        subparser.add_argument("--max-steps", type=int, default=80)
+        subparser.add_argument("--max-api-concurrency", type=int, default=8)
+        subparser.add_argument("--keep-workspaces", action="store_true", help="Retain mutable checkouts for debugging.")
+        subparser.add_argument("--resume", action="store_true", help="Resume terminal/patch-ready instance states in this run directory.")
+        subparser.add_argument("--retry-failed", action="store_true", help="With --resume, retry failed instances.")
+        subparser.add_argument("--evaluate", action="store_true", help="Run the official SWE-bench Harness after solving.")
+        subparser.add_argument("--no-evaluate", action="store_true", help="Do not invoke the Harness.")
+        subparser.add_argument("--live", action="store_true", help="Show the interactive Agent trace (recommended only for smoke runs).")
+        subparser.add_argument("--verbose", action="store_true")
+        subparser.add_argument("--no-stream", action="store_true")
+
+    swebench_list = swebench_actions.add_parser("list", help="List safe task metadata without gold patches/tests.")
+    add_swebench_flags(swebench_list, default_split="dev")
+    swebench_list.set_defaults(func=swebench_command)
+    swebench_run = swebench_actions.add_parser("run", help="Solve selected tasks or an explicit full split.")
+    add_swebench_flags(swebench_run, default_split="test")
+    swebench_run.set_defaults(func=swebench_command)
+    swebench_smoke = swebench_actions.add_parser("smoke", help="Run 1-5 manually selected tasks using the full runner path.")
+    add_swebench_flags(swebench_smoke, default_split="dev")
+    swebench_smoke.set_defaults(func=swebench_command)
 
     chat_parser = subparsers.add_parser("chat")
     add_common(chat_parser)

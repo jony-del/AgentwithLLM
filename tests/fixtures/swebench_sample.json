@@ -1,0 +1,12 @@
+[
+  {
+    "instance_id": "demo__repo-1",
+    "repo": "demo/repo",
+    "base_commit": "0000000000000000000000000000000000000000",
+    "problem_statement": "Fix the parser edge case.",
+    "patch": "gold patch must stay private",
+    "test_patch": "gold tests must stay private",
+    "FAIL_TO_PASS": ["tests/test_parser.py::test_edge"],
+    "PASS_TO_PASS": ["tests/test_parser.py::test_existing"]
+  }
+]
