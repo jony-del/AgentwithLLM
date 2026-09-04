@@ -61,7 +61,9 @@ content_budget_bytes = 65536
 auto_extract = true           # extract automatically when a run completes
 team_auto_extract = false      # team memory requires explicit writes by default
 dedup_threshold = 0.85        # skip a new memory this similar to an existing one
-extraction_dead_letter_limit = 1000 # bounded poison-item diagnostics; never stores raw content
+# Permanent invalid/secret-bearing model items are skipped independently. Their
+# content-free diagnostics share the cursor's atomic state commit and stay bounded.
+extraction_dead_letter_limit = 1000
 
 # Dreaming: manual (`polaris dream`) and gated automatic consolidation.
 auto_dream = true
@@ -121,7 +123,10 @@ dir = "~/.polaris/projects"
 persist_compaction_boundary = true
 
 [session.retention]
-enabled = true
+enabled = true # false disables BOTH transcript and terminal-journal automatic deletion
+# Cleanup always protects the current/active session, tagged or malformed transcripts,
+# and unfinished/corrupt recovery journals. `polaris sessions prune` is dry-run by
+# default; add `--apply` to execute exactly the reported transcript selection.
 transcript_days = 90
 max_transcripts_per_project = 200
 preserve_tagged = true
@@ -541,6 +546,8 @@ max_delivery_attempts = 3       # includes the initial attempt
 retry_base_seconds = 30         # exponential retry: 30s, then 60s
 retry_max_seconds = 600
 delivery_lease_seconds = 1800   # expired running deliveries are recovered
+# Exhausted deliveries enter an owner-scoped dead letter. Agents inspect/redrive them
+# with cron_delivery_list and cron_delivery_retry; redrive requires confirmation.
 [tools.lsp]
 autodetect = false
 max_restarts = 3

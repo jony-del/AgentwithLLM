@@ -1,5 +1,35 @@
 # Polaris / Agent with LLM
 
+## Reliability and retention defaults
+
+Session cleanup is enabled by default. Resumable transcripts are retained for 90 days
+and capped at 200 per project; verified terminal recovery journals are retained for
+7 days and capped at 500 per session. Cleanup runs at most once per day. The current
+session, active sessions, tagged transcripts, malformed transcripts, and unfinished
+recovery journals are always protected. Preview or apply the same transcript plan with:
+
+```console
+polaris sessions prune
+polaris sessions prune --apply
+```
+
+Set `[session.retention] enabled = false` to disable both transcript and recovery-journal
+automatic deletion. The remaining limits and protection switches are documented in
+`agent.toml.example`.
+
+Automatic memory extraction processes model output item by item. Permanently invalid or
+secret-bearing items go to a bounded 1,000-entry diagnostic dead-letter queue without
+their original content; valid siblings are still stored and infrastructure failures do
+not advance the extraction cursor. Scheduler deliveries use three attempts with 30s/60s
+exponential retry (capped at 600s) and a 1,800s lease. An agent can inspect and explicitly
+redrive only its own dead letters with `cron_delivery_list` and `cron_delivery_retry`.
+
+OpenAI-compatible streaming requests ask for usage with
+`stream_options.include_usage=true`, including support for usage-only terminal chunks.
+If an endpoint explicitly rejects that option, Polaris retries once without it and caches
+the endpoint capability; unrelated 4xx responses are never retried as compatibility
+fallbacks.
+
 Polaris 是一个带工具、权限、MCP、记忆和沙箱能力的 Python ReAct Agent。普通用户不需要先安装
 Python：项目安装器会准备隔离的 Python 环境，并补齐 Git、ripgrep、Node/npm/npx 和容器沙箱。
 

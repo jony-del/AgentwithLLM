@@ -703,6 +703,9 @@ class CompressionPipeline:
             "projected_chars": original_chars,
             "chunks": 1,
             "calls": 0,
+            "input_chars": 0,
+            "output_chars": 0,
+            "output_budget_tokens": 0,
             "omitted_chars": 0,
             "fallback": False,
             "output_truncated": False,
@@ -745,26 +748,42 @@ class CompressionPipeline:
             chunks=len(chunks),
         )
         if len(chunks) == 1:
+            budget = max(1, self.config.summary_total_output_tokens)
             metadata["calls"] = 1
-            budget = min(
-                self.config.summary_total_output_tokens,
-                self.config.compact_summary_start_tokens,
-            )
-            return await summarizer(self._with_summary_budget(chunks[0], budget))
+            metadata["input_chars"] = self._char_count(chunks[0])
+            metadata["output_budget_tokens"] = budget
+            value = await summarizer(self._with_summary_budget(chunks[0], budget))
+            metadata["output_chars"] = len(value)
+            return value
 
         map_summaries: list[str] = []
-        spent = 0
+        spent_output = 0
+        total_output = max(1, self.config.summary_total_output_tokens)
+        synthesis_reserve = min(
+            max(1, self.config.compact_summary_start_tokens),
+            max(1, total_output // 2),
+        )
         for chunk in chunks:
+            available = total_output - spent_output - synthesis_reserve
             budget = min(
                 self.config.summary_map_output_tokens,
-                self.config.summary_total_output_tokens - spent,
+                max(0, available),
             )
             if budget <= 0:
                 break
+            metadata["calls"] = int(str(metadata["calls"])) + 1
+            metadata["input_chars"] = (
+                int(str(metadata["input_chars"])) + self._char_count(chunk)
+            )
+            metadata["output_budget_tokens"] = (
+                int(str(metadata["output_budget_tokens"])) + budget
+            )
+            spent_output += budget
             try:
                 value = await summarizer(self._with_summary_budget(chunk, budget))
                 if not value.strip():
                     raise ValueError("empty map summary")
+                metadata["output_chars"] = int(str(metadata["output_chars"])) + len(value)
             except Exception:  # noqa: BLE001 - per-chunk fallback is intentional
                 value = self._track_b_body(chunk)
                 metadata["fallback"] = True
@@ -773,24 +792,35 @@ class CompressionPipeline:
                 max(256, self.config.summary_input_max_chars // max(1, len(chunks))),
             )
             map_summaries.append(value)
-            spent += budget
-            metadata["calls"] = int(str(metadata["calls"])) + 1
         if not map_summaries:
             raise ValueError("summary token budget exhausted")
-        synthesis_budget = self.config.summary_total_output_tokens - spent
+        synthesis_budget = total_output - spent_output
         if synthesis_budget <= 0:
             raise ValueError("summary token budget exhausted")
-        synthesis = [
-            Message("user", f"Chronological chunk {index + 1}:\n{value}")
-            for index, value in enumerate(map_summaries)
-        ]
+        remaining_input = max(
+            0,
+            self.config.summary_total_input_max_chars
+            - int(str(metadata["input_chars"])),
+        )
+        synthesis_limit = min(self.config.summary_input_max_chars, remaining_input)
+        synthesis = self._synthesis_messages(map_summaries, synthesis_limit)
+        if not synthesis:
+            raise ValueError("summary input budget exhausted")
+        synthesis_chars = self._char_count(synthesis)
         metadata["calls"] = int(str(metadata["calls"])) + 1
-        return await summarizer(self._with_summary_budget(synthesis, synthesis_budget))
+        metadata["input_chars"] = int(str(metadata["input_chars"])) + synthesis_chars
+        metadata["output_budget_tokens"] = (
+            int(str(metadata["output_budget_tokens"])) + synthesis_budget
+        )
+        value = await summarizer(self._with_summary_budget(synthesis, synthesis_budget))
+        metadata["output_chars"] = int(str(metadata["output_chars"])) + len(value)
+        return value
 
     def _summary_chunks(
         self, prefix: list[Message]
     ) -> tuple[list[list[Message]], int, int]:
         per_call = max(1, self.config.summary_input_max_chars)
+        total_cap = max(1, self.config.summary_total_input_max_chars)
         rounds = group_into_rounds(prefix)
         chunks: list[list[Message]] = []
         current: list[Message] = []
@@ -806,16 +836,30 @@ class CompressionPipeline:
         if current:
             chunks.append(current)
         raw_chars = self._char_count(prefix)
-        if (
-            len(chunks) <= self.config.summary_max_chunks
-            and raw_chars <= self.config.summary_total_input_max_chars
-        ):
+        if len(chunks) == 1 and raw_chars <= min(per_call, total_cap):
             return chunks, raw_chars, 0
+        if len(chunks) > 1:
+            synthesis_reserve = min(
+                per_call,
+                max(1, total_cap // (len(chunks) + 1)),
+            )
+            if (
+                len(chunks) <= self.config.summary_max_chunks
+                and raw_chars <= total_cap - synthesis_reserve
+                and all(self._char_count(chunk) <= per_call for chunk in chunks)
+            ):
+                return chunks, raw_chars, 0
 
         # Cover the complete chronology with contiguous bands. Each band becomes one
         # synthetic message whose per-round excerpts are evenly budgeted, so the middle
         # of a long transcript cannot disappear behind a head/tail cut.
         band_count = min(self.config.summary_max_chunks, max(1, len(rounds)))
+        synthesis_reserve = (
+            min(per_call, max(1, total_cap // (band_count + 1)))
+            if band_count > 1
+            else 0
+        )
+        map_total = max(1, total_cap - synthesis_reserve)
         projected: list[list[Message]] = []
         kept_chars = 0
         for band in range(band_count):
@@ -824,18 +868,96 @@ class CompressionPipeline:
             selected = rounds[start:end]
             allowance = min(
                 per_call,
-                max(1, self.config.summary_total_input_max_chars // band_count),
+                max(
+                    1,
+                    map_total // band_count
+                    + (1 if band < map_total % band_count else 0),
+                ),
             )
-            per_round = max(16, allowance // max(1, len(selected)) - 12)
+            per_round = max(1, allowance // max(1, len(selected)) - 16)
             lines: list[str] = []
             for offset, round_messages in enumerate(selected, start=start):
-                raw = " ".join(f"[{m.role}] {m.content}" for m in round_messages)
-                excerpt = raw[:per_round]
+                excerpt = self._project_round(round_messages, per_round)
                 lines.append(f"[round {offset + 1}] {excerpt}")
             text, _ = self._cap_text("\n".join(lines), allowance)
             kept_chars += len(text)
             projected.append([Message("user", text, metadata={"coverage_projection": True})])
         return projected, kept_chars, max(0, raw_chars - kept_chars)
+
+    def _synthesis_messages(
+        self, map_summaries: list[str], limit: int
+    ) -> list[Message]:
+        """Build a chronology-preserving synthesis input without exceeding ``limit``."""
+
+        if limit <= 0 or not map_summaries:
+            return []
+        messages: list[Message] = []
+        remaining = limit
+        for index, value in enumerate(map_summaries):
+            if remaining <= 0:
+                break
+            remaining_items = len(map_summaries) - index
+            allowance = max(1, remaining // remaining_items)
+            header = f"Chronological chunk {index + 1}:\n"
+            content = header + self._timeline_excerpt(
+                value, max(0, allowance - len(header))
+            )
+            content = content[:allowance]
+            messages.append(Message("user", content))
+            remaining -= len(content)
+        return messages
+
+    def _project_round(self, messages: list[Message], limit: int) -> str:
+        """Project one inseparable tool round with head/middle/tail coverage."""
+
+        if limit <= 0 or not messages:
+            return ""
+        chosen = messages
+        if len(messages) > max(1, limit // 16):
+            count = max(1, limit // 16)
+            indices = {
+                round(index * (len(messages) - 1) / max(1, count - 1))
+                for index in range(count)
+            }
+            chosen = [messages[index] for index in sorted(indices)]
+        parts: list[str] = []
+        remaining = limit
+        for index, message in enumerate(chosen):
+            remaining_items = len(chosen) - index
+            allowance = max(1, remaining // remaining_items)
+            # Tiny per-round slices prioritize the actual chronology signal; the
+            # outer ``[round N]`` label already identifies the record.
+            label = "" if allowance < 32 else f"[{message.role}] "
+            part = label + self._timeline_excerpt(
+                message.content, max(0, allowance - len(label))
+            )
+            part = part[:allowance]
+            parts.append(part)
+            remaining -= len(part)
+        return "\n".join(parts)[:limit]
+
+    @staticmethod
+    def _timeline_excerpt(value: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        if len(value) <= limit:
+            return value
+        marker = " ... "
+        if limit < 64:
+            return value[:limit]
+        usable = limit - 2 * len(marker)
+        head = max(1, usable // 3)
+        middle = max(1, usable // 3)
+        tail = max(1, usable - head - middle)
+        midpoint = len(value) // 2
+        middle_start = max(0, midpoint - middle // 2)
+        return (
+            value[:head]
+            + marker
+            + value[middle_start : middle_start + middle]
+            + marker
+            + value[-tail:]
+        )[:limit]
 
     @staticmethod
     def _with_summary_budget(messages: list[Message], budget: int) -> list[Message]:
@@ -854,8 +976,33 @@ class CompressionPipeline:
         return value[: max(0, limit - len(marker))] + marker, True
 
     def _track_b_body(self, prefix: list[Message]) -> str:
-        summary = " | ".join(f"{m.role}: {m.content[:160]}" for m in prefix)
-        return self._cap_text(summary, self.config.track_b_max_chars)[0]
+        return self._bounded_track_b(prefix)[0]
+
+    def _bounded_track_b(self, prefix: list[Message]) -> tuple[str, bool]:
+        """Incrementally construct Track B; never allocate an unbounded joined string."""
+
+        limit = max(0, self.config.track_b_max_chars)
+        if limit == 0:
+            return "", bool(prefix)
+        marker = " [... summary truncated ...]"
+        pieces: list[str] = []
+        used = 0
+        truncated = False
+        for message in prefix:
+            part = (" | " if pieces else "") + f"{message.role}: {message.content[:160]}"
+            if used + len(part) <= limit:
+                pieces.append(part)
+                used += len(part)
+                continue
+            remaining = limit - used
+            if remaining > 0:
+                if remaining > len(marker):
+                    pieces.append(part[: remaining - len(marker)] + marker)
+                else:
+                    pieces.append(marker[:remaining])
+            truncated = True
+            break
+        return "".join(pieces), truncated
 
     def _collapse_prefix_naive(self, prefix: list[Message]) -> tuple[Message, bool]:
         """Deterministic Track B fold: join the old prefix into one USER summary message.
@@ -863,8 +1010,7 @@ class CompressionPipeline:
         Pure string manipulation, no model call — the offline/no-key default and the
         fallback when an LLM summary (Track A) is unavailable or fails. Byte-stable for a
         given input (the continuation wrapper is fixed text)."""
-        raw = " | ".join(f"{m.role}: {m.content[:160]}" for m in prefix)
-        summary, truncated = self._cap_text(raw, self.config.track_b_max_chars)
+        summary, truncated = self._bounded_track_b(prefix)
         return build_summary_user_message(
             summary, marker="context_collapse", messages_collapsed=len(prefix)
         ), truncated

@@ -795,8 +795,8 @@ class ReActAgent:
     def recover_turn_journals(self, *, dry_run: bool = False) -> list[dict[str, str]]:
         """Recover this project/session's verified journals and emit run audit events."""
 
-        if not dry_run:
-            retention = self.config.session_retention
+        retention = self.config.session_retention
+        if not dry_run and retention.enabled:
             journal_report = TurnExecutionJournal.prune_terminal(
                 self.executor.journal_storage,
                 retention_days=retention.terminal_journal_days,

@@ -129,12 +129,25 @@ async def _read_frame(stream: asyncio.StreamReader) -> dict[str, Any]:
 async def _terminate_workflow_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         if os.name == "nt":
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill", "/PID", str(process.pid), "/T", "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+            from agent_core.hook_adapters import (
+                _windows_descendant_pids,
+                _windows_terminate_pid,
             )
-            await killer.wait()
+
+            def terminate_windows() -> None:
+                descendants = _windows_descendant_pids(process.pid)
+                for pid in [*reversed(descendants), process.pid]:
+                    if _windows_terminate_pid(pid):
+                        continue
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=3,
+                    )
+
+            await asyncio.to_thread(terminate_windows)
         else:
             try:
                 getattr(os, "killpg")(process.pid, signal.SIGTERM)
@@ -303,6 +316,8 @@ class WorkflowRuntime:
                         return message.get("result")
                     elif message.get("type") == "error":
                         raise WorkflowError(str(message.get("error") or "workflow failed"))
+                    else:
+                        raise WorkflowError("workflow runtime returned an invalid frame type")
         finally:
             for task in tasks:
                 task.cancel()

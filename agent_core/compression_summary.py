@@ -253,14 +253,27 @@ def build_summarizer(
         # the whole ladder shares one (non-stacked) timeout. Each attempt overrides the
         # live-run knobs: bounded output, streamed, no thinking, no tools (empty list).
         result_content = ""
+        remaining = requested_cap
         for budget in ladder:
+            attempt_budget = budget if remaining is None else min(budget, remaining)
+            if attempt_budget <= 0:
+                break
             summary_config = replace(
-                provider_config, max_tokens=budget, stream=True, thinking_budget=None
+                provider_config,
+                max_tokens=attempt_budget,
+                stream=True,
+                thinking_budget=None,
             )
             result = await provider.complete(messages, [], summary_config, stream=sink)
             result_content = result.content
             if result.stop_reason != "max_tokens":
                 break
+            if remaining is not None:
+                # The injected cap covers the complete retry ladder, not every
+                # attempt. Count the requested allowance, rather than provider usage,
+                # so sparse or missing usage metadata cannot make later retries exceed
+                # the hard output-budget allocation.
+                remaining = max(0, remaining - attempt_budget)
         return extract_summary(result_content)
 
     return summarize

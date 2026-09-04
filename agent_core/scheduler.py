@@ -152,6 +152,15 @@ class SchedulerStore:
                 "UPDATE deliveries SET available_at=COALESCE(available_at,due_at,created_at) "
                 "WHERE available_at IS NULL"
             )
+            # A pre-lease schema (or interrupted additive migration) may contain a
+            # running row with no expiry. It can never be reclaimed as-is, so make it
+            # retryable without deleting or rewriting the delivery identity.
+            db.execute(
+                "UPDATE deliveries SET state='retry_wait',"
+                "available_at=COALESCE(available_at,due_at,created_at),"
+                "last_error=COALESCE(last_error,'lease_missing_after_migration') "
+                "WHERE state='running' AND lease_until IS NULL"
+            )
             db.execute("PRAGMA user_version=2")
 
     def create(
@@ -380,7 +389,7 @@ class SchedulerStore:
             job = db.execute(
                 "SELECT one_shot FROM jobs WHERE id=?", (delivery["job_id"],)
             ).fetchone()
-            if job is not None and not int(job["one_shot"]):
+            if job is not None:
                 db.execute(
                     "UPDATE jobs SET inflight=0,coalesced=0 WHERE id=?",
                     (delivery["job_id"],),
@@ -494,11 +503,14 @@ class SchedulerStore:
     def complete_delivery(self, delivery_id: int) -> None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT job_id FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
+            row = db.execute(
+                "SELECT job_id FROM deliveries WHERE id=? AND state='running'",
+                (delivery_id,),
+            ).fetchone()
             if row is not None:
                 db.execute(
                     "UPDATE deliveries SET state='completed',lease_until=NULL,finished_at=? "
-                    "WHERE id=?",
+                    "WHERE id=? AND state='running'",
                     (time.time(), delivery_id),
                 )
                 one_shot = db.execute(

@@ -838,6 +838,28 @@ class TurnExecutionJournal:
         scan_interval_seconds: int = 86_400,
         now: float | None = None,
     ) -> dict[str, int]:
+        """Delete terminal journals under one cross-process retention lock."""
+
+        lock_path = storage.recovery_root / ".retention.lock"
+        with FileLock(lock_path):
+            return cls._prune_terminal_unlocked(
+                storage,
+                retention_days=retention_days,
+                max_per_session=max_per_session,
+                scan_interval_seconds=scan_interval_seconds,
+                now=now,
+            )
+
+    @classmethod
+    def _prune_terminal_unlocked(
+        cls,
+        storage: JournalStorage,
+        *,
+        retention_days: int = 7,
+        max_per_session: int = 500,
+        scan_interval_seconds: int = 86_400,
+        now: float | None = None,
+    ) -> dict[str, int]:
         """Delete only verified terminal journals, at most once per scan interval."""
 
         now = time.time() if now is None else now

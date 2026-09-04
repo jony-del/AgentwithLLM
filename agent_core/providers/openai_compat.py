@@ -108,6 +108,7 @@ class OpenAICompatProvider(LLMProvider):
         self._client_loop: Any = None
         self._transport: Any = None
         self._stream_usage_supported: bool | None = None
+        self._stream_usage_probe_lock: asyncio.Lock | None = None
 
     @staticmethod
     def _warn_deprecated_env(old: str, new: str) -> None:
@@ -153,7 +154,7 @@ class OpenAICompatProvider(LLMProvider):
             return self._parse_response(payload)
 
         # Streaming: retry only connection setup; never mid-stream (no half-reprints).
-        async def open_stream():
+        async def open_stream_once():
             effective_body = dict(body)
             if self._stream_usage_supported is False:
                 effective_body.pop("stream_options", None)
@@ -189,6 +190,16 @@ class OpenAICompatProvider(LLMProvider):
             if "stream_options" in effective_body:
                 self._stream_usage_supported = True
             return response
+
+        async def open_stream():
+            if self._stream_usage_supported is not None:
+                return await open_stream_once()
+            if self._stream_usage_probe_lock is None:
+                self._stream_usage_probe_lock = asyncio.Lock()
+            async with self._stream_usage_probe_lock:
+                # Re-evaluate after waiting: another request may have cached an
+                # explicit rejection and this request must not repeat the probe.
+                return await open_stream_once()
 
         response = await self._request_with_retry(open_stream, model=config.model, scope=scope)
         try:
@@ -441,6 +452,9 @@ class OpenAICompatProvider(LLMProvider):
         if self._client is None or self._client_loop is not loop:
             self._client = httpx.AsyncClient(timeout=None, transport=self._transport)
             self._client_loop = loop
+            # asyncio synchronization primitives are loop-scoped once contended.
+            # A provider reused from a new loop needs a fresh capability probe lock.
+            self._stream_usage_probe_lock = None
         return self._client
 
     async def _request_with_retry(

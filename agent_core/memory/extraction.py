@@ -159,15 +159,19 @@ class MemoryExtractor:
             if not eligible:
                 return []
             final_uuid = eligible[-1].uuid
+            expected_cursor = self._cursor_uuid
+            ordered_uuids = [message.uuid for message in eligible]
             if self._direct_write_since_extract:
                 self._direct_write_since_extract = False
-                await self._commit_cursor(key, final_uuid)
-                self._cursor_uuid = final_uuid
+                self._cursor_uuid = await self._commit_cursor(
+                    key, final_uuid, expected_cursor, ordered_uuids
+                )
                 return []
             request = self._build_request(eligible)
             if request is None:
-                await self._commit_cursor(key, final_uuid)
-                self._cursor_uuid = final_uuid
+                self._cursor_uuid = await self._commit_cursor(
+                    key, final_uuid, expected_cursor, ordered_uuids
+                )
                 return []
             result = await self.provider.complete(request, [], self.provider_config)
             stored, dead_letters, skipped = await self._store_items(
@@ -175,8 +179,13 @@ class MemoryExtractor:
             )
             # Cursor and poison diagnostics commit together. Repository/IO failures still
             # abort before this point and deliberately leave the cursor unchanged.
-            await self._commit_state(key, final_uuid, dead_letters)
-            self._cursor_uuid = final_uuid
+            self._cursor_uuid = await self._commit_state(
+                key,
+                final_uuid,
+                dead_letters,
+                expected_cursor=expected_cursor,
+                ordered_uuids=ordered_uuids,
+            )
             self.last_report = {
                 "accepted": len(stored),
                 "dead_lettered": len(dead_letters),
@@ -184,21 +193,60 @@ class MemoryExtractor:
             }
             return stored
 
-    async def _commit_cursor(self, key: str, message_uuid: str) -> None:
-        await self._commit_state(key, message_uuid, [])
+    async def _commit_cursor(
+        self,
+        key: str,
+        message_uuid: str,
+        expected_cursor: str | None,
+        ordered_uuids: list[str],
+    ) -> str:
+        return await self._commit_state(
+            key,
+            message_uuid,
+            [],
+            expected_cursor=expected_cursor,
+            ordered_uuids=ordered_uuids,
+        )
 
     async def _commit_state(
-        self, key: str, message_uuid: str, dead_letters: list[dict[str, Any]]
-    ) -> None:
+        self,
+        key: str,
+        message_uuid: str,
+        dead_letters: list[dict[str, Any]],
+        *,
+        expected_cursor: str | None,
+        ordered_uuids: list[str],
+    ) -> str:
+        def choose_cursor(current: object) -> str:
+            """Never let an older concurrent extraction move a cursor backwards.
+
+            UUIDs are opaque, so ordering comes from the conversation snapshot the
+            extractor actually processed.  If another process committed a cursor that
+            is absent from this snapshot, it necessarily observed a different/newer
+            view and wins.  If both cursors are present, keep the later one.
+            """
+
+            if not isinstance(current, str) or current == expected_cursor:
+                return message_uuid
+            positions = {item: index for index, item in enumerate(ordered_uuids)}
+            current_position = positions.get(current)
+            candidate_position = positions.get(message_uuid)
+            if current_position is None:
+                return current
+            if candidate_position is None or current_position >= candidate_position:
+                return current
+            return message_uuid
+
         if self._state_path is None:
-            self._cursor_by_key[key] = message_uuid
+            selected_cursor = choose_cursor(self._cursor_by_key.get(key))
+            self._cursor_by_key[key] = selected_cursor
             self._dead_letters = (
                 self._dead_letters + dead_letters
             )[-self.config.extraction_dead_letter_limit :]
-            return
+            return selected_cursor
         state_path = self._state_path
 
-        def write() -> None:
+        def write() -> str:
             from agent_core.file_lock import FileLock
             from agent_core.memory.repository import _atomic_write
 
@@ -208,13 +256,19 @@ class MemoryExtractor:
                     current = json.loads(state_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     current = {}
-                current_cursors = current.get("cursors", {}) if isinstance(current, dict) else {}
-                current_dead = current.get("dead_letters", []) if isinstance(current, dict) else []
+                has_current_state = isinstance(current, dict) and current.get("v") == 1
+                current_cursors = (
+                    current.get("cursors", {}) if has_current_state else dict(self._cursor_by_key)
+                )
+                current_dead = (
+                    current.get("dead_letters", []) if has_current_state else list(self._dead_letters)
+                )
                 if not isinstance(current_cursors, dict):
-                    current_cursors = {}
+                    current_cursors = dict(self._cursor_by_key)
                 if not isinstance(current_dead, list):
-                    current_dead = []
-                current_cursors[key] = message_uuid
+                    current_dead = list(self._dead_letters)
+                selected_cursor = choose_cursor(current_cursors.get(key))
+                current_cursors[key] = selected_cursor
                 bounded_cursors = dict(list(current_cursors.items())[-1000:])
                 bounded_dead = [
                     item for item in [*current_dead, *dead_letters] if isinstance(item, dict)
@@ -223,7 +277,10 @@ class MemoryExtractor:
                     "v": 1,
                     "cursors": bounded_cursors,
                     "dead_letters": bounded_dead,
-                    "legacy_cursor_imported": bool(self._legacy_cursor_path),
+                    "legacy_cursor_imported": bool(
+                        self._legacy_cursor_path is not None
+                        and self._legacy_cursor_path.exists()
+                    ),
                 }
                 _atomic_write(
                     state_path,
@@ -235,8 +292,9 @@ class MemoryExtractor:
                     if isinstance(value, str)
                 }
                 self._dead_letters = bounded_dead
+                return selected_cursor
 
-        await asyncio.to_thread(write)
+        return await asyncio.to_thread(write)
 
     def _messages_after_cursor(self, messages: list[Message]) -> list[Message]:
         eligible = [

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent_core.file_lock import FileLock
 from agent_core.session import SessionRetentionConfig
 from agent_core.transcript import load_transcript, project_dir
 
@@ -22,6 +23,38 @@ def _contained(candidate: Path, root: Path) -> bool:
 
 
 def prune_sessions(
+    root: str | Path,
+    workspace: str | Path,
+    config: SessionRetentionConfig,
+    *,
+    current_session_id: str | None = None,
+    apply: bool = False,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Build/apply one prune plan while excluding concurrent cleanup processes."""
+
+    project = project_dir(root, workspace).resolve()
+    if not config.enabled or not project.is_dir():
+        return _prune_sessions_unlocked(
+            root,
+            workspace,
+            config,
+            current_session_id=current_session_id,
+            apply=apply,
+            now=now,
+        )
+    with FileLock(project / ".retention.lock"):
+        return _prune_sessions_unlocked(
+            root,
+            workspace,
+            config,
+            current_session_id=current_session_id,
+            apply=apply,
+            now=now,
+        )
+
+
+def _prune_sessions_unlocked(
     root: str | Path,
     workspace: str | Path,
     config: SessionRetentionConfig,
@@ -112,23 +145,24 @@ def maybe_prune_sessions(
     if not config.enabled or not project.is_dir():
         return None
     marker = project / ".retention-state.json"
-    try:
-        state = json.loads(marker.read_text(encoding="utf-8"))
-        if now - float(state.get("last_scan", 0)) < config.scan_interval_seconds:
-            return None
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    report = prune_sessions(
-        root, workspace, config, current_session_id=current_session_id,
-        apply=True, now=now,
-    )
-    temporary = marker.with_suffix(marker.suffix + f".{os.getpid()}.tmp")
-    try:
-        temporary.write_text(json.dumps({"v": 1, "last_scan": now}), encoding="utf-8")
-        os.replace(temporary, marker)
-    except OSError:
+    with FileLock(project / ".retention.lock"):
         try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
+            state = json.loads(marker.read_text(encoding="utf-8"))
+            if now - float(state.get("last_scan", 0)) < config.scan_interval_seconds:
+                return None
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
-    return report
+        report = _prune_sessions_unlocked(
+            root, workspace, config, current_session_id=current_session_id,
+            apply=True, now=now,
+        )
+        temporary = marker.with_suffix(marker.suffix + f".{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps({"v": 1, "last_scan": now}), encoding="utf-8")
+            os.replace(temporary, marker)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return report

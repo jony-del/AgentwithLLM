@@ -197,8 +197,8 @@ def test_scheduler_missed_recurring_catches_up_once_and_one_shot_requires_resolu
     missed = store.missed_one_shots("s", "a")
     assert [item["id"] for item in missed] == [one_shot["id"]]
     store.resolve_missed_one_shot(str(one_shot["id"]), deliver=True, now=due + 2)
-    pending = store.pending("s", "a")
-    once_delivery = next(item for item in pending if item["job_id"] == one_shot["id"])
+    claimed = store.claim_deliveries("s", "a", now=due + 2)
+    once_delivery = next(item for item in claimed if item["job_id"] == one_shot["id"])
     store.complete_delivery(int(once_delivery["id"]))
     with pytest.raises(CronError):
         store.get(str(one_shot["id"]))

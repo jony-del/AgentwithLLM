@@ -39,6 +39,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .file_lock import FileLock
 from .models import Message
 from .permission_audit import sanitize_log_payload
 
@@ -140,7 +141,9 @@ class TranscriptStore:
         self._warned = False
         self.last_error: str | None = None
         self._round_checksums: set[str] | None = None
+        self._round_index_size: int | None = None
         self._round_index_path = self.path.with_suffix(self.path.suffix + ".round-index.json")
+        self._process_lock_path = self.path.with_suffix(self.path.suffix + ".write.lock")
         self._activity_path = self.path.with_suffix(
             self.path.suffix + f".active.{os.getpid()}"
         )
@@ -309,7 +312,7 @@ class TranscriptStore:
         checksum = str(record.get("checksum") or "")
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
-            with self._lock:
+            with self._lock, FileLock(self._process_lock_path):
                 checksums = self._load_round_index_locked()
                 if checksum and checksum in checksums:
                     return True
@@ -343,7 +346,14 @@ class TranscriptStore:
 
     def _load_round_index_locked(self) -> set[str]:
         if self._round_checksums is not None:
-            return self._round_checksums
+            try:
+                current_size = self.path.stat().st_size if self.path.exists() else 0
+            except OSError:
+                current_size = -1
+            if current_size == self._round_index_size:
+                return self._round_checksums
+            self._round_checksums = None
+            self._round_index_size = None
         try:
             raw = json.loads(self._round_index_path.read_text(encoding="utf-8"))
             if (
@@ -355,6 +365,7 @@ class TranscriptStore:
                 self._round_checksums = {
                     item for item in raw["checksums"] if isinstance(item, str)
                 }
+                self._round_index_size = int(raw["transcript_size"])
                 return self._round_checksums
         except (OSError, ValueError, TypeError):
             pass
@@ -374,12 +385,17 @@ class TranscriptStore:
         except OSError:
             pass
         self._round_checksums = checksums
+        try:
+            self._round_index_size = self.path.stat().st_size if self.path.exists() else 0
+        except OSError:
+            self._round_index_size = None
         return checksums
 
     def _write_round_index_locked(self, checksums: set[str]) -> None:
+        transcript_size = self.path.stat().st_size
         payload = {
             "v": 1,
-            "transcript_size": self.path.stat().st_size,
+            "transcript_size": transcript_size,
             "checksums": sorted(checksums),
         }
         temporary = self._round_index_path.with_suffix(self._round_index_path.suffix + ".tmp")
@@ -388,17 +404,25 @@ class TranscriptStore:
             encoding="utf-8",
         )
         temporary.replace(self._round_index_path)
+        self._round_index_size = transcript_size
 
-    def _refresh_round_index_size_locked(self) -> None:
+    def _refresh_round_index_size_locked(self, previous_size: int) -> None:
         """Advance a valid sidecar after a non-round append without rescanning history."""
 
         try:
-            if self._round_checksums is not None:
+            if (
+                self._round_checksums is not None
+                and self._round_index_size == previous_size
+            ):
                 self._write_round_index_locked(self._round_checksums)
                 return
             raw = json.loads(self._round_index_path.read_text(encoding="utf-8"))
             checksums = raw.get("checksums") if isinstance(raw, dict) else None
-            if raw.get("v") != 1 or not isinstance(checksums, list):
+            if (
+                raw.get("v") != 1
+                or raw.get("transcript_size") != previous_size
+                or not isinstance(checksums, list)
+            ):
                 return
             self._round_checksums = {item for item in checksums if isinstance(item, str)}
             self._write_round_index_locked(self._round_checksums)
@@ -417,8 +441,9 @@ class TranscriptStore:
     def _write_sync(self, record: dict) -> bool:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
-            with self._lock:
+            with self._lock, FileLock(self._process_lock_path):
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                previous_size = self.path.stat().st_size if self.path.exists() else 0
                 with self.path.open("a", encoding="utf-8", errors="replace") as file:
                     self._ensure_session_header_locked(file)
                     file.write(line)
@@ -428,7 +453,7 @@ class TranscriptStore:
                     except OSError:
                         pass
                 self._touch_activity_locked()
-                self._refresh_round_index_size_locked()
+                self._refresh_round_index_size_locked(previous_size)
                 self.last_error = None
             return True
         except OSError as exc:
@@ -520,6 +545,7 @@ class _Accumulator:
         "workspace",
         "diagnostics",
         "_workspace_conflict",
+        "_owner_session_id",
     )
 
     def __init__(self, session_id: str) -> None:
@@ -533,6 +559,7 @@ class _Accumulator:
         self.workspace: Path | None = None
         self.diagnostics: list[TranscriptDiagnostic] = []
         self._workspace_conflict = False
+        self._owner_session_id: str | None = None
 
     def _diagnose(
         self, code: str, line: int | None, entry_type: object = None, detail: str = ""
@@ -570,15 +597,12 @@ class _Accumulator:
             self._diagnose("unsupported_version", line_number, etype)
             return
         if etype == _SESSION:
-            session_id = entry.get("session_id")
-            if not isinstance(session_id, str) or not session_id:
-                self._diagnose("invalid_session", line_number, etype)
-                return
-            self.session_id = session_id
-            self._capture_workspace(entry, line_number)
+            self._accept_envelope(entry, line_number, etype)
         elif etype == "message":
             message = self._validated_message(entry, line_number, etype)
-            if message is not None:
+            if message is not None and self._accept_envelope(
+                entry, line_number, etype
+            ):
                 self._feed_message(message, entry, line_number)
         elif etype == "tool_round":
             messages = entry.get("messages")
@@ -605,6 +629,8 @@ class _Accumulator:
                 or any(item_id in self.messages for item_id in ids)
             ):
                 self._diagnose("invalid_tool_round_message", line_number, etype)
+                return
+            if not self._accept_envelope(entry, line_number, etype):
                 return
             for message in validated:
                 assert message is not None
@@ -638,10 +664,11 @@ class _Accumulator:
             if any(item is None for item in validated) or len(ids) != len(set(ids)):
                 self._diagnose("invalid_snapshot_message", line_number, etype)
                 return
+            if not self._accept_envelope(entry, line_number, etype):
+                return
             self.messages.clear()
             self.order.clear()
             self.relinks.clear()
-            self._capture_workspace(entry, line_number)
             for message in validated:
                 assert message is not None
                 self._feed_message(message, entry, line_number)
@@ -651,19 +678,22 @@ class _Accumulator:
             if isinstance(msg_uuid, str) and (
                 parent_uuid is None or isinstance(parent_uuid, str)
             ):
-                self.relinks[msg_uuid] = parent_uuid
+                if self._accept_envelope(entry, line_number, etype):
+                    self.relinks[msg_uuid] = parent_uuid
             else:
                 self._diagnose("invalid_relink", line_number, etype)
         elif etype == _TITLE:
             title = entry.get("title")
             if isinstance(title, str):
-                self.title = title
+                if self._accept_envelope(entry, line_number, etype):
+                    self.title = title
             else:
                 self._diagnose("invalid_title", line_number, etype)
         elif etype == _TAG:
             tag = entry.get("tag")
             if isinstance(tag, str):
-                self.tag = tag
+                if self._accept_envelope(entry, line_number, etype):
+                    self.tag = tag
             else:
                 self._diagnose("invalid_tag", line_number, etype)
         # Unknown entry types are ignored, keeping the format forward-compatible.
@@ -706,33 +736,63 @@ class _Accumulator:
             return None
 
     def _feed_message(self, msg: Message, envelope: dict, line: int | None) -> None:
-        session_id = envelope.get("session_id")
-        if session_id is not None and not isinstance(session_id, str):
-            self._diagnose("invalid_envelope_session", line, envelope.get("type"))
-            return
-        self.session_id = session_id or self.session_id
-        self.branch = envelope.get("git_branch") or self.branch
-        self._capture_workspace(envelope, line)
         if msg.uuid in self.messages:
             self._diagnose("duplicate_uuid", line, envelope.get("type"))
             return
         self.order.append(msg.uuid)
         self.messages[msg.uuid] = msg
 
-    def _capture_workspace(self, envelope: dict, line: int | None = None) -> None:
-        if self._workspace_conflict:
-            return
+    def _accept_envelope(
+        self, envelope: dict, line: int | None, entry_type: str
+    ) -> bool:
+        raw_session = envelope.get("session_id")
+        if entry_type == _SESSION and (
+            not isinstance(raw_session, str) or not raw_session
+        ):
+            self._diagnose("invalid_session", line, entry_type)
+            return False
+        if raw_session is not None:
+            if not isinstance(raw_session, str) or not raw_session:
+                self._diagnose("invalid_envelope_session", line, entry_type)
+                return False
+            if self._owner_session_id is None:
+                self._owner_session_id = raw_session
+                self.session_id = raw_session
+            elif raw_session != self._owner_session_id:
+                self._diagnose(
+                    "session_conflict", line, entry_type, str(raw_session)
+                )
+                return False
+        timestamp = envelope.get("ts")
+        if timestamp is not None and (
+            isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+        ):
+            self._diagnose("invalid_timestamp", line, entry_type)
+            return False
+        branch = envelope.get("git_branch")
+        if branch is not None and not isinstance(branch, str):
+            self._diagnose("invalid_git_branch", line, entry_type)
+            return False
+        if not self._capture_workspace(envelope, line):
+            return False
+        if branch:
+            self.branch = branch
+        return True
+
+    def _capture_workspace(self, envelope: dict, line: int | None = None) -> bool:
         raw = envelope.get("cwd")
         if raw is None:
-            return
+            return True
+        if self._workspace_conflict:
+            return False
         if not isinstance(raw, str) or not raw:
             self._diagnose("invalid_workspace", line, envelope.get("type"))
-            return
+            return False
         try:
             candidate = Path(raw).resolve()
         except (OSError, ValueError):
             self._diagnose("invalid_workspace", line, envelope.get("type"))
-            return
+            return False
         if self.workspace is None:
             self.workspace = candidate
         elif os.path.normcase(str(self.workspace)) != os.path.normcase(str(candidate)):
@@ -740,6 +800,8 @@ class _Accumulator:
             self.workspace = None
             self._workspace_conflict = True
             self._diagnose("workspace_conflict", line, envelope.get("type"))
+            return False
+        return True
 
     def finish(self, path: Path) -> "LoadedTranscript":
         # Apply relinks: a compaction boundary re-points the kept tail's head at the
