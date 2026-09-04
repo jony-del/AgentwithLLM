@@ -9,7 +9,10 @@ from pathlib import Path
 import sqlite3
 import time
 import uuid
+import re
 from zoneinfo import ZoneInfo
+
+from agent_core.permission_audit import redact_secret_material
 
 
 class CronError(ValueError):
@@ -76,10 +79,24 @@ class CronExpression:
 
 
 class SchedulerStore:
-    def __init__(self, path: str | Path, *, max_jobs: int = 50, max_prompt_chars: int = 16_000) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_jobs: int = 50,
+        max_prompt_chars: int = 16_000,
+        max_delivery_attempts: int = 3,
+        retry_base_seconds: float = 30,
+        retry_max_seconds: float = 600,
+        delivery_lease_seconds: float = 1800,
+    ) -> None:
         self.path = Path(path).expanduser()
         self.max_jobs = max_jobs
         self.max_prompt_chars = max_prompt_chars
+        self.max_delivery_attempts = max(1, int(max_delivery_attempts))
+        self.retry_base_seconds = max(0.0, float(retry_base_seconds))
+        self.retry_max_seconds = max(self.retry_base_seconds, float(retry_max_seconds))
+        self.delivery_lease_seconds = max(1.0, float(delivery_lease_seconds))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -110,10 +127,32 @@ class SchedulerStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, owner_session TEXT NOT NULL,
                     owner_agent TEXT NOT NULL, prompt TEXT NOT NULL, due_at REAL NOT NULL,
                     state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0, available_at REAL,
+                    claimed_at REAL, lease_until REAL, last_error TEXT, finished_at REAL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(deliveries)").fetchall()
+            }
+            migrations = {
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "available_at": "REAL",
+                "claimed_at": "REAL",
+                "lease_until": "REAL",
+                "last_error": "TEXT",
+                "finished_at": "REAL",
+            }
+            for name, declaration in migrations.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {declaration}")
+            db.execute(
+                "UPDATE deliveries SET available_at=COALESCE(available_at,due_at,created_at) "
+                "WHERE available_at IS NULL"
+            )
+            db.execute("PRAGMA user_version=2")
 
     def create(
         self, *, owner_session: str, owner_agent: str, schedule: str, timezone: str,
@@ -266,10 +305,156 @@ class SchedulerStore:
     ) -> builtins.list[dict[str, object]]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM deliveries WHERE owner_session=? AND owner_agent=? AND state='pending' ORDER BY id",
+                "SELECT * FROM deliveries WHERE owner_session=? AND owner_agent=? "
+                "AND state IN ('pending','retry_wait') ORDER BY id",
                 (owner_session, owner_agent),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def claim_deliveries(
+        self,
+        owner_session: str,
+        owner_agent: str,
+        *,
+        limit: int = 10,
+        now: float | None = None,
+    ) -> builtins.list[dict[str, object]]:
+        """Recover expired leases and transactionally claim due deliveries."""
+
+        now = time.time() if now is None else now
+        claimed: builtins.list[dict[str, object]] = []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            expired = db.execute(
+                "SELECT d.*,j.one_shot FROM deliveries d JOIN jobs j ON j.id=d.job_id "
+                "WHERE d.state='running' AND d.lease_until IS NOT NULL AND d.lease_until<=?",
+                (now,),
+            ).fetchall()
+            for row in expired:
+                self._fail_delivery_locked(db, dict(row), "lease_expired", now)
+            rows = db.execute(
+                "SELECT * FROM deliveries WHERE owner_session=? AND owner_agent=? "
+                "AND state IN ('pending','retry_wait') AND COALESCE(available_at,due_at)<=? "
+                "ORDER BY COALESCE(available_at,due_at),id LIMIT ?",
+                (owner_session, owner_agent, now, max(0, min(int(limit), 100))),
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    "UPDATE deliveries SET state='running',attempt_count=attempt_count+1,"
+                    "claimed_at=?,lease_until=?,last_error=NULL WHERE id=?",
+                    (now, now + self.delivery_lease_seconds, row["id"]),
+                )
+                current = db.execute(
+                    "SELECT * FROM deliveries WHERE id=?", (row["id"],)
+                ).fetchone()
+                if current is not None:
+                    claimed.append(dict(current))
+            db.execute("COMMIT")
+        return claimed
+
+    @staticmethod
+    def _safe_error(error: str) -> str:
+        clean = redact_secret_material(re.sub(r"[\x00-\x1f\x7f]", " ", error))
+        if re.search(
+            r"(?i)(?:api[_-]?key|token|password|secret|authorization)\s*[:=]",
+            clean,
+        ):
+            return "<redacted-error>"
+        return clean[:500]
+
+    def _fail_delivery_locked(
+        self,
+        db: sqlite3.Connection,
+        delivery: dict[str, object],
+        error: str,
+        now: float,
+    ) -> str:
+        attempts = int(str(delivery.get("attempt_count") or 0))
+        if attempts >= self.max_delivery_attempts:
+            state = "dead_letter"
+            db.execute(
+                "UPDATE deliveries SET state=?,available_at=NULL,lease_until=NULL,"
+                "last_error=?,finished_at=? WHERE id=?",
+                (state, self._safe_error(error), now, delivery["id"]),
+            )
+            job = db.execute(
+                "SELECT one_shot FROM jobs WHERE id=?", (delivery["job_id"],)
+            ).fetchone()
+            if job is not None and not int(job["one_shot"]):
+                db.execute(
+                    "UPDATE jobs SET inflight=0,coalesced=0 WHERE id=?",
+                    (delivery["job_id"],),
+                )
+            return state
+        delay = min(
+            self.retry_max_seconds,
+            self.retry_base_seconds * (2 ** max(0, attempts - 1)),
+        )
+        state = "retry_wait"
+        db.execute(
+            "UPDATE deliveries SET state=?,available_at=?,lease_until=NULL,last_error=? "
+            "WHERE id=?",
+            (state, now + delay, self._safe_error(error), delivery["id"]),
+        )
+        return state
+
+    def fail_delivery(
+        self, delivery_id: int, error: str, *, now: float | None = None
+    ) -> str:
+        now = time.time() if now is None else now
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT d.*,j.one_shot FROM deliveries d JOIN jobs j ON j.id=d.job_id "
+                "WHERE d.id=? AND d.state='running'",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                raise CronError(f"delivery is not running: {delivery_id}")
+            state = self._fail_delivery_locked(db, dict(row), error, now)
+            db.execute("COMMIT")
+        return state
+
+    def list_dead_letters(
+        self, *, owner_session: str, owner_agent: str
+    ) -> builtins.list[dict[str, object]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id,job_id,owner_session,owner_agent,due_at,state,created_at,"
+                "attempt_count,last_error,finished_at FROM deliveries "
+                "WHERE owner_session=? AND owner_agent=? AND state='dead_letter' "
+                "ORDER BY finished_at DESC,id DESC",
+                (owner_session, owner_agent),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def redrive_dead_letter(
+        self,
+        delivery_id: int,
+        *,
+        owner_session: str,
+        owner_agent: str,
+        now: float | None = None,
+    ) -> None:
+        now = time.time() if now is None else now
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT job_id FROM deliveries WHERE id=? AND owner_session=? "
+                "AND owner_agent=? AND state='dead_letter'",
+                (delivery_id, owner_session, owner_agent),
+            ).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                raise CronError(f"unknown owned dead-letter delivery: {delivery_id}")
+            db.execute(
+                "UPDATE deliveries SET state='pending',attempt_count=0,available_at=?,"
+                "claimed_at=NULL,lease_until=NULL,last_error=NULL,finished_at=NULL WHERE id=?",
+                (now, delivery_id),
+            )
+            db.execute("UPDATE jobs SET inflight=1 WHERE id=?", (row["job_id"],))
+            db.execute("COMMIT")
 
     def missed_one_shots(
         self, owner_session: str, owner_agent: str
@@ -311,7 +496,11 @@ class SchedulerStore:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT job_id FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
             if row is not None:
-                db.execute("UPDATE deliveries SET state='completed' WHERE id=?", (delivery_id,))
+                db.execute(
+                    "UPDATE deliveries SET state='completed',lease_until=NULL,finished_at=? "
+                    "WHERE id=?",
+                    (time.time(), delivery_id),
+                )
                 one_shot = db.execute(
                     "SELECT one_shot FROM jobs WHERE id=?", (row["job_id"],)
                 ).fetchone()

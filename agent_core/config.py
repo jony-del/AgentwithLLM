@@ -13,6 +13,7 @@ if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-
     from agent_core.memory.config import MemoryConfig
     from agent_core.permission_rules import RuleSet
     from agent_core.sandbox import SandboxConfig
+    from agent_core.session import SessionRetentionConfig
     from agent_core.skills import SkillsConfig
     from agent_core.tool_use_summary import ToolUseSummaryConfig
     from agent_core.tools.web import WebPolicyConfig
@@ -389,6 +390,18 @@ def resolve_session_dir(config_file: str | Path = "agent.toml") -> str:
     return value
 
 
+def resolve_session_retention_config(
+    config_file: str | Path = "agent.toml",
+) -> "SessionRetentionConfig":
+    from agent_core.session import SessionRetentionConfig
+
+    table = load_agent_toml(config_file).get("session")
+    retention = table.get("retention") if isinstance(table, dict) else None
+    return SessionRetentionConfig.from_dict(
+        retention if isinstance(retention, dict) else None
+    )
+
+
 def resolve_persist_compaction_boundary(config_file: str | Path = "agent.toml") -> bool:
     """Whether a compaction fold writes a compact boundary into the transcript.
 
@@ -453,6 +466,17 @@ def resolve_compression_config(config_file: str | Path = "agent.toml") -> "Compr
 
     table = load_agent_toml(config_file).get("compression")
     config = overlay_dataclass(CompressionConfig(), table if isinstance(table, dict) else None)
+    config.summary_input_max_chars = max(1, int(config.summary_input_max_chars))
+    config.summary_total_input_max_chars = max(
+        config.summary_input_max_chars, int(config.summary_total_input_max_chars)
+    )
+    config.summary_max_chunks = max(1, min(32, int(config.summary_max_chunks)))
+    config.summary_map_output_tokens = max(1, int(config.summary_map_output_tokens))
+    config.summary_total_output_tokens = max(
+        config.summary_map_output_tokens, int(config.summary_total_output_tokens)
+    )
+    config.summary_output_max_chars = max(256, int(config.summary_output_max_chars))
+    config.track_b_max_chars = max(256, int(config.track_b_max_chars))
 
     disable = os.getenv("AGENT_DISABLE_LLM_SUMMARY")
     if disable is not None and coerce_to_type(bool, disable):
@@ -538,6 +562,9 @@ def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig
         prompt_validation = table.get("prompt_validation")
         if isinstance(prompt_validation, dict):
             config.prompt_validation = config.prompt_validation.from_dict(prompt_validation)
+        limits = table.get("limits")
+        if isinstance(limits, dict):
+            config.limits = config.limits.from_dict(limits)
         external = table.get("external")
         if isinstance(external, list):
             valid_events = {event.value for event in HookEvent}

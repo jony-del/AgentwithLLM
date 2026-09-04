@@ -196,17 +196,24 @@ class _NullStreamHandler:
     def on_tool_args_delta(self, tool_name: str, partial_json: str) -> None: ...
 
 
-def _budget_ladder(config: CompressionConfig, ceiling: int) -> list[int]:
+def _budget_ladder(
+    config: CompressionConfig, ceiling: int, requested_cap: int | None = None
+) -> list[int]:
     """Build the ascending output-token escalation ladder, clamped to the model ceiling.
 
     Tiers: steady-state start -> compaction cap -> model hard ceiling. Deduped, clamped
     to ``ceiling``, sorted ascending, then truncated to ``1 + compact_max_output_retries``
     attempts (first attempt plus the allowed escalations).
     """
-    tiers = (config.compact_summary_start_tokens, config.compact_max_output_tokens, ceiling)
+    effective_ceiling = min(ceiling, requested_cap) if requested_cap is not None else ceiling
+    tiers = (
+        min(config.compact_summary_start_tokens, effective_ceiling),
+        min(config.compact_max_output_tokens, effective_ceiling),
+        effective_ceiling,
+    )
     ladder: list[int] = []
     for tier in tiers:
-        value = min(int(tier), int(ceiling))
+        value = min(int(tier), int(effective_ceiling))
         if value > 0 and value not in ladder:
             ladder.append(value)
     ladder.sort()
@@ -236,7 +243,9 @@ def build_summarizer(
         messages = [Message("system", SUMMARY_SYSTEM), Message("user", convo)]
         model = provider_config.model
         ceiling = tokens.model_output_tokens(model)[1]
-        ladder = _budget_ladder(config, ceiling)
+        requested = prefix[0].metadata.get("_summary_output_tokens") if prefix else None
+        requested_cap = int(requested) if isinstance(requested, int) and requested > 0 else None
+        ladder = _budget_ladder(config, ceiling, requested_cap)
         sink = _NullStreamHandler()
         # Escalation ladder: try the steady-state budget first; only when the model
         # actually truncated (stop_reason "max_tokens") retry at the next, larger tier.

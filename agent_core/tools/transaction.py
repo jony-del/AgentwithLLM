@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
+from agent_core.file_lock import FileLock
 from agent_core.permission_audit import redact_secret_material
 
 
@@ -338,6 +339,12 @@ class TurnExecutionJournal:
             name=f"turn-journal-{self.turn_id[:8]}",
             daemon=True,
         )
+        if _ownership is None:
+            try:
+                self._update_open_index(self.storage, self.path, add=True)
+            except OSError as exc:
+                self._ownership.release()
+                raise JournalWriteError("could not register open turn journal") from exc
         self._writer.start()
 
     def record(self, state: str, **payload: Any) -> None:
@@ -412,14 +419,21 @@ class TurnExecutionJournal:
         if self._closed:
             return
         # A durable no-op makes every earlier telemetry request visible first.
+        terminal_written = False
         try:
             self.record("journal_closed")
+            terminal_written = True
         except JournalWriteError:
             pass
         self._closed = True
         self._requests.put(None)
         self._writer.join(timeout=2)
         self._ownership.release()
+        if terminal_written:
+            try:
+                self._update_open_index(self.storage, self.path, add=False)
+            except OSError:
+                pass
 
     def _release_for_later_recovery(self) -> None:
         """Release ownership without writing a terminal state."""
@@ -708,7 +722,7 @@ class TurnExecutionJournal:
         return True
 
     @classmethod
-    def _journal_paths(cls, storage: JournalStorage) -> list[Path]:
+    def _all_journal_paths(cls, storage: JournalStorage) -> list[Path]:
         base = storage.recovery_root
         if not base.exists() or not base.is_dir():
             return []
@@ -725,6 +739,156 @@ class TurnExecutionJournal:
                 continue
             paths.extend(sorted(run_root.glob("*.jsonl")))
         return paths
+
+    @classmethod
+    def _open_index_path(cls, storage: JournalStorage) -> Path:
+        return storage.recovery_root / ".open-journals.json"
+
+    @classmethod
+    def _update_open_index(
+        cls, storage: JournalStorage, path: Path, *, add: bool
+    ) -> None:
+        base = storage.recovery_root
+        try:
+            relative = path.resolve().relative_to(base.resolve()).as_posix()
+        except (OSError, ValueError):
+            return
+        index = cls._open_index_path(storage)
+        with _AUDIT_LOCK, FileLock(index.with_suffix(".lock")):
+            try:
+                raw = json.loads(index.read_text(encoding="utf-8"))
+                values = raw.get("paths", []) if isinstance(raw, dict) else []
+            except (OSError, ValueError):
+                values = []
+            paths = {item for item in values if isinstance(item, str)}
+            if add:
+                paths.add(relative)
+            else:
+                paths.discard(relative)
+            _secure_mkdir(base)
+            temporary = index.with_suffix(index.suffix + f".{uuid.uuid4().hex}.tmp")
+            temporary.write_text(
+                json.dumps({"v": 1, "paths": sorted(paths)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, index)
+
+    @classmethod
+    def _journal_paths(cls, storage: JournalStorage) -> list[Path]:
+        """Read the durable open index; rebuild it with one bounded full scan if needed."""
+
+        base = storage.recovery_root
+        index = cls._open_index_path(storage)
+        try:
+            raw = json.loads(index.read_text(encoding="utf-8"))
+            values = raw.get("paths") if isinstance(raw, dict) and raw.get("v") == 1 else None
+            if not isinstance(values, list):
+                raise ValueError("invalid open-journal index")
+            indexed_paths: list[Path] = []
+            for value in values:
+                if not isinstance(value, str) or "\\" in value:
+                    raise ValueError("invalid open-journal path")
+                relative = PurePosixPath(value)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("invalid open-journal path")
+                path = base.joinpath(*relative.parts)
+                if path.is_file() and _contained(path, base):
+                    indexed_paths.append(path)
+            return sorted(indexed_paths)
+        except (OSError, ValueError, TypeError):
+            pass
+        rebuilt_paths: list[Path] = []
+        for path in cls._all_journal_paths(storage):
+            records, error = cls._load_verified(path)
+            if error is not None or not records or records[-1].get("state") not in {
+                "history_persisted", "rolled_back", "indeterminate_external_effect",
+                "external_effect_history_missing", "journal_closed",
+            }:
+                rebuilt_paths.append(path)
+        try:
+            with _AUDIT_LOCK, FileLock(index.with_suffix(".lock")):
+                _secure_mkdir(base)
+                values = {
+                    path.resolve().relative_to(base.resolve()).as_posix()
+                    for path in rebuilt_paths
+                }
+                try:
+                    current = json.loads(index.read_text(encoding="utf-8"))
+                    current_paths = current.get("paths", []) if isinstance(current, dict) else []
+                    values.update(item for item in current_paths if isinstance(item, str))
+                except (OSError, ValueError):
+                    pass
+                temporary = index.with_suffix(index.suffix + f".{uuid.uuid4().hex}.tmp")
+                temporary.write_text(
+                    json.dumps({"v": 1, "paths": sorted(values)}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, index)
+        except OSError:
+            pass
+        return rebuilt_paths
+
+    @classmethod
+    def prune_terminal(
+        cls,
+        storage: JournalStorage,
+        *,
+        retention_days: int = 7,
+        max_per_session: int = 500,
+        scan_interval_seconds: int = 86_400,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Delete only verified terminal journals, at most once per scan interval."""
+
+        now = time.time() if now is None else now
+        marker = storage.recovery_root / ".retention-state.json"
+        try:
+            raw = json.loads(marker.read_text(encoding="utf-8"))
+            if now - float(raw.get("last_scan", 0)) < scan_interval_seconds:
+                return {"deleted": 0, "bytes": 0, "errors": 0, "skipped": 1}
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        terminal: list[tuple[Path, float, int]] = []
+        terminal_states = {
+            "history_persisted", "rolled_back", "indeterminate_external_effect",
+            "external_effect_history_missing", "journal_closed",
+        }
+        for path in cls._all_journal_paths(storage):
+            records, error = cls._load_verified(path)
+            if error is not None or not records or records[-1].get("state") not in terminal_states:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            terminal.append((path, stat.st_mtime, stat.st_size))
+        terminal.sort(key=lambda item: item[1], reverse=True)
+        cutoff = now - max(1, retention_days) * 86_400
+        selected = [
+            item for index, item in enumerate(terminal)
+            if item[1] < cutoff or index >= max(1, max_per_session)
+        ]
+        report = {"deleted": 0, "bytes": 0, "errors": 0, "skipped": 0}
+        for path, _modified, size in selected:
+            ownership = _JournalOwnership(path.with_suffix(".lock"))
+            if not ownership.acquire():
+                continue
+            try:
+                path.unlink()
+                report["deleted"] += 1
+                report["bytes"] += size
+            except OSError:
+                report["errors"] += 1
+            finally:
+                ownership.release()
+        try:
+            _secure_mkdir(storage.recovery_root)
+            temporary = marker.with_suffix(marker.suffix + f".{uuid.uuid4().hex}.tmp")
+            temporary.write_text(json.dumps({"v": 1, "last_scan": now}), encoding="utf-8")
+            os.replace(temporary, marker)
+        except OSError:
+            report["errors"] += 1
+        return report
 
     @classmethod
     def _reconcile_history_payload(

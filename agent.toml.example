@@ -61,6 +61,7 @@ content_budget_bytes = 65536
 auto_extract = true           # extract automatically when a run completes
 team_auto_extract = false      # team memory requires explicit writes by default
 dedup_threshold = 0.85        # skip a new memory this similar to an existing one
+extraction_dead_letter_limit = 1000 # bounded poison-item diagnostics; never stores raw content
 
 # Dreaming: manual (`polaris dream`) and gated automatic consolidation.
 auto_dream = true
@@ -118,6 +119,15 @@ dir = "~/.polaris/projects"
 # boundary) — like the reference. Set false to keep transcripts a faithful full record and
 # have resume reload everything (the loop re-compacts). Env: AGENT_PERSIST_COMPACT_BOUNDARY.
 persist_compaction_boundary = true
+
+[session.retention]
+enabled = true
+transcript_days = 90
+max_transcripts_per_project = 200
+preserve_tagged = true
+terminal_journal_days = 7
+max_terminal_journals_per_session = 500
+scan_interval_seconds = 86400
 
 # --- One-time project context (CLAUDE.md + git) -----------------------------
 # At run start the agent discovers CLAUDE.md files (workspace up to the root, plus
@@ -237,6 +247,15 @@ max_chars = 100000             # reject prompts larger than this; 0 disables the
 reject_control_chars = true    # reject NUL / C0 control chars (tab/newline/CR are allowed)
 neutralize_framing = true      # wrap+escape spoofed control framing instead of rejecting it
 
+[hooks.limits]
+total_bytes = 262144
+output_bytes = 262144
+string_bytes = 65536
+max_depth = 12
+max_items = 100
+max_messages = 20
+message_chars = 2000
+
 # External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
 # carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
 # {"hookSpecificOutput": {"additionalContext": "..."}} is injected). `prompt`/`agent` are
@@ -285,6 +304,12 @@ collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
 use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
 summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
 summary_input_max_chars = 16000 # hard cap on the prefix fed to the summary call
+summary_total_input_max_chars = 64000 # total chronological coverage budget
+summary_max_chunks = 4          # map chunks, split only at tool-round boundaries
+summary_map_output_tokens = 2048
+summary_total_output_tokens = 20000
+summary_output_max_chars = 16000
+track_b_max_chars = 16000
 # Track A summary OUTPUT budget — a streamed escalation ladder (parity with the reference's
 # streamed compact). Attempt 1 uses compact_summary_start_tokens; on a max_tokens truncation
 # it escalates to compact_max_output_tokens, then to the model's hard ceiling
@@ -512,6 +537,10 @@ enabled = true
 max_jobs = 50
 max_prompt_chars = 16000
 database = "~/.polaris/scheduler.sqlite3"
+max_delivery_attempts = 3       # includes the initial attempt
+retry_base_seconds = 30         # exponential retry: 30s, then 60s
+retry_max_seconds = 600
+delivery_lease_seconds = 1800   # expired running deliveries are recovered
 [tools.lsp]
 autodetect = false
 max_restarts = 3

@@ -373,6 +373,7 @@ class CompressionEvent:
     before_chars: int
     after_chars: int
     detail: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -387,6 +388,12 @@ class CompressionConfig:
     use_llm_summary: bool = True
     summary_keep_recent: int = 8
     summary_input_max_chars: int = 16000
+    summary_total_input_max_chars: int = 64000
+    summary_max_chunks: int = 4
+    summary_map_output_tokens: int = 2048
+    summary_total_output_tokens: int = 20000
+    summary_output_max_chars: int = 16000
+    track_b_max_chars: int = 16000
     # Track A summary OUTPUT budget, as a 3-tier escalation ladder (mirrors the
     # reference's streamed compact: steady-state -> compaction cap -> model ceiling). The
     # call STREAMS (compression_summary.py) so the high tiers don't trip the SDK's
@@ -654,7 +661,9 @@ class CompressionPipeline:
             # Boundary snapping kept everything recent (e.g. one giant round) — nothing
             # to fold; leave the history unchanged rather than emit an empty summary.
             return messages, CompressionEvent("context_collapse", before, before)
-        summary_message, note = await self._collapse_prefix(prefix, summarizer if use_llm else None)
+        summary_message, note, budget_metadata = await self._collapse_prefix(
+            prefix, summarizer if use_llm else None
+        )
         # Attachments (re-injected file context) are appended ONLY here, on a real fold —
         # the early-return no-fold paths above leave history untouched and inject nothing.
         # They live in the conversation TAIL (after ``recent``) and are NOT pinned, so the
@@ -665,7 +674,10 @@ class CompressionPipeline:
             *ephemeral,
         ]
         detail = f"collapsed {len(prefix)} msgs ({note})"
-        return collapsed, CompressionEvent("context_collapse", before, self._char_count(collapsed), detail)
+        return collapsed, CompressionEvent(
+            "context_collapse", before, self._char_count(collapsed), detail,
+            budget_metadata,
+        )
 
     @staticmethod
     def _is_preserved(message: Message) -> bool:
@@ -675,7 +687,7 @@ class CompressionPipeline:
 
     async def _collapse_prefix(
         self, prefix: list[Message], summarizer: Summarizer | None
-    ) -> tuple[Message, str]:
+    ) -> tuple[Message, str, dict[str, object]]:
         """Fold the old prefix into one USER summary message, returning it plus a note.
 
         Track A (``summarizer`` present): ask the model for a structured summary, wrapped
@@ -685,34 +697,177 @@ class CompressionPipeline:
         always succeeds and the run never breaks. The note (``llm_summary`` /
         ``summary_fallback: ...`` / ``track_b``) flows into the compression log event.
         """
+        original_chars = self._char_count(prefix)
+        base_metadata: dict[str, object] = {
+            "original_chars": original_chars,
+            "projected_chars": original_chars,
+            "chunks": 1,
+            "calls": 0,
+            "omitted_chars": 0,
+            "fallback": False,
+            "output_truncated": False,
+        }
         if summarizer is None:
-            return self._collapse_prefix_naive(prefix), "track_b"
+            block, truncated = self._collapse_prefix_naive(prefix)
+            base_metadata["output_truncated"] = truncated
+            return block, "track_b", base_metadata
         try:
             timeout = self.config.summary_timeout_seconds
+            operation = self._summarize_hierarchical(prefix, summarizer, base_metadata)
             if timeout is not None:
-                summary = await asyncio.wait_for(summarizer(prefix), timeout)
+                summary = await asyncio.wait_for(operation, timeout)
             else:
-                summary = await summarizer(prefix)
+                summary = await operation
             if not summary or not summary.strip():
                 raise ValueError("empty summary")
         except Exception as exc:  # noqa: BLE001 - any summarizer failure must degrade, not crash
-            return self._collapse_prefix_naive(prefix), f"summary_fallback: {type(exc).__name__}"
+            block, truncated = self._collapse_prefix_naive(prefix)
+            base_metadata["fallback"] = True
+            base_metadata["output_truncated"] = truncated
+            return block, f"summary_fallback: {type(exc).__name__}", base_metadata
+        summary, truncated = self._cap_text(summary, self.config.summary_output_max_chars)
+        base_metadata["output_truncated"] = truncated
         block = build_summary_user_message(
             summary, marker="llm_summary", messages_collapsed=len(prefix)
         )
-        return block, "llm_summary"
+        return block, "llm_summary", base_metadata
+
+    async def _summarize_hierarchical(
+        self,
+        prefix: list[Message],
+        summarizer: Summarizer,
+        metadata: dict[str, object],
+    ) -> str:
+        chunks, projected_chars, omitted_chars = self._summary_chunks(prefix)
+        metadata.update(
+            projected_chars=projected_chars,
+            omitted_chars=omitted_chars,
+            chunks=len(chunks),
+        )
+        if len(chunks) == 1:
+            metadata["calls"] = 1
+            budget = min(
+                self.config.summary_total_output_tokens,
+                self.config.compact_summary_start_tokens,
+            )
+            return await summarizer(self._with_summary_budget(chunks[0], budget))
+
+        map_summaries: list[str] = []
+        spent = 0
+        for chunk in chunks:
+            budget = min(
+                self.config.summary_map_output_tokens,
+                self.config.summary_total_output_tokens - spent,
+            )
+            if budget <= 0:
+                break
+            try:
+                value = await summarizer(self._with_summary_budget(chunk, budget))
+                if not value.strip():
+                    raise ValueError("empty map summary")
+            except Exception:  # noqa: BLE001 - per-chunk fallback is intentional
+                value = self._track_b_body(chunk)
+                metadata["fallback"] = True
+            value, _ = self._cap_text(
+                value,
+                max(256, self.config.summary_input_max_chars // max(1, len(chunks))),
+            )
+            map_summaries.append(value)
+            spent += budget
+            metadata["calls"] = int(str(metadata["calls"])) + 1
+        if not map_summaries:
+            raise ValueError("summary token budget exhausted")
+        synthesis_budget = self.config.summary_total_output_tokens - spent
+        if synthesis_budget <= 0:
+            raise ValueError("summary token budget exhausted")
+        synthesis = [
+            Message("user", f"Chronological chunk {index + 1}:\n{value}")
+            for index, value in enumerate(map_summaries)
+        ]
+        metadata["calls"] = int(str(metadata["calls"])) + 1
+        return await summarizer(self._with_summary_budget(synthesis, synthesis_budget))
+
+    def _summary_chunks(
+        self, prefix: list[Message]
+    ) -> tuple[list[list[Message]], int, int]:
+        per_call = max(1, self.config.summary_input_max_chars)
+        rounds = group_into_rounds(prefix)
+        chunks: list[list[Message]] = []
+        current: list[Message] = []
+        current_chars = 0
+        for round_messages in rounds:
+            round_chars = self._char_count(round_messages)
+            if current and current_chars + round_chars > per_call:
+                chunks.append(current)
+                current = []
+                current_chars = 0
+            current.extend(round_messages)
+            current_chars += round_chars
+        if current:
+            chunks.append(current)
+        raw_chars = self._char_count(prefix)
+        if (
+            len(chunks) <= self.config.summary_max_chunks
+            and raw_chars <= self.config.summary_total_input_max_chars
+        ):
+            return chunks, raw_chars, 0
+
+        # Cover the complete chronology with contiguous bands. Each band becomes one
+        # synthetic message whose per-round excerpts are evenly budgeted, so the middle
+        # of a long transcript cannot disappear behind a head/tail cut.
+        band_count = min(self.config.summary_max_chunks, max(1, len(rounds)))
+        projected: list[list[Message]] = []
+        kept_chars = 0
+        for band in range(band_count):
+            start = len(rounds) * band // band_count
+            end = len(rounds) * (band + 1) // band_count
+            selected = rounds[start:end]
+            allowance = min(
+                per_call,
+                max(1, self.config.summary_total_input_max_chars // band_count),
+            )
+            per_round = max(16, allowance // max(1, len(selected)) - 12)
+            lines: list[str] = []
+            for offset, round_messages in enumerate(selected, start=start):
+                raw = " ".join(f"[{m.role}] {m.content}" for m in round_messages)
+                excerpt = raw[:per_round]
+                lines.append(f"[round {offset + 1}] {excerpt}")
+            text, _ = self._cap_text("\n".join(lines), allowance)
+            kept_chars += len(text)
+            projected.append([Message("user", text, metadata={"coverage_projection": True})])
+        return projected, kept_chars, max(0, raw_chars - kept_chars)
 
     @staticmethod
-    def _collapse_prefix_naive(prefix: list[Message]) -> Message:
+    def _with_summary_budget(messages: list[Message], budget: int) -> list[Message]:
+        if not messages:
+            return messages
+        first = messages[0]
+        metadata = dict(first.metadata)
+        metadata["_summary_output_tokens"] = max(1, int(budget))
+        return [replace(first, metadata=metadata), *messages[1:]]
+
+    @staticmethod
+    def _cap_text(value: str, limit: int) -> tuple[str, bool]:
+        if limit <= 0 or len(value) <= limit:
+            return value, False
+        marker = "\n[... summary truncated ...]"
+        return value[: max(0, limit - len(marker))] + marker, True
+
+    def _track_b_body(self, prefix: list[Message]) -> str:
+        summary = " | ".join(f"{m.role}: {m.content[:160]}" for m in prefix)
+        return self._cap_text(summary, self.config.track_b_max_chars)[0]
+
+    def _collapse_prefix_naive(self, prefix: list[Message]) -> tuple[Message, bool]:
         """Deterministic Track B fold: join the old prefix into one USER summary message.
 
         Pure string manipulation, no model call — the offline/no-key default and the
         fallback when an LLM summary (Track A) is unavailable or fails. Byte-stable for a
         given input (the continuation wrapper is fixed text)."""
-        summary = " | ".join(f"{m.role}: {m.content[:160]}" for m in prefix)
+        raw = " | ".join(f"{m.role}: {m.content[:160]}" for m in prefix)
+        summary, truncated = self._cap_text(raw, self.config.track_b_max_chars)
         return build_summary_user_message(
             summary, marker="context_collapse", messages_collapsed=len(prefix)
-        )
+        ), truncated
 
     @staticmethod
     def _char_count(messages: list[Message]) -> int:

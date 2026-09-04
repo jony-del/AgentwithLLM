@@ -138,6 +138,12 @@ class TranscriptStore:
             self.path = proj / session_id / "subagents" / f"agent-{agent_id}.jsonl"
         self._lock = threading.Lock()
         self._warned = False
+        self.last_error: str | None = None
+        self._round_checksums: set[str] | None = None
+        self._round_index_path = self.path.with_suffix(self.path.suffix + ".round-index.json")
+        self._activity_path = self.path.with_suffix(
+            self.path.suffix + f".active.{os.getpid()}"
+        )
 
     def _session_record(self) -> dict[str, object]:
         return {
@@ -154,7 +160,18 @@ class TranscriptStore:
             return
         file.write(json.dumps(self._session_record(), ensure_ascii=False) + "\n")
 
-    async def append_message(self, message: Message) -> None:
+    def _touch_activity_locked(self) -> None:
+        self._activity_path.write_text(
+            json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8"
+        )
+
+    def close(self) -> None:
+        try:
+            self._activity_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def append_message(self, message: Message) -> bool:
         message_data = message.to_dict()
         if message.metadata.get("sensitive"):
             message_data["content"] = "<redacted-sensitive-tool-output>"
@@ -168,9 +185,9 @@ class TranscriptStore:
             "git_branch": self._cwd_branch,
             "ts": time.time(),
         }
-        await asyncio.to_thread(self._write_sync, record)
+        return await asyncio.to_thread(self._write_sync, record)
 
-    async def append_meta(self, kind: str, payload: dict) -> None:
+    async def append_meta(self, kind: str, payload: dict) -> bool:
         record = {
             "type": kind,
             "v": SCHEMA_VERSION,
@@ -178,7 +195,7 @@ class TranscriptStore:
             "ts": time.time(),
             **payload,
         }
-        await asyncio.to_thread(self._write_sync, record)
+        return await asyncio.to_thread(self._write_sync, record)
 
     async def append_tool_round(
         self,
@@ -293,12 +310,9 @@ class TranscriptStore:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
             with self._lock:
-                if checksum and self.path.exists():
-                    marker = f'"checksum": "{checksum}"'
-                    if marker in self.path.read_text(
-                        encoding="utf-8", errors="replace"
-                    ):
-                        return True
+                checksums = self._load_round_index_locked()
+                if checksum and checksum in checksums:
+                    return True
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8", errors="replace") as file:
                     self._ensure_session_header_locked(file)
@@ -308,8 +322,17 @@ class TranscriptStore:
                         os.fsync(file.fileno())
                     except OSError:
                         pass
+                self._touch_activity_locked()
+                if checksum:
+                    checksums.add(checksum)
+                    try:
+                        self._write_round_index_locked(checksums)
+                    except OSError:
+                        pass
+                self.last_error = None
             return True
         except OSError as exc:
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
             if not self._warned:
                 print(
                     f"[transcript] write failed ({exc}); resume disabled this run",
@@ -318,14 +341,78 @@ class TranscriptStore:
                 self._warned = True
             return False
 
-    async def append_relink(self, uuid: str, parent_uuid: str | None) -> None:
+    def _load_round_index_locked(self) -> set[str]:
+        if self._round_checksums is not None:
+            return self._round_checksums
+        try:
+            raw = json.loads(self._round_index_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(raw, dict)
+                and raw.get("v") == 1
+                and raw.get("transcript_size") == (self.path.stat().st_size if self.path.exists() else 0)
+                and isinstance(raw.get("checksums"), list)
+            ):
+                self._round_checksums = {
+                    item for item in raw["checksums"] if isinstance(item, str)
+                }
+                return self._round_checksums
+        except (OSError, ValueError, TypeError):
+            pass
+        checksums: set[str] = set()
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as file:
+                for line in file:
+                    if '"type": "tool_round"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    checksum = entry.get("checksum") if isinstance(entry, dict) else None
+                    if isinstance(checksum, str):
+                        checksums.add(checksum)
+        except OSError:
+            pass
+        self._round_checksums = checksums
+        return checksums
+
+    def _write_round_index_locked(self, checksums: set[str]) -> None:
+        payload = {
+            "v": 1,
+            "transcript_size": self.path.stat().st_size,
+            "checksums": sorted(checksums),
+        }
+        temporary = self._round_index_path.with_suffix(self._round_index_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self._round_index_path)
+
+    def _refresh_round_index_size_locked(self) -> None:
+        """Advance a valid sidecar after a non-round append without rescanning history."""
+
+        try:
+            if self._round_checksums is not None:
+                self._write_round_index_locked(self._round_checksums)
+                return
+            raw = json.loads(self._round_index_path.read_text(encoding="utf-8"))
+            checksums = raw.get("checksums") if isinstance(raw, dict) else None
+            if raw.get("v") != 1 or not isinstance(checksums, list):
+                return
+            self._round_checksums = {item for item in checksums if isinstance(item, str)}
+            self._write_round_index_locked(self._round_checksums)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+
+    async def append_relink(self, uuid: str, parent_uuid: str | None) -> bool:
         """Record that ``uuid``'s parent should be re-pointed to ``parent_uuid`` on load.
 
         Written at a compaction boundary to re-attach the kept tail's first message to the
         summary (the append-only file can't mutate the original line). ``load_transcript``
         applies these last-wins after parsing all messages.
         """
-        await self.append_meta(_RELINK, {"uuid": uuid, "parent_uuid": parent_uuid})
+        return await self.append_meta(_RELINK, {"uuid": uuid, "parent_uuid": parent_uuid})
 
     def _write_sync(self, record: dict) -> bool:
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
@@ -340,8 +427,12 @@ class TranscriptStore:
                         os.fsync(file.fileno())
                     except OSError:
                         pass
+                self._touch_activity_locked()
+                self._refresh_round_index_size_locked()
+                self.last_error = None
             return True
         except OSError as exc:
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
             # Persistence is best-effort: a transcript write must never crash an
             # otherwise healthy run. Warn once, then stay quiet.
             if not self._warned:
@@ -351,6 +442,14 @@ class TranscriptStore:
 
 
 # --------------------------------------------------------------------------- read side
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptDiagnostic:
+    code: str
+    line: int | None = None
+    entry_type: str | None = None
+    detail: str = ""
 
 
 @dataclass(slots=True)
@@ -363,6 +462,7 @@ class LoadedTranscript:
     tag: str | None = None
     git_branch: str | None = None
     workspace: Path | None = None
+    diagnostics: list[TranscriptDiagnostic] = field(default_factory=list)
 
     @property
     def first_prompt(self) -> str:
@@ -387,9 +487,19 @@ class LoadedTranscript:
             return None
         parents = {m.parent_uuid for m in self.messages.values() if m.parent_uuid}
         for uid in reversed(self.order):
-            if uid not in parents:
+            if uid not in parents and self._chain_is_valid(uid):
                 return uid
-        return self.order[-1]
+        return None
+
+    def _chain_is_valid(self, leaf: str) -> bool:
+        seen: set[str] = set()
+        uid: str | None = leaf
+        while uid is not None:
+            if uid in seen or uid not in self.messages:
+                return False
+            seen.add(uid)
+            uid = self.messages[uid].parent_uuid
+        return True
 
 
 class _Accumulator:
@@ -408,6 +518,7 @@ class _Accumulator:
         "tag",
         "branch",
         "workspace",
+        "diagnostics",
         "_workspace_conflict",
     )
 
@@ -420,44 +531,90 @@ class _Accumulator:
         self.tag: str | None = None
         self.branch: str | None = None
         self.workspace: Path | None = None
+        self.diagnostics: list[TranscriptDiagnostic] = []
         self._workspace_conflict = False
 
-    def feed(self, line: str) -> None:
+    def _diagnose(
+        self, code: str, line: int | None, entry_type: object = None, detail: str = ""
+    ) -> None:
+        self.diagnostics.append(
+            TranscriptDiagnostic(
+                code=code,
+                line=line,
+                entry_type=entry_type if isinstance(entry_type, str) else None,
+                detail=detail[:160],
+            )
+        )
+
+    def feed(self, line: str, line_number: int | None = None) -> None:
         line = line.strip()
         if not line:
             return
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
+            self._diagnose("invalid_json", line_number)
             return
         if not isinstance(entry, dict):
+            self._diagnose("record_not_object", line_number)
             return
         etype = entry.get("type")
+        if not isinstance(etype, str):
+            self._diagnose("invalid_type", line_number)
+            return
+        version = entry.get("v")
+        if version is not None and (
+            not isinstance(version, int) or isinstance(version, bool) or version < 1
+            or version > SCHEMA_VERSION
+        ):
+            self._diagnose("unsupported_version", line_number, etype)
+            return
         if etype == _SESSION:
-            self.session_id = str(entry.get("session_id") or self.session_id)
-            self._capture_workspace(entry)
+            session_id = entry.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                self._diagnose("invalid_session", line_number, etype)
+                return
+            self.session_id = session_id
+            self._capture_workspace(entry, line_number)
         elif etype == "message":
-            self._feed_message(entry, entry)
+            message = self._validated_message(entry, line_number, etype)
+            if message is not None:
+                self._feed_message(message, entry, line_number)
         elif etype == "tool_round":
             messages = entry.get("messages")
             manifest = entry.get("execution_manifest")
             checksum = entry.get("checksum")
             if not isinstance(messages, list) or not isinstance(manifest, dict):
+                self._diagnose("invalid_tool_round", line_number, etype)
                 return
             body = {"messages": messages, "execution_manifest": manifest}
             canonical = json.dumps(
                 body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
             )
             if checksum != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+                self._diagnose("checksum_mismatch", line_number, etype)
                 return
-            for raw_message in messages:
-                if isinstance(raw_message, dict):
-                    self._feed_message(raw_message, entry)
+            validated = [
+                self._validated_message(raw, line_number, etype)
+                for raw in messages
+            ]
+            ids = [item.uuid for item in validated if item is not None]
+            if (
+                any(item is None for item in validated)
+                or len(ids) != len(set(ids))
+                or any(item_id in self.messages for item_id in ids)
+            ):
+                self._diagnose("invalid_tool_round_message", line_number, etype)
+                return
+            for message in validated:
+                assert message is not None
+                self._feed_message(message, entry, line_number)
         elif etype == _COMPACTION_SNAPSHOT:
             messages = entry.get("messages")
             source_head = entry.get("source_head")
             checksum = entry.get("checksum")
             if not isinstance(messages, list):
+                self._diagnose("invalid_snapshot", line_number, etype)
                 return
             snapshot_body: dict[str, object] = {
                 "messages": messages,
@@ -471,14 +628,23 @@ class _Accumulator:
                 default=str,
             )
             if checksum != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+                self._diagnose("checksum_mismatch", line_number, etype)
+                return
+            validated = [
+                self._validated_message(raw, line_number, etype)
+                for raw in messages
+            ]
+            ids = [item.uuid for item in validated if item is not None]
+            if any(item is None for item in validated) or len(ids) != len(set(ids)):
+                self._diagnose("invalid_snapshot_message", line_number, etype)
                 return
             self.messages.clear()
             self.order.clear()
             self.relinks.clear()
-            self._capture_workspace(entry)
-            for raw_message in messages:
-                if isinstance(raw_message, dict):
-                    self._feed_message(raw_message, entry)
+            self._capture_workspace(entry, line_number)
+            for message in validated:
+                assert message is not None
+                self._feed_message(message, entry, line_number)
         elif etype == _RELINK:
             msg_uuid = entry.get("uuid")
             parent_uuid = entry.get("parent_uuid")
@@ -486,34 +652,94 @@ class _Accumulator:
                 parent_uuid is None or isinstance(parent_uuid, str)
             ):
                 self.relinks[msg_uuid] = parent_uuid
+            else:
+                self._diagnose("invalid_relink", line_number, etype)
         elif etype == _TITLE:
-            self.title = entry.get("title", self.title)
+            title = entry.get("title")
+            if isinstance(title, str):
+                self.title = title
+            else:
+                self._diagnose("invalid_title", line_number, etype)
         elif etype == _TAG:
-            self.tag = entry.get("tag", self.tag)
+            tag = entry.get("tag")
+            if isinstance(tag, str):
+                self.tag = tag
+            else:
+                self._diagnose("invalid_tag", line_number, etype)
         # Unknown entry types are ignored, keeping the format forward-compatible.
 
-    def _feed_message(self, value: dict, envelope: dict) -> None:
-        msg = Message.from_dict(value)
-        self.session_id = envelope.get("session_id", self.session_id)
+    def _validated_message(
+        self, value: object, line: int | None, entry_type: str
+    ) -> Message | None:
+        if not isinstance(value, dict):
+            self._diagnose("message_not_object", line, entry_type)
+            return None
+        role = value.get("role")
+        content = value.get("content", "")
+        metadata = value.get("metadata", {})
+        identity = value.get("message_id") or value.get("uuid")
+        parent = value.get("parent_id", value.get("parent_uuid"))
+        message_version = value.get("version", 1)
+        if role not in {"system", "user", "assistant", "tool"}:
+            self._diagnose("invalid_message_role", line, entry_type)
+            return None
+        if not isinstance(content, str) or not isinstance(metadata, dict):
+            self._diagnose("invalid_message_fields", line, entry_type)
+            return None
+        for optional in ("name", "origin_id", "round_id"):
+            if value.get(optional) is not None and not isinstance(value.get(optional), str):
+                self._diagnose("invalid_message_fields", line, entry_type)
+                return None
+        if identity is not None and (not isinstance(identity, str) or not identity):
+            self._diagnose("invalid_message_identity", line, entry_type)
+            return None
+        if parent is not None and not isinstance(parent, str):
+            self._diagnose("invalid_message_parent", line, entry_type)
+            return None
+        if not isinstance(message_version, int) or isinstance(message_version, bool) or message_version < 1:
+            self._diagnose("invalid_message_version", line, entry_type)
+            return None
+        try:
+            return Message.from_dict(value)
+        except (KeyError, TypeError, ValueError):
+            self._diagnose("invalid_message", line, entry_type)
+            return None
+
+    def _feed_message(self, msg: Message, envelope: dict, line: int | None) -> None:
+        session_id = envelope.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            self._diagnose("invalid_envelope_session", line, envelope.get("type"))
+            return
+        self.session_id = session_id or self.session_id
         self.branch = envelope.get("git_branch") or self.branch
-        self._capture_workspace(envelope)
-        if msg.uuid not in self.messages:
-            self.order.append(msg.uuid)
+        self._capture_workspace(envelope, line)
+        if msg.uuid in self.messages:
+            self._diagnose("duplicate_uuid", line, envelope.get("type"))
+            return
+        self.order.append(msg.uuid)
         self.messages[msg.uuid] = msg
 
-    def _capture_workspace(self, envelope: dict) -> None:
+    def _capture_workspace(self, envelope: dict, line: int | None = None) -> None:
         if self._workspace_conflict:
             return
         raw = envelope.get("cwd")
-        if not isinstance(raw, str) or not raw:
+        if raw is None:
             return
-        candidate = Path(raw).resolve()
+        if not isinstance(raw, str) or not raw:
+            self._diagnose("invalid_workspace", line, envelope.get("type"))
+            return
+        try:
+            candidate = Path(raw).resolve()
+        except (OSError, ValueError):
+            self._diagnose("invalid_workspace", line, envelope.get("type"))
+            return
         if self.workspace is None:
             self.workspace = candidate
         elif os.path.normcase(str(self.workspace)) != os.path.normcase(str(candidate)):
             # A transcript must never change project identity mid-file.
             self.workspace = None
             self._workspace_conflict = True
+            self._diagnose("workspace_conflict", line, envelope.get("type"))
 
     def finish(self, path: Path) -> "LoadedTranscript":
         # Apply relinks: a compaction boundary re-points the kept tail's head at the
@@ -522,6 +748,23 @@ class _Accumulator:
             msg = self.messages.get(msg_uuid)
             if msg is not None:
                 msg.parent_uuid = parent
+        for msg_uuid, msg in self.messages.items():
+            if msg.parent_uuid is not None and msg.parent_uuid not in self.messages:
+                self._diagnose("orphan_parent", None, "message", msg_uuid)
+        cycle_members: set[str] = set()
+        for start in self.order:
+            positions: dict[str, int] = {}
+            walk: list[str] = []
+            uid: str | None = start
+            while uid is not None and uid in self.messages:
+                if uid in positions:
+                    cycle_members.update(walk[positions[uid] :])
+                    break
+                positions[uid] = len(walk)
+                walk.append(uid)
+                uid = self.messages[uid].parent_uuid
+        for msg_uuid in sorted(cycle_members):
+            self._diagnose("parent_cycle", None, "message", msg_uuid)
         return LoadedTranscript(
             path=path,
             session_id=self.session_id,
@@ -531,6 +774,7 @@ class _Accumulator:
             tag=self.tag,
             git_branch=self.branch,
             workspace=self.workspace,
+            diagnostics=self.diagnostics,
         )
 
 
@@ -559,12 +803,12 @@ def load_transcript(path: str | Path, *, skip_precompact: bool = True) -> Loaded
             acc.feed(line)
         with path.open("rb") as file:
             file.seek(boundary_offset)
-            for raw in file:
-                acc.feed(raw.decode("utf-8", "ignore"))
+            for line_number, raw in enumerate(file, start=1):
+                acc.feed(raw.decode("utf-8", "ignore"), line_number)
     else:
         with path.open("r", encoding="utf-8") as file:
-            for line in file:
-                acc.feed(line)
+            for line_number, line in enumerate(file, start=1):
+                acc.feed(line, line_number)
 
     return acc.finish(path)
 

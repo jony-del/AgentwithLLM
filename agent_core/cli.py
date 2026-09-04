@@ -26,6 +26,7 @@ from agent_core.config import (
     resolve_persist_compaction_boundary,
     resolve_sandbox_config,
     resolve_session_dir,
+    resolve_session_retention_config,
     resolve_skills_config,
     resolve_tool_use_summary_config,
     resolve_tool_suite_config,
@@ -398,6 +399,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
         session_dir=_session_dir(args),
         persist_compaction_boundary=resolve_persist_compaction_boundary(config_file),
+        session_retention=resolve_session_retention_config(config_file),
         skills=resolve_skills_config(config_file),
         capabilities=resolve_capabilities_config(config_file),
         hooks=resolve_hooks_config(config_file),
@@ -1056,6 +1058,26 @@ def sessions_command(args: argparse.Namespace) -> int:
         print("Session persistence is disabled (empty session dir).")
         return 0
     cwd = Path.cwd().resolve()
+    if getattr(args, "action", "list") == "prune":
+        from agent_core.retention import prune_sessions
+
+        report = prune_sessions(
+            root,
+            cwd,
+            resolve_session_retention_config(_config_file(args)),
+            apply=bool(getattr(args, "apply", False)),
+        )
+        verb = "Deleted" if report["dry_run"] is False else "Would delete"
+        print(
+            f"{verb} {report['deleted'] if not report['dry_run'] else len(report['selected'])} "
+            f"session(s), {report['bytes']} byte(s); protected={report['protected']}, "
+            f"errors={report['errors']}."
+        )
+        for session_id in report["selected"]:
+            print(f"  {session_id}")
+        if report["dry_run"]:
+            print("Re-run with --apply to execute this retention plan.")
+        return 0
     infos = list_sessions(project_dir(root, cwd))
     if not infos:
         print(f"No saved sessions for {cwd}")
@@ -2075,7 +2097,11 @@ def main(argv: list[str] | None = None) -> int:
         "sessions", help="List resumable sessions saved for the current project."
     )
     sessions_parser.add_argument(
-        "action", nargs="?", choices=["list"], default="list", help="list: show saved sessions."
+        "action", nargs="?", choices=["list", "prune"], default="list",
+        help="list saved sessions, or preview retention pruning."
+    )
+    sessions_parser.add_argument(
+        "--apply", action="store_true", help="Apply a sessions prune plan."
     )
     sessions_parser.add_argument("--session-dir", metavar="PATH", default=None)
     add_config_flag(sessions_parser)

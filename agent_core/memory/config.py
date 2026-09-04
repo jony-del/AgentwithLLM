@@ -100,6 +100,7 @@ class MemoryConfig:
     auto_extract: bool = True
     team_auto_extract: bool = False
     dedup_threshold: float = 0.85
+    extraction_dead_letter_limit: int = 1000
 
     forget_threshold: float = 0.15
     forget_min_access: int = 1
@@ -140,4 +141,7 @@ class MemoryConfig:
         )
         config.recall_k = max(0, int(config.recall_k))
         config.content_budget_bytes = max(1024, int(config.content_budget_bytes))
+        config.extraction_dead_letter_limit = max(
+            1, min(10_000, int(config.extraction_dead_letter_limit))
+        )
         return config

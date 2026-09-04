@@ -17,7 +17,11 @@ def _store(session: Any) -> SchedulerStore:
     if session.scheduler_store is None:
         config = session.tool_suite.scheduler
         session.scheduler_store = SchedulerStore(
-            config.database_path(), max_jobs=config.max_jobs, max_prompt_chars=config.max_prompt_chars
+            config.database_path(), max_jobs=config.max_jobs, max_prompt_chars=config.max_prompt_chars,
+            max_delivery_attempts=config.max_delivery_attempts,
+            retry_base_seconds=config.retry_base_seconds,
+            retry_max_seconds=config.retry_max_seconds,
+            delivery_lease_seconds=config.delivery_lease_seconds,
         )
     return session.scheduler_store
 
@@ -112,3 +116,56 @@ class CronDeleteTool(_CronTool):
             owner_session=self.session.session_id, owner_agent=self.session.agent_id,
         )
         return ToolResult(self.name, "Deleted." if deleted else "Cron job not found.", ok=deleted)
+
+
+@builtin_tool
+class CronDeliveryListTool(_CronTool):
+    name = "cron_delivery_list"
+    description = "List dead-letter scheduler deliveries owned by this agent."
+    input_schema = {"type": "object", "properties": {}, "required": []}
+    risk = ToolRisk.READ
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        deliveries = await asyncio.to_thread(
+            _store(self.session).list_dead_letters,
+            owner_session=self.session.session_id,
+            owner_agent=self.session.agent_id,
+        )
+        return ToolResult(
+            self.name,
+            json.dumps(deliveries, indent=2, default=str),
+            metadata={"count": len(deliveries)},
+        )
+
+
+@builtin_tool
+class CronDeliveryRetryTool(_CronTool):
+    name = "cron_delivery_retry"
+    description = "Retry one dead-letter scheduler delivery owned by this agent."
+    input_schema = {
+        "type": "object",
+        "properties": {"delivery_id": {"type": "integer", "minimum": 1}},
+        "required": ["delivery_id"],
+    }
+    risk = ToolRisk.WRITE
+
+    async def check_permissions(
+        self, arguments: dict[str, Any], context: PermissionContext
+    ) -> PermissionResult:
+        return PermissionResult.ask(
+            "dead-letter redrive requires explicit confirmation",
+            bypass_immune=True,
+            classifier_approvable=False,
+        )
+
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
+        try:
+            await asyncio.to_thread(
+                _store(self.session).redrive_dead_letter,
+                int(str(arguments.get("delivery_id", 0))),
+                owner_session=self.session.session_id,
+                owner_agent=self.session.agent_id,
+            )
+        except (CronError, OSError, ValueError, sqlite3.Error) as exc:
+            return ToolResult(self.name, f"Delivery retry failed: {exc}", ok=False)
+        return ToolResult(self.name, "Dead-letter delivery queued for retry.")

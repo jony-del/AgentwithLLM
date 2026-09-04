@@ -102,6 +102,7 @@ from agent_core.session import (
     SessionContext,
     SessionDescriptor,
     SessionRuntime,
+    SessionRetentionConfig,
 )
 from agent_core.skills import (
     SkillRegistry,
@@ -200,6 +201,8 @@ _READ_ONLY_CHILD_TOOLS = frozenset(
         "cron_create",
         "cron_list",
         "cron_delete",
+        "cron_delivery_list",
+        "cron_delivery_retry",
     }
 )
 _FULL_CHILD_TOOLS = _READ_ONLY_CHILD_TOOLS | {
@@ -288,6 +291,7 @@ class ReActConfig:
     # the transcript stays a faithful full record and a resume reloads everything, letting
     # the live loop re-compact (cheaper/simpler; the original decoupled behavior).
     persist_compaction_boundary: bool = True
+    session_retention: SessionRetentionConfig = field(default_factory=SessionRetentionConfig)
     system_prompt: str = (
         "You are a ReAct agent. Reason briefly, call tools when useful, "
         "and return a final answer when the task is complete. "
@@ -474,6 +478,23 @@ class ReActAgent:
             )
         else:
             self.transcript = None
+        if self.transcript is not None:
+            try:
+                from agent_core.retention import maybe_prune_sessions
+
+                retention_report = maybe_prune_sessions(
+                    self.config.session_dir,
+                    self._initial_workspace,
+                    self.config.session_retention,
+                    current_session_id=self.session_id,
+                )
+                if retention_report is not None:
+                    self.logger.write_nowait("session_retention", retention_report)
+            except Exception as exc:  # noqa: BLE001 - retention must fail open
+                self.logger.write_nowait(
+                    "session_retention",
+                    {"status": "failed", "error": type(exc).__name__},
+                )
         # uuid of the last message appended to the transcript, so each new message links
         # back to its predecessor. Reset at the top of every run().
         self._last_message_uuid: str | None = None
@@ -608,7 +629,10 @@ class ReActAgent:
         if not self.config.tools.lsp.servers:
             self.registry.unregister("lsp")
         if not self.config.tools.scheduler.enabled:
-            for name in ("cron_create", "cron_list", "cron_delete"):
+            for name in (
+                "cron_create", "cron_list", "cron_delete",
+                "cron_delivery_list", "cron_delivery_retry",
+            ):
                 self.registry.unregister(name)
         blanket_denied = {
             rule.tool_name for rule in self.config.permission_rules.deny if rule.content is None
@@ -771,6 +795,16 @@ class ReActAgent:
     def recover_turn_journals(self, *, dry_run: bool = False) -> list[dict[str, str]]:
         """Recover this project/session's verified journals and emit run audit events."""
 
+        if not dry_run:
+            retention = self.config.session_retention
+            journal_report = TurnExecutionJournal.prune_terminal(
+                self.executor.journal_storage,
+                retention_days=retention.terminal_journal_days,
+                max_per_session=retention.max_terminal_journals_per_session,
+                scan_interval_seconds=retention.scan_interval_seconds,
+            )
+            if journal_report.get("deleted") or journal_report.get("errors"):
+                self.logger.write_nowait("journal_retention", journal_report)
         outcomes = TurnExecutionJournal.recover_all(
             self.executor.journal_storage,
             history_writer=(
@@ -802,6 +836,16 @@ class ReActAgent:
 
         if self._active_scope is not None:
             raise RuntimeError("a session can only be switched while the agent is idle")
+        for diagnostic in loaded.diagnostics:
+            self.logger.write_nowait(
+                "transcript_diagnostic",
+                {
+                    "code": diagnostic.code,
+                    "line": diagnostic.line,
+                    "entry_type": diagnostic.entry_type,
+                    "detail": diagnostic.detail,
+                },
+            )
         workspace = self.session.workspace.resolve()
         source_workspace = (loaded.workspace or workspace).resolve()
         if os.path.normcase(str(source_workspace)) != os.path.normcase(str(workspace)):
@@ -1302,6 +1346,7 @@ class ReActAgent:
         """
         scope.raise_if_cancelled()
         self._last_message_uuid = None
+        self.runtime.durable_head.memory_head_id = None
         self._pending_tool_use_summary = None
         self._background_hook_tasks = set()
         self._run_start_time = started
@@ -1366,6 +1411,9 @@ class ReActAgent:
                 messages.insert(insert_at, past)
                 insert_at += 1
                 self._last_message_uuid = past.uuid
+                self.runtime.durable_head.memory_head_id = past.uuid
+                if not self.runtime.durable_head.persistence_degraded:
+                    self.runtime.durable_head.durable_head_id = past.uuid
         # The new batch was present while recall/project context found its anchor.
         # Re-add each message sequentially below so hook-added context and transcript
         # parent links stay in exact per-command order.
@@ -1752,6 +1800,7 @@ class ReActAgent:
                 assistant_message.parent_uuid = self._last_message_uuid
                 messages.append(assistant_message)
                 self._last_message_uuid = assistant_message.uuid
+                self.runtime.durable_head.memory_head_id = assistant_message.uuid
             else:
                 await self._emit(messages, assistant_message)
 
@@ -1887,6 +1936,7 @@ class ReActAgent:
                 tool_message.parent_uuid = self._last_message_uuid
                 messages.append(tool_message)
                 self._last_message_uuid = tool_message.uuid
+                self.runtime.durable_head.memory_head_id = tool_message.uuid
                 tool_messages.append(tool_message)
                 # Record read-file state HERE (not in the read tool — its mixin shape
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
@@ -1909,11 +1959,12 @@ class ReActAgent:
                     "tool_round_history",
                     {"status": "journal_failed", "error": f"{type(exc).__name__}: {exc}"},
                 )
-            if self.transcript is not None:
+            if self.transcript is not None and not self.runtime.durable_head.persistence_degraded:
                 persisted = await self.transcript.append_tool_round(
                     assistant_message, tool_messages, manifest
                 )
                 if persisted:
+                    self.runtime.durable_head.durable_head_id = self._last_message_uuid
                     try:
                         await tool_batch.mark_history_persisted_async()
                     except Exception as exc:
@@ -1924,6 +1975,8 @@ class ReActAgent:
                                 "error": f"{type(exc).__name__}: {exc}",
                             },
                         )
+                else:
+                    await self._degrade_transcript("append_tool_round")
             else:
                 try:
                     await tool_batch.mark_history_persisted_async()
@@ -2009,9 +2062,31 @@ class ReActAgent:
         """
         message.parent_uuid = self._last_message_uuid
         messages.append(message)
-        if self.transcript is not None:
-            await self.transcript.append_message(message)
+        if self.transcript is not None and not self.runtime.durable_head.persistence_degraded:
+            if await self.transcript.append_message(message):
+                self.runtime.durable_head.durable_head_id = message.uuid
+            else:
+                await self._degrade_transcript("append_message")
         self._last_message_uuid = message.uuid
+        self.runtime.durable_head.memory_head_id = message.uuid
+
+    async def _degrade_transcript(self, operation: str) -> None:
+        head = self.runtime.durable_head
+        if head.persistence_degraded:
+            return
+        head.persistence_degraded = True
+        head.operation = operation
+        head.first_error = (
+            self.transcript.last_error if self.transcript is not None else "transcript unavailable"
+        )
+        await self.logger.write(
+            "transcript_persistence_degraded",
+            {
+                "operation": operation,
+                "durable_head_id": head.durable_head_id,
+                "error": head.first_error,
+            },
+        )
 
     async def _commit_compaction_boundary(
         self, before: list[Message], after: list[Message]
@@ -2060,10 +2135,15 @@ class ReActAgent:
         for message in resumable:
             message.parent_uuid = parent
             parent = message.uuid
-        if await self.transcript.append_compaction_snapshot(
-            resumable, source_head=source_head
-        ):
-            self._last_message_uuid = parent
+        if not self.runtime.durable_head.persistence_degraded:
+            if await self.transcript.append_compaction_snapshot(
+                resumable, source_head=source_head
+            ):
+                self.runtime.durable_head.durable_head_id = parent
+            else:
+                await self._degrade_transcript("append_compaction_snapshot")
+        self._last_message_uuid = parent
+        self.runtime.durable_head.memory_head_id = parent
         return
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
@@ -2227,9 +2307,13 @@ class ReActAgent:
             return None, True
         # Chain + persist the new task (parent = last history message, or None).
         user_message.parent_uuid = self._last_message_uuid
-        if self.transcript is not None:
-            await self.transcript.append_message(user_message)
+        if self.transcript is not None and not self.runtime.durable_head.persistence_degraded:
+            if await self.transcript.append_message(user_message):
+                self.runtime.durable_head.durable_head_id = user_message.uuid
+            else:
+                await self._degrade_transcript("append_user_message")
         self._last_message_uuid = user_message.uuid
+        self.runtime.durable_head.memory_head_id = user_message.uuid
         if not self.hooks.user_prompt_hooks:
             return None, False
         if outcome.block:
@@ -2527,6 +2611,10 @@ class ReActAgent:
             self.session.scheduler_store = SchedulerStore(
                 config.database_path(), max_jobs=config.max_jobs,
                 max_prompt_chars=config.max_prompt_chars,
+                max_delivery_attempts=config.max_delivery_attempts,
+                retry_base_seconds=config.retry_base_seconds,
+                retry_max_seconds=config.retry_max_seconds,
+                delivery_lease_seconds=config.delivery_lease_seconds,
             )
             self.runtime.scheduler_store = self.session.scheduler_store
         return self.session.scheduler_store
@@ -2595,9 +2683,12 @@ class ReActAgent:
         if store is None:
             return current, results
         pending = await asyncio.to_thread(
-            store.pending, self.session.session_id, self.session.agent_id
+            store.claim_deliveries,
+            self.session.session_id,
+            self.session.agent_id,
+            limit=10,
         )
-        for delivery in pending[:10]:
+        for delivery in pending:
             await self._audit_event(
                 "scheduler_delivery",
                 {"delivery_id": delivery["id"], "job_id": delivery["job_id"], "state": "started"},
@@ -2611,9 +2702,34 @@ class ReActAgent:
                     "scheduler_job_id": str(delivery["job_id"]),
                 },
             )
-            result = await self.run_messages(
-                [scheduled_message], history=current or None
-            )
+            try:
+                result = await self.run_messages(
+                    [scheduled_message], history=current or None
+                )
+            except asyncio.CancelledError:
+                state = await asyncio.to_thread(
+                    store.fail_delivery,
+                    int(str(delivery["id"])),
+                    "CancelledError",
+                )
+                await self._audit_event(
+                    "scheduler_delivery",
+                    {"delivery_id": delivery["id"], "job_id": delivery["job_id"],
+                     "state": state, "attempt": delivery.get("attempt_count")},
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001 - one delivery must not block the queue
+                state = await asyncio.to_thread(
+                    store.fail_delivery,
+                    int(str(delivery["id"])),
+                    type(exc).__name__,
+                )
+                await self._audit_event(
+                    "scheduler_delivery",
+                    {"delivery_id": delivery["id"], "job_id": delivery["job_id"],
+                     "state": state, "attempt": delivery.get("attempt_count")},
+                )
+                continue
             current = result.messages
             results.append(result)
             await asyncio.to_thread(store.complete_delivery, int(str(delivery["id"])))
@@ -2766,10 +2882,14 @@ class ReActAgent:
                 cursor_key=self.session_id,
             )
         except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
-            await self.logger.write("memory_extract", {"error": f"{type(exc).__name__}: {exc}"})
+            await self.logger.write("memory_extract", {"error_type": type(exc).__name__})
             return
-        if stored:
-            await self.logger.write("memory_extract", {"count": len(stored), "ids": [r.id for r in stored]})
+        report = dict(getattr(self.extractor, "last_report", {}))
+        if stored or any(report.values()):
+            await self.logger.write(
+                "memory_extract",
+                {"count": len(stored), "ids": [r.id for r in stored], **report},
+            )
         await self._maybe_auto_dream()
 
     async def _maybe_auto_dream(self) -> None:
@@ -2837,6 +2957,11 @@ class ReActAgent:
             state["after"] = event.after_chars
             if event.detail:
                 state["details"].append(event.detail)
+            if event.metadata:
+                self.logger.write_nowait(
+                    "compression_budget",
+                    {"stage": event.stage, **event.metadata},
+                )
             self.ui.on_compaction_progress(done / total, event.stage)
             if done == total:
                 self.ui.on_compaction_end(
@@ -3100,6 +3225,7 @@ class ReActAgent:
                     provider=self.provider,
                     base_config=self._provider_config(),
                     subagent_factory=self.session.subagent_factory,
+                    limits=self.config.hooks.limits,
                 )
             except Exception as exc:
                 if self.config.sandbox.enabled and spec.type in {"command", "http"}:

@@ -12,6 +12,9 @@ import json
 import os
 import re
 import shutil
+import signal
+import struct
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -25,13 +28,20 @@ class WorkflowError(RuntimeError):
     pass
 
 
+_MAX_WORKFLOW_FRAME_BYTES = 1024 * 1024
+
+
 _RUNNER = r"""
 const vm = require('node:vm');
-const readline = require('node:readline');
-const rl = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+const MAX_FRAME = 1024 * 1024;
 let nextId = 1, total = 0, initialized = false;
 const waiting = new Map();
-function send(v) { process.stdout.write(JSON.stringify(v) + '\n'); }
+function send(v) {
+  let body = Buffer.from(JSON.stringify(v), 'utf8');
+  if (body.length > MAX_FRAME) body = Buffer.from(JSON.stringify({type:'error', error:'result_too_large'}));
+  const header = Buffer.allocUnsafe(4); header.writeUInt32BE(body.length, 0);
+  process.stdout.write(Buffer.concat([header, body]));
+}
 function agent(prompt, options = {}) {
   if (++total > 1000) return Promise.reject(new Error('workflow agent limit exceeded'));
   const id = nextId++;
@@ -45,8 +55,7 @@ async function pipeline(items, fn) {
   await Promise.all(Array.from({length: Math.min(16, items.length)}, worker));
   return out;
 }
-rl.on('line', async line => {
-  let msg; try { msg = JSON.parse(line); } catch (_) { return; }
+async function receive(msg) {
   if (!initialized && msg.type === 'init') {
     initialized = true;
     const source = String(msg.source).replace(/^\s*export\s+const\s+meta\s*=/m, 'const meta =');
@@ -65,8 +74,83 @@ rl.on('line', async line => {
     const pending = waiting.get(msg.id); if (!pending) return; waiting.delete(msg.id);
     if (msg.ok) pending.resolve(msg.result); else pending.resolve(null);
   }
+}
+let input = Buffer.alloc(0);
+process.stdin.on('data', chunk => {
+  input = Buffer.concat([input, chunk]);
+  while (input.length >= 4) {
+    const size = input.readUInt32BE(0);
+    if (size > MAX_FRAME) { send({type:'error', error:'frame_too_large'}); process.exitCode = 2; return; }
+    if (input.length < 4 + size) return;
+    const body = input.subarray(4, 4 + size); input = input.subarray(4 + size);
+    let msg; try { msg = JSON.parse(body.toString('utf8')); }
+    catch (_) { send({type:'error', error:'invalid_json'}); continue; }
+    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+      send({type:'error', error:'invalid_frame_type'}); continue;
+    }
+    void receive(msg);
+  }
+});
+process.stdin.on('end', () => {
+  if (input.length) send({type:'error', error:'truncated_frame'});
 });
 """
+
+
+def _encode_frame(message: dict[str, Any]) -> bytes:
+    body = json.dumps(message, ensure_ascii=False, default=str).encode("utf-8")
+    if len(body) > _MAX_WORKFLOW_FRAME_BYTES:
+        raise WorkflowError("workflow frame exceeded size limit")
+    return struct.pack(">I", len(body)) + body
+
+
+async def _read_frame(stream: asyncio.StreamReader) -> dict[str, Any]:
+    try:
+        header = await stream.readexactly(4)
+    except asyncio.IncompleteReadError as exc:
+        code = "truncated frame header" if exc.partial else "runtime closed"
+        raise WorkflowError(f"workflow {code}") from exc
+    size = struct.unpack(">I", header)[0]
+    if size > _MAX_WORKFLOW_FRAME_BYTES:
+        raise WorkflowError("workflow frame exceeded size limit")
+    try:
+        body = await stream.readexactly(size)
+    except asyncio.IncompleteReadError as exc:
+        raise WorkflowError("workflow truncated frame body") from exc
+    try:
+        message = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkflowError("workflow runtime returned invalid JSON") from exc
+    if not isinstance(message, dict):
+        raise WorkflowError("workflow runtime returned a non-object frame")
+    return message
+
+
+async def _terminate_workflow_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        if os.name == "nt":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(process.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        else:
+            try:
+                getattr(os, "killpg")(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            if os.name != "nt":
+                try:
+                    getattr(os, "killpg")(process.pid, getattr(signal, "SIGKILL", 9))
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            await process.wait()
 
 
 class WorkflowRuntime:
@@ -131,12 +215,18 @@ class WorkflowRuntime:
             if (value := os.environ.get(key)) is not None
         }
         try:
+            process_options: dict[str, Any] = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_options["start_new_session"] = True
             process = await asyncio.create_subprocess_exec(
                 *(str(item) for item in argv),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=minimal_env,
+                **process_options,
             )
         except Exception:
             shutil.rmtree(private_temp, ignore_errors=True)
@@ -150,7 +240,15 @@ class WorkflowRuntime:
         count = 0
 
         async def send(message: dict[str, Any]) -> None:
-            encoded = json.dumps(message, ensure_ascii=False, default=str).encode("utf-8") + b"\n"
+            try:
+                encoded = _encode_frame(message)
+            except WorkflowError:
+                if message.get("type") != "agent_result":
+                    raise
+                encoded = _encode_frame(
+                    {"type": "agent_result", "id": message.get("id"), "ok": False,
+                     "error": "result_too_large"}
+                )
             async with write_lock:
                 process_stdin.write(encoded)
                 await process_stdin.drain()
@@ -182,23 +280,20 @@ class WorkflowRuntime:
             except Exception:
                 await send({"type": "agent_result", "id": request_id, "ok": False})
 
-        await send({"type": "init", "source": source, "args": args})
         try:
+            await send({"type": "init", "source": source, "args": args})
             async with asyncio.timeout(timeout):
                 while True:
-                    line = await process_stdout.readline()
-                    if not line:
-                        stderr = await process.stderr.read() if process.stderr else b""
+                    try:
+                        message = await _read_frame(process_stdout)
+                    except WorkflowError as exc:
+                        if str(exc) != "workflow runtime closed":
+                            raise
+                        stderr = await process.stderr.read(501) if process.stderr else b""
                         raise WorkflowError(
                             "workflow runtime exited unexpectedly: "
                             + stderr.decode("utf-8", "replace")[:500]
-                        )
-                    if len(line) > 1_000_000:
-                        raise WorkflowError("workflow runtime message exceeded size limit")
-                    try:
-                        message = json.loads(line)
-                    except ValueError as exc:
-                        raise WorkflowError("workflow runtime returned invalid JSON") from exc
+                        ) from exc
                     if message.get("type") == "agent":
                         task = asyncio.create_task(handle(message))
                         tasks.add(task)
@@ -212,7 +307,5 @@ class WorkflowRuntime:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
+            await _terminate_workflow_process(process)
             shutil.rmtree(private_temp, ignore_errors=True)

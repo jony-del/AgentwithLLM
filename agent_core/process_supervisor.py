@@ -138,6 +138,7 @@ class ProcessSupervisor:
         self._event_sink = event_sink
         self._tasks: dict[str, ProcessTask] = {}
         self._history: dict[str, dict[str, object]] = {}
+        self.recovered_lost_count = 0
         self._closed = False
         for path in self.root.glob("*.json"):
             try:
@@ -145,6 +146,26 @@ class ProcessSupervisor:
             except (OSError, ValueError):
                 continue
             if isinstance(value, dict) and isinstance(value.get("task_id"), str):
+                if value.get("state") == "running":
+                    value = {
+                        **value,
+                        "state": "lost",
+                        "exit_code": None,
+                        "lost_at": time.time(),
+                        "loss_reason": "supervisor_restart",
+                    }
+                    temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+                    try:
+                        temporary.write_text(
+                            json.dumps(value, ensure_ascii=False), encoding="utf-8"
+                        )
+                        os.replace(temporary, path)
+                        self.recovered_lost_count += 1
+                    except OSError:
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 self._history[str(value["task_id"])] = value
 
     def tasks(self) -> list[ProcessTask]:

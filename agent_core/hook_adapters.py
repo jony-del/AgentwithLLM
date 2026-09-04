@@ -28,17 +28,22 @@ Invariants (aligned with the project's timeout / degrade discipline):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
+import signal
+import subprocess
 import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from agent_core.hooks import ExternalHookSpec, HookContext, HookOutcome
+from agent_core.hooks import ExternalHookSpec, HookContext, HookLimitsConfig, HookOutcome
 from agent_core.models import Message
 from agent_core.permission_rules import ParsedRule, RuleSet, parse_rule
 from agent_core.providers.base import ProviderConfig
+from agent_core.prompt_ingress import defang_reserved_tags
 
 if TYPE_CHECKING:
     from agent_core.providers.base import LLMProvider
@@ -47,6 +52,118 @@ if TYPE_CHECKING:
 # Bounds on the JSON projection so an external hook never receives the whole transcript.
 _MAX_PROJECTED_MESSAGES = 20
 _MAX_PROJECTED_CONTENT = 2000
+_SENSITIVE_KEY = re.compile(
+    r"(?:secret|token|password|authorization|api[-_]?key|cookie|credential)", re.IGNORECASE
+)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_TRUNCATION_MARKER = "鈥?[truncated]"
+
+
+def _truncate_utf8(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    marker = _TRUNCATION_MARKER.encode("utf-8")
+    usable = max(0, limit - len(marker))
+    return encoded[:usable].decode("utf-8", "ignore") + _TRUNCATION_MARKER, True
+
+
+def _sanitize_projection(
+    value: Any,
+    limits: HookLimitsConfig,
+    counters: dict[str, int],
+    *,
+    depth: int = 0,
+    key: str = "",
+) -> Any:
+    if _SENSITIVE_KEY.search(key):
+        counters["redacted"] += 1
+        return "<redacted>"
+    if depth >= limits.max_depth:
+        counters["depth_truncated"] += 1
+        return "<max-depth>"
+    if isinstance(value, str):
+        cleaned = defang_reserved_tags(_CONTROL_CHARS.sub("�", value))
+        cleaned, truncated = _truncate_utf8(cleaned, limits.string_bytes)
+        counters["strings_truncated"] += int(truncated)
+        return cleaned
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        items = list(value.items())
+        if len(items) > limits.max_items:
+            counters["items_truncated"] += len(items) - limits.max_items
+        for raw_key, item in items[: limits.max_items]:
+            item_key = str(raw_key)
+            result[item_key] = _sanitize_projection(
+                item, limits, counters, depth=depth + 1, key=item_key
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        if len(value) > limits.max_items:
+            counters["items_truncated"] += len(value) - limits.max_items
+        return [
+            _sanitize_projection(item, limits, counters, depth=depth + 1)
+            for item in value[: limits.max_items]
+        ]
+    return _sanitize_projection(str(value), limits, counters, depth=depth, key=key)
+
+
+def _longest_string_path(value: Any, path: tuple[Any, ...] = ()) -> tuple[tuple[Any, ...], int]:
+    best = (path, len(value.encode("utf-8"))) if isinstance(value, str) else ((), -1)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            candidate = _longest_string_path(item, (*path, key))
+            if candidate[1] > best[1]:
+                best = candidate
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            candidate = _longest_string_path(item, (*path, index))
+            if candidate[1] > best[1]:
+                best = candidate
+    return best
+
+
+def _set_path(value: Any, path: tuple[Any, ...], replacement: Any) -> None:
+    target = value
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+
+
+def bounded_hook_payload(
+    value: Any, limits: HookLimitsConfig | None = None
+) -> tuple[Any, dict[str, int]]:
+    limits = limits or HookLimitsConfig()
+    counters = {
+        "redacted": 0,
+        "strings_truncated": 0,
+        "items_truncated": 0,
+        "depth_truncated": 0,
+        "total_truncated": 0,
+    }
+    projected = _sanitize_projection(value, limits, counters)
+    while len(json.dumps(projected, ensure_ascii=False, default=str).encode("utf-8")) > limits.total_bytes:
+        path, length = _longest_string_path(projected)
+        if not path or length <= len(_TRUNCATION_MARKER.encode("utf-8")):
+            if isinstance(projected, dict):
+                removable = [key for key in reversed(projected) if key != "hook_event_name"]
+                if not removable:
+                    projected = {"error": "projection_too_large"}
+                    break
+                projected.pop(removable[0], None)
+                counters["items_truncated"] += 1
+                continue
+            projected = "<projection-too-large>"
+            break
+        target = projected
+        for part in path:
+            target = target[part]
+        replacement, _ = _truncate_utf8(target, max(16, length // 2))
+        _set_path(projected, path, replacement)
+        counters["total_truncated"] += 1
+    return projected, counters
 
 # Official hook events mapped to the HookPipeline collection they belong in.  Events for
 # which Polaris does not yet have a host firing seam are retained in ``unhandled_hooks``
@@ -95,6 +212,7 @@ def project_hook_input(
     *,
     max_messages: int = _MAX_PROJECTED_MESSAGES,
     max_content_chars: int = _MAX_PROJECTED_CONTENT,
+    limits: HookLimitsConfig | None = None,
 ) -> dict[str, Any]:
     """Project a ``HookContext`` to the stable JSON an external hook receives.
 
@@ -118,6 +236,11 @@ def project_hook_input(
     if ctx.detail is not None:
         # Already a small, JSON-safe payload built at the firing seam (see HookContext).
         data["detail"] = ctx.detail
+    limits = limits or HookLimitsConfig(
+        max_messages=max_messages, message_chars=max_content_chars
+    )
+    max_messages = min(max_messages, limits.max_messages)
+    max_content_chars = min(max_content_chars, limits.message_chars)
     tail = ctx.messages[-max_messages:] if max_messages > 0 else []
     projected = []
     for message in tail:
@@ -126,7 +249,14 @@ def project_hook_input(
             content = content[:max_content_chars] + "…"
         projected.append({"role": message.role, "content": content})
     data["messages"] = projected
-    return data
+    bounded, counters = bounded_hook_payload(data, limits)
+    if isinstance(bounded, dict):
+        bounded["_projection"] = counters
+        # The counters themselves may cross a very small custom test budget.
+        if len(json.dumps(bounded, ensure_ascii=False).encode("utf-8")) > limits.total_bytes:
+            bounded.pop("_projection", None)
+        return bounded
+    return {"hook_event_name": ctx.event.value, "error": "projection_too_large"}
 
 
 class HookFailedError(RuntimeError):
@@ -137,7 +267,9 @@ class HookFailedError(RuntimeError):
     """
 
 
-def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
+def outcome_from_output(
+    stdout: str, returncode: int, limits: HookLimitsConfig | None = None
+) -> HookOutcome:
     """Map a command/http hook's textual output + exit code to a :class:`HookOutcome`.
 
     Block when the exit code is 2 (reference convention) or the JSON says so
@@ -194,12 +326,33 @@ def outcome_from_output(stdout: str, returncode: int) -> HookOutcome:
             metadata = {}
     else:
         metadata = {}
+    output_limits = replace(
+        limits or HookLimitsConfig(),
+        total_bytes=(limits.output_bytes if limits is not None else HookLimitsConfig().output_bytes),
+        string_bytes=min(
+            (limits.string_bytes if limits is not None else HookLimitsConfig().string_bytes),
+            (limits.output_bytes if limits is not None else HookLimitsConfig().output_bytes),
+        ),
+    )
+    bounded, counters = bounded_hook_payload(
+        {
+            "additional_context": additional,
+            "reason": reason,
+            "metadata": metadata,
+        },
+        output_limits,
+    )
+    bounded = bounded if isinstance(bounded, dict) else {}
+    metadata_out = bounded.get("metadata")
+    if not isinstance(metadata_out, dict):
+        metadata_out = {}
+    metadata_out["projection"] = counters
     return HookOutcome(
         block=block,
-        additional_context=additional,
-        reason=reason,
+        additional_context=bounded.get("additional_context") if isinstance(bounded.get("additional_context"), str) else None,
+        reason=bounded.get("reason") if isinstance(bounded.get("reason"), str) else None,
         decision=decision,
-        metadata=metadata,
+        metadata=metadata_out,
     )
 
 
@@ -212,10 +365,16 @@ class _ExternalHookAdapter:
     the degrade-to-allow guard shared by all transports.
     """
 
-    def __init__(self, spec: ExternalHookSpec, logger: "JSONLRunLogger") -> None:
+    def __init__(
+        self,
+        spec: ExternalHookSpec,
+        logger: "JSONLRunLogger",
+        limits: HookLimitsConfig | None = None,
+    ) -> None:
         self.spec = spec
         self.logger = logger
         self.event = spec.event
+        self.limits = limits or HookLimitsConfig()
 
     def _matches(self, ctx: HookContext) -> bool:
         if self.spec.matcher is not None and ctx.trigger is not None:
@@ -353,13 +512,80 @@ def _tool_names_match(expected: str, actual: str) -> bool:
     return any(left in aliases and right in aliases for aliases in _TOOL_ALIASES.values())
 
 
+async def _bounded_communicate(
+    proc: asyncio.subprocess.Process, payload: bytes, output_limit: int
+) -> tuple[bytes, bytes]:
+    if proc.stdin is not None:
+        proc.stdin.write(payload)
+        await proc.stdin.drain()
+        proc.stdin.close()
+    reads: list[asyncio.Task[bytes]] = []
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            reads.append(asyncio.create_task(asyncio.sleep(0, result=b"")))
+        else:
+            reads.append(asyncio.create_task(stream.read(output_limit + 1)))
+    try:
+        stdout, stderr = await asyncio.gather(*reads)
+    finally:
+        for task in reads:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*reads, return_exceptions=True)
+    if len(stdout) > output_limit or len(stderr) > output_limit:
+        raise ValueError("command hook output exceeded configured byte limit")
+    await proc.wait()
+    return stdout, stderr
+
+
+async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """Best-effort cleanup on success, timeout, cancellation, and pipe failure."""
+
+    if os.name == "nt":
+        if proc.returncode is None:
+            def terminate_windows() -> None:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=3,
+                )
+
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                await asyncio.to_thread(terminate_windows)
+    else:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            getattr(os, "killpg")(proc.pid, signal.SIGTERM)
+        await asyncio.sleep(0)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            getattr(os, "killpg")(proc.pid, getattr(signal, "SIGKILL", 9))
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1)
+    drains: list[Awaitable[bytes]] = []
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            drains.append(stream.read())
+    if drains:
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*drains)
+
+
 class CommandHookAdapter(_ExternalHookAdapter):
     """Spawn a subprocess, feed projected JSON on stdin, read stdout/exit-code decision."""
 
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
         if not self.spec.command and not self.spec.command_argv:
             return HookOutcome()
-        payload = json.dumps(project_hook_input(ctx)).encode("utf-8")
+        payload = json.dumps(project_hook_input(ctx, limits=self.limits)).encode("utf-8")
+        process_options: dict[str, Any] = {}
+        if os.name == "nt":
+            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            process_options["start_new_session"] = True
         if self.spec.command_argv:
             proc = await asyncio.create_subprocess_exec(
                 *self.spec.command_argv,
@@ -367,6 +593,7 @@ class CommandHookAdapter(_ExternalHookAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, **(self.spec.env or {})},
+                **process_options,
             )
         else:
             proc = await asyncio.create_subprocess_shell(
@@ -375,23 +602,28 @@ class CommandHookAdapter(_ExternalHookAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, **(self.spec.env or {})},
+                **process_options,
             )
         try:
+            communicate = _bounded_communicate(proc, payload, self.limits.output_bytes)
             if ctx.execution_scope is None:
                 stdout, _stderr = await asyncio.wait_for(
-                    proc.communicate(payload), timeout=self.spec.timeout
+                    communicate, timeout=self.spec.timeout
                 )
             else:
                 stdout, _stderr = await ctx.execution_scope.run_awaitable(
-                    proc.communicate(payload), timeout=self.spec.timeout
+                    communicate, timeout=self.spec.timeout
                 )
         except asyncio.TimeoutError:
-            # Single non-stacked timeout: kill the process and reap it (no zombies).
-            proc.kill()
-            await proc.wait()
             await self._log("timeout", f"{self.spec.timeout}s")
             raise HookFailedError(f"timed out after {self.spec.timeout}s") from None
-        return outcome_from_output(stdout.decode("utf-8", "replace"), proc.returncode or 0)
+        except ValueError as exc:
+            raise HookFailedError(str(exc)) from exc
+        finally:
+            await _terminate_process_tree(proc)
+        return outcome_from_output(
+            stdout.decode("utf-8", "replace"), proc.returncode or 0, self.limits
+        )
 
 
 class HttpHookAdapter(_ExternalHookAdapter):
@@ -400,7 +632,7 @@ class HttpHookAdapter(_ExternalHookAdapter):
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
         if not self.spec.url:
             return HookOutcome()
-        payload = json.dumps(project_hook_input(ctx)).encode("utf-8")
+        payload = json.dumps(project_hook_input(ctx, limits=self.limits)).encode("utf-8")
         headers = {"Content-Type": "application/json", **(self.spec.headers or {})}
         url = self.spec.url
         timeout = self.spec.timeout
@@ -410,7 +642,10 @@ class HttpHookAdapter(_ExternalHookAdapter):
             # urlopen's own timeout is the single bound (no stacked outer timeout).
             with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - project-trusted URL
                 status = getattr(response, "status", 200) or 200
-                return status, response.read().decode("utf-8", "replace")
+                body = response.read(self.limits.output_bytes + 1)
+                if len(body) > self.limits.output_bytes:
+                    raise HookFailedError("HTTP hook response exceeded output limit")
+                return status, body.decode("utf-8", "replace")
 
         try:
             status, body = await asyncio.to_thread(_post)
@@ -421,7 +656,7 @@ class HttpHookAdapter(_ExternalHookAdapter):
             await self._log("http_status", str(status))
             raise HookFailedError(f"HTTP {status}")
         # HTTP carries no exit code; only the JSON body drives the block decision.
-        return outcome_from_output(body, 0)
+        return outcome_from_output(body, 0, self.limits)
 
 
 class PromptHookAdapter(_ExternalHookAdapter):
@@ -438,8 +673,9 @@ class PromptHookAdapter(_ExternalHookAdapter):
         logger: "JSONLRunLogger",
         provider: "LLMProvider",
         base_config: "ProviderConfig",
+        limits: HookLimitsConfig | None = None,
     ) -> None:
-        super().__init__(spec, logger)
+        super().__init__(spec, logger, limits)
         self.provider = provider
         self.base_config = base_config
 
@@ -451,7 +687,7 @@ class PromptHookAdapter(_ExternalHookAdapter):
             model=self.spec.model or self.base_config.model,
             max_tokens=min(self.base_config.max_tokens or 1024, 1024),
         )
-        snapshot = json.dumps(project_hook_input(ctx), ensure_ascii=False)
+        snapshot = json.dumps(project_hook_input(ctx, limits=self.limits), ensure_ascii=False)
         messages = [
             Message(
                 "user",
@@ -467,7 +703,8 @@ class PromptHookAdapter(_ExternalHookAdapter):
                 self.provider.complete(messages, [], config, scope=ctx.execution_scope),
                 timeout=self.spec.timeout,
             )
-        text = (result.content or "").strip()
+        text, _ = _truncate_utf8((result.content or "").strip(), self.limits.output_bytes)
+        text = defang_reserved_tags(_CONTROL_CHARS.sub("�", text))
         return HookOutcome(additional_context=text or None)
 
 
@@ -479,14 +716,15 @@ class AgentHookAdapter(_ExternalHookAdapter):
         spec: ExternalHookSpec,
         logger: "JSONLRunLogger",
         subagent_factory: Callable[..., Awaitable[str]],
+        limits: HookLimitsConfig | None = None,
     ) -> None:
-        super().__init__(spec, logger)
+        super().__init__(spec, logger, limits)
         self.subagent_factory = subagent_factory
 
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
         if not self.spec.prompt:
             return HookOutcome()
-        snapshot = json.dumps(project_hook_input(ctx), ensure_ascii=False)
+        snapshot = json.dumps(project_hook_input(ctx, limits=self.limits), ensure_ascii=False)
         task = f"{self.spec.prompt}\n\n<hook_input>\n{snapshot}\n</hook_input>"
         if ctx.execution_scope is None:
             result = await asyncio.wait_for(
@@ -497,7 +735,8 @@ class AgentHookAdapter(_ExternalHookAdapter):
                 self.subagent_factory(task, "hook", self.spec.model),
                 timeout=self.spec.timeout,
             )
-        text = (result or "").strip()
+        text, _ = _truncate_utf8((result or "").strip(), self.limits.output_bytes)
+        text = defang_reserved_tags(_CONTROL_CHARS.sub("�", text))
         return HookOutcome(additional_context=text or None)
 
 
@@ -508,6 +747,7 @@ def build_external_adapter(
     provider: "LLMProvider | None" = None,
     base_config: "ProviderConfig | None" = None,
     subagent_factory: Callable[..., Awaitable[str]] | None = None,
+    limits: HookLimitsConfig | None = None,
 ) -> _ExternalHookAdapter | None:
     """Build the adapter for one spec, or ``None`` when its dependencies are unavailable.
 
@@ -517,15 +757,17 @@ def build_external_adapter(
     model-backed hooks instead of failing.
     """
     if spec.type == "command":
-        return CommandHookAdapter(spec, logger)
+        return CommandHookAdapter(spec, logger, limits)
     if spec.type == "http":
-        return HttpHookAdapter(spec, logger)
+        return HttpHookAdapter(spec, logger, limits)
     if spec.type == "prompt":
         if provider is None:
             return None
-        return PromptHookAdapter(spec, logger, provider, base_config or ProviderConfig())
+        return PromptHookAdapter(
+            spec, logger, provider, base_config or ProviderConfig(), limits
+        )
     if spec.type == "agent":
         if subagent_factory is None:
             return None
-        return AgentHookAdapter(spec, logger, subagent_factory)
+        return AgentHookAdapter(spec, logger, subagent_factory, limits)
     return None

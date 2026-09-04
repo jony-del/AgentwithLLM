@@ -99,6 +99,33 @@ class PromptValidationConfig:
 
 
 @dataclass(slots=True)
+class HookLimitsConfig:
+    """Byte and shape limits applied at every external-hook boundary."""
+
+    total_bytes: int = 256 * 1024
+    output_bytes: int = 256 * 1024
+    string_bytes: int = 64 * 1024
+    max_depth: int = 12
+    max_items: int = 100
+    max_messages: int = 20
+    message_chars: int = 2000
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "HookLimitsConfig":
+        from agent_core.config import overlay_dataclass
+
+        config = overlay_dataclass(cls(), data)
+        config.total_bytes = max(1024, int(config.total_bytes))
+        config.output_bytes = max(1024, int(config.output_bytes))
+        config.string_bytes = max(64, min(int(config.string_bytes), config.total_bytes))
+        config.max_depth = max(1, min(64, int(config.max_depth)))
+        config.max_items = max(1, min(10_000, int(config.max_items)))
+        config.max_messages = max(0, min(1000, int(config.max_messages)))
+        config.message_chars = max(1, int(config.message_chars))
+        return config
+
+
+@dataclass(slots=True)
 class ExternalHookSpec:
     """One config-driven external hook entry from ``[[hooks.external]]``.
 
@@ -142,6 +169,7 @@ class HooksConfig:
     enabled: bool = True
     builtin: BuiltinHooksConfig = field(default_factory=BuiltinHooksConfig)
     prompt_validation: PromptValidationConfig = field(default_factory=PromptValidationConfig)
+    limits: HookLimitsConfig = field(default_factory=HookLimitsConfig)
     external: list[ExternalHookSpec] = field(default_factory=list)
 
 

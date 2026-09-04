@@ -181,6 +181,10 @@ class SchedulerToolConfig:
     max_jobs: int = 50
     max_prompt_chars: int = 16_000
     database: str = "~/.polaris/scheduler.sqlite3"
+    max_delivery_attempts: int = 3
+    retry_base_seconds: float = 30
+    retry_max_seconds: float = 600
+    delivery_lease_seconds: float = 1800
 
     def database_path(self) -> Path:
         return Path(self.database).expanduser()
@@ -258,8 +262,18 @@ class ToolSuiteConfig:
         })
         scheduler = SchedulerToolConfig(**{
             key: value for key, value in dict(raw.get("scheduler", {}) or {}).items()
-            if key in {"enabled", "max_jobs", "max_prompt_chars", "database"}
+            if key in {
+                "enabled", "max_jobs", "max_prompt_chars", "database",
+                "max_delivery_attempts", "retry_base_seconds", "retry_max_seconds",
+                "delivery_lease_seconds",
+            }
         })
+        scheduler.max_delivery_attempts = max(1, int(scheduler.max_delivery_attempts))
+        scheduler.retry_base_seconds = max(0.0, float(scheduler.retry_base_seconds))
+        scheduler.retry_max_seconds = max(
+            scheduler.retry_base_seconds, float(scheduler.retry_max_seconds)
+        )
+        scheduler.delivery_lease_seconds = max(1.0, float(scheduler.delivery_lease_seconds))
         policies = _parse_tool_policies(
             raw.get("execution_policies", raw.get("policies", {}))
         )

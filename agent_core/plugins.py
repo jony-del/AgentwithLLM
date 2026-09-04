@@ -2805,6 +2805,7 @@ def _load_plugin_hooks(
                             provider=agent.provider,
                             base_config=agent._provider_config(),
                             subagent_factory=agent.session.subagent_factory,
+                            limits=agent.config.hooks.limits,
                         )
                     except Exception as exc:
                         raise PluginError(

@@ -64,6 +64,44 @@ class SessionSelection:
 
 
 @dataclass(slots=True)
+class SessionRetentionConfig:
+    enabled: bool = True
+    transcript_days: int = 90
+    max_transcripts_per_project: int = 200
+    preserve_tagged: bool = True
+    terminal_journal_days: int = 7
+    max_terminal_journals_per_session: int = 500
+    scan_interval_seconds: int = 86_400
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SessionRetentionConfig":
+        from agent_core.config import overlay_dataclass
+
+        config = overlay_dataclass(cls(), data)
+        config.transcript_days = max(1, int(config.transcript_days))
+        config.max_transcripts_per_project = max(
+            1, int(config.max_transcripts_per_project)
+        )
+        config.terminal_journal_days = max(1, int(config.terminal_journal_days))
+        config.max_terminal_journals_per_session = max(
+            1, int(config.max_terminal_journals_per_session)
+        )
+        config.scan_interval_seconds = max(60, int(config.scan_interval_seconds))
+        return config
+
+
+@dataclass(slots=True)
+class DurableHead:
+    """Separate live conversation state from the last confirmed transcript record."""
+
+    memory_head_id: str | None = None
+    durable_head_id: str | None = None
+    persistence_degraded: bool = False
+    first_error: str | None = None
+    operation: str | None = None
+
+
+@dataclass(slots=True)
 class SessionRuntime:
     """All mutable state and owned resources for one active session."""
 
@@ -74,6 +112,7 @@ class SessionRuntime:
     process_supervisor: Any | None = None
     scheduler_store: Any | None = None
     counters: dict[str, int] = field(default_factory=dict)
+    durable_head: DurableHead = field(default_factory=DurableHead)
     created_at: float = field(default_factory=time.monotonic)
     closed: bool = False
 
@@ -83,6 +122,11 @@ class SessionRuntime:
         if self.closed:
             return
         self.closed = True
+        if self.transcript is not None:
+            close_transcript = getattr(self.transcript, "close", None)
+            if callable(close_transcript):
+                with contextlib.suppress(Exception):
+                    close_transcript()
         if self.process_supervisor is not None:
             with contextlib.suppress(Exception):
                 await self.process_supervisor.shutdown()

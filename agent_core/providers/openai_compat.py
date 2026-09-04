@@ -107,6 +107,7 @@ class OpenAICompatProvider(LLMProvider):
         self._client: Any = None
         self._client_loop: Any = None
         self._transport: Any = None
+        self._stream_usage_supported: bool | None = None
 
     @staticmethod
     def _warn_deprecated_env(old: str, new: str) -> None:
@@ -153,14 +154,40 @@ class OpenAICompatProvider(LLMProvider):
 
         # Streaming: retry only connection setup; never mid-stream (no half-reprints).
         async def open_stream():
+            effective_body = dict(body)
+            if self._stream_usage_supported is False:
+                effective_body.pop("stream_options", None)
             request = client.build_request(
-                "POST", url, json=body, headers=self._headers(), timeout=config.timeout
+                "POST", url, json=effective_body, headers=self._headers(), timeout=config.timeout
             )
             response = await client.send(request, stream=True)
             if response.status_code >= 400:
                 await response.aread()
+                error_text = response.text
+                status = response.status_code
                 await response.aclose()
+                if (
+                    "stream_options" in effective_body
+                    and self._stream_usage_unsupported(status, error_text)
+                ):
+                    self._stream_usage_supported = False
+                    fallback_body = dict(effective_body)
+                    fallback_body.pop("stream_options", None)
+                    fallback_request = client.build_request(
+                        "POST", url, json=fallback_body, headers=self._headers(),
+                        timeout=config.timeout,
+                    )
+                    fallback = await client.send(fallback_request, stream=True)
+                    if fallback.status_code >= 400:
+                        await fallback.aread()
+                        await fallback.aclose()
+                        raise httpx.HTTPStatusError(
+                            "error", request=fallback_request, response=fallback
+                        )
+                    return fallback
                 raise httpx.HTTPStatusError("error", request=request, response=response)
+            if "stream_options" in effective_body:
+                self._stream_usage_supported = True
             return response
 
         response = await self._request_with_retry(open_stream, model=config.model, scope=scope)
@@ -192,9 +219,26 @@ class OpenAICompatProvider(LLMProvider):
             body["temperature"] = config.temperature
         if streaming:
             body["stream"] = True
+            if self._stream_usage_supported is not False:
+                body["stream_options"] = {"include_usage": True}
         if tools:
             body["tools"] = [self._format_tool(schema) for schema in tools]
         return body
+
+    @staticmethod
+    def _stream_usage_unsupported(status: int, text: str) -> bool:
+        if status not in {400, 422}:
+            return False
+        lowered = text.casefold()
+        names_option = "stream_options" in lowered or "include_usage" in lowered
+        rejects_option = any(
+            marker in lowered
+            for marker in (
+                "unsupported", "not supported", "unknown", "unrecognized",
+                "unexpected", "extra", "not permitted", "invalid parameter",
+            )
+        )
+        return names_option and rejects_option
 
     @staticmethod
     def _format_tool(schema: dict[str, Any]) -> dict[str, Any]:
