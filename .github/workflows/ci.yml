@@ -9,6 +9,28 @@ on:
   pull_request:
 
 jobs:
+  mcp-compat:
+    name: MCP 2.x (${{ matrix.mcp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ["mcp==2.1.0", "mcp<3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install MCP compatibility edge
+        run: |
+          pip install -e .[mcp,dev]
+          pip install --upgrade "${{ matrix.mcp }}"
+      - name: MCP 2.x import smoke test
+        run: python -c "from mcp.server.mcpserver import MCPServer; from mcp.client.streamable_http import streamable_http_client"
+      - name: MCP integration tests
+        run: python -m pytest -q tests/test_mcp.py
+
   test:
     strategy:
       fail-fast: false

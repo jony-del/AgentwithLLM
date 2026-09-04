@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
@@ -35,6 +36,7 @@ from agent_core.providers.base import StreamedToolCall
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import (
     ConcurrencySpec,
+    ExecutionScope,
     ExecutionSafety,
     ResourceLock,
     Tool,
@@ -135,6 +137,7 @@ class ToolExecutor:
         tool_calls: list[ToolCall],
         should_cancel: Callable[[], bool] | None = None,
         messages: list[Message] | None = None,
+        execution_scope: ExecutionScope | None = None,
     ) -> list[ToolResult]:
         """Execute a complete turn through the incremental resource scheduler.
 
@@ -144,7 +147,11 @@ class ToolExecutor:
         overlap, while ordinary blocking tools are offloaded to worker threads —
         bounded by ``max_workers`` so the thread ceiling holds.
         """
-        batch = self.begin_batch(messages=messages, should_cancel=should_cancel)
+        batch = self.begin_batch(
+            messages=messages,
+            should_cancel=should_cancel,
+            execution_scope=execution_scope,
+        )
         return await batch.finish(tool_calls, messages=messages)
 
     def begin_batch(
@@ -152,9 +159,15 @@ class ToolExecutor:
         *,
         messages: list[Message] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        execution_scope: ExecutionScope | None = None,
     ) -> "StreamingToolBatch":
         """Create one turn-scoped incremental execution batch."""
-        return StreamingToolBatch(self, messages=messages, should_cancel=should_cancel)
+        return StreamingToolBatch(
+            self,
+            messages=messages,
+            should_cancel=should_cancel,
+            execution_scope=execution_scope,
+        )
 
     async def _run_tool(
         self,
@@ -286,7 +299,7 @@ class ToolExecutor:
             if should_cancel is not None and should_cancel():
                 results.append(await self._finish(tool_call, self._cancelled_result(tool_call.name), "cancelled"))
                 continue
-            prepared = await self._prepare(index, tool_call, messages, should_cancel)
+            prepared = await self._prepare(index, tool_call, messages, should_cancel, None)
             if isinstance(prepared, ToolResult):
                 results.append(prepared)
                 continue
@@ -305,6 +318,7 @@ class ToolExecutor:
         tool_call: ToolCall,
         messages: list[Message] | None,
         should_cancel: Callable[[], bool] | None,
+        execution_scope: ExecutionScope | None,
         *,
         provisional: bool = False,
     ) -> _PreparedCall | ToolResult:
@@ -350,6 +364,7 @@ class ToolExecutor:
                         "tool_input": dict(rewritten_call.arguments),
                         "tool_use_id": rewritten_call.id,
                     },
+                    execution_scope=execution_scope,
                 )
             )
             updated_input = external_pre.metadata.get("updated_input")
@@ -525,7 +540,9 @@ class ToolExecutor:
         # path (interactive prompt / collapsed denial).
         hook_verdict: dict[str, object] | None = None
         if (decision.ask_user or decision.ask_collapsed) and self.hooks.permission_request_hooks:
-            outcome = await self._run_permission_request(tool, rewritten_call, decision.reason)
+            outcome = await self._run_permission_request(
+                tool, rewritten_call, decision.reason, execution_scope=execution_scope
+            )
             if outcome is not None and outcome.decision in {"allow", "deny"}:
                 hook_verdict = {"decision": outcome.decision, "reason": outcome.reason}
                 allowed = outcome.decision == "allow"
@@ -747,7 +764,12 @@ class ToolExecutor:
         return result
 
     async def _run_permission_request(
-        self, tool: Tool, tool_call: ToolCall, ask_reason: str
+        self,
+        tool: Tool,
+        tool_call: ToolCall,
+        ask_reason: str,
+        *,
+        execution_scope: ExecutionScope | None = None,
     ) -> HookOutcome | None:
         """Run the control-path PermissionRequest fold over a bounded projection.
 
@@ -766,6 +788,7 @@ class ToolExecutor:
                 "ask_reason": ask_reason,
                 "arguments": arguments,
             },
+            execution_scope=execution_scope,
         )
         try:
             return await self.hooks.run_permission_request(ctx)
@@ -919,6 +942,7 @@ class _TrackedCall:
     underlying_task: asyncio.Task[ToolResult] | None = None
     cleanup_pending: bool = False
     arguments_completed_at: float = field(default_factory=time.monotonic)
+    recovery_message_uuid: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class StreamingToolBatch:
@@ -930,10 +954,12 @@ class StreamingToolBatch:
         *,
         messages: list[Message] | None,
         should_cancel: Callable[[], bool] | None,
+        execution_scope: ExecutionScope | None = None,
     ) -> None:
         self.executor = executor
         self.base_messages = list(messages or [])
         self.should_cancel = should_cancel
+        self.execution_scope = execution_scope
         self.turn_id = uuid.uuid4().hex
         self.journal = TurnExecutionJournal(executor.journal_storage, self.turn_id)
         self.created_at = time.monotonic()
@@ -961,6 +987,11 @@ class StreamingToolBatch:
         self._orphaned_events = 0
         self._history_context: dict[str, object] | None = None
         self.metrics: dict[str, object] = {}
+
+    def _create_task(self, awaitable, *, name: str | None = None):
+        if self.execution_scope is not None:
+            return self.execution_scope.create_task(awaitable, name=name)
+        return asyncio.create_task(awaitable, name=name)
 
     @staticmethod
     def _same_call(left: ToolCall, right: ToolCall) -> bool:
@@ -1065,7 +1096,7 @@ class StreamingToolBatch:
             )
         except (JournalWriteError, TypeError) as exc:
             self._journal_error = str(exc)
-        tracked.preparation_task = asyncio.create_task(self._prepare(tracked))
+        tracked.preparation_task = self._create_task(self._prepare(tracked))
         return tracked
 
     async def _prepare(self, tracked: _TrackedCall) -> None:
@@ -1090,6 +1121,7 @@ class StreamingToolBatch:
                 tracked.original_call,
                 tracked.messages,
                 self.should_cancel,
+                self.execution_scope,
                 provisional=True,
             )
         else:
@@ -1105,6 +1137,7 @@ class StreamingToolBatch:
                     tracked.original_call,
                     tracked.messages,
                     self.should_cancel,
+                    self.execution_scope,
                 )
         if isinstance(prepared, ToolResult):
             tracked.observed = not tracked.streamed or self._turn_validated
@@ -1114,7 +1147,7 @@ class StreamingToolBatch:
         async with self._state_lock:
             if self._should_stop(tracked):
                 tracked.state = "cancelling"
-                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+                tracked.execution_task = self._create_task(self._complete_cancelled(tracked))
                 return
             tracked.prepared = prepared
             tracked.safety_hint = prepared.policy.safety
@@ -1137,6 +1170,12 @@ class StreamingToolBatch:
             self._aborted
             or tracked.cancel_requested
             or (self.should_cancel is not None and self.should_cancel())
+            or (self.execution_scope is not None and self.execution_scope.cancelled())
+            or (
+                self.execution_scope is not None
+                and self.execution_scope.deadline is not None
+                and time.monotonic() >= self.execution_scope.deadline
+            )
         )
 
     def _rebuild_dependencies_locked(self) -> None:
@@ -1226,7 +1265,7 @@ class StreamingToolBatch:
                 continue
             if tracked.cancel_requested:
                 tracked.state = "cancelling"
-                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+                tracked.execution_task = self._create_task(self._complete_cancelled(tracked))
                 continue
             unresolved = [
                 self._calls[index]
@@ -1238,7 +1277,7 @@ class StreamingToolBatch:
             dependency_failure = self._dependency_failure(tracked)
             if dependency_failure is not None:
                 tracked.state = "running"
-                tracked.execution_task = asyncio.create_task(
+                tracked.execution_task = self._create_task(
                     self._complete_dependency_failure(tracked, *dependency_failure)
                 )
                 active.append(tracked)
@@ -1249,7 +1288,7 @@ class StreamingToolBatch:
                 continue
             tracked.state = "running"
             tracked.started_at = time.monotonic()
-            tracked.execution_task = asyncio.create_task(self._execute(tracked))
+            tracked.execution_task = self._create_task(self._execute(tracked))
             active.append(tracked)
 
     async def _complete_dependency_failure(
@@ -1309,21 +1348,33 @@ class StreamingToolBatch:
                         transaction.declare_resources,
                         prepared.spec.locks,
                     )
+            stable_key: str | None
             if prepared.policy.safety is ExecutionSafety.FINAL_ONLY:
+                stable_key = prepared.policy.idempotency_key or hashlib.sha256(
+                    (
+                        f"{self.journal.storage.project_id}:{self.journal.storage.session_id}:"
+                        f"{self.turn_id}:{tracked.ordinal}:{prepared.tool_call.id or ''}:"
+                        f"{prepared.tool.name}"
+                    ).encode("utf-8")
+                ).hexdigest()
                 await asyncio.to_thread(
                     self.journal.record,
                     "external_intent",
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
-                    idempotency_key=prepared.policy.idempotency_key,
+                    idempotency_key=stable_key,
                 )
                 external_started = True
+            else:
+                stable_key = prepared.policy.idempotency_key
             context = ToolExecutionContext(
                 self.turn_id,
                 workspace_view=transaction,
                 provisional=prepared.policy.safety is not ExecutionSafety.FINAL_ONLY,
+                execution_scope=self.execution_scope,
+                idempotency_key=stable_key,
             )
-            run_task = asyncio.create_task(
+            run_task = self._create_task(
                 self.executor._run_tool(prepared, self._sync_semaphore, context)
             )
             tracked.underlying_task = run_task
@@ -1358,7 +1409,10 @@ class StreamingToolBatch:
                         indeterminate=True,
                     )
             else:
-                result = await run_task
+                if self.execution_scope is None:
+                    result = await run_task
+                else:
+                    result = await self.execution_scope.run_awaitable(run_task)
             if transaction is not None:
                 result = replace(
                     result,
@@ -1378,12 +1432,16 @@ class StreamingToolBatch:
                     ok=result.ok,
                 )
             elif prepared.policy.safety is ExecutionSafety.FINAL_ONLY:
+                recovery_payload = self._build_recovery_payload(tracked, result)
                 await asyncio.to_thread(
                     self.journal.record,
-                    "external_outcome",
+                    "external_outcome_committed",
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     ok=result.ok,
+                    idempotency_key=stable_key,
+                    tool_result=asdict(result),
+                    history_payload=recovery_payload,
                 )
         except JournalWriteError as exc:
             error_type = (
@@ -1405,9 +1463,19 @@ class StreamingToolBatch:
         except Exception as exc:
             result = ToolResult(
                 prepared.tool.name,
-                f"Tool error: {exc}",
+                (
+                    "Tool outcome is indeterminate after external execution: "
+                    if external_started
+                    else "Tool error: "
+                ) + str(exc),
                 ok=False,
-                metadata={"error_type": type(exc).__name__},
+                metadata={
+                    "error_type": (
+                        "IndeterminateExternalEffect"
+                        if external_started
+                        else type(exc).__name__
+                    )
+                },
             )
         await self._complete(tracked, result)
 
@@ -1457,7 +1525,7 @@ class StreamingToolBatch:
             tracked.cancel_requested = True
             if tracked.state == "queued":
                 tracked.state = "cancelling"
-                tracked.execution_task = asyncio.create_task(self._complete_cancelled(tracked))
+                tracked.execution_task = self._create_task(self._complete_cancelled(tracked))
 
     async def abort(self, reason: str) -> None:
         """Stop admitting calls and drain every task so none escapes the turn."""
@@ -1644,7 +1712,7 @@ class StreamingToolBatch:
             else:
                 try:
                     if self._transaction is not None:
-                        commit_task = asyncio.create_task(asyncio.to_thread(self._transaction.commit))
+                        commit_task = self._create_task(asyncio.to_thread(self._transaction.commit))
                         try:
                             self._committed_paths = await asyncio.shield(commit_task)
                         except asyncio.CancelledError:
@@ -1739,6 +1807,7 @@ class StreamingToolBatch:
                     tracked.original_call,
                     list(messages or tracked.messages),
                     self.should_cancel,
+                    self.execution_scope,
                 )
                 if isinstance(authorized, ToolResult):
                     tracked.observed = True
@@ -1771,21 +1840,44 @@ class StreamingToolBatch:
 
         if self._history_context is None:
             return
+        payload = self._build_recovery_payload()
+        if payload is None:
+            return
+        await asyncio.to_thread(
+            self.journal.record,
+            "history_ready",
+            history_payload=payload,
+            precommit=True,
+        )
+
+    def _build_recovery_payload(
+        self,
+        current: _TrackedCall | None = None,
+        current_result: ToolResult | None = None,
+    ) -> dict[str, object] | None:
+        """Build one ordered, durable history projection from known outcomes."""
+
+        if self._history_context is None:
+            return None
         assistant = self._history_context.get("assistant")
         if not isinstance(assistant, dict):
-            return
+            return None
         parent_uuid = str(assistant.get("uuid") or "") or None
+        round_id = str(assistant.get("round_id") or assistant.get("uuid") or "") or None
         tool_messages: list[dict[str, object]] = []
-        for call, tracked in bindings:
-            result = tracked.result if tracked is not None else None
+        complete = True
+        for tracked in sorted(self._calls, key=lambda item: item.ordinal):
+            call = tracked.original_call
+            result = current_result if tracked is current else tracked.result
             if result is None:
+                complete = False
                 result = ToolResult(
                     call.name,
-                    "Tool outcome pending at crash-recovery checkpoint",
+                    "Tool was not completed before crash recovery",
                     ok=False,
                     metadata={
-                        "error_type": "RecoveryPending",
-                        "execution_status": "pending",
+                        "error_type": "RecoveryNotExecuted",
+                        "execution_status": "not_executed",
                     },
                 )
             message = Message(
@@ -1796,22 +1888,30 @@ class StreamingToolBatch:
                     **result.metadata,
                     "ok": result.ok,
                     "tool_call_id": call.id,
+                    "ordinal": tracked.ordinal,
                 },
+                uuid=tracked.recovery_message_uuid,
                 parent_uuid=parent_uuid,
+                round_id=round_id,
             )
             parent_uuid = message.uuid
             tool_messages.append(message.to_dict())
-        payload = {
+        manifest = self.execution_manifest()
+        if current is not None and current_result is not None:
+            calls = manifest.get("calls")
+            if isinstance(calls, list):
+                for item in calls:
+                    if isinstance(item, dict) and item.get("ordinal") == current.ordinal:
+                        item["ok"] = current_result.ok
+                        item["status"] = current_result.metadata.get(
+                            "execution_status", "finalized"
+                        )
+        return {
             **self._history_context,
             "tool_results": tool_messages,
-            "execution_manifest": self.execution_manifest(),
+            "execution_manifest": manifest,
+            "complete": complete,
         }
-        await asyncio.to_thread(
-            self.journal.record,
-            "history_ready",
-            history_payload=payload,
-            precommit=True,
-        )
 
     async def _wait_prepared(self) -> None:
         while True:
@@ -1979,6 +2079,10 @@ class StreamingToolBatch:
                 for item in sorted(self._calls, key=lambda value: value.ordinal)
             ],
         }
+
+    def recovery_message_uuid(self, ordinal: int) -> str | None:
+        tracked = self._by_ordinal.get(ordinal)
+        return tracked.recovery_message_uuid if tracked is not None else None
 
     def prime_history_payload(self, payload: dict[str, object]) -> None:
         """Supply transcript identity before :meth:`finish` reaches commit."""

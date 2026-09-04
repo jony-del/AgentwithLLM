@@ -43,11 +43,11 @@ from agent_core.skills import (
     parse_slash_command,
 )
 from agent_core.transcript import (
-    TranscriptStore,
-    build_chain,
-    find_session,
+    LoadedTranscript,
+    fork_chain,
     list_sessions,
     load_transcript,
+    locate_session,
     project_dir,
     session_label,
 )
@@ -923,18 +923,66 @@ async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list
         print("Resume with: /resume <id>  (or type /resume and pick from the menu)")
         return ChatTurn()
 
-    path = find_session(session_dir, workspace, target)
-    if path is None:
+    location = locate_session(session_dir, workspace, target)
+    if location is None:
         print(f"No session found with id {target!r}.")
         return ChatTurn()
-    loaded = load_transcript(path)
-    resumed = build_chain(loaded)
-    # Repoint the agent so subsequent turns persist to the resumed session.
-    agent.session_id = loaded.session_id
-    agent.session.session_id = loaded.session_id
-    agent.transcript = TranscriptStore(session_dir, workspace, loaded.session_id)
-    agent.rebind_turn_journal_session()
+    if location.workspace.resolve() != workspace.resolve():
+        print(
+            f"Session {target} belongs to {location.workspace.resolve()}. "
+            "Change to that project and resume again; use /branch "
+            f"{target} to copy it into the current project."
+        )
+        return ChatTurn()
+    loaded = load_transcript(location.path)
+    resumed = await agent.resume_loaded_session(loaded)
     print(f"Resumed session {loaded.session_id} ({len(resumed)} messages).")
+    return ChatTurn(history=resumed)
+
+
+async def _cmd_branch(
+    agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
+) -> ChatTurn:
+    """Clone a saved/current chain into a fresh session in the current project."""
+
+    del ui
+    if not agent.config.session_dir:
+        print("Session persistence is disabled; cannot branch.")
+        return ChatTurn()
+    target = args.strip()
+    if target:
+        location = locate_session(agent.config.session_dir, agent.session.workspace, target)
+        if location is None:
+            print(f"No session found with id {target!r}.")
+            return ChatTurn()
+        source = load_transcript(location.path)
+    else:
+        resumable = [
+            message
+            for message in history
+            if message.role != "system" and message.metadata.get("pinned") != "user_context"
+        ]
+        source = LoadedTranscript(
+            path=(agent.transcript.path if agent.transcript is not None else Path(".")),
+            session_id=agent.session_id,
+            messages={message.uuid: message for message in resumable},
+            order=[message.uuid for message in resumable],
+            workspace=agent.session.workspace,
+        )
+    branch_id, cloned = fork_chain(source)
+    target_path = project_dir(agent.config.session_dir, agent.session.workspace) / f"{branch_id}.jsonl"
+    branch = LoadedTranscript(
+        path=target_path,
+        session_id=branch_id,
+        messages={message.uuid: message for message in cloned},
+        order=[message.uuid for message in cloned],
+        workspace=agent.session.workspace,
+    )
+    resumed = await agent.resume_loaded_session(branch)
+    if agent.transcript is not None:
+        for message in cloned:
+            await agent.transcript.append_message(message)
+    print(f"Branched into session {branch_id} ({len(resumed)} messages).")
     return ChatTurn(history=resumed)
 
 
@@ -977,6 +1025,7 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
     "memory": CommandSpec(_cmd_memory, "Inspect or curate long-term memory."),
     "resume": CommandSpec(_cmd_resume, "List or resume a saved session (alias /continue)."),
     "continue": CommandSpec(_cmd_resume, "List or resume a saved session.", canonical="resume"),
+    "branch": CommandSpec(_cmd_branch, "Clone a session into a new branch."),
 }
 
 # Compatibility maps used by completion and integrations.

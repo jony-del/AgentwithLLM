@@ -26,6 +26,7 @@ from agent_core.tools.builtin import (
     unified_diff,
 )
 from agent_core.tools.catalog import builtin_tool
+from agent_core.unified_diff import PatchError, PatchHunk, PatchOperation, parse_unified_diff
 
 _MAX_GLOB_RESULTS = 200
 
@@ -207,60 +208,79 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         try:
-            files = _parse_unified_diff(str(arguments.get("patch", "")))
-        except _PatchError:
+            patch_set = parse_unified_diff(str(arguments.get("patch", "")))
+        except PatchError:
             return ConcurrencySpec((self.workspace_lock(".", "write", subtree=True),))
-        if not files:
-            return ConcurrencySpec((self.workspace_lock(".", "write", subtree=True),))
-        locks = tuple(self.workspace_lock(target, "write") for target, _, _ in files)
+        locks = tuple(self.workspace_lock(file.target, "write") for file in patch_set.files)
         return ConcurrencySpec(locks)
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         patch_text = str(arguments.get("patch", ""))
         try:
-            files = _parse_unified_diff(patch_text)
-        except _PatchError as exc:
+            patch_set = parse_unified_diff(patch_text)
+        except PatchError as exc:
             return ToolResult(self.name, f"Could not parse patch: {exc}", ok=False, metadata={"error_type": "BadPatch"})
-        if not files:
-            return ToolResult(self.name, "Patch contained no file hunks", ok=False, metadata={"error_type": "BadPatch"})
 
         # Pass 1: compute every new file body before touching disk, so a failure midway
         # leaves the workspace untouched (atomic across files).
-        planned: list[tuple[Path, str, bool]] = []  # (path, new_text, is_new_file)
-        for target, hunks, is_new in files:
+        planned: list[tuple[Path, str | None, PatchOperation]] = []
+        for patch_file in patch_set.files:
+            target = patch_file.target
             path = self.resolve_workspace_path(target)
-            if is_new:
-                new_text = "\n".join(line for _, added in hunks for line in added)
-                planned.append((path, new_text + ("\n" if new_text else ""), True))
+            if patch_file.operation is PatchOperation.CREATE:
+                if path.exists():
+                    return ToolResult(
+                        self.name,
+                        f"File already exists: {target}",
+                        ok=False,
+                        metadata={"error_type": "AlreadyExists"},
+                    )
+                new_text = _apply_hunks("", patch_file.hunks)
+                if new_text and patch_text.endswith("\n"):
+                    new_text += "\n"
+                planned.append((path, new_text, patch_file.operation))
                 continue
             if not path.exists():
                 return ToolResult(self.name, f"No such file to patch: {target}", ok=False, metadata={"error_type": "NotFound"})
             original = path.read_text(encoding="utf-8")
             try:
-                updated = _apply_hunks(original, hunks)
-            except _PatchError as exc:
+                updated = _apply_hunks(original, patch_file.hunks)
+            except PatchError as exc:
                 return ToolResult(
                     self.name,
                     f"Hunk did not apply to {target}: {exc} (no changes written)",
                     ok=False,
                     metadata={"error_type": "HunkFailed"},
                 )
-            planned.append((path, updated, False))
+            if patch_file.operation is PatchOperation.DELETE and updated:
+                return ToolResult(
+                    self.name,
+                    f"Delete patch did not remove all content from {target} (no changes written)",
+                    ok=False,
+                    metadata={"error_type": "HunkFailed"},
+                )
+            planned.append(
+                (path, None if patch_file.operation is PatchOperation.DELETE else updated, patch_file.operation)
+            )
 
         # Pass 2: write everything.
-        for path, new_text, is_new in planned:
-            if is_new:
+        for path, planned_text, operation in planned:
+            if operation is PatchOperation.DELETE:
+                path.unlink()
+                continue
+            if operation is PatchOperation.CREATE:
                 path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_text, encoding="utf-8")
+            assert planned_text is not None
+            path.write_text(planned_text, encoding="utf-8")
         summary = ", ".join(p.relative_to(self.workspace).as_posix() for p, _, _ in planned)
         return ToolResult(self.name, f"Patched {len(planned)} file(s): {summary}")
 
     def render_args(self, arguments: dict[str, object]) -> str | None:
         try:
-            files = _parse_unified_diff(str(arguments.get("patch", "")))
-        except _PatchError:
+            patch_set = parse_unified_diff(str(arguments.get("patch", "")))
+        except PatchError:
             return None
-        names = ", ".join(target for target, _, _ in files)
+        names = ", ".join(file.target for file in patch_set.files)
         return names or None
 
     def render_result(self, arguments: dict[str, object], result: ToolResult) -> str | None:
@@ -270,19 +290,14 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
 
 # --- unified-diff parsing/application (stdlib only) ------------------------------
 
-class _PatchError(Exception):
-    """The patch is malformed or a hunk's context could not be located."""
+# Compatibility helpers retained for callers that imported the old private parser;
+# all authorization and execution paths above use ``parse_unified_diff``.
+_PatchError = PatchError
 
 
 def _strip_ab_prefix(path: str) -> str:
-    path = path.strip()
-    # Drop a trailing tab-separated timestamp some diff tools append.
-    path = path.split("\t", 1)[0]
-    for prefix in ("a/", "b/"):
-        if path.startswith(prefix):
-            return path[len(prefix):]
-    return path
-
+    path = path.strip().split("\t", 1)[0]
+    return path[2:] if path.startswith(("a/", "b/")) else path
 
 def _parse_unified_diff(patch_text: str):
     """Parse into ``[(target_path, hunks, is_new_file), ...]``.
@@ -291,6 +306,17 @@ def _parse_unified_diff(patch_text: str):
     context+added lines to substitute. Line numbers in ``@@`` headers are ignored (we
     anchor on context), which makes the patch resilient to small offset drift.
     """
+    patch_set = parse_unified_diff(patch_text)
+    return [
+        (
+            file.target,
+            [(list(hunk.old_lines), list(hunk.new_lines)) for hunk in file.hunks],
+            file.operation is PatchOperation.CREATE,
+        )
+        for file in patch_set.files
+    ]
+
+    # Kept below only to preserve blame context for the pre-canonical implementation.
     lines = patch_text.splitlines()
     files: list[tuple[str, list[tuple[list[str], list[str]]], bool]] = []
     i = 0
@@ -336,12 +362,14 @@ def _parse_unified_diff(patch_text: str):
     return files
 
 
-def _apply_hunks(original: str, hunks: list[tuple[list[str], list[str]]]) -> str:
+def _apply_hunks(original: str, hunks: tuple[PatchHunk, ...]) -> str:
     """Apply each hunk by locating its old-block as a contiguous run of lines."""
     had_trailing_newline = original.endswith("\n")
     file_lines = original.splitlines()
     cursor = 0
-    for old_block, new_block in hunks:
+    for hunk in hunks:
+        old_block = list(hunk.old_lines)
+        new_block = list(hunk.new_lines)
         if not old_block:
             # Pure insertion with no context anchor: append at the cursor.
             file_lines[cursor:cursor] = new_block
@@ -351,11 +379,11 @@ def _apply_hunks(original: str, hunks: list[tuple[list[str], list[str]]]) -> str
         if index < 0:
             index = _find_block(file_lines, old_block, 0)  # fall back to a full scan
         if index < 0:
-            raise _PatchError("context lines not found")
+            raise PatchError("context lines not found")
         file_lines[index:index + len(old_block)] = new_block
         cursor = index + len(new_block)
     result = "\n".join(file_lines)
-    if had_trailing_newline:
+    if had_trailing_newline and result:
         result += "\n"
     return result
 

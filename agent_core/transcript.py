@@ -30,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -45,10 +46,12 @@ from .permission_audit import sanitize_log_payload
 _TITLE = "custom-title"
 _TAG = "tag"
 _RELINK = "relink"
+_SESSION = "session"
+_COMPACTION_SNAPSHOT = "compaction_snapshot"
 
 # Schema version stamped on every transcript entry (the "v" field). Bump on breaking
 # changes to the entry shape; loaders stay tolerant of records without it (pre-v1).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Above this file size, the resume load skips everything before the last compaction
 # boundary (reading only post-boundary bytes + a cheap pre-boundary metadata rescue),
@@ -59,6 +62,7 @@ SKIP_PRECOMPACT_THRESHOLD = 5 * 1024 * 1024
 # ``json.dumps`` default ``": "`` separator is stable). Used to locate the last boundary
 # without JSON-parsing every line.
 _BOUNDARY_MARKER = b'"compact_boundary": true'
+_SNAPSHOT_MARKER = b'"type": "compaction_snapshot"'
 
 
 def sanitize_project(cwd: str | Path) -> str:
@@ -68,6 +72,13 @@ def sanitize_project(cwd: str | Path) -> str:
     scheme), so ``E:\\ZNGZ\\Code_copy`` becomes ``E--ZNGZ-Code-copy`` — distinct cwds
     never collide, and the same cwd always resolves to the same project dir.
     """
+    resolved = os.path.normcase(str(Path(cwd).resolve()))
+    slug = "-".join(filter(None, re.split(r"[^A-Za-z0-9]+", resolved)))
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    return f"{slug[:96] or 'project'}-{digest}"
+
+
+def _legacy_sanitize_project(cwd: str | Path) -> str:
     resolved = str(Path(cwd).resolve())
     return "".join(c if c.isalnum() else "-" for c in resolved)
 
@@ -128,6 +139,21 @@ class TranscriptStore:
         self._lock = threading.Lock()
         self._warned = False
 
+    def _session_record(self) -> dict[str, object]:
+        return {
+            "type": _SESSION,
+            "v": SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "cwd": self.workspace,
+            "project_id": sanitize_project(self.workspace),
+            "ts": time.time(),
+        }
+
+    def _ensure_session_header_locked(self, file) -> None:
+        if self.path.exists() and self.path.stat().st_size > 0:
+            return
+        file.write(json.dumps(self._session_record(), ensure_ascii=False) + "\n")
+
     async def append_message(self, message: Message) -> None:
         message_data = message.to_dict()
         if message.metadata.get("sensitive"):
@@ -164,6 +190,42 @@ class TranscriptStore:
 
         record = self._tool_round_record(assistant, tool_results, execution_manifest)
         return await asyncio.to_thread(self._write_tool_round_once_sync, record)
+
+    async def append_compaction_snapshot(
+        self,
+        messages: list[Message],
+        *,
+        source_head: str | None,
+    ) -> bool:
+        """Persist the complete ordered resumable conversation as one record."""
+
+        serialized: list[dict[str, object]] = []
+        parent: str | None = None
+        for message in messages:
+            value = message.to_dict()
+            value["parent_uuid"] = parent
+            value["parent_id"] = parent
+            if message.metadata.get("sensitive"):
+                value["content"] = "<redacted-sensitive-tool-output>"
+            clean = sanitize_log_payload(value)
+            serialized.append(clean)
+            parent = message.uuid
+        body = {"messages": serialized, "source_head": source_head}
+        canonical = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
+        record = {
+            "type": _COMPACTION_SNAPSHOT,
+            "v": SCHEMA_VERSION,
+            **body,
+            "checksum": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "compact_boundary": True,
+            "session_id": self.session_id,
+            "cwd": self.workspace,
+            "git_branch": self._cwd_branch,
+            "ts": time.time(),
+        }
+        return await asyncio.to_thread(self._write_sync, record)
 
     def _tool_round_record(
         self,
@@ -239,6 +301,7 @@ class TranscriptStore:
                         return True
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8", errors="replace") as file:
+                    self._ensure_session_header_locked(file)
                     file.write(line)
                     file.flush()
                     try:
@@ -270,6 +333,7 @@ class TranscriptStore:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8", errors="replace") as file:
+                    self._ensure_session_header_locked(file)
                     file.write(line)
                     file.flush()
                     try:
@@ -298,6 +362,7 @@ class LoadedTranscript:
     title: str | None = None
     tag: str | None = None
     git_branch: str | None = None
+    workspace: Path | None = None
 
     @property
     def first_prompt(self) -> str:
@@ -334,7 +399,17 @@ class _Accumulator:
     entries identically. ``relinks`` are applied last (last-wins) to re-point parents.
     """
 
-    __slots__ = ("session_id", "messages", "order", "relinks", "title", "tag", "branch")
+    __slots__ = (
+        "session_id",
+        "messages",
+        "order",
+        "relinks",
+        "title",
+        "tag",
+        "branch",
+        "workspace",
+        "_workspace_conflict",
+    )
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
@@ -344,6 +419,8 @@ class _Accumulator:
         self.title: str | None = None
         self.tag: str | None = None
         self.branch: str | None = None
+        self.workspace: Path | None = None
+        self._workspace_conflict = False
 
     def feed(self, line: str) -> None:
         line = line.strip()
@@ -353,8 +430,13 @@ class _Accumulator:
             entry = json.loads(line)
         except json.JSONDecodeError:
             return
+        if not isinstance(entry, dict):
+            return
         etype = entry.get("type")
-        if etype == "message":
+        if etype == _SESSION:
+            self.session_id = str(entry.get("session_id") or self.session_id)
+            self._capture_workspace(entry)
+        elif etype == "message":
             self._feed_message(entry, entry)
         elif etype == "tool_round":
             messages = entry.get("messages")
@@ -371,8 +453,39 @@ class _Accumulator:
             for raw_message in messages:
                 if isinstance(raw_message, dict):
                     self._feed_message(raw_message, entry)
+        elif etype == _COMPACTION_SNAPSHOT:
+            messages = entry.get("messages")
+            source_head = entry.get("source_head")
+            checksum = entry.get("checksum")
+            if not isinstance(messages, list):
+                return
+            snapshot_body: dict[str, object] = {
+                "messages": messages,
+                "source_head": source_head,
+            }
+            canonical = json.dumps(
+                snapshot_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if checksum != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+                return
+            self.messages.clear()
+            self.order.clear()
+            self.relinks.clear()
+            self._capture_workspace(entry)
+            for raw_message in messages:
+                if isinstance(raw_message, dict):
+                    self._feed_message(raw_message, entry)
         elif etype == _RELINK:
-            self.relinks[entry["uuid"]] = entry.get("parent_uuid")
+            msg_uuid = entry.get("uuid")
+            parent_uuid = entry.get("parent_uuid")
+            if isinstance(msg_uuid, str) and (
+                parent_uuid is None or isinstance(parent_uuid, str)
+            ):
+                self.relinks[msg_uuid] = parent_uuid
         elif etype == _TITLE:
             self.title = entry.get("title", self.title)
         elif etype == _TAG:
@@ -383,9 +496,24 @@ class _Accumulator:
         msg = Message.from_dict(value)
         self.session_id = envelope.get("session_id", self.session_id)
         self.branch = envelope.get("git_branch") or self.branch
+        self._capture_workspace(envelope)
         if msg.uuid not in self.messages:
             self.order.append(msg.uuid)
         self.messages[msg.uuid] = msg
+
+    def _capture_workspace(self, envelope: dict) -> None:
+        if self._workspace_conflict:
+            return
+        raw = envelope.get("cwd")
+        if not isinstance(raw, str) or not raw:
+            return
+        candidate = Path(raw).resolve()
+        if self.workspace is None:
+            self.workspace = candidate
+        elif os.path.normcase(str(self.workspace)) != os.path.normcase(str(candidate)):
+            # A transcript must never change project identity mid-file.
+            self.workspace = None
+            self._workspace_conflict = True
 
     def finish(self, path: Path) -> "LoadedTranscript":
         # Apply relinks: a compaction boundary re-points the kept tail's head at the
@@ -402,6 +530,7 @@ class _Accumulator:
             title=self.title,
             tag=self.tag,
             git_branch=self.branch,
+            workspace=self.workspace,
         )
 
 
@@ -452,7 +581,31 @@ def _last_boundary_offset(path: Path) -> int:
     try:
         with path.open("rb") as file:
             for raw in file:
-                if _BOUNDARY_MARKER in raw:
+                is_valid_snapshot = False
+                if _SNAPSHOT_MARKER in raw:
+                    try:
+                        entry = json.loads(raw)
+                        if not isinstance(entry, dict):
+                            raise ValueError("snapshot must be a JSON object")
+                        body = {
+                            "messages": entry.get("messages"),
+                            "source_head": entry.get("source_head"),
+                        }
+                        canonical = json.dumps(
+                            body,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+                        is_valid_snapshot = entry.get("checksum") == hashlib.sha256(
+                            canonical.encode("utf-8")
+                        ).hexdigest()
+                    except (UnicodeDecodeError, ValueError):
+                        is_valid_snapshot = False
+                if is_valid_snapshot or (
+                    _SNAPSHOT_MARKER not in raw and _BOUNDARY_MARKER in raw
+                ):
                     last = offset
                     found = True
                 offset += len(raw)
@@ -518,6 +671,7 @@ class SessionInfo:
     title: str | None = None
     tag: str | None = None
     git_branch: str | None = None
+    workspace: Path | None = None
 
 
 def read_lite(path: str | Path) -> SessionInfo | None:
@@ -534,6 +688,7 @@ def read_lite(path: str | Path) -> SessionInfo | None:
     title: str | None = None
     tag: str | None = None
     branch: str | None = None
+    workspace: Path | None = None
     session_id = path.stem
     msg_marker = b'"type": "message"'
     title_marker = b'"type": "%s"' % _TITLE.encode()
@@ -541,6 +696,14 @@ def read_lite(path: str | Path) -> SessionInfo | None:
     try:
         with path.open("rb") as file:
             for raw in file:
+                if b'"type": "session"' in raw:
+                    try:
+                        header = json.loads(raw)
+                        if isinstance(header.get("cwd"), str):
+                            workspace = Path(header["cwd"]).resolve()
+                        session_id = header.get("session_id", session_id)
+                    except (json.JSONDecodeError, OSError):
+                        pass
                 if msg_marker in raw:
                     count += 1
                     if not first_prompt:
@@ -550,6 +713,8 @@ def read_lite(path: str | Path) -> SessionInfo | None:
                             continue
                         session_id = entry.get("session_id", session_id)
                         branch = entry.get("git_branch") or branch
+                        if workspace is None and isinstance(entry.get("cwd"), str):
+                            workspace = Path(entry["cwd"]).resolve()
                         if entry.get("role") == "user" and str(entry.get("content", "")).strip():
                             first_prompt = " ".join(str(entry["content"]).split())[:200]
                 elif title_marker in raw:
@@ -575,6 +740,7 @@ def read_lite(path: str | Path) -> SessionInfo | None:
         title=title,
         tag=tag,
         git_branch=branch,
+        workspace=workspace,
     )
 
 
@@ -611,24 +777,58 @@ def session_label(info: SessionInfo) -> str:
     return info.title or info.first_prompt or "(empty)"
 
 
-def find_session(root: str | Path, cwd: str | Path, session_id: str) -> Path | None:
-    """Locate a session file by id: current project first, then across all projects.
+@dataclass(frozen=True, slots=True)
+class SessionLocation:
+    path: Path
+    workspace: Path
 
-    The cross-project scan is what lets ``--resume <id>`` work from a different cwd.
-    """
-    here = project_dir(root, cwd) / f"{session_id}.jsonl"
-    if here.is_file():
-        return here
+
+class AmbiguousSessionError(RuntimeError):
+    pass
+
+
+def locate_session(root: str | Path, cwd: str | Path, session_id: str) -> SessionLocation | None:
+    """Locate a session and validate the workspace identity persisted inside it."""
+
+    current = Path(cwd).resolve()
     base = Path(root).expanduser()
-    if not base.is_dir():
-        return None
-    for proj in base.iterdir():
-        if not proj.is_dir():
+    current_dirs = {
+        project_dir(base, current),
+        base / _legacy_sanitize_project(current),
+    }
+    candidates = [folder / f"{session_id}.jsonl" for folder in current_dirs]
+    if base.is_dir():
+        candidates.extend(
+            folder / f"{session_id}.jsonl"
+            for folder in base.iterdir()
+            if folder.is_dir()
+        )
+    matches: dict[Path, SessionLocation] = {}
+    for candidate in candidates:
+        try:
+            resolved_candidate = candidate.resolve()
+        except OSError:
             continue
-        candidate = proj / f"{session_id}.jsonl"
-        if candidate.is_file():
-            return candidate
-    return None
+        if not candidate.is_file() or resolved_candidate in matches:
+            continue
+        loaded = load_transcript(candidate, skip_precompact=False)
+        workspace = loaded.workspace
+        if workspace is None:
+            if candidate.parent not in current_dirs:
+                continue
+            workspace = current
+        matches[resolved_candidate] = SessionLocation(candidate, workspace)
+    if len(matches) > 1:
+        paths = ", ".join(str(item.path) for item in matches.values())
+        raise AmbiguousSessionError(f"session id {session_id!r} is ambiguous: {paths}")
+    return next(iter(matches.values()), None)
+
+
+def find_session(root: str | Path, cwd: str | Path, session_id: str) -> Path | None:
+    """Compatibility wrapper returning only the verified transcript path."""
+
+    location = locate_session(root, cwd, session_id)
+    return location.path if location is not None else None
 
 
 def fork_chain(loaded: LoadedTranscript, leaf: str | None = None) -> tuple[str, list[Message]]:

@@ -76,6 +76,24 @@ def test_no_default_marketplace(tmp_path: Path, monkeypatch) -> None:
     assert PluginManager(tmp_path).marketplaces() == {}
 
 
+def test_prompt_expansion_cannot_read_arbitrary_host_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PLUGIN_HOST_SECRET", "must-not-leak")
+    rendered = plugins_module._expand_plugin_vars(
+        "root=${CLAUDE_PLUGIN_ROOT}; public=${user_config.region}; secret=${PLUGIN_HOST_SECRET}",
+        tmp_path / "plugin",
+        tmp_path / "workspace",
+        tmp_path / "data",
+        {"region": "eu"},
+    )
+
+    assert "public=eu" in rendered
+    assert "must-not-leak" not in rendered
+    assert "${PLUGIN_HOST_SECRET}" in rendered
+    assert plugins_module._expand_executable_env("${PLUGIN_HOST_SECRET}") == "must-not-leak"
+
+
 def test_plugin_enable_rewrites_multiline_local_array_safely(
     tmp_path: Path, monkeypatch
 ) -> None:

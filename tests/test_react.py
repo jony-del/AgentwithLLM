@@ -299,7 +299,9 @@ async def test_run_stops_when_provider_gate_sees_cancel(tmp_path: Path) -> None:
     result = await agent.run("hello", should_cancel=cancel_after_loop_guard)
 
     assert "interrupt" in result.answer.lower()
-    assert result.steps == 1
+    # The unified execution scope probes during preflight as well as provider attempts,
+    # so cancellation can now stop before the first sampling step.
+    assert result.steps == 0
 
 
 class _CancelDuringTurnProvider:

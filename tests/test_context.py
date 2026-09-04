@@ -441,10 +441,12 @@ async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatc
 
     result = await agent.run("hello")
 
-    # Order: system(+gitStatus) → memory recall (system) → userContext user → user task.
+    # Order: system(+gitStatus) → pinned untrusted memory data → userContext → user task.
     assert result.messages[0].role == "system"
     assert "gitStatus: GIT BLOCK" in result.messages[0].content
-    assert result.messages[1].content == "RECALLED MEMORY BLOCK"
+    assert "RECALLED MEMORY BLOCK" in result.messages[1].content
+    assert result.messages[1].role == "user"
+    assert result.messages[1].metadata["prompt_ingress"]["source"] == "memory_recall"
     assert result.messages[1].metadata["memory"] == "recall"
     assert result.messages[2].metadata.get("pinned") == "user_context"
     assert "# claudeMd\nCLAUDEMD BLOCK" in result.messages[2].content

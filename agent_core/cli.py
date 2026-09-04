@@ -61,16 +61,17 @@ from agent_core.chat_commands import (
     is_immediate_command,
 )
 from agent_core.react import ReActAgent, ReActConfig
+from agent_core.session import SessionDescriptor, SessionSelection
 from agent_core.sandbox import SandboxManager, SandboxRequiredError, get_shared_manager
 from agent_core.tools.base import ExecutionScope
 from agent_core.tools.registry import ToolRegistry
 from agent_core.transcript import (
     build_chain,
-    find_session,
     fork_chain,
     latest_session,
     list_sessions,
     load_transcript,
+    locate_session,
     new_session_id,
     project_dir,
     session_label,
@@ -415,16 +416,20 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     # load any prior conversation to seed it. ``seed`` is the fork's cloned chain that
     # must be written into the fresh transcript before the run; for plain resume it is
     # empty because the history already lives on disk.
-    session_id, history, seed = _resolve_session(args, config.session_dir)
+    selection = _resolve_session(args, config.session_dir)
     agent = ReActAgent(
-        provider=provider, config=config, tools=registry, ui=ui, session_id=session_id,
+        provider=provider,
+        config=config,
+        tools=registry,
+        ui=ui,
+        session_id=selection.descriptor.session_id,
         mcp_manager=manager, sandbox=sandbox,
     )
     agent._sandbox_cli_locked = (
         getattr(args, "sandbox", None) is not None
         or getattr(args, "sandbox_backend", None) is not None
     )
-    return BuiltAgent(agent, ui, manager, history, seed)
+    return BuiltAgent(agent, ui, manager, list(selection.history), list(selection.seed))
 
 
 @dataclass(slots=True)
@@ -447,7 +452,7 @@ def _session_dir(args: argparse.Namespace) -> str:
 
 def _resolve_session(
     args: argparse.Namespace, session_dir: str
-) -> tuple[str, list[Message], list[Message]]:
+) -> SessionSelection:
     """Pick the session id and seed history from ``--resume``/``--continue``/``--fork-session``.
 
     Returns ``(session_id, history, seed)``: ``history`` is fed to ``run(history=...)``;
@@ -460,12 +465,12 @@ def _resolve_session(
     cont = getattr(args, "continue_", False)
     cwd = Path.cwd().resolve()
 
-    path = None
+    location = None
     if resume_id:
         if not session_dir:
             raise RuntimeError("--resume needs session persistence (it is disabled)")
-        path = find_session(session_dir, cwd, resume_id)
-        if path is None:
+        location = locate_session(session_dir, cwd, resume_id)
+        if location is None:
             raise RuntimeError(f"no session found with id {resume_id!r}")
     elif cont:
         if not session_dir:
@@ -473,16 +478,29 @@ def _resolve_session(
         info = latest_session(project_dir(session_dir, cwd))
         if info is None:
             raise RuntimeError("no prior session to continue in this project")
-        path = info.path
+        source_workspace = info.workspace or cwd
+        from agent_core.transcript import SessionLocation
 
-    if path is None:
-        return explicit or new_session_id(), [], []
+        location = SessionLocation(info.path, source_workspace)
 
-    loaded = load_transcript(path)
+    if location is None:
+        session_id = explicit or new_session_id()
+        return SessionSelection("new", SessionDescriptor(session_id, cwd))
+
+    loaded = load_transcript(location.path)
     if fork:
         new_id, cloned = fork_chain(loaded)
-        return explicit or new_id, cloned, list(cloned)
-    return loaded.session_id, build_chain(loaded), []
+        session_id = explicit or new_id
+        target = SessionDescriptor(session_id, cwd)
+        return SessionSelection("fork", target, tuple(cloned), tuple(cloned))
+    if os.path.normcase(str(location.workspace.resolve())) != os.path.normcase(str(cwd)):
+        raise RuntimeError(
+            f"session {loaded.session_id} belongs to project {location.workspace.resolve()}; "
+            f"change to that directory and run --resume {loaded.session_id} again, or use "
+            "--fork-session to branch into the current project"
+        )
+    descriptor = SessionDescriptor(loaded.session_id, cwd, location.path)
+    return SessionSelection("resume", descriptor, tuple(build_chain(loaded)))
 
 
 async def _async_input(

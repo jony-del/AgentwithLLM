@@ -7,7 +7,7 @@ single/multiple selection, and the two UI-owned escape hatches are cheap to test
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 QuestionRowKind = Literal["option", "custom", "discussion"]
@@ -230,7 +230,7 @@ async def _run_picker(picker: QuestionPicker) -> QuestionAction:
         event.app.exit(result="cancel")
 
     app: Application[QuestionAction] = Application(
-        layout=Layout(HSplit([Window(FormattedTextControl(fragments), wrap_lines=True)])),
+        layout=Layout(HSplit([Window(FormattedTextControl(cast(Any, fragments)), wrap_lines=True)])),
         key_bindings=keys,
         mouse_support=False,
         full_screen=False,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any, cast
 
 from agent_core.model_catalog import SELECTABLE_MODELS, available_efforts
 
@@ -202,7 +203,7 @@ async def run_model_picker(
         event.app.exit(result=None)
 
     app: Application = Application(
-        layout=Layout(HSplit([Window(FormattedTextControl(fragments), wrap_lines=True)])),
+        layout=Layout(HSplit([Window(FormattedTextControl(cast(Any, fragments)), wrap_lines=True)])),
         key_bindings=kb,
         mouse_support=False,
         full_screen=False,

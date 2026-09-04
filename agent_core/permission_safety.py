@@ -21,6 +21,7 @@ from agent_core.permission_types import (
     PermissionRule,
     PermissionRuleSource,
 )
+from agent_core.unified_diff import PatchError, parse_unified_diff
 
 _SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube"})
 _SECRET_PATTERNS = (
@@ -92,17 +93,11 @@ def extract_path_targets(tool_name: str, arguments: dict[str, Any]) -> list[Path
 
     if tool_name == "apply_patch":
         patch = str(arguments.get("patch", ""))
-        targets: list[PathTarget] = []
-        for line in patch.splitlines():
-            if not line.startswith("+++ "):
-                continue
-            target = line[4:].strip().split("\t", 1)[0]
-            if target == "/dev/null":
-                continue
-            if target.startswith("b/"):
-                target = target[2:]
-            targets.append(PathTarget(target, "write"))
-        return targets
+        try:
+            parsed = parse_unified_diff(patch)
+        except PatchError:
+            return []
+        return [PathTarget(target, "write") for target in parsed.targets]
 
     if tool_name == "run_tests" and arguments.get("target"):
         target = str(arguments["target"]).split("::", 1)[0]

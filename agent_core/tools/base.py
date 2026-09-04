@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from agent_core.execution import ExecutionScope
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_types import PermissionContext, PermissionResult
 
@@ -105,15 +106,24 @@ class ToolExecutionContext:
     turn_id: str
     workspace_view: WorkspaceView | None = None
     provisional: bool = False
+    execution_scope: "ExecutionScope | None" = None
+    idempotency_key: str | None = None
 
 
 _EXECUTION_CONTEXT: ContextVar[ToolExecutionContext | None] = ContextVar(
     "polaris_tool_execution_context", default=None
 )
-
-
 def current_execution_context() -> ToolExecutionContext | None:
     return _EXECUTION_CONTEXT.get()
+
+
+def current_execution_scope() -> "ExecutionScope | None":
+    context = current_execution_context()
+    if context is not None and context.execution_scope is not None:
+        return context.execution_scope
+    from agent_core.execution import current_execution_scope as current_run_scope
+
+    return current_run_scope()
 
 
 def execution_workspace(default: str | Path) -> Path:
@@ -127,47 +137,6 @@ def execution_workspace(default: str | Path) -> Path:
     if context is not None and context.workspace_view is not None:
         return context.workspace_view.execution_root()
     return Path(default).resolve()
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionScope:
-    """Per-call filesystem/network boundaries passed to execution providers.
-
-    A scope is immutable so concurrent tools cannot accidentally mutate global
-    sandbox state while another command is being prepared.  Backends that do not
-    yet understand the extra roots still receive the active workspace through the
-    existing wrap seam and therefore fail no less safely than before.
-    """
-
-    workspace: Path
-    git_common_dir: Path | None = None
-    read_only_roots: tuple[Path, ...] = ()
-    writable_roots: tuple[Path, ...] = ()
-    private_temp: Path | None = None
-    network: Literal["deny", "allow"] = "deny"
-    workspace_writable: bool = True
-
-    @classmethod
-    def for_workspace(
-        cls,
-        workspace: str | Path,
-        *,
-        git_common_dir: str | Path | None = None,
-        read_only_roots: tuple[str | Path, ...] = (),
-        writable_roots: tuple[str | Path, ...] = (),
-        private_temp: str | Path | None = None,
-        network: Literal["deny", "allow"] = "deny",
-        workspace_writable: bool = True,
-    ) -> "ExecutionScope":
-        return cls(
-            Path(workspace).resolve(),
-            Path(git_common_dir).resolve() if git_common_dir is not None else None,
-            tuple(Path(item).resolve() for item in read_only_roots),
-            tuple(Path(item).resolve() for item in writable_roots),
-            Path(private_temp).resolve() if private_temp is not None else None,
-            network,
-            workspace_writable,
-        )
 
 
 class WorkspacePathMixin:

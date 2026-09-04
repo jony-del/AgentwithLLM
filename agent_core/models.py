@@ -30,6 +30,24 @@ class Message:
     # two messages with the same content but distinct ids still compare equal.
     uuid: str = field(default_factory=lambda: _uuid.uuid4().hex, compare=False)
     parent_uuid: str | None = field(default=None, compare=False)
+    origin_id: str | None = field(default=None, compare=False)
+    version: int = field(default=1, compare=False)
+    round_id: str | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.origin_id is None:
+            self.origin_id = self.uuid
+        self.version = max(1, int(self.version))
+        if self.round_id is None and self.role == "assistant" and self.metadata.get("tool_calls"):
+            self.round_id = self.uuid
+
+    @property
+    def message_id(self) -> str:
+        return self.uuid
+
+    @property
+    def parent_id(self) -> str | None:
+        return self.parent_uuid
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -38,6 +56,11 @@ class Message:
             "metadata": self.metadata,
             "uuid": self.uuid,
             "parent_uuid": self.parent_uuid,
+            "message_id": self.uuid,
+            "parent_id": self.parent_uuid,
+            "origin_id": self.origin_id,
+            "version": self.version,
+            "round_id": self.round_id,
         }
         if self.name:
             data["name"] = self.name
@@ -57,8 +80,11 @@ class Message:
             content=data.get("content", ""),
             name=data.get("name"),
             metadata=dict(data.get("metadata") or {}),
-            uuid=data.get("uuid") or _uuid.uuid4().hex,
-            parent_uuid=data.get("parent_uuid"),
+            uuid=data.get("message_id") or data.get("uuid") or _uuid.uuid4().hex,
+            parent_uuid=data.get("parent_id", data.get("parent_uuid")),
+            origin_id=data.get("origin_id"),
+            version=data.get("version", 1),
+            round_id=data.get("round_id"),
         )
 
 

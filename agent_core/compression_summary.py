@@ -17,6 +17,7 @@ from dataclasses import replace
 from agent_core import tokens
 from agent_core.compression import CompressionConfig, Summarizer
 from agent_core.models import Message
+from agent_core.prompt_ingress import defang_reserved_tags
 from agent_core.providers.base import GatedProvider, LLMProvider, ProviderConfig
 from agent_core.providers.fake import FakeProvider
 
@@ -154,7 +155,7 @@ def render_prefix(prefix: list[Message], max_chars: int) -> str:
     comfortable single-call budget.
     """
     lines = [f"[{message.role}] {message.content}" for message in prefix]
-    convo = "\n".join(lines)
+    convo = defang_reserved_tags("\n".join(lines))
     if max_chars > 0 and len(convo) > max_chars:
         half = max(200, max_chars // 2)
         convo = f"{convo[:half]}\n...[transcript truncated]...\n{convo[-half:]}"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import inspect
 import logging
 import time
@@ -10,6 +11,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from agent_core.models import LLMResult, Message, ToolCall
+from agent_core.execution import ExecutionScope, current_execution_scope
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,7 @@ class LLMProvider(ABC):
         config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> LLMResult:
         """Return the next assistant response.
 
@@ -230,7 +233,7 @@ class _TokenBucket:
         self._updated = time.monotonic()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
+    async def acquire(self, scope: ExecutionScope | None = None) -> None:
         if self.rate_per_sec <= 0:
             return
         async with self._lock:
@@ -242,7 +245,10 @@ class _TokenBucket:
                     self._tokens -= 1.0
                     return
                 wait = (1.0 - self._tokens) / self.rate_per_sec
-                await asyncio.sleep(wait)
+                if scope is None:
+                    await asyncio.sleep(wait)
+                else:
+                    await scope.sleep(wait)
 
 
 class ProviderGate:
@@ -270,6 +276,49 @@ class ProviderGate:
             self._bucket = _TokenBucket(self.rate_limit)
         return self._semaphore, self._bucket
 
+    @asynccontextmanager
+    async def attempt(self, scope: ExecutionScope | None = None):
+        """Acquire limits for one physical provider request, not a retry loop."""
+
+        semaphore, bucket = self._ensure()
+        if scope is None:
+            await semaphore.acquire()
+        else:
+            scope.raise_if_cancelled()
+            await scope.run_awaitable(semaphore.acquire())
+        try:
+            await bucket.acquire(scope)
+            if scope is not None:
+                scope.raise_if_cancelled()
+            yield
+        finally:
+            semaphore.release()
+
+
+@asynccontextmanager
+async def provider_attempt(scope: ExecutionScope | None):
+    """Bound one network attempt using the gate carried by ``scope``."""
+
+    gate = scope.provider_gate if scope is not None else None
+    if isinstance(gate, ProviderGate):
+        async with gate.attempt(scope):
+            yield
+        return
+    if scope is not None:
+        scope.raise_if_cancelled()
+    yield
+
+
+def _supports_scope(provider: object) -> bool:
+    try:
+        parameters = inspect.signature(getattr(provider, "complete")).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        item.name == "scope" or item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in parameters
+    )
+
 
 class GatedProvider(LLMProvider):
     """Wrap a provider so concurrent children share one bounded API-call budget.
@@ -290,23 +339,24 @@ class GatedProvider(LLMProvider):
         config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> LLMResult:
         if should_cancel is not None and should_cancel():
             raise asyncio.CancelledError("provider call cancelled before start")
-        semaphore, bucket = self.gate._ensure()
-        async with semaphore:
-            if should_cancel is not None and should_cancel():
-                raise asyncio.CancelledError("provider call cancelled before start")
-            await bucket.acquire()
-            # Forward the cancel probe so a streaming provider can poll it as
-            # deltas arrive (Esc interrupts mid-response, not just at turn
-            # boundaries). Only pass it through when present, so minimal providers
-            # whose ``complete`` omits the kwarg keep working unchanged.
-            if should_cancel is not None:
-                return await self.inner.complete(
-                    messages, tools, config, stream, should_cancel=should_cancel
-                )
-            return await self.inner.complete(messages, tools, config, stream)
+        scope = scope or current_execution_scope()
+        call_scope = scope.with_provider_gate(self.gate) if scope is not None else None
+        kwargs: dict[str, Any] = {}
+        if should_cancel is not None:
+            kwargs["should_cancel"] = should_cancel
+        if _supports_scope(self.inner):
+            kwargs["scope"] = call_scope
+            result = self.inner.complete(messages, tools, config, stream, **kwargs)
+            return await call_scope.run_awaitable(result) if call_scope is not None else await result
+
+        # Compatibility path: a legacy provider is one opaque physical attempt.
+        async with self.gate.attempt(call_scope):
+            result = self.inner.complete(messages, tools, config, stream, **kwargs)
+            return await call_scope.run_awaitable(result) if call_scope is not None else await result
 
 
 def gated_provider(

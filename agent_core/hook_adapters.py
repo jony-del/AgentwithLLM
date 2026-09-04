@@ -377,9 +377,14 @@ class CommandHookAdapter(_ExternalHookAdapter):
                 env={**os.environ, **(self.spec.env or {})},
             )
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=self.spec.timeout
-            )
+            if ctx.execution_scope is None:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(payload), timeout=self.spec.timeout
+                )
+            else:
+                stdout, _stderr = await ctx.execution_scope.run_awaitable(
+                    proc.communicate(payload), timeout=self.spec.timeout
+                )
         except asyncio.TimeoutError:
             # Single non-stacked timeout: kill the process and reap it (no zombies).
             proc.kill()
@@ -453,9 +458,15 @@ class PromptHookAdapter(_ExternalHookAdapter):
                 f"{self.spec.prompt}\n\n<hook_input>\n{snapshot}\n</hook_input>",
             )
         ]
-        result = await asyncio.wait_for(
-            self.provider.complete(messages, [], config), timeout=self.spec.timeout
-        )
+        if ctx.execution_scope is None:
+            result = await asyncio.wait_for(
+                self.provider.complete(messages, [], config), timeout=self.spec.timeout
+            )
+        else:
+            result = await ctx.execution_scope.run_awaitable(
+                self.provider.complete(messages, [], config, scope=ctx.execution_scope),
+                timeout=self.spec.timeout,
+            )
         text = (result.content or "").strip()
         return HookOutcome(additional_context=text or None)
 
@@ -477,9 +488,15 @@ class AgentHookAdapter(_ExternalHookAdapter):
             return HookOutcome()
         snapshot = json.dumps(project_hook_input(ctx), ensure_ascii=False)
         task = f"{self.spec.prompt}\n\n<hook_input>\n{snapshot}\n</hook_input>"
-        result = await asyncio.wait_for(
-            self.subagent_factory(task, "hook", self.spec.model), timeout=self.spec.timeout
-        )
+        if ctx.execution_scope is None:
+            result = await asyncio.wait_for(
+                self.subagent_factory(task, "hook", self.spec.model), timeout=self.spec.timeout
+            )
+        else:
+            result = await ctx.execution_scope.run_awaitable(
+                self.subagent_factory(task, "hook", self.spec.model),
+                timeout=self.spec.timeout,
+            )
         text = (result or "").strip()
         return HookOutcome(additional_context=text or None)
 

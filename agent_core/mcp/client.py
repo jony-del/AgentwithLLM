@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import ipaddress
 import os
@@ -125,7 +126,7 @@ class MCPClientManager:
         async def list_roots(_context: Any) -> Any:
             roots = []
             for raw in server.roots:
-                expanded = _expand_env(raw)
+                expanded = raw
                 uri = expanded if "://" in expanded else Path(expanded).expanduser().resolve().as_uri()
                 roots.append(types.Root(uri=FileUrl(uri), name=Path(expanded).name or None))
             return types.ListRootsResult(roots=roots)
@@ -150,8 +151,13 @@ class MCPClientManager:
 
     async def _open_transport(self, stack: AsyncExitStack, server: MCPServerConfig):
         transport = (server.transport or "stdio").lower()
-        if server.network_policy == "public-only" and transport != "stdio":
-            _validate_public_remote(server.url)
+        public_addresses: tuple[str, ...] = ()
+        if server.network_policy == "public-only":
+            if transport not in {"streamable-http", "streamable_http", "http"}:
+                raise ValueError("untrusted remote MCP requires streamable HTTPS")
+            if server.headers or server.headers_helper or server.env or server.oauth:
+                raise ValueError("untrusted remote MCP must not receive credentials or host environment")
+            public_addresses = _validate_public_remote(server.url)
         headers = {key: _expand_env(value) for key, value in server.headers.items()}
         if server.headers_helper:
             headers.update(_run_headers_helper(server))
@@ -160,31 +166,47 @@ class MCPClientManager:
             from mcp.client.stdio import stdio_client
 
             params = StdioServerParameters(
-                command=_expand_env(server.command),
-                args=[_expand_env(item) for item in server.args],
+                command=server.command,
+                args=list(server.args),
                 # Never expose the full Polaris environment to an MCP child.  A small
                 # runtime baseline keeps executable lookup/platform startup working;
                 # everything else must be explicitly configured for this server.
                 env=_minimal_stdio_env(server),
-                cwd=_expand_env(server.cwd) or None,
+                cwd=server.cwd or None,
             )
             streams = await stack.enter_async_context(stdio_client(params))
         elif transport in ("streamable-http", "streamable_http", "http"):
-            from mcp.client.streamable_http import streamablehttp_client
+            import httpx2
+            from mcp.client.streamable_http import streamable_http_client
 
+            timeout = httpx2.Timeout(server.timeout, read=max(server.timeout, 300.0))
+            if public_addresses:
+                client = _public_http_client(
+                    server.url,
+                    public_addresses,
+                    timeout=timeout,
+                )
+            else:
+                client = httpx2.AsyncClient(
+                    headers=headers or None,
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                )
+            http_client = await stack.enter_async_context(client)
             streams = await stack.enter_async_context(
-                streamablehttp_client(_expand_env(server.url), headers=headers or None)
+                streamable_http_client(server.url, http_client=http_client)
             )
         elif transport == "sse":
             from mcp.client.sse import sse_client
 
             streams = await stack.enter_async_context(
-                sse_client(_expand_env(server.url), headers=headers or None)
+                sse_client(server.url, headers=headers or None)
             )
         elif transport in {"ws", "wss", "websocket"}:
             from mcp.client.websocket import websocket_client
 
-            streams = await stack.enter_async_context(websocket_client(_expand_env(server.url)))
+            streams = await stack.enter_async_context(websocket_client(server.url))
         else:
             raise ValueError(f"Unknown MCP transport '{server.transport}' for server '{server.name}'")
         # streamable-http yields (read, write, get_session_id); stdio yields (read, write).
@@ -231,7 +253,12 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(
             session.call_tool(tool, arguments or {}), self._loop
         )
-        return future.result(timeout if timeout is not None else server_config.timeout if (server_config := next((item for item in self._config.servers if item.name == server), None)) is not None else self._call_timeout)
+        bounded = timeout if timeout is not None else server_config.timeout if (server_config := next((item for item in self._config.servers if item.name == server), None)) is not None else self._call_timeout
+        try:
+            return future.result(bounded)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"MCP tool call timed out after {bounded:.3f}s") from None
 
     def list_resources(self, server: str | None = None, timeout: float | None = None) -> list[dict[str, Any]]:
         if self._loop is None or self._closed:
@@ -254,7 +281,12 @@ class MCPClientManager:
             return records
 
         future = asyncio.run_coroutine_threadsafe(collect(), self._loop)
-        return future.result(timeout if timeout is not None else self._call_timeout)
+        bounded = timeout if timeout is not None else self._call_timeout
+        try:
+            return future.result(bounded)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"MCP resource listing timed out after {bounded:.3f}s") from None
 
     def read_resource(self, server: str, uri: str, timeout: float | None = None) -> Any:
         if self._loop is None or self._closed:
@@ -263,7 +295,12 @@ class MCPClientManager:
         if session is None:
             raise KeyError(f"Unknown MCP server: {server}")
         future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
-        return future.result(timeout if timeout is not None else self._call_timeout)
+        bounded = timeout if timeout is not None else self._call_timeout
+        try:
+            return future.result(bounded)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"MCP resource read timed out after {bounded:.3f}s") from None
 
 
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -283,13 +320,13 @@ def _minimal_stdio_env(server: MCPServerConfig) -> dict[str, str]:
     return result
 
 
-def _validate_public_remote(url: str) -> None:
+def _validate_public_remote(url: str) -> tuple[str, ...]:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("discovered remote MCP URL must be credential-free HTTPS")
     try:
         addresses = {
-            item[4][0]
+            str(item[4][0])
             for item in socket.getaddrinfo(
                 parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM
             )
@@ -301,6 +338,71 @@ def _validate_public_remote(url: str) -> None:
     for raw in addresses:
         if not ipaddress.ip_address(raw).is_global:
             raise ValueError(f"remote MCP host resolves to a non-public address: {raw}")
+    return tuple(sorted(addresses))
+
+
+def _public_http_client(
+    url: str,
+    addresses: tuple[str, ...],
+    *,
+    timeout: Any,
+) -> Any:
+    """Build a proxy-free, redirect-free client pinned to prevalidated DNS answers."""
+
+    import httpcore2
+    import httpx2
+    from httpcore2._backends.auto import AutoBackend
+
+    expected_host = (urlsplit(url).hostname or "").casefold()
+
+    class _PinnedBackend(httpcore2.AsyncNetworkBackend):
+        def __init__(self) -> None:
+            self._delegate = AutoBackend()
+
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            local_address: str | None = None,
+            socket_options: Any = None,
+        ) -> Any:
+            if host.casefold().rstrip(".") != expected_host.rstrip("."):
+                raise OSError("remote MCP attempted to connect to an unpinned host")
+            last_error: BaseException | None = None
+            for address in addresses:
+                try:
+                    return await self._delegate.connect_tcp(
+                        address,
+                        port,
+                        timeout=timeout,
+                        local_address=local_address,
+                        socket_options=socket_options,
+                    )
+                except Exception as exc:  # try every address from the validated set
+                    last_error = exc
+            assert last_error is not None
+            raise last_error
+
+        async def connect_unix_socket(
+            self, path: str, timeout: float | None = None, socket_options: Any = None
+        ) -> Any:
+            raise OSError("remote MCP cannot use Unix sockets")
+
+        async def sleep(self, seconds: float) -> None:
+            await self._delegate.sleep(seconds)
+
+    transport = httpx2.AsyncHTTPTransport(trust_env=False, retries=0)
+    # httpx2 does not yet expose resolver injection, while httpcore2 does. Replacing
+    # the freshly-created pool's backend keeps TLS SNI/certificate validation bound to
+    # the original hostname while the TCP connection uses only the approved addresses.
+    transport._pool._network_backend = _PinnedBackend()
+    return httpx2.AsyncClient(
+        transport=transport,
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    )
 
 
 def _expand_env(value: str) -> str:

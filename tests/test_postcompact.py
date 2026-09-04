@@ -61,9 +61,10 @@ def test_build_read_attachments_framing_and_metadata(tmp_path: Path) -> None:
     agent.session.record_read(str((tmp_path / "a.txt").resolve()), "AAA")
     [msg] = agent._build_read_attachments()
     assert msg.role == "user"
-    assert msg.metadata == {"post_compact_attachment": True}
+    assert msg.metadata["post_compact_attachment"] is True
+    assert msg.metadata["prompt_ingress"]["source"] == "compression_input"
     assert "post_compact_attachment" in msg.metadata
-    assert "<system-reminder>" in msg.content and "</system-reminder>" in msg.content
+    assert '<untrusted-data source="compression_input">' in msg.content
     assert "re-attached after the conversation was compacted" in msg.content
     assert "## a.txt" in msg.content  # workspace-relative heading
     assert "AAA" in msg.content

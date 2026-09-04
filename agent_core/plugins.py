@@ -2140,13 +2140,14 @@ class PluginManager:
                         allowed_hook_ids=allowed,
                         workspace=agent.session.workspace,
                         plugin_data=plugin_data,
-                        user_config=configured,
+                        user_config=public_config,
+                        runtime_config=configured,
                     )
                 )
             if "mcp" in components:
                 plugin_mcp = _load_plugin_mcp(
                     root, namespace, manifest, agent.session.workspace,
-                    plugin_data, configured,
+                    plugin_data, public_config, configured,
                 )
                 if plugin_id in selected_components:
                     plugin_mcp = _restrict_autonomous_mcp(agent, root, plugin_mcp)
@@ -2158,11 +2159,13 @@ class PluginManager:
                         TrustTier.LOCAL_USER_DECLARED.value,
                     }:
                         server.risk = "dangerous"
+                        if (server.transport or "stdio").casefold() != "stdio":
+                            server.network_policy = "public-only"
                 mcp_servers.extend(plugin_mcp)
 
             metadata = _load_non_mcp_components(
                 root, namespace, manifest, components, agent.session.workspace,
-                plugin_data, configured,
+                plugin_data, public_config, configured,
             )
             if plugin_id in selected_components and metadata["lsp"]:
                 if not agent.sandbox.is_enabled():
@@ -2730,6 +2733,7 @@ def _load_plugin_hooks(
     workspace: Path,
     plugin_data: Path,
     user_config: dict[str, Any],
+    runtime_config: dict[str, Any] | None = None,
     allowed_hook_ids: tuple[str, ...] | None = None,
 ) -> list[tuple[str, Any]]:
     result: list[tuple[str, Any]] = []
@@ -2779,8 +2783,11 @@ def _load_plugin_hooks(
                         values, root, workspace, plugin_data, user_config
                     )
                     values["env"] = {
-                        **dict(values.get("env") or {}),
-                        **_plugin_option_env(user_config),
+                        **{
+                            str(key): _expand_executable_env(str(value))
+                            for key, value in dict(values.get("env") or {}).items()
+                        },
+                        **_plugin_option_env(runtime_config or user_config),
                     }
                     try:
                         spec = ExternalHookSpec(
@@ -2859,6 +2866,7 @@ def _restrict_autonomous_hook(
 def _load_plugin_mcp(
     root: Path, namespace: str, manifest: dict[str, Any], workspace: Path,
     plugin_data: Path, user_config: dict[str, Any],
+    runtime_config: dict[str, Any] | None = None,
 ) -> list[MCPServerConfig]:
     result: list[MCPServerConfig] = []
     raw_mcp = manifest.get("mcpServers")
@@ -2888,8 +2896,11 @@ def _load_plugin_mcp(
             body, root, workspace, plugin_data, user_config
         )
         expanded["env"] = {
-            **dict(expanded.get("env") or {}),
-            **_plugin_option_env(user_config),
+            **{
+                str(key): _expand_executable_env(str(value))
+                for key, value in dict(expanded.get("env") or {}).items()
+            },
+            **_plugin_option_env(runtime_config or user_config),
         }
         result.append(
             MCPServerConfig.from_dict(f"{namespace}:{name}", expanded)
@@ -2940,6 +2951,7 @@ def _load_non_mcp_components(
     workspace: Path,
     plugin_data: Path,
     user_config: dict[str, Any],
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from agent_core.tool_config import LSPServerConfig
 
@@ -2957,8 +2969,11 @@ def _load_non_mcp_components(
                     value, root, workspace, plugin_data, user_config
                 )
                 expanded["env"] = {
-                    **dict(expanded.get("env") or {}),
-                    **_plugin_option_env(user_config),
+                    **{
+                        str(key): _expand_executable_env(str(value))
+                        for key, value in dict(expanded.get("env") or {}).items()
+                    },
+                    **_plugin_option_env(runtime_config or user_config),
                 }
                 expanded["name"] = f"{namespace}:{name}"
                 expanded["plugin_root"] = str(root)
@@ -3012,7 +3027,8 @@ def _load_non_mcp_components(
             mcp_names = {
                 item.name.split(":", 1)[-1]
                 for item in _load_plugin_mcp(
-                    root, namespace, manifest, workspace, plugin_data, user_config
+                    root, namespace, manifest, workspace, plugin_data, user_config,
+                    runtime_config,
                 )
             }
         for item in manifest["channels"]:
@@ -3213,6 +3229,16 @@ def _plugin_option_env(values: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _expand_executable_env(value: str) -> str:
+    """Resolve host variables only for an explicit executable environment value."""
+
+    return re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+        lambda match: os.getenv(match.group(1), match.group(2) or ""),
+        value,
+    )
+
+
 def _expand_plugin_vars(
     value: Any,
     root: Path,
@@ -3236,11 +3262,11 @@ def _expand_plugin_vars(
                 lambda match: str(user_config.get(match.group(1), "")),
                 result,
             )
-        return re.sub(
-            r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-            lambda match: os.getenv(match.group(1), match.group(2) or ""),
-            result,
-        )
+        # Arbitrary host environment variables are deliberately left literal here.
+        # Prompt-bearing plugin content only receives framework paths and public
+        # ``user_config``. Executable components resolve environment references solely
+        # in their explicit ``env``/``headers`` maps at the process/transport boundary.
+        return result
     if isinstance(value, list):
         return [
             _expand_plugin_vars(

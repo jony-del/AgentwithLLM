@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import floor
 
 from agent_core import tokens
@@ -174,6 +174,8 @@ def is_preserved(message: Message) -> bool:
     Prior summary blocks (carrying a ``_COLLAPSE_MARKERS`` marker) are NOT preserved —
     they are re-foldable conversation even when carried as a USER message.
     """
+    if message.metadata.get("deadline_wrapup") or message.metadata.get("ephemeral_control"):
+        return False
     if message.metadata.get("pinned"):
         return True
     return message.role == "system" and message.metadata.get("compressed") not in _COLLAPSE_MARKERS
@@ -264,8 +266,15 @@ def truncate_head_for_ptl_retry(
     never produce an assistant-first slice or an orphaned tool_result. That is why we
     don't need the reference's synthetic-marker re-prepend dance.
     """
+    ephemeral = [
+        m for m in messages
+        if m.metadata.get("deadline_wrapup") or m.metadata.get("ephemeral_control")
+    ]
+    ephemeral_ids = {id(message) for message in ephemeral}
     preserved = [m for m in messages if is_preserved(m)]
-    conversation = [m for m in messages if not is_preserved(m)]
+    conversation = [
+        m for m in messages if not is_preserved(m) and id(m) not in ephemeral_ids
+    ]
     rounds = group_into_rounds(conversation)
     if len(rounds) < 2:
         return None
@@ -286,7 +295,7 @@ def truncate_head_for_ptl_retry(
     if drop < 1:
         return None
     kept_conversation = [m for group in rounds[drop:] for m in group]
-    return _ensure_user_first([*preserved, *kept_conversation])
+    return _ensure_user_first([*preserved, *kept_conversation, *ephemeral])
 
 
 def _metadata_for_compressed(message: Message, marker: str) -> dict[str, object]:
@@ -294,6 +303,18 @@ def _metadata_for_compressed(message: Message, marker: str) -> dict[str, object]
     metadata = {**message.metadata, "compressed": marker}
     metadata.pop("provider_state", None)
     return metadata
+
+
+def _evolve_message(message: Message, content: str, marker: str) -> Message:
+    """Create a new content version without changing the logical message identity."""
+
+    return replace(
+        message,
+        content=content,
+        metadata=_metadata_for_compressed(message, marker),
+        origin_id=message.origin_id or message.uuid,
+        version=message.version + 1,
+    )
 
 
 def shrink_oversize_messages(
@@ -336,9 +357,7 @@ def shrink_oversize_messages(
         omitted = len(message.content) - 2 * min_keep_chars
         content = f"{head}\n[truncated {omitted} chars]\n{tail}"
         saved_chars = len(message.content) - len(content)
-        result[i] = Message(
-            message.role, content, message.name, _metadata_for_compressed(message, "ptl_shrink")
-        )
+        result[i] = _evolve_message(message, content, "ptl_shrink")
         changed = True
         dropped += max(0, saved_chars) // tokens.ROUGH_BYTES_PER_TOKEN
         if dropped >= tokens_to_drop:
@@ -569,7 +588,7 @@ class CompressionPipeline:
             if message.role == "tool" and len(message.content) > limit:
                 half = max(100, limit // 2)
                 content = f"{message.content[:half]}\n[snip]\n{message.content[-half:]}"
-                snipped.append(Message(message.role, content, message.name, _metadata_for_compressed(message, "snip")))
+                snipped.append(_evolve_message(message, content, "snip"))
                 count += 1
             else:
                 snipped.append(message)
@@ -592,7 +611,7 @@ class CompressionPipeline:
                 continue
             if len(message.content) > limit:
                 content = f"{message.content[:limit]} [microcompact: omitted {len(message.content) - limit} chars]"
-                compacted.append(Message(message.role, content, message.name, _metadata_for_compressed(message, "microcompact")))
+                compacted.append(_evolve_message(message, content, "microcompact"))
                 count += 1
             else:
                 compacted.append(message)
@@ -617,12 +636,15 @@ class CompressionPipeline:
         # USER system-reminder). Everything else — incl. a prior summary block now
         # carrying a USER role — is foldable conversation, so repeated compactions
         # re-summarize rather than stacking stale summaries.
+        ephemeral = [
+            m for m in messages
+            if m.metadata.get("deadline_wrapup") or m.metadata.get("ephemeral_control")
+        ]
+        ephemeral_ids = {id(message) for message in ephemeral}
         preserved = [m for m in messages if self._is_preserved(m)]
-        conversation_messages = [m for m in messages if not self._is_preserved(m)]
-        # All preserved messages sit at the front by construction (base system, recall,
-        # userContext are injected before any conversation), so reassembly stays
-        # [*preserved, summary, *recent] with original ordering intact.
-        assert messages[: len(preserved)] == preserved, "preserved messages must form a prefix"
+        conversation_messages = [
+            m for m in messages if not self._is_preserved(m) and id(m) not in ephemeral_ids
+        ]
         if len(conversation_messages) <= keep + 1:
             return messages, CompressionEvent("context_collapse", before, before)
         # Snap the prefix/recent split to a round boundary so a tool_call is never
@@ -640,6 +662,7 @@ class CompressionPipeline:
         collapsed = [
             *preserved,
             *build_post_compact_messages(summary_message, recent, attachments=attachments),
+            *ephemeral,
         ]
         detail = f"collapsed {len(prefix)} msgs ({note})"
         return collapsed, CompressionEvent("context_collapse", before, self._char_count(collapsed), detail)

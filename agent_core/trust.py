@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +36,194 @@ logger = logging.getLogger(__name__)
 
 # Default user-level trust store. Overridable via AGENT_TRUST_STORE (tests, odd homes).
 DEFAULT_TRUST_STORE = "~/.polaris/trusted.json"
+
+
+class TrustClassification(str, Enum):
+    """How a repository-controlled setting affects host authority."""
+
+    TIGHTENING = "tightening"
+    NEUTRAL = "neutral"
+    TRUSTED_ONLY = "trusted_only"
+
+
+_MISSING = object()
+
+
+@dataclass(frozen=True, slots=True)
+class TrustRule:
+    """One declarative entry in the repository-config trust matrix.
+
+    ``capture_path`` allows a group such as ``capabilities`` to be fingerprinted and
+    removed as one unit.  Extraction and filtering intentionally consume this same
+    table, preventing their security decisions from drifting apart.
+    """
+
+    path: tuple[str, ...]
+    label: str
+    when: Callable[[Any], bool]
+    capture_path: tuple[str, ...] | None = None
+    classification: TrustClassification = TrustClassification.TRUSTED_ONLY
+
+
+def _present(value: Any) -> bool:
+    return value is not _MISSING and value not in (None, "", [], {}, ())
+
+
+def _truthy(value: Any) -> bool:
+    if value is _MISSING:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _is_false(value: Any) -> bool:
+    return value is not _MISSING and not _truthy(value)
+
+
+def _not_wsl2(value: Any) -> bool:
+    return value is not _MISSING and str(value).casefold() != "wsl2"
+
+
+def _privileged_permission(value: Any) -> bool:
+    return str(value).strip().casefold() in {"acceptedits", "auto", "bypass", "bypasspermissions"}
+
+
+# Values omitted here either do not affect authority or are explicitly tightening.
+# Unknown keys inside the protected tables are handled fail-closed below.
+TRUST_MATRIX: tuple[TrustRule, ...] = (
+    TrustRule(("model",), "model", _present),
+    TrustRule(("provider",), "provider", _present),
+    TrustRule(("permission",), "permission", _privileged_permission),
+    TrustRule(("permissions", "allow"), "permissions.allow", _present),
+    TrustRule(("hooks", "external"), "hooks.external", _present),
+    TrustRule(("hooks", "enabled"), "hooks.enabled", _is_false),
+    TrustRule(("hooks", "prompt_validation", "enabled"), "hooks.prompt_validation.enabled", _is_false),
+    TrustRule(
+        ("hooks", "prompt_validation", "reject_control_chars"),
+        "hooks.prompt_validation.reject_control_chars",
+        _is_false,
+    ),
+    TrustRule(
+        ("hooks", "prompt_validation", "neutralize_framing"),
+        "hooks.prompt_validation.neutralize_framing",
+        _is_false,
+    ),
+    TrustRule(("sandbox", "excluded_commands"), "sandbox.excluded_commands", _present),
+    TrustRule(
+        ("sandbox", "auto_allow_command_if_sandboxed"),
+        "sandbox.auto_allow_command_if_sandboxed",
+        _truthy,
+    ),
+    TrustRule(
+        ("sandbox", "allow_unattended_unsandboxed"),
+        "sandbox.allow_unattended_unsandboxed",
+        _truthy,
+    ),
+    TrustRule(
+        ("sandbox", "allow_unsandboxed_commands"),
+        "sandbox.allow_unsandboxed_commands",
+        _truthy,
+    ),
+    TrustRule(("sandbox", "fail_if_unavailable"), "sandbox.fail_if_unavailable", _is_false),
+    TrustRule(
+        ("sandbox", "network", "allowed_domains"),
+        "sandbox.network.allowed_domains",
+        _present,
+    ),
+    TrustRule(
+        ("sandbox", "network", "allow_local_binding"),
+        "sandbox.network.allow_local_binding",
+        _truthy,
+    ),
+    TrustRule(("sandbox", "filesystem", "allow_read"), "sandbox.filesystem.allow_read", _present),
+    TrustRule(("sandbox", "filesystem", "allow_write"), "sandbox.filesystem.allow_write", _present),
+    TrustRule(("sandbox", "container", "runtime"), "sandbox.container.runtime", _present),
+    TrustRule(("sandbox", "container", "image"), "sandbox.container.image", _present),
+    TrustRule(("sandbox", "container", "oci_runtime"), "sandbox.container.oci_runtime", _present),
+    TrustRule(("sandbox", "container", "auto_pull"), "sandbox.container.auto_pull", _truthy),
+    TrustRule(
+        ("sandbox", "container", "read_only_rootfs"),
+        "sandbox.container.read_only_rootfs",
+        _is_false,
+    ),
+    TrustRule(
+        ("sandbox", "container", "drop_all_capabilities"),
+        "sandbox.container.drop_all_capabilities",
+        _is_false,
+    ),
+    TrustRule(
+        ("sandbox", "container", "no_new_privileges"),
+        "sandbox.container.no_new_privileges",
+        _is_false,
+    ),
+    TrustRule(
+        ("sandbox", "container", "windows_isolation"),
+        "sandbox.container.windows_isolation",
+        _not_wsl2,
+    ),
+    TrustRule(("sandbox", "vm", "provider"), "sandbox.vm.provider", _present),
+    TrustRule(("sandbox", "vm", "base_image"), "sandbox.vm.base_image", _present),
+    TrustRule(("sandbox", "vm", "vm_name"), "sandbox.vm.vm_name", _present),
+    TrustRule(("sandbox", "vm", "snapshot_name"), "sandbox.vm.snapshot_name", _present),
+    TrustRule(("sandbox", "vm", "guest_host"), "sandbox.vm.guest_host", _present),
+    TrustRule(("sandbox", "vm", "reset_each_task"), "sandbox.vm.reset_each_task", _is_false),
+    TrustRule(("mcp", "servers"), "mcp.servers", _present),
+    TrustRule(
+        ("capabilities",),
+        "capabilities",
+        _present,
+        capture_path=("capabilities",),
+    ),
+    TrustRule(("tools", "execution_policies"), "tools.execution_policies", _present),
+    TrustRule(("tools", "policies"), "tools.execution_policies", _present),
+    TrustRule(("tools", "shell", "bash", "executable"), "tools.shell.bash.executable", _present),
+    TrustRule(
+        ("tools", "shell", "powershell", "executable"),
+        "tools.shell.powershell.executable",
+        _present,
+    ),
+    TrustRule(("tools", "lsp", "servers"), "tools.lsp.servers", _present),
+    TrustRule(("tools", "lsp", "autodetect"), "tools.lsp.autodetect", _truthy),
+    TrustRule(("tools", "scheduler", "database"), "tools.scheduler.database", _present),
+    TrustRule(("tools", "worktree", "root"), "tools.worktree.root", _present),
+    TrustRule(("skills", "user_dir"), "skills.user_dir", _present),
+    TrustRule(("skills", "skills_dirs"), "skills.skills_dirs", _present),
+    TrustRule(("plugins",), "plugins", _present, capture_path=("plugins",)),
+    TrustRule(("web", "allowed_domains"), "web.allowed_domains", _present),
+)
+
+
+_PROTECTED_KEYS: dict[tuple[str, ...], frozenset[str]] = {
+    ("permissions",): frozenset({"allow", "ask", "deny"}),
+    ("hooks",): frozenset({"enabled", "external", "builtin", "prompt_validation"}),
+    ("hooks", "prompt_validation"): frozenset(
+        {"enabled", "max_chars", "reject_control_chars", "neutralize_framing"}
+    ),
+    ("sandbox",): frozenset(
+        {
+            "enabled", "backend", "fail_if_unavailable",
+            "auto_allow_command_if_sandboxed", "allow_unsandboxed_commands",
+            "allow_unattended_unsandboxed", "excluded_commands", "network",
+            "filesystem", "container", "vm",
+        }
+    ),
+    ("sandbox", "network"): frozenset({"allowed_domains", "allow_local_binding"}),
+    ("sandbox", "filesystem"): frozenset({"allow_write", "deny_write", "deny_read", "allow_read"}),
+    ("sandbox", "container"): frozenset(
+        {
+            "runtime", "image", "auto_pull", "oci_runtime", "read_only_rootfs",
+            "drop_all_capabilities", "no_new_privileges", "memory", "cpus",
+            "pids_limit", "windows_isolation",
+        }
+    ),
+    ("sandbox", "vm"): frozenset(
+        {"provider", "base_image", "vm_name", "snapshot_name", "guest_host", "reset_each_task"}
+    ),
+    ("mcp",): frozenset({"servers"}),
+    ("tools",): frozenset({"execution_policies", "policies", "shell", "lsp", "notebook", "worktree", "scheduler"}),
+    ("web",): frozenset({"allowed_domains", "blocked_domains"}),
+}
 
 
 def trust_store_path() -> Path:
@@ -50,86 +240,13 @@ def widening_subset(raw: dict[str, Any]) -> dict[str, Any]:
     these re-triggers TOFU.
     """
     subset: dict[str, Any] = {}
-
-    permissions = raw.get("permissions")
-    if isinstance(permissions, dict) and permissions.get("allow"):
-        subset["permissions.allow"] = permissions["allow"]
-
-    hooks = raw.get("hooks")
-    if isinstance(hooks, dict) and hooks.get("external"):
-        subset["hooks.external"] = hooks["external"]
-
-    sandbox = raw.get("sandbox")
-    if isinstance(sandbox, dict):
-        if sandbox.get("excluded_commands"):
-            subset["sandbox.excluded_commands"] = sandbox["excluded_commands"]
-        for flag in (
-            "auto_allow_command_if_sandboxed",
-            "allow_unattended_unsandboxed",
-            "allow_unsandboxed_commands",
-        ):
-            if _truthy(sandbox.get(flag)):
-                subset[f"sandbox.{flag}"] = True
-        if "fail_if_unavailable" in sandbox and not _truthy(sandbox.get("fail_if_unavailable")):
-            subset["sandbox.fail_if_unavailable"] = False
-        network = sandbox.get("network")
-        if isinstance(network, dict):
-            if network.get("allowed_domains"):
-                subset["sandbox.network.allowed_domains"] = network["allowed_domains"]
-            if _truthy(network.get("allow_local_binding")):
-                subset["sandbox.network.allow_local_binding"] = True
-        filesystem = sandbox.get("filesystem")
-        if isinstance(filesystem, dict):
-            for key in ("allow_read", "allow_write"):
-                if filesystem.get(key):
-                    subset[f"sandbox.filesystem.{key}"] = filesystem[key]
-        container = sandbox.get("container")
-        if isinstance(container, dict):
-            for key in ("image", "oci_runtime"):
-                if container.get(key):
-                    subset[f"sandbox.container.{key}"] = container[key]
-            for key in ("read_only_rootfs", "drop_all_capabilities", "no_new_privileges"):
-                if key in container and not _truthy(container.get(key)):
-                    subset[f"sandbox.container.{key}"] = False
-            if str(container.get("windows_isolation", "wsl2")).casefold() != "wsl2":
-                subset["sandbox.container.windows_isolation"] = container["windows_isolation"]
-        vm = sandbox.get("vm")
-        if isinstance(vm, dict) and vm.get("base_image"):
-            subset["sandbox.vm.base_image"] = vm["base_image"]
-
-    mcp = raw.get("mcp")
-    if isinstance(mcp, dict) and mcp.get("servers"):
-        subset["mcp.servers"] = mcp["servers"]
-
-    capabilities = raw.get("capabilities")
-    if isinstance(capabilities, dict) and (
-        capabilities.get("mode") == "autonomous-trusted"
-        or capabilities.get("trusted_marketplaces")
-        or capabilities.get("allowed_hooks")
-    ):
-        subset["capabilities"] = capabilities
-
-    tools = raw.get("tools")
-    if isinstance(tools, dict):
-        policies = tools.get("execution_policies", tools.get("policies"))
-        if policies:
-            subset["tools.execution_policies"] = policies
-        shell = tools.get("shell")
-        if isinstance(shell, dict):
-            for dialect in ("bash", "powershell"):
-                table = shell.get(dialect)
-                if isinstance(table, dict) and table.get("executable"):
-                    subset[f"tools.shell.{dialect}.executable"] = table["executable"]
-        lsp = tools.get("lsp")
-        if isinstance(lsp, dict) and lsp.get("servers"):
-            subset["tools.lsp.servers"] = lsp["servers"]
-
-    # [web].allowed_domains widens egress in unattended modes (D10). blocked_domains
-    # only tightens and passes through freely.
-    web = raw.get("web")
-    if isinstance(web, dict) and web.get("allowed_domains"):
-        subset["web.allowed_domains"] = web["allowed_domains"]
-
+    for rule in TRUST_MATRIX:
+        value = _get_path(raw, rule.path)
+        if rule.classification is TrustClassification.TRUSTED_ONLY and rule.when(value):
+            capture = rule.capture_path or rule.path
+            subset[rule.label] = copy.deepcopy(_get_path(raw, capture))
+    for path, value in _unknown_protected_entries(raw):
+        subset[".".join(path)] = copy.deepcopy(value)
     return subset
 
 
@@ -140,64 +257,47 @@ def strip_widening(raw: dict[str, Any]) -> dict[str, Any]:
     survives untouched.
     """
     out = copy.deepcopy(raw)
-    permissions = out.get("permissions")
-    if isinstance(permissions, dict):
-        permissions.pop("allow", None)
-    hooks = out.get("hooks")
-    if isinstance(hooks, dict):
-        hooks.pop("external", None)
-    sandbox = out.get("sandbox")
-    if isinstance(sandbox, dict):
-        sandbox.pop("excluded_commands", None)
-        sandbox.pop("auto_allow_command_if_sandboxed", None)
-        sandbox.pop("allow_unattended_unsandboxed", None)
-        sandbox.pop("allow_unsandboxed_commands", None)
-        sandbox.pop("fail_if_unavailable", None)
-        network = sandbox.get("network")
-        if isinstance(network, dict):
-            network.pop("allowed_domains", None)
-            network.pop("allow_local_binding", None)
-        filesystem = sandbox.get("filesystem")
-        if isinstance(filesystem, dict):
-            filesystem.pop("allow_read", None)
-            filesystem.pop("allow_write", None)
-        container = sandbox.get("container")
-        if isinstance(container, dict):
-            for key in (
-                "image", "oci_runtime", "read_only_rootfs", "drop_all_capabilities",
-                "no_new_privileges", "windows_isolation",
-            ):
-                container.pop(key, None)
-        vm = sandbox.get("vm")
-        if isinstance(vm, dict):
-            vm.pop("base_image", None)
-    mcp = out.get("mcp")
-    if isinstance(mcp, dict):
-        mcp.pop("servers", None)
-    capabilities = out.get("capabilities")
-    if isinstance(capabilities, dict) and (
-        capabilities.get("mode") == "autonomous-trusted"
-        or capabilities.get("trusted_marketplaces")
-        or capabilities.get("allowed_hooks")
-    ):
-        out.pop("capabilities", None)
-    tools = out.get("tools")
-    if isinstance(tools, dict):
-        tools.pop("execution_policies", None)
-        tools.pop("policies", None)
-        shell = tools.get("shell")
-        if isinstance(shell, dict):
-            for dialect in ("bash", "powershell"):
-                table = shell.get(dialect)
-                if isinstance(table, dict):
-                    table.pop("executable", None)
-        lsp = tools.get("lsp")
-        if isinstance(lsp, dict):
-            lsp.pop("servers", None)
-    web = out.get("web")
-    if isinstance(web, dict):
-        web.pop("allowed_domains", None)
+    removals: set[tuple[str, ...]] = set()
+    for rule in TRUST_MATRIX:
+        if rule.classification is TrustClassification.TRUSTED_ONLY and rule.when(
+            _get_path(raw, rule.path)
+        ):
+            removals.add(rule.capture_path or rule.path)
+    removals.update(path for path, _value in _unknown_protected_entries(raw))
+    for path in sorted(removals, key=len, reverse=True):
+        _delete_path(out, path)
     return out
+
+
+def _get_path(raw: dict[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = raw
+    for part in path:
+        if not isinstance(current, dict) or part not in current:
+            return _MISSING
+        current = current[part]
+    return current
+
+
+def _delete_path(raw: dict[str, Any], path: tuple[str, ...]) -> None:
+    if not path:
+        return
+    parent = _get_path(raw, path[:-1])
+    if isinstance(parent, dict):
+        parent.pop(path[-1], None)
+
+
+def _unknown_protected_entries(raw: dict[str, Any]) -> list[tuple[tuple[str, ...], Any]]:
+    """Return unknown privilege-table keys so new syntax fails closed by default."""
+
+    unknown: list[tuple[tuple[str, ...], Any]] = []
+    for parent_path, known in _PROTECTED_KEYS.items():
+        parent = _get_path(raw, parent_path)
+        if not isinstance(parent, dict):
+            continue
+        for key, value in parent.items():
+            if key not in known:
+                unknown.append((parent_path + (str(key),), value))
+    return unknown
 
 
 def fingerprint(subset: dict[str, Any]) -> str:
@@ -248,12 +348,6 @@ class TrustStore:
             return {}
 
 
-def _truthy(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
 def _default_prompter(message: str) -> bool:
     """Interactive TOFU prompt; only usable on a real terminal."""
     try:
@@ -271,7 +365,9 @@ def _render_prompt(project: Path, subset: dict[str, Any], changed: bool) -> str:
         "/ MCP servers / web egress allowlist). Repo config can tighten policy freely, but widening needs your "
         "approval (recorded per project; you will be re-asked if it changes):"
     )
-    body = json.dumps(subset, indent=2, ensure_ascii=False, default=str)
+    # Values can contain credentials (for example MCP headers).  The decision UI and
+    # audit trail name affected settings without copying secrets into terminal logs.
+    body = "\n".join(f"  - {key}" for key in sorted(subset))
     return f"{head}\n{body}"
 
 

@@ -15,6 +15,7 @@ from agent_core.providers.base import (
     StreamHandler,
     notify_streamed_tool_call,
 )
+from agent_core.execution import ExecutionScope
 
 
 class FakeProvider(LLMProvider):
@@ -36,6 +37,7 @@ class FakeProvider(LLMProvider):
         config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> LLMResult:
         self.calls += 1
         if self.fail_once_context and self.calls == 1:
@@ -62,9 +64,12 @@ class FakeProvider(LLMProvider):
                         ),
                     )
                     if self.stream_delay:
-                        await asyncio.sleep(self.stream_delay)
+                        if scope is None:
+                            await asyncio.sleep(self.stream_delay)
+                        else:
+                            await scope.sleep(self.stream_delay)
             elif result.content:
-                await self._stream_text(result.content, stream, should_cancel)
+                await self._stream_text(result.content, stream, should_cancel, scope)
         result.termination_event = "fake.complete"
         return result
 
@@ -98,6 +103,7 @@ class FakeProvider(LLMProvider):
         text: str,
         stream: StreamHandler,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> None:
         chunks = text.split(" ")
         for index, chunk in enumerate(chunks):
@@ -105,7 +111,10 @@ class FakeProvider(LLMProvider):
                 raise asyncio.CancelledError("fake stream cancelled by user")
             stream.on_text_delta(chunk if index == 0 else " " + chunk)
             if self.stream_delay:
-                await asyncio.sleep(self.stream_delay)
+                if scope is None:
+                    await asyncio.sleep(self.stream_delay)
+                else:
+                    await scope.sleep(self.stream_delay)
 
     @staticmethod
     def _maybe_memory_response(messages: list[Message]) -> str | None:

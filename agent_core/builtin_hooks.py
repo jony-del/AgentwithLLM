@@ -19,6 +19,12 @@ import re
 from typing import TYPE_CHECKING
 
 from agent_core.hooks import HookContext, HookOutcome, PromptValidationConfig
+from agent_core.prompt_ingress import (
+    UNTRUSTED_PREAMBLE,
+    find_disallowed_control_chars,
+    neutralize_user_prompt,
+    reserved_tags_in,
+)
 
 if TYPE_CHECKING:
     from agent_core.session import SessionContext
@@ -216,7 +222,7 @@ class PromptValidationHook:
                     ),
                 )
             if self.config.reject_control_chars:
-                bad = _find_disallowed_control_chars(prompt)
+                bad = find_disallowed_control_chars(prompt)
                 if bad:
                     return HookOutcome(
                         block=True,
@@ -226,11 +232,11 @@ class PromptValidationHook:
                         ),
                     )
             if self.config.neutralize_framing:
-                tags = _reserved_tags_in(prompt)
+                tags = reserved_tags_in(prompt)
                 if tags:
                     return HookOutcome(
-                        transformed_prompt=_neutralize(prompt),
-                        additional_context=_UNTRUSTED_PREAMBLE,
+                        transformed_prompt=neutralize_user_prompt(prompt),
+                        additional_context=UNTRUSTED_PREAMBLE,
                         reason="User prompt contained framework control framing; handled as data.",
                         metadata={"neutralized": True, "tags": tags},
                     )

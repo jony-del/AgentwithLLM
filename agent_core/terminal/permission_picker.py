@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 from agent_core.permissions import PermissionMode, permission_mode_label
 
@@ -106,7 +107,7 @@ async def run_permission_picker(
         event.app.exit(result=None)
 
     app: Application = Application(
-        layout=Layout(HSplit([Window(FormattedTextControl(fragments), wrap_lines=True)])),
+        layout=Layout(HSplit([Window(FormattedTextControl(cast(Any, fragments)), wrap_lines=True)])),
         key_bindings=kb,
         mouse_support=False,
         full_screen=False,

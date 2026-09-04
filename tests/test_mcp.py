@@ -1,6 +1,7 @@
 import sys
 import threading
 import time
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -289,12 +290,44 @@ def test_remote_mcp_is_rejected_when_container_sandbox_is_enabled(
         _start_mcp(ToolRegistry(), str(config_path), sandbox=sandbox, workspace=tmp_path)
 
 
+def test_public_remote_rejects_any_private_dns_answer(monkeypatch) -> None:
+    from agent_core.mcp.client import _validate_public_remote
+
+    monkeypatch.setattr(
+        "agent_core.mcp.client.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("127.0.0.1", 443)),
+        ],
+    )
+    with pytest.raises(ValueError, match="non-public"):
+        _validate_public_remote("https://example.com/mcp")
+
+
+async def test_untrusted_remote_rejects_credentials_before_connecting() -> None:
+    from agent_core.mcp.client import MCPClientManager
+
+    server = MCPServerConfig(
+        name="community",
+        transport="streamable-http",
+        url="https://example.com/mcp",
+        headers={"Authorization": "Bearer secret"},
+        discovered=True,
+        trust_tier="community",
+        network_policy="public-only",
+    )
+    manager = MCPClientManager(MCPConfig(servers=[server]))
+    async with AsyncExitStack() as stack:
+        with pytest.raises(ValueError, match="must not receive credentials"):
+            await manager._open_transport(stack, server)
+
+
 # --- integration (requires the optional `mcp` SDK and a real subprocess) --------
 
 _SERVER = '''
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("testsrv")
+mcp = MCPServer("testsrv")
 
 
 @mcp.tool()

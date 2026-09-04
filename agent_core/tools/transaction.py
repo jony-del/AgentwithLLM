@@ -296,7 +296,8 @@ class TurnExecutionJournal:
     intent cannot first be persisted.
     """
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
+    READABLE_SCHEMA_VERSIONS = frozenset({3, 4})
     MAX_BYTES = 16 * 1024 * 1024
     MAX_RECORDS = 10_000
     MAX_LINE_BYTES = 1024 * 1024
@@ -468,6 +469,7 @@ class TurnExecutionJournal:
         if len(lines) > cls.MAX_RECORDS:
             return records, "too_many_records"
         previous_checksum = ""
+        schema_version: int | None = None
         expected_owner: dict[str, Any] | None = None
         for expected_sequence, raw_line in enumerate(lines):
             if len(raw_line) > cls.MAX_LINE_BYTES:
@@ -478,8 +480,12 @@ class TurnExecutionJournal:
                 return [], "invalid_json"
             if not isinstance(value, dict):
                 return [], "record_not_object"
-            if value.get("v") != cls.SCHEMA_VERSION:
+            if value.get("v") not in cls.READABLE_SCHEMA_VERSIONS:
                 return [], "unsupported_schema"
+            if schema_version is None:
+                schema_version = int(value["v"])
+            elif value.get("v") != schema_version:
+                return [], "schema_changed"
             if value.get("sequence") != expected_sequence:
                 return [], "invalid_sequence"
             if not isinstance(value.get("state"), str) or not value["state"]:
@@ -721,6 +727,55 @@ class TurnExecutionJournal:
         return paths
 
     @classmethod
+    def _reconcile_history_payload(
+        cls,
+        records: list[dict[str, Any]],
+        history_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay indeterminate external intents onto the latest durable history."""
+
+        payload = json.loads(json.dumps(history_payload, ensure_ascii=False, default=str))
+        outcomes = {
+            int(item["ordinal"])
+            for item in records
+            if item.get("state") in {"external_outcome", "external_outcome_committed"}
+            and isinstance(item.get("ordinal"), int)
+        }
+        uncertain = {
+            int(item["ordinal"])
+            for item in records
+            if item.get("state") == "external_intent"
+            and isinstance(item.get("ordinal"), int)
+            and int(item["ordinal"]) not in outcomes
+        }
+        results = payload.get("tool_results")
+        if not isinstance(results, list):
+            return payload
+        for index, raw in enumerate(results):
+            if not isinstance(raw, dict):
+                continue
+            metadata = raw.get("metadata")
+            ordinal = metadata.get("ordinal", index) if isinstance(metadata, dict) else index
+            if ordinal not in uncertain:
+                continue
+            updated = dict(metadata) if isinstance(metadata, dict) else {}
+            updated.update(
+                {
+                    "ok": False,
+                    "error_type": "IndeterminateExternalEffect",
+                    "execution_status": "indeterminate",
+                    "ordinal": ordinal,
+                }
+            )
+            raw["content"] = (
+                f"{raw.get('name') or 'tool'}: External operation may have completed; "
+                "automatic replay was suppressed"
+            )
+            raw["metadata"] = updated
+        payload["complete"] = True
+        return payload
+
+    @classmethod
     def recover_all(
         cls,
         storage: JournalStorage,
@@ -814,7 +869,12 @@ class TurnExecutionJournal:
                 (item.get("history_payload") for item in reversed(records) if item.get("history_payload")),
                 None,
             )
-            history_recoverable = "committed" in states or "external_outcome" in states
+            if isinstance(history_payload, dict):
+                history_payload = cls._reconcile_history_payload(records, history_payload)
+            history_recoverable = "committed" in states or any(
+                state in states
+                for state in {"external_outcome", "external_outcome_committed"}
+            )
             action = "rollback_workspace" if "committed" not in states else "recover_history"
             if history_recoverable and history_writer is not None and isinstance(history_payload, dict):
                 action = "recover_history"
@@ -885,7 +945,10 @@ class TurnExecutionJournal:
                 if "external_intent" in states and "external_outcome" not in states:
                     journal.record("indeterminate_external_effect")
                     outcomes.append({"turn_id": turn_id, "status": "IndeterminateExternalEffect"})
-                elif "external_outcome" in states:
+                elif any(
+                    state in states
+                    for state in {"external_outcome", "external_outcome_committed"}
+                ):
                     journal.record("external_effect_history_missing")
                     outcomes.append(
                         {"turn_id": turn_id, "status": "external_effect_history_missing"}

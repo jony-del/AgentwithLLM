@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import subprocess
 import time
 import json
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
@@ -71,6 +73,11 @@ from agent_core.permission_classifier import (
 from agent_core.permission_rules import RuleSet
 from agent_core.permission_types import PermissionRuleSource, ToolCallSource
 from agent_core.permissions import PermissionMode, PermissionPolicy
+from agent_core.prompt_ingress import (
+    PromptSource,
+    canonicalize_untrusted_context,
+    canonicalize_user_prompt,
+)
 from agent_core.providers.base import (
     LLMProvider,
     ProviderConfig,
@@ -89,8 +96,13 @@ from agent_core.sandbox import (
     get_shared_manager,
 )
 from agent_core.scheduler import SchedulerStore
-from agent_core.tools.base import ExecutionScope
-from agent_core.session import SessionAwareMixin, SessionContext
+from agent_core.execution import ExecutionScope, execution_scope_context
+from agent_core.session import (
+    SessionAwareMixin,
+    SessionContext,
+    SessionDescriptor,
+    SessionRuntime,
+)
 from agent_core.skills import (
     SkillRegistry,
     SkillsConfig,
@@ -113,7 +125,7 @@ from agent_core.tool_use_summary import (
     ToolUseSummarizer,
     build_tool_use_summarizer,
 )
-from agent_core.transcript import TranscriptStore, new_session_id
+from agent_core.transcript import LoadedTranscript, TranscriptStore, build_chain, new_session_id
 from agent_core.tools.catalog import default_tools, populate_registry
 from agent_core.tools.executor import StreamingToolBatch, ToolExecutor
 from agent_core.tools.registry import ToolRegistry
@@ -413,6 +425,7 @@ class ReActAgent:
         # spawned by the sub-agent/teammate factories so the whole fan-out is bounded
         # by one budget. Set at the top of run(); None when no run is active or uncapped.
         self._active_deadline: float | None = None
+        self._active_scope: ExecutionScope | None = None
         self._reported_missed_jobs: set[str] = set()
         # Wrap the provider in a shared, bounded concurrency gate (idempotent): the
         # top-level agent creates it from config, and children spawned with
@@ -741,6 +754,19 @@ class ReActAgent:
             )
         self.capability_manager = CapabilityManager(self, self.config.capabilities)
         self.session.capability_manager = self.capability_manager
+        self.runtime = SessionRuntime(
+            descriptor=SessionDescriptor(
+                self.session_id,
+                self.session.workspace,
+                self.transcript.path if self.transcript is not None else None,
+            ),
+            context=self.session,
+            transcript=self.transcript,
+            permissions=self.permissions,
+            process_supervisor=self.process_supervisor,
+            scheduler_store=self.session.scheduler_store,
+            counters={"input_tokens": 0, "output_tokens": 0},
+        )
 
     def recover_turn_journals(self, *, dry_run: bool = False) -> list[dict[str, str]]:
         """Recover this project/session's verified journals and emit run audit events."""
@@ -770,6 +796,138 @@ class ReActAgent:
         )
         self.executor.rebind_journal_storage(storage)
         return self.recover_turn_journals()
+
+    async def resume_loaded_session(self, loaded: LoadedTranscript) -> list[Message]:
+        """Atomically replace mutable session state at an idle boundary."""
+
+        if self._active_scope is not None:
+            raise RuntimeError("a session can only be switched while the agent is idle")
+        workspace = self.session.workspace.resolve()
+        source_workspace = (loaded.workspace or workspace).resolve()
+        if os.path.normcase(str(source_workspace)) != os.path.normcase(str(workspace)):
+            raise RuntimeError(
+                f"session belongs to {source_workspace}; change to that project and resume again"
+            )
+
+        old_runtime = self.runtime
+        new_transcript = (
+            TranscriptStore(self.config.session_dir, workspace, loaded.session_id)
+            if self.config.session_dir
+            else None
+        )
+        old_session = self.session
+        new_session = SessionContext(
+            workspace=workspace,
+            session_id=loaded.session_id,
+            agent_id=self.logger.run_id,
+            subagent_factory=self._spawn_subagent,
+            teammate_factory=self._spawn_teammate,
+            team_store=self.team_store,
+            ui_notify=self.ui.on_todos,
+            skills=self.skills,
+            run_dir=self.config.run_dir,
+            run_id=self.logger.run_id,
+            permission_mode_setter=self.set_permission_mode,
+            tool_suite=self.config.tools,
+            logger=self.logger,
+            audit_event=self._audit_event,
+            mcp_manager=old_session.mcp_manager,
+            registry=self.registry,
+            plugin_skill_invoked=self._start_skill_monitors,
+            ask_user=old_session.ask_user,
+            plugin_workflows=dict(self.plugin_workflows),
+            plugin_bin_paths=tuple(self.plugin_bin_paths),
+            depth=old_session.depth,
+            max_depth=old_session.max_depth,
+        )
+        new_process_supervisor = ProcessSupervisor(
+            self.config.tools.shell,
+            Path(self.config.run_dir) / "tasks" / loaded.session_id,
+            event_sink=self._audit_event,
+        )
+        new_session.process_supervisor = new_process_supervisor
+        new_session.worktree_manager = WorktreeManager(
+            new_session, self.registry, self.sandbox, self.config.tools.worktree
+        )
+        current_mode = self.permissions.mode
+        if current_mode is PermissionMode.PLAN:
+            new_session.plan_state.enter(
+                PermissionMode.DEFAULT.value,
+                new_session.plan_store.path_for(loaded.session_id, new_session.agent_id),
+            )
+        new_permissions = PermissionPolicy(
+            current_mode,
+            prompter=self.ui.request_permission if self.ui.is_live else None,
+            rules=self.config.permission_rules,
+            sandbox=self.sandbox,
+            workspace=workspace,
+            plan_state=new_session.plan_state,
+            managed_policy_provider=self.managed_policy_provider,
+            allow_unsandboxed_unattended=False,
+        )
+        new_session.permission_grant_setter = new_permissions.add_session_rule
+        new_session.permission_workspace_setter = lambda path: setattr(
+            new_permissions, "workspace", path
+        )
+        new_session.registered_tool_names = frozenset(tool.name for tool in self.registry.list())
+        new_executor = ToolExecutor(
+            self.registry,
+            new_permissions,
+            self.hooks,
+            self.logger,
+            self.ui,
+            self.permission_classifier,
+            parallel_tools=self.config.parallel_tools,
+            max_workers=self.config.max_tool_workers,
+            journal_storage=JournalStorage.user_state(
+                workspace, loaded.session_id, self.logger.run_id
+            ),
+        )
+        candidate = SessionRuntime(
+            descriptor=SessionDescriptor(
+                loaded.session_id,
+                workspace,
+                new_transcript.path if new_transcript is not None else loaded.path,
+            ),
+            context=new_session,
+            transcript=new_transcript,
+            permissions=new_permissions,
+            process_supervisor=new_process_supervisor,
+            counters={"input_tokens": 0, "output_tokens": 0},
+        )
+
+        # Candidate construction above is side-effect free with respect to the live
+        # bindings. Close old owned resources, then publish every pointer together.
+        await old_runtime.close()
+        self.session_id = loaded.session_id
+        self.session = new_session
+        self.transcript = new_transcript
+        self.process_supervisor = new_process_supervisor
+        self.permissions = new_permissions
+        self.executor = new_executor
+        self.runtime = candidate
+        for tool in self.registry.list():
+            if isinstance(tool, SessionAwareMixin):
+                tool.bind_session(new_session)
+        self.registry.bind_runtime(
+            session=new_session,
+            sandbox=self.sandbox,
+            web_policy=self.config.web,
+            unattended=self._is_unattended_mode(),
+        )
+        self.capability_manager = CapabilityManager(self, self.config.capabilities)
+        new_session.capability_manager = self.capability_manager
+        self.fast_mode = False
+        self.session_title = loaded.title
+        self._session_input_tokens = 0
+        self._session_output_tokens = 0
+        self._last_usage_tokens = 0
+        self._session_started = time.monotonic()
+        self._session_start_fired = False
+        self._reported_missed_jobs.clear()
+        self._last_message_uuid = None
+        self.recover_turn_journals()
+        return build_chain(loaded)
 
     def _build_memory(
         self,
@@ -1051,6 +1209,79 @@ class ReActAgent:
         midturn_drain: Callable[[], list[Message]] | None = None,
         *,
         _user_messages: list[Message] | None = None,
+        execution_scope: ExecutionScope | None = None,
+    ) -> AgentRunResult:
+        """Run within one root/inherited execution budget, including preflight work."""
+
+        started = time.monotonic()
+        owned_scope = execution_scope is None
+        if execution_scope is None:
+            if deadline is None and self.config.max_wall_seconds is not None:
+                deadline = started + self.config.max_wall_seconds
+            execution_scope = ExecutionScope.for_workspace(
+                self.session.workspace,
+                deadline=deadline,
+                cancel_probe=should_cancel,
+                recovery_context={
+                    "session_id": self.session_id,
+                    "run_id": self.logger.run_id,
+                },
+            )
+        else:
+            execution_scope = execution_scope.child(
+                deadline=deadline,
+                workspace=self.session.workspace,
+                recovery_context={
+                    "session_id": self.session_id,
+                    "run_id": self.logger.run_id,
+                },
+            )
+        self._active_scope = execution_scope
+        self._active_deadline = execution_scope.deadline
+        try:
+            with execution_scope_context(execution_scope):
+                return await self._run_scoped(
+                    task,
+                    history=history,
+                    midturn_drain=midturn_drain,
+                    _user_messages=_user_messages,
+                    scope=execution_scope,
+                    started=started,
+                )
+        except TimeoutError:
+            messages = list(getattr(self, "_active_messages", []))
+            if not messages:
+                messages = [Message("system", self.config.system_prompt), Message("user", task)]
+            return await self._stopped(
+                messages, 0, "deadline", "reaching the wall-clock deadline"
+            )
+        except asyncio.CancelledError:
+            # Convert only this execution tree's cooperative token/probe into the
+            # product-level stopped result. Cancellation of the caller task itself
+            # remains structural and must propagate.
+            if not execution_scope.cancelled():
+                raise
+            messages = list(getattr(self, "_active_messages", []))
+            if not messages:
+                messages = [Message("system", self.config.system_prompt), Message("user", task)]
+            return await self._stopped(
+                messages, 0, "interrupted", "being interrupted by the user (Esc)"
+            )
+        finally:
+            self._active_scope = None
+            self._active_deadline = None
+            if owned_scope:
+                await execution_scope.close()
+
+    async def _run_scoped(
+        self,
+        task: str,
+        *,
+        history: list[Message] | None,
+        midturn_drain: Callable[[], list[Message]] | None,
+        _user_messages: list[Message] | None,
+        scope: ExecutionScope,
+        started: float,
     ) -> AgentRunResult:
         """Drive the ReAct loop to completion and return the final answer.
 
@@ -1069,54 +1300,57 @@ class ReActAgent:
         ``history`` are dropped), and the history is assumed already persisted, so it is
         only re-linked into the message chain, not re-written to the transcript.
         """
+        scope.raise_if_cancelled()
         self._last_message_uuid = None
         self._pending_tool_use_summary = None
         self._background_hook_tasks = set()
-        self._run_start_time = time.monotonic()
+        self._run_start_time = started
         self._run_input_tokens = 0
         self._run_output_tokens = 0
         self._run_context_tokens = 0
         # Per-task VM rollback: restore the base snapshot so each run starts from a clean
         # guest (no-op for native/container tiers and when reset_each_task is off).
         self.sandbox.reset()
+        scope.raise_if_cancelled()
         # A live UI's interactive permission prompt runs on a worker thread; give it
         # the running loop so it can bridge the prompt back onto the main thread.
         if self.ui.is_live:
             self.ui.bind_event_loop(asyncio.get_running_loop())
-        await self._sync_plugin_monitors()
+        await scope.run_awaitable(self._sync_plugin_monitors())
         user_messages = list(_user_messages) if _user_messages is not None else [Message("user", task)]
         if not user_messages:
             raise ValueError("at least one user message is required")
         if any(message.role != "user" for message in user_messages):
             raise ValueError("run user messages must all have role='user'")
+        default_source = (
+            PromptSource.RESUME.value if history else PromptSource.INITIAL.value
+        )
+        for submitted in user_messages:
+            submitted.metadata.setdefault(
+                "prompt_source",
+                str(submitted.metadata.get("queue_delivery") or default_source),
+            )
         user_message = user_messages[0]
-        recalled_task = "\n".join(message.content for message in user_messages)
         system_prompt = self.config.system_prompt
         messages: list[Message] = [Message("system", system_prompt), *user_messages]
-        for submitted in user_messages:
-            await self.logger.write(
-                "user",
-                {
-                    "content": submitted.content,
-                    "uuid": submitted.uuid,
-                    **self._trace_fields(),
-                },
-            )
         # ``_recall``/``_inject_project_context`` position the recall and pinned
         # userContext blocks relative to the trailing user task, so the task must already
         # be in place. Final front order: system(+gitStatus) → (recall) → userContext → task.
-        await self._recall(recalled_task, messages)
-        await self._inject_project_context(messages)
+        await scope.run_awaitable(self._inject_project_context(messages))
         if self._plugin_notifications:
             pending = list(self._plugin_notifications)
             self._plugin_notifications.clear()
-            encoded = json.dumps(pending, ensure_ascii=False)[:65536].replace("<", "\\u003c")
+            envelope = canonicalize_untrusted_context(
+                json.dumps(pending, ensure_ascii=False),
+                PromptSource.PLUGIN_NOTIFICATION,
+            )
             notice = Message(
                 "user",
-                "<untrusted-data source=\"plugin-notifications\">\n"
-                + encoded
-                + "\n</untrusted-data>",
-                metadata={"plugin_notification": True},
+                envelope.canonical_text,
+                metadata={
+                    "plugin_notification": True,
+                    "prompt_ingress": envelope.metadata(),
+                },
             )
             messages.insert(messages.index(user_message), notice)
         self._sync_permission_mode_context(messages)
@@ -1141,11 +1375,11 @@ class ReActAgent:
         # before UserPromptSubmit so subscribers see the session open first.
         if not self._session_start_fired:
             self._session_start_fired = True
-            await self._fire_observational(
+            await scope.run_awaitable(self._fire_observational(
                 HookEvent.SESSION_START,
                 {"run_id": self.logger.run_id, **self._trace_fields()},
                 messages,
-            )
+            ))
         # UserPromptSubmit fires once the task is in place but before the first model
         # call, so a hook can abort the run (block), rewrite the task to neutralize untrusted
         # framing (transformed_prompt), or inject extra grounding (additional_context). The new
@@ -1156,12 +1390,12 @@ class ReActAgent:
         first_block_reason = ""
         for index, submitted in enumerate(user_messages):
             messages.append(submitted)
-            blocked, was_blocked = await self._run_user_prompt_hooks(
+            blocked, was_blocked = await scope.run_awaitable(self._run_user_prompt_hooks(
                 messages,
                 submitted,
                 submitted.content,
                 blocked_as_warning=batch_mode or index > 0,
-            )
+            ))
             if index == 0 and was_blocked:
                 first_should_query = False
                 first_block_reason = (
@@ -1176,25 +1410,33 @@ class ReActAgent:
             self._emit_recap(messages, 0, "blocked")
             await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
             return AgentRunResult(answer, messages, 0, self.logger.run_id)
-        discovery = await asyncio.to_thread(
-            self.capability_manager.auto_discover,
-            recalled_task,
+        accepted_ids = {message.uuid for message in messages}
+        canonical_task = "\n".join(
+            submitted.content
+            for submitted in user_messages
+            if submitted.uuid in accepted_ids
         )
+        await scope.run_awaitable(self._recall(canonical_task, messages))
+        discovery = await scope.run_awaitable(asyncio.to_thread(
+            self.capability_manager.auto_discover,
+            canonical_task,
+        ))
         if discovery.get("searched"):
-            encoded_discovery = json.dumps(
+            discovery_envelope = canonicalize_untrusted_context(json.dumps(
                 {
                     "matches": discovery.get("matches", [])[:5],
                     "activations": discovery.get("activations", {}),
                 },
                 ensure_ascii=False,
-            )[:65536].replace("<", "\\u003c")
+            ), PromptSource.CAPABILITY_DISCOVERY)
             messages.append(
                 Message(
                     "user",
-                    '<untrusted-data source="capability-discovery">\n'
-                    + encoded_discovery
-                    + "\n</untrusted-data>",
-                    metadata={"capability_discovery": True},
+                    discovery_envelope.canonical_text,
+                    metadata={
+                        "capability_discovery": True,
+                        "prompt_ingress": discovery_envelope.metadata(),
+                    },
                 )
             )
             await self.logger.write(
@@ -1207,12 +1449,9 @@ class ReActAgent:
         # Exposed read-only to the persistent terminal's Ctrl+O transcript snapshot.
         self._active_messages = messages
 
-        cancelled = should_cancel or (lambda: False)
-        start = time.monotonic()
-        if deadline is None and self.config.max_wall_seconds is not None:
-            deadline = start + self.config.max_wall_seconds
-        # Stash for the sub-agent/teammate factories so children share this budget.
-        self._active_deadline = deadline
+        cancelled = scope.cancelled
+        deadline = scope.deadline
+        start = started
         # Soft deadline: a fraction of *this run's* window (not max_wall_seconds, which
         # may differ from the inherited budget), after which we nudge the model once.
         soft_threshold: float | None = None
@@ -1278,7 +1517,9 @@ class ReActAgent:
             # One batch spans this provider attempt. In quiet/headless runs the sink is
             # still installed when streaming tool execution is enabled: transport
             # streaming is what exposes completed tool blocks early; display is optional.
-            tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
+            tool_batch = self.executor.begin_batch(
+                messages=messages, should_cancel=cancelled, execution_scope=scope
+            )
             sink: StreamHandler | None = None
             if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
                 capabilities = provider_capabilities(self.provider)
@@ -1309,7 +1550,7 @@ class ReActAgent:
                 self._sync_permission_mode_context(messages)
                 result = await self.provider.complete(
                     messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
-                    should_cancel=cancelled,
+                    should_cancel=cancelled, scope=scope,
                 )
             except asyncio.CancelledError:
                 await tool_batch.abort("provider_cancelled")
@@ -1344,7 +1585,9 @@ class ReActAgent:
                     await self._run_post_compact_hooks(messages, before_compaction, "reactive")
                 result = None
                 for _ in range(MAX_PTL_RETRIES):
-                    tool_batch = self.executor.begin_batch(messages=messages, should_cancel=cancelled)
+                    tool_batch = self.executor.begin_batch(
+                        messages=messages, should_cancel=cancelled, execution_scope=scope
+                    )
                     sink = None
                     if self.config.stream and (self.ui.is_live or self.config.streaming_tool_execution):
                         capabilities = provider_capabilities(self.provider)
@@ -1375,7 +1618,7 @@ class ReActAgent:
                         self._sync_permission_mode_context(messages)
                         result = await self.provider.complete(
                             messages, self.registry.schemas_for_llm(), self._provider_config(), stream=sink,
-                            should_cancel=cancelled,
+                            should_cancel=cancelled, scope=scope,
                         )
                         break
                     except asyncio.CancelledError:
@@ -1558,12 +1801,18 @@ class ReActAgent:
                         or stop.reason
                         or "A stop hook requested that you keep working instead of stopping."
                     )
+                    directive_envelope = canonicalize_untrusted_context(
+                        directive, PromptSource.HOOK_CONTEXT
+                    )
                     await self._emit(
                         messages,
                         Message(
                             "user",
-                            f"<system-reminder>\n{directive}\n</system-reminder>",
-                            metadata={"stop_hook": "continue"},
+                            directive_envelope.canonical_text,
+                            metadata={
+                                "stop_hook": "continue",
+                                "prompt_ingress": directive_envelope.metadata(),
+                            },
                         ),
                     )
                     await self.logger.write(
@@ -1619,7 +1868,9 @@ class ReActAgent:
                     item.metadata["activation_status"] = outcome.get("status")
                     await self.logger.write("capability_activation", outcome)
             tool_messages: list[Message] = []
-            for tool_call, tool_result in zip(result.tool_calls, tool_results, strict=True):
+            for ordinal, (tool_call, tool_result) in enumerate(
+                zip(result.tool_calls, tool_results, strict=True)
+            ):
                 observation = f"{tool_result.name}: {tool_result.content}"
                 tool_message = Message(
                     "tool",
@@ -1630,6 +1881,8 @@ class ReActAgent:
                         "ok": tool_result.ok,
                         "tool_call_id": tool_call.id,
                     },
+                    uuid=tool_batch.recovery_message_uuid(ordinal) or uuid.uuid4().hex,
+                    round_id=assistant_message.round_id,
                 )
                 tool_message.parent_uuid = self._last_message_uuid
                 messages.append(tool_message)
@@ -1679,17 +1932,24 @@ class ReActAgent:
 
             # Interactive input entered while tools were running is inserted only after
             # the complete tool-result batch, immediately before the next provider call.
-            # These messages have already been classified by the host as ordinary
-            # prompts (slash commands remain queued), and intentionally bypass
-            # UserPromptSubmit hooks because this is a current-turn steering seam.
+            # It traverses the same canonical ingress + UserPromptSubmit pipeline as
+            # initial and between-turn prompts.
             if midturn_drain is not None:
                 for queued_message in midturn_drain():
-                    await self._emit(messages, queued_message)
+                    queued_message.metadata["prompt_source"] = PromptSource.MIDTURN.value
+                    messages.append(queued_message)
+                    await scope.run_awaitable(self._run_user_prompt_hooks(
+                        messages,
+                        queued_message,
+                        queued_message.content,
+                        blocked_as_warning=True,
+                    ))
                     await self.logger.write(
                         "queued_prompt",
                         {
                             "content": queued_message.content,
                             "delivery": "midturn",
+                            "prompt_ingress": queued_message.metadata.get("prompt_ingress", {}),
                             **self._trace_fields(),
                         },
                     )
@@ -1769,8 +2029,12 @@ class ReActAgent:
         """
         if self.transcript is None or not self.config.persist_compaction_boundary:
             return
-        before_uuids = {m.uuid for m in before}
-        new_msgs = [m for m in after if m.uuid not in before_uuids]
+        before_versions = {(message.uuid, message.version) for message in before}
+        new_msgs = [
+            message
+            for message in after
+            if (message.uuid, message.version) not in before_versions
+        ]
         if not new_msgs:
             return  # snip/microcompact only, or nothing changed — no boundary to write.
         summary = next((m for m in new_msgs if is_summary_message(m)), None)
@@ -1780,34 +2044,27 @@ class ReActAgent:
             return
 
         # The summary becomes a new root; record the real predecessor for forensics.
-        if self._last_message_uuid is not None:
-            summary.metadata["logical_parent_uuid"] = self._last_message_uuid
+        source_head = self._last_message_uuid
+        if source_head is not None:
+            summary.metadata["logical_parent_uuid"] = source_head
         summary.metadata["compact_boundary"] = True
-        summary.parent_uuid = None
-        await self.transcript.append_message(summary)
-
-        # Everything after the summary in the folded list is either kept tail (already on
-        # disk, uuid in ``before``) or new attachments. Preserved front matter sits before
-        # the summary, so it is excluded here.
-        tail = after[after.index(summary) + 1 :]
-        recent = [m for m in tail if m.uuid in before_uuids]
-        attachments = [m for m in tail if m.uuid not in before_uuids]
-
-        if recent:
-            # Re-point the kept tail's head onto the summary via an append-only relink
-            # (the original line can't be mutated); keep the in-memory chain in sync.
-            recent[0].parent_uuid = summary.uuid
-            await self.transcript.append_relink(recent[0].uuid, summary.uuid)
-            running = recent[-1].uuid
-        else:
-            running = summary.uuid
-
-        for attachment in attachments:
-            attachment.parent_uuid = running
-            await self.transcript.append_message(attachment)
-            running = attachment.uuid
-
-        self._last_message_uuid = running
+        resumable = [
+            message
+            for message in after
+            if message.role != "system"
+            and not message.metadata.get("pinned")
+            and not message.metadata.get("deadline_wrapup")
+            and not message.metadata.get("ephemeral_control")
+        ]
+        parent: str | None = None
+        for message in resumable:
+            message.parent_uuid = parent
+            parent = message.uuid
+        if await self.transcript.append_compaction_snapshot(
+            resumable, source_head=source_head
+        ):
+            self._last_message_uuid = parent
+        return
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
         """Shared exit path for run interruption (cancel / max_steps / deadline)."""
@@ -1899,16 +2156,48 @@ class ReActAgent:
         with no user-prompt hooks the task is simply persisted unchanged.
         """
         outcome = HookOutcome()
+        raw_source = str(
+            user_message.metadata.get("prompt_source")
+            or user_message.metadata.get("queue_delivery")
+            or PromptSource.INITIAL.value
+        )
+        try:
+            source = PromptSource(raw_source)
+        except ValueError:
+            source = PromptSource.INITIAL
         if self.hooks.user_prompt_hooks:
             ctx = HookContext(
                 event=HookEvent.USER_PROMPT_SUBMIT,
                 messages=messages,
                 session_id=self.session_id,
                 prompt=task,
+                detail={"prompt_source": source.value, "may_grant_permissions": False},
+                execution_scope=self._active_scope,
             )
             outcome = await self.hooks.run_user_prompt(ctx)
             if outcome.transformed_prompt is not None:
                 user_message.content = outcome.transformed_prompt
+        envelope = canonicalize_user_prompt(
+            user_message.content,
+            source,
+            hooks_applied=bool(self.hooks.user_prompt_hooks),
+            already_neutralized=(
+                bool((outcome.metadata or {}).get("neutralized"))
+                and user_message.content.startswith("<untrusted_user_input")
+            ),
+        )
+        user_message.content = envelope.canonical_text
+        user_message.metadata["prompt_source"] = source.value
+        user_message.metadata["prompt_ingress"] = envelope.metadata()
+        await self.logger.write(
+            "user",
+            {
+                "content": user_message.content,
+                "uuid": user_message.uuid,
+                "prompt_ingress": envelope.metadata(),
+                **self._trace_fields(),
+            },
+        )
         if self.hooks.user_prompt_hooks:
             await self.logger.write(
                 "hook",
@@ -1950,12 +2239,19 @@ class ReActAgent:
             await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
             return AgentRunResult(answer, messages, 0, self.logger.run_id), True
         if outcome.additional_context:
+            context_envelope = canonicalize_untrusted_context(
+                outcome.additional_context,
+                PromptSource.HOOK_CONTEXT,
+            )
             await self._emit(
                 messages,
                 Message(
                     "user",
-                    f"<system-reminder>\n{outcome.additional_context}\n</system-reminder>",
-                    metadata={"hook": "user_prompt_context"},
+                    context_envelope.canonical_text,
+                    metadata={
+                        "hook": "user_prompt_context",
+                        "prompt_ingress": context_envelope.metadata(),
+                    },
                 ),
             )
         return None, False
@@ -1970,6 +2266,7 @@ class ReActAgent:
             messages=messages,
             session_id=self.session_id,
             trigger=trigger,
+            execution_scope=self._active_scope,
         )
         outcome = await self.hooks.run_pre_compact(ctx)
         await self.logger.write(
@@ -1995,6 +2292,7 @@ class ReActAgent:
             session_id=self.session_id,
             trigger=trigger,
             summary=summary,
+            execution_scope=self._active_scope,
         )
         outcome = await self.hooks.run_post_compact(ctx)
         await self.logger.write(
@@ -2002,12 +2300,18 @@ class ReActAgent:
             {"event": "PostCompact", "trigger": trigger, "has_summary": summary is not None},
         )
         if outcome.additional_context:
+            envelope = canonicalize_untrusted_context(
+                outcome.additional_context, PromptSource.HOOK_CONTEXT
+            )
             await self._emit(
                 messages,
                 Message(
                     "user",
-                    f"<system-reminder>\n{outcome.additional_context}\n</system-reminder>",
-                    metadata={"hook": "post_compact_context"},
+                    envelope.canonical_text,
+                    metadata={
+                        "hook": "post_compact_context",
+                        "prompt_ingress": envelope.metadata(),
+                    },
                 ),
             )
 
@@ -2024,6 +2328,7 @@ class ReActAgent:
             session_id=self.session_id,
             last_assistant_message=last_assistant_text,
             stop_hook_active=stop_blocks > 0,
+            execution_scope=self._active_scope,
         )
         outcome = await self.hooks.run_stop(ctx)
         await self.logger.write(
@@ -2042,6 +2347,7 @@ class ReActAgent:
             messages=list(messages),
             session_id=self.session_id,
             last_assistant_message=last_assistant_text,
+            execution_scope=self._active_scope,
         )
         task = asyncio.create_task(self._post_sampling_runner(ctx))
         self._background_hook_tasks.add(task)
@@ -2071,7 +2377,11 @@ class ReActAgent:
             HookEvent.SUBAGENT_STOP: self.hooks.run_subagent_stop,
         }[event]
         ctx = HookContext(
-            event=event, messages=messages, session_id=self.session_id, detail=detail
+            event=event,
+            messages=messages,
+            session_id=self.session_id,
+            detail=detail,
+            execution_scope=self._active_scope,
         )
         error: str | None = None
         try:
@@ -2194,20 +2504,7 @@ class ReActAgent:
         for task in monitor_tasks:
             task.cancel()
         await asyncio.gather(*monitor_tasks, return_exceptions=True)
-        await self.process_supervisor.shutdown()
-        if self.session.scheduler_store is not None:
-            await asyncio.to_thread(
-                self.session.scheduler_store.delete_session_jobs,
-                self.session.session_id,
-                self.session.agent_id,
-            )
-        lsp_manager = self.session.lsp_manager
-        if lsp_manager is not None:
-            close = getattr(lsp_manager, "close", None)
-            if close is not None:
-                result = close()
-                if asyncio.iscoroutine(result):
-                    await result
+        await self.runtime.close()
         for manager in self._registry_mcp_managers.values():
             await asyncio.to_thread(manager.close)
         self._registry_mcp_managers.clear()
@@ -2231,6 +2528,7 @@ class ReActAgent:
                 config.database_path(), max_jobs=config.max_jobs,
                 max_prompt_chars=config.max_prompt_chars,
             )
+            self.runtime.scheduler_store = self.session.scheduler_store
         return self.session.scheduler_store
 
     async def scheduler_heartbeat(self, *, ttl: float = 120) -> None:
@@ -2304,7 +2602,18 @@ class ReActAgent:
                 "scheduler_delivery",
                 {"delivery_id": delivery["id"], "job_id": delivery["job_id"], "state": "started"},
             )
-            result = await self.run(str(delivery["prompt"]), history=current or None)
+            scheduled_message = Message(
+                "user",
+                str(delivery["prompt"]),
+                metadata={
+                    "prompt_source": PromptSource.SCHEDULER.value,
+                    "scheduler_delivery_id": str(delivery["id"]),
+                    "scheduler_job_id": str(delivery["job_id"]),
+                },
+            )
+            result = await self.run_messages(
+                [scheduled_message], history=current or None
+            )
             current = result.messages
             results.append(result)
             await asyncio.to_thread(store.complete_delivery, int(str(delivery["id"])))
@@ -2353,9 +2662,21 @@ class ReActAgent:
                 },
             )
             return
-        # Right after the main system prompt, before the user task, tagged so
-        # extraction skips it and context_collapse keeps it pinned.
-        messages.insert(1, Message("system", block, metadata={"memory": "recall"}))
+        envelope = canonicalize_untrusted_context(block, PromptSource.MEMORY_RECALL)
+        # Right after the main system prompt, before the user task. Recalled content
+        # remains a pinned user-data frame; it never acquires system-message authority.
+        messages.insert(
+            1,
+            Message(
+                "user",
+                envelope.canonical_text,
+                metadata={
+                    "memory": "recall",
+                    "pinned": "memory_recall",
+                    "prompt_ingress": envelope.metadata(),
+                },
+            ),
+        )
         await self.logger.write(
             "memory_recall",
             {
@@ -2619,15 +2940,27 @@ class ReActAgent:
         if not sections:
             return []
         joined = "\n\n".join(sections)
-        text = (
-            "<system-reminder>\n"
+        envelope = canonicalize_untrusted_context(
+            (
             "Files you read earlier, re-attached after the conversation was compacted. "
             "This is a snapshot — the file may have changed since; re-read it if you need "
             "the current contents.\n"
-            f"{joined}\n"
-            "</system-reminder>"
+            f"{joined}"
+            ),
+            PromptSource.COMPRESSION,
+            max_chars=max(1, total_budget + 512),
+            max_bytes=max(4, (total_budget + 512) * 4),
         )
-        return [Message("user", text, metadata={"post_compact_attachment": True})]
+        return [
+            Message(
+                "user",
+                envelope.canonical_text,
+                metadata={
+                    "post_compact_attachment": True,
+                    "prompt_ingress": envelope.metadata(),
+                },
+            )
+        ]
 
     def _relativize(self, key: str) -> str:
         """Workspace-relative path for the attachment heading; fall back to the raw key."""
@@ -3022,7 +3355,11 @@ class ReActAgent:
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
         try:
-            result = await child.run(task, deadline=self._active_deadline)
+            child_parameters = inspect.signature(child.run).parameters
+            if self._active_scope is not None and "execution_scope" in child_parameters:
+                result = await child.run(task, execution_scope=self._active_scope.child())
+            else:
+                result = await child.run(task, deadline=self._active_deadline)
             drain = getattr(child, "drain_scheduler_deliveries", None)
             _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
             if scheduled:
@@ -3222,7 +3559,11 @@ class ReActAgent:
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
         try:
-            result = await child.run(prompt, deadline=self._active_deadline)
+            child_parameters = inspect.signature(child.run).parameters
+            if self._active_scope is not None and "execution_scope" in child_parameters:
+                result = await child.run(prompt, execution_scope=self._active_scope.child())
+            else:
+                result = await child.run(prompt, deadline=self._active_deadline)
             drain = getattr(child, "drain_scheduler_deliveries", None)
             _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
             if scheduled:

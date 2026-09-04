@@ -83,6 +83,32 @@ def test_sanitize_project_distinguishes_cwds() -> None:
     assert "/" not in a and ":" not in a
 
 
+def test_workspace_conflict_is_permanent_and_malformed_entries_are_ignored(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    transcript = tmp_path / "conflicted.jsonl"
+    records: list[object] = [
+        [],
+        {"type": "session", "session_id": "conflicted", "cwd": str(first)},
+        {"type": "session", "session_id": "conflicted", "cwd": str(second)},
+        # A later matching record must not erase evidence of the conflict.
+        {"type": "session", "session_id": "conflicted", "cwd": str(first)},
+        {"type": "relink", "parent_uuid": None},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+
+    loaded = load_transcript(transcript)
+
+    assert loaded.session_id == "conflicted"
+    assert loaded.workspace is None
+
+
 # --------------------------------------------------------------------------- write/read
 
 

@@ -136,7 +136,7 @@ class MCPPackageManager:
                 raise MCPPackageError("Registry record has no remote endpoint")
             url = _public_https(str(remote.get("url") or ""))
             transport = str(remote.get("type") or remote.get("transport") or "streamable-http")
-            if transport not in {"streamable-http", "sse"}:
+            if transport != "streamable-http":
                 raise MCPPackageError(f"unsupported Registry remote transport: {transport}")
             header_names: list[tuple[str, str]] = []
             for header in remote.get("headers", []) if isinstance(remote.get("headers"), list) else []:

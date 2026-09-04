@@ -39,8 +39,10 @@ from agent_core.providers.base import (
     ProviderCapabilities,
     ProviderConfig,
     StreamHandler,
+    provider_attempt,
 )
 from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
+from agent_core.execution import ExecutionScope
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _MAX_RETRY_AFTER = 30.0
@@ -123,6 +125,7 @@ class OpenAICompatProvider(LLMProvider):
         config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> LLMResult:
         if not self.api_key:
             raise RuntimeError(
@@ -145,7 +148,7 @@ class OpenAICompatProvider(LLMProvider):
                     raise httpx.HTTPStatusError("error", request=response.request, response=response)
                 return response.json()
 
-            payload = await self._request_with_retry(send_once, model=config.model)
+            payload = await self._request_with_retry(send_once, model=config.model, scope=scope)
             return self._parse_response(payload)
 
         # Streaming: retry only connection setup; never mid-stream (no half-reprints).
@@ -160,9 +163,10 @@ class OpenAICompatProvider(LLMProvider):
                 raise httpx.HTTPStatusError("error", request=request, response=response)
             return response
 
-        response = await self._request_with_retry(open_stream, model=config.model)
+        response = await self._request_with_retry(open_stream, model=config.model, scope=scope)
         try:
-            return await self._consume_stream(response, stream, should_cancel)
+            consumed = self._consume_stream(response, stream, should_cancel)
+            return await scope.run_awaitable(consumed) if scope is not None else await consumed
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise LLMTransientError(
                 f"chat-completions stream interrupted: {type(exc).__name__}: {exc}"
@@ -395,11 +399,19 @@ class OpenAICompatProvider(LLMProvider):
             self._client_loop = loop
         return self._client
 
-    async def _request_with_retry(self, op, *, model: str | None = None):
+    async def _request_with_retry(
+        self,
+        op,
+        *,
+        model: str | None = None,
+        scope: ExecutionScope | None = None,
+    ):
         attempt = 0
         while True:
             try:
-                return await op()
+                async with provider_attempt(scope):
+                    result = op()
+                    return await scope.run_awaitable(result) if scope is not None else await result
             except httpx.HTTPStatusError as exc:
                 response = exc.response
                 code = response.status_code
@@ -407,7 +419,10 @@ class OpenAICompatProvider(LLMProvider):
                 if code in _RETRYABLE_STATUS and attempt < self.max_retries:
                     delay = self._retry_delay(attempt, self._parse_retry_after(response.headers.get("Retry-After")))
                     self._announce_retry(attempt, delay, f"HTTP {code}")
-                    await asyncio.sleep(delay)
+                    if scope is None:
+                        await asyncio.sleep(delay)
+                    else:
+                        await scope.sleep(delay)
                     attempt += 1
                     continue
                 raise self._http_error(code, text, model=model) from exc
@@ -415,7 +430,10 @@ class OpenAICompatProvider(LLMProvider):
                 if attempt < self.max_retries:
                     delay = self._retry_delay(attempt, None)
                     self._announce_retry(attempt, delay, f"{type(exc).__name__}: {exc}")
-                    await asyncio.sleep(delay)
+                    if scope is None:
+                        await asyncio.sleep(delay)
+                    else:
+                        await scope.sleep(delay)
                     attempt += 1
                     continue
                 raise LLMTransientError(

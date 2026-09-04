@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_core.models import Message, ToolCall, ToolResult
+from agent_core.execution import ExecutionScope
 
 
 @dataclass(slots=True)
@@ -226,6 +227,7 @@ class HookContext:
     last_assistant_message: str | None = None
     stop_hook_active: bool = False
     detail: dict[str, object] | None = None
+    execution_scope: ExecutionScope | None = None
 
 
 @dataclass(slots=True)
@@ -453,6 +455,10 @@ class HookPipeline:
             if outcome is None:
                 continue
             seen.append(outcome)
+            if outcome.transformed_prompt is not None:
+                # Every later hook inspects the canonical output of the earlier hook,
+                # never the raw pre-firewall submission.
+                ctx.prompt = outcome.transformed_prompt
             if outcome.block:
                 return self._fold(seen, outcome)
         return self._fold(seen, None)

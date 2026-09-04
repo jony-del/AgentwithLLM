@@ -6,7 +6,7 @@ from typing import Any
 from agent_core.mcp.config import MCPServerConfig
 from agent_core.models import ToolResult, ToolRisk
 from agent_core.tools.adapters import ToolAdapter
-from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
+from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool, current_execution_scope
 
 _RISK = {
     "read": ToolRisk.READ,
@@ -77,9 +77,17 @@ class MCPTool(Tool):
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
+            scope = current_execution_scope()
+            timeout = scope.remaining_budget() if scope is not None else None
             # ``call_tool`` blocks on a future from the manager's background loop;
             # park that wait on a worker thread.
-            result = await asyncio.to_thread(self._manager.call_tool, self._server, self._remote, arguments)
+            result = await asyncio.to_thread(
+                self._manager.call_tool,
+                self._server,
+                self._remote,
+                arguments,
+                timeout,
+            )
         except Exception as exc:  # noqa: BLE001 - surface transport/timeout errors as a failed result
             return ToolResult(self.name, f"MCP tool error: {exc}", ok=False)
         text = _flatten_content(getattr(result, "content", None))

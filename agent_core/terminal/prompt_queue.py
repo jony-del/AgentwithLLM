@@ -54,6 +54,7 @@ class QueuedPrompt:
                 "queue_mode": self.mode,
                 "queue_origin": self.origin,
                 "queue_delivery": delivery,
+                "prompt_source": delivery,
             },
             uuid=self.uuid,
         )

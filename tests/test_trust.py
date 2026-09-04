@@ -67,6 +67,7 @@ def test_widening_subset_extracts_only_grants(tmp_path: Path) -> None:
     raw = load_agent_toml(_write_repo(tmp_path) / "agent.toml")  # explicit path → unfiltered
     subset = trust.widening_subset(raw)
     assert set(subset) == {
+        "model",
         "permissions.allow",
         "hooks.external",
         "sandbox.excluded_commands",
@@ -147,6 +148,37 @@ def test_fingerprint_is_stable_and_change_sensitive() -> None:
     b = {"hooks.external": [{"event": "Stop"}], "permissions.allow": ["bash"]}
     assert trust.fingerprint(a) == trust.fingerprint(b)  # key order irrelevant
     assert trust.fingerprint(a) != trust.fingerprint({"permissions.allow": ["bash", "x"]})
+
+
+def test_top_level_provider_model_and_privileged_modes_are_tofu_gated() -> None:
+    raw = {
+        "provider": "openai-compat",
+        "model": "repo-controlled-model",
+        "permission": "bypass",
+        "effort": "low",
+    }
+    assert set(trust.widening_subset(raw)) == {"provider", "model", "permission"}
+    assert trust.strip_widening(raw) == {"effort": "low"}
+
+    tightening = {"permission": "plan", "permissions": {"ask": ["bash"], "deny": ["web_fetch"]}}
+    assert trust.widening_subset(tightening) == {}
+    assert trust.strip_widening(tightening) == tightening
+
+
+def test_unknown_privilege_key_fails_closed_and_prompt_redacts_value(tmp_path: Path) -> None:
+    secret = "Bearer must-not-appear"
+    raw = {"sandbox": {"future_escape_hatch": secret}}
+    prompts: list[str] = []
+    effective = trust.apply_repo_trust_policy(
+        raw,
+        project=tmp_path,
+        store=trust.TrustStore(tmp_path / "t.json"),
+        prompter=lambda prompt: prompts.append(prompt) or False,
+        interactive=True,
+    )
+    assert effective == {"sandbox": {}}
+    assert prompts and "sandbox.future_escape_hatch" in prompts[0]
+    assert secret not in prompts[0]
 
 
 def test_tofu_store_roundtrip(tmp_path: Path) -> None:

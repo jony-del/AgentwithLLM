@@ -72,6 +72,8 @@ def _service_is_registered(receipt: dict[str, Any]) -> bool:
         return False
     platform = receipt.get("platform")
     if platform == "win32":
+        if len(resources) > 1 and not Path(resources[1]).is_file():
+            return False
         command = ["schtasks", "/Query", "/TN", resources[0]]
     elif str(platform).startswith("linux"):
         command = ["systemctl", "--user", "is-enabled", Path(resources[0]).name]
@@ -118,17 +120,27 @@ def install_user_service(
         task_name = "Polaris Scheduler"
         task_command = subprocess.list2cmdline(command)
         if len(task_command) > 261:
-            raise RuntimeError(
-                "scheduler command exceeds the Windows Task Scheduler /TR limit; "
-                "install Polaris in a shorter path"
+            launcher = receipt_path.with_name(f"{SERVICE_ID}.cmd").resolve()
+            escaped = task_command.replace("%", "%%")
+            _atomic_bytes(
+                launcher,
+                ("@echo off\r\n" + escaped + "\r\n").encode("utf-8"),
             )
+            task_command = subprocess.list2cmdline([str(launcher)])
+            if len(task_command) > 261:
+                launcher.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "scheduler launcher path exceeds the Windows Task Scheduler /TR limit; "
+                    "choose a shorter receipt path"
+                )
+            resources.append(str(launcher))
         _run([
             "schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/RL", "LIMITED",
             "/TR", task_command,
             "/F",
         ])
         _run(["schtasks", "/Run", "/TN", task_name])
-        resources.append(task_name)
+        resources.insert(0, task_name)
     elif platform.startswith("linux"):
         if not os.environ.get("XDG_RUNTIME_DIR"):
             raise RuntimeError("systemd user services require XDG_RUNTIME_DIR and a user service manager")
@@ -178,6 +190,8 @@ def uninstall_user_service(
     if platform == "win32":
         if resources:
             _run(["schtasks", "/Delete", "/TN", resources[0], "/F"])
+        for item in resources[1:]:
+            Path(item).unlink(missing_ok=True)
     elif platform.startswith("linux"):
         for item in resources:
             unit = Path(item)

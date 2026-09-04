@@ -260,8 +260,11 @@ def test_scheduler_windows_service_receipt_upgrade_and_exact_uninstall(
     task_command = create[create.index("/TR") + 1]
     assert len(task_command) <= 261
     assert "-EncodedCommand" not in task_command
-    assert str(executable.resolve()) in task_command
-    assert str(database.resolve()) in task_command
+    launcher = Path(installed["resources"][1])
+    assert str(launcher) in task_command and launcher.is_file()
+    launcher_text = launcher.read_text(encoding="utf-8")
+    assert str(executable.resolve()) in launcher_text
+    assert str(database.resolve()) in launcher_text
     assert any(call[:2] == ["schtasks", "/Run"] for call in calls)
 
     calls.clear()

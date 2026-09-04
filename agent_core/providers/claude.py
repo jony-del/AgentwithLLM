@@ -27,7 +27,9 @@ from agent_core.providers.base import (
     StreamedToolCall,
     StreamHandler,
     notify_streamed_tool_call,
+    provider_attempt,
 )
+from agent_core.execution import ExecutionScope
 
 # HTTP statuses worth retrying: request timeout / lock conflict, rate limiting, and
 # transient upstream failures. 529 is Anthropic's "overloaded" signal. Everything
@@ -198,6 +200,7 @@ class ClaudeProvider(LLMProvider):
         config: ProviderConfig,
         stream: StreamHandler | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> LLMResult:
         """Send one Messages API request over a shared ``httpx.AsyncClient``.
 
@@ -235,10 +238,10 @@ class ClaudeProvider(LLMProvider):
                 return response.json()
 
             try:
-                payload = await self._request_with_retry(send_once)
+                payload = await self._request_with_retry(send_once, scope=scope)
             except _FastModeFallback as fallback:
-                await self._disable_fast_and_cool_down(body, fallback)
-                payload = await self._request_with_retry(send_once)
+                await self._disable_fast_and_cool_down(body, fallback, scope=scope)
+                payload = await self._request_with_retry(send_once, scope=scope)
             return self._parse_response(payload)
 
         # Streaming: retry only the connection setup (send + status). Once the body is
@@ -267,13 +270,14 @@ class ClaudeProvider(LLMProvider):
             return response
 
         try:
-            response = await self._request_with_retry(open_stream)
+            response = await self._request_with_retry(open_stream, scope=scope)
         except _FastModeFallback as fallback:
-            await self._disable_fast_and_cool_down(body, fallback)
-            response = await self._request_with_retry(open_stream)
+            await self._disable_fast_and_cool_down(body, fallback, scope=scope)
+            response = await self._request_with_retry(open_stream, scope=scope)
         assert stream is not None
         try:
-            return await self._consume_stream(response, stream, should_cancel)
+            consumed = self._consume_stream(response, stream, should_cancel)
+            return await scope.run_awaitable(consumed) if scope is not None else await consumed
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise LLMTransientError(
                 f"Claude API stream interrupted: {self._describe_network_error(exc)}"
@@ -288,7 +292,7 @@ class ClaudeProvider(LLMProvider):
             self._client_loop = loop
         return self._client
 
-    async def _request_with_retry(self, op):
+    async def _request_with_retry(self, op, *, scope: ExecutionScope | None = None):
         """Run ``op`` with bounded exponential backoff on transient faults.
 
         A retryable HTTP status or a transient transport error backs off and tries
@@ -299,7 +303,9 @@ class ClaudeProvider(LLMProvider):
         attempt = 0
         while True:
             try:
-                return await op()
+                async with provider_attempt(scope):
+                    result = op()
+                    return await scope.run_awaitable(result) if scope is not None else await result
             except httpx.HTTPStatusError as exc:
                 response = exc.response
                 code = response.status_code
@@ -307,7 +313,10 @@ class ClaudeProvider(LLMProvider):
                 if code in _RETRYABLE_STATUS and attempt < self.max_retries:
                     delay = self._retry_delay(attempt, self._parse_retry_after(response.headers.get("Retry-After")))
                     self._announce_retry(attempt, delay, f"HTTP {code}")
-                    await asyncio.sleep(delay)
+                    if scope is None:
+                        await asyncio.sleep(delay)
+                    else:
+                        await scope.sleep(delay)
                     attempt += 1
                     continue
                 raise self._http_error(code, error_text) from exc
@@ -315,7 +324,10 @@ class ClaudeProvider(LLMProvider):
                 if attempt < self.max_retries:
                     delay = self._retry_delay(attempt, None)
                     self._announce_retry(attempt, delay, self._describe_network_error(exc))
-                    await asyncio.sleep(delay)
+                    if scope is None:
+                        await asyncio.sleep(delay)
+                    else:
+                        await scope.sleep(delay)
                     attempt += 1
                     continue
                 raise LLMTransientError(
@@ -388,11 +400,17 @@ class ClaudeProvider(LLMProvider):
         self,
         body: dict[str, Any],
         fallback: _FastModeFallback,
+        *,
+        scope: ExecutionScope | None = None,
     ) -> None:
         body.pop("speed", None)
         self._fast_disabled_reason = fallback.reason
         if fallback.retry_after is not None:
-            await asyncio.sleep(min(fallback.retry_after, _MAX_RETRY_AFTER))
+            delay = min(fallback.retry_after, _MAX_RETRY_AFTER)
+            if scope is None:
+                await asyncio.sleep(delay)
+            else:
+                await scope.sleep(delay)
 
     def consume_fast_disabled_reason(self) -> str | None:
         reason, self._fast_disabled_reason = self._fast_disabled_reason, None

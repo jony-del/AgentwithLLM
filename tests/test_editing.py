@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import pytest
 
 from agent_core.models import ToolRisk
 from agent_core.tools.editing import ApplyPatchTool, GlobTool, MultiEditTool
+from agent_core.unified_diff import PatchError, PatchOperation, parse_unified_diff
 
 
 # --- glob --------------------------------------------------------------------
@@ -169,3 +171,33 @@ async def test_apply_patch_is_atomic_across_files(tmp_path: Path) -> None:
 
 def test_apply_patch_is_write_risk() -> None:
     assert ApplyPatchTool().risk is ToolRisk.WRITE
+
+
+async def test_apply_patch_deletes_file(tmp_path: Path) -> None:
+    target = tmp_path / "obsolete.txt"
+    target.write_text("obsolete\n", encoding="utf-8")
+    patch = "--- a/obsolete.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-obsolete\n"
+
+    parsed = parse_unified_diff(patch)
+    assert parsed.files[0].operation is PatchOperation.DELETE
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
+
+    assert result.ok, result.content
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        "--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        "--- /dev/null\n+++ b/../escape.txt\n@@ -0,0 +1 @@\n+x\n",
+        "--- /dev/null\n+++ C:/absolute.txt\n@@ -0,0 +1 @@\n+x\n",
+        (
+            "--- /dev/null\n+++ b/dup.txt\n@@ -0,0 +1 @@\n+one\n"
+            "--- /dev/null\n+++ b/dup.txt\n@@ -0,0 +1 @@\n+two\n"
+        ),
+    ],
+)
+def test_canonical_patch_parser_rejects_ambiguous_targets(patch: str) -> None:
+    with pytest.raises(PatchError):
+        parse_unified_diff(patch)

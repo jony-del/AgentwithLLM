@@ -14,11 +14,14 @@ callable, so there is no import cycle.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 # Cap on the recently-read file snapshots kept on a session (Phase 3E). Only the most
@@ -29,6 +32,74 @@ _MAX_READ_FILE_STATE = 20
 # Allowed to-do states, mirroring Claude Code's TodoWrite.
 VALID_TODO_STATUS = frozenset({"pending", "in_progress", "completed"})
 _TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+
+
+@dataclass(frozen=True, slots=True)
+class SessionDescriptor:
+    """Stable identity of one resumable session and its owning project."""
+
+    session_id: str
+    workspace: Path
+    transcript_path: Path | None = None
+    project_id: str = ""
+
+    def __post_init__(self) -> None:
+        from agent_core.transcript import sanitize_project
+
+        workspace = self.workspace.resolve()
+        object.__setattr__(self, "workspace", workspace)
+        object.__setattr__(self, "project_id", self.project_id or sanitize_project(workspace))
+        if self.transcript_path is not None:
+            object.__setattr__(self, "transcript_path", self.transcript_path.resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSelection:
+    """Decision returned by CLI/chat session resolution."""
+
+    action: str
+    descriptor: SessionDescriptor
+    history: tuple[Any, ...] = ()
+    seed: tuple[Any, ...] = ()
+
+
+@dataclass(slots=True)
+class SessionRuntime:
+    """All mutable state and owned resources for one active session."""
+
+    descriptor: SessionDescriptor
+    context: "SessionContext"
+    transcript: Any | None = None
+    permissions: Any | None = None
+    process_supervisor: Any | None = None
+    scheduler_store: Any | None = None
+    counters: dict[str, int] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.monotonic)
+    closed: bool = False
+
+    async def close(self) -> None:
+        """Idempotently stop only resources owned by this session."""
+
+        if self.closed:
+            return
+        self.closed = True
+        if self.process_supervisor is not None:
+            with contextlib.suppress(Exception):
+                await self.process_supervisor.shutdown()
+        if self.scheduler_store is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    self.scheduler_store.delete_session_jobs,
+                    self.context.session_id,
+                    self.context.agent_id,
+                )
+        lsp_manager = self.context.lsp_manager
+        close = getattr(lsp_manager, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                value = close()
+                if asyncio.iscoroutine(value):
+                    await value
 
 
 @dataclass(slots=True)
