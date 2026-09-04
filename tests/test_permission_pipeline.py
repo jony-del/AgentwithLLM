@@ -123,6 +123,34 @@ def test_static_read_only_shell_wrapper_is_allowed() -> None:
 
 @pytest.mark.parametrize(
     "command",
+    ["ruff format .", "npm run format", "black --check . && ruff format src/"],
+)
+def test_format_subcommand_is_not_misclassified_as_destructive(command: str) -> None:
+    result = analyze_command(command)
+
+    assert result.behavior is not PermissionBehavior.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["format C:", "format.com D:\\ /q", "mkfs.ext4 /dev/sda1", "diskpart"],
+)
+def test_disk_utilities_in_executable_position_are_denied(command: str) -> None:
+    result = analyze_command(command)
+
+    assert result.behavior is PermissionBehavior.DENY
+    assert result.category == "destructive"
+
+
+def test_shell_wrapper_cannot_hide_destructive_executable() -> None:
+    result = analyze_command('bash -c "format C:"')
+
+    assert result.behavior is PermissionBehavior.DENY
+    assert result.category == "destructive"
+
+
+@pytest.mark.parametrize(
+    "command",
     ["PATH=/tmp/fake git status", "LD_PRELOAD=x git status", "$env:PATH='x'; git status"],
 )
 def test_binary_hijack_environment_cannot_gain_fast_allow(command: str) -> None:

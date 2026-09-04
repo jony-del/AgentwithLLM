@@ -57,7 +57,11 @@ from agent_core.memory.retrieval import RepositoryMemoryRetriever
 from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.lifecycle import MemoryLifecycle
 from agent_core.file_lock import FileLock
-from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
+from agent_core.managed_policy import (
+    FileManagedPolicyProvider,
+    ManagedPolicyDefinition,
+    ManagedPolicyProvider,
+)
 from agent_core.models import (
     LLMContextTooLongError,
     LLMTransientError,
@@ -71,7 +75,7 @@ from agent_core.permission_classifier import (
     ProviderAutoPermissionClassifier,
 )
 from agent_core.permission_rules import RuleSet
-from agent_core.permission_types import PermissionRuleSource, ToolCallSource
+from agent_core.permission_types import ManagedPolicySnapshot, PermissionRuleSource, ToolCallSource
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.prompt_ingress import (
     PromptSource,
@@ -638,12 +642,15 @@ class ReActAgent:
             rule.tool_name for rule in self.config.permission_rules.deny if rule.content is None
         }
         try:
-            managed_rules = self.managed_policy_provider.load().rules()
+            managed_definition = self.managed_policy_provider.load()
+            managed_rules = managed_definition.rules()
             blanket_denied.update(
                 rule.tool_name for rule in managed_rules.deny if rule.content is None
             )
         except Exception:
-            pass
+            managed_definition = None
+        if managed_definition is not None:
+            self._announce_managed_policy(managed_definition)
         for name in blanket_denied:
             if any(item.name == name for item in self.registry.deferred()):
                 self.registry.unregister(name)
@@ -674,6 +681,7 @@ class ReActAgent:
             plan_state=self.session.plan_state,
             managed_policy_provider=self.managed_policy_provider,
             allow_unsandboxed_unattended=self._unsandboxed_permission_ack,
+            managed_policy_listener=self._on_managed_policy_reload,
         )
         self.session.permission_grant_setter = self.permissions.add_session_rule
         self.session.permission_workspace_setter = lambda path: setattr(
@@ -1117,6 +1125,55 @@ class ReActAgent:
             "allow_unattended_unsandboxed = true (env AGENT_SANDBOX_ALLOW_UNATTENDED=1)."
         )
 
+    def _announce_managed_policy(self, definition: ManagedPolicyDefinition) -> None:
+        """One-time run-log event recording that an administrator policy is in force.
+
+        The payload carries the digest (truncated), flags and rule counts only —
+        never rule text, which is the administrator's deployment detail.
+        """
+        snapshot = definition.snapshot()
+        if not (
+            definition.digest
+            or definition.allow
+            or definition.deny
+            or definition.ask
+            or snapshot.forbidden_modes
+            or snapshot.require_sandbox_for_unattended
+            or snapshot.allow_managed_rules_only
+            or snapshot.disable_persistent_grants
+        ):
+            return
+        self.logger.write_nowait(
+            "managed_policy",
+            {"state": "active", **self._managed_policy_payload(snapshot, definition)},
+        )
+
+    def _on_managed_policy_reload(
+        self, snapshot: ManagedPolicySnapshot, definition: ManagedPolicyDefinition
+    ) -> None:
+        """PermissionPolicy listener: a live reload swapped the effective policy."""
+        self.logger.write_nowait(
+            "managed_policy",
+            {"state": "reloaded", **self._managed_policy_payload(snapshot, definition)},
+        )
+
+    @staticmethod
+    def _managed_policy_payload(
+        snapshot: ManagedPolicySnapshot, definition: ManagedPolicyDefinition
+    ) -> dict[str, Any]:
+        return {
+            "digest": snapshot.policy_digest[:12] or None,
+            "forbidden_modes": sorted(mode.value for mode in snapshot.forbidden_modes),
+            "require_sandbox_for_unattended": snapshot.require_sandbox_for_unattended,
+            "allow_managed_rules_only": snapshot.allow_managed_rules_only,
+            "disable_persistent_grants": snapshot.disable_persistent_grants,
+            "rules": {
+                "allow": len(definition.allow),
+                "deny": len(definition.deny),
+                "ask": len(definition.ask),
+            },
+        }
+
     def set_permission_mode(
         self,
         mode: PermissionMode | str,
@@ -1559,7 +1616,9 @@ class ReActAgent:
                 for event in events:
                     await self.logger.write("compression", asdict(event))
                 await self._commit_compaction_boundary(before_compaction, messages)
-                if events:
+                # PostCompact fires on a real fold, not on breaker-only observability
+                # events (nothing was compacted on a failure/reset/tripped round).
+                if any(event.stage != "autocompact_breaker" for event in events):
                     await self._run_post_compact_hooks(messages, before_compaction, "auto")
 
             # One batch spans this provider attempt. In quiet/headless runs the sink is

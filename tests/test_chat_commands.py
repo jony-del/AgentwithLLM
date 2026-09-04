@@ -396,3 +396,74 @@ async def test_rename_persists_custom_title(tmp_path, capsys) -> None:
     assert agent.session_title == "My useful session"
     assert '"type": "custom-title"' in agent.transcript.path.read_text(encoding="utf-8")
     assert "renamed" in capsys.readouterr().out.lower()
+
+
+async def test_status_reports_managed_policy_digest(capsys) -> None:
+    from agent_core.managed_policy import ManagedPolicyDefinition, StaticManagedPolicyProvider
+    from agent_core.permission_types import PermissionMode
+
+    provider = StaticManagedPolicyProvider(
+        ManagedPolicyDefinition(
+            forbidden_modes=frozenset({PermissionMode.BYPASS}),
+            digest="0123456789abcdef",
+        )
+    )
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(memory=MemoryConfig(enabled=False)),
+        managed_policy_provider=provider,
+    )
+
+    await dispatch("/status", agent, NullUI(), [])
+
+    out = capsys.readouterr().out
+    assert "digest 0123456789ab" in out
+    assert "bypass" in out
+
+
+async def test_status_reports_managed_policy_off(capsys) -> None:
+    await dispatch("/status", _agent(skills=[]), NullUI(), [])
+    assert "managed     off" in capsys.readouterr().out
+
+
+async def test_context_threshold_matches_compression_config(capsys) -> None:
+    from agent_core import tokens
+    from agent_core.compression import CompressionConfig
+
+    cfg = CompressionConfig(
+        context_window_tokens=100_000,
+        autocompact_buffer_tokens=5_000,
+        reserved_output_tokens_for_summary=2_000,
+    )
+    agent = _agent(skills=[], compression=cfg)
+
+    await dispatch("/context", agent, NullUI(), [])
+
+    out = capsys.readouterr().out
+    expected = tokens.auto_compact_threshold(
+        agent.config.model,
+        context_window_override=100_000,
+        buffer_tokens=5_000,
+        reserved_output_tokens=2_000,
+    )
+    assert f"{expected:,}" in out
+    assert "100,000" in out  # the window cap is reflected too
+
+
+async def test_status_counts_mcp_servers_from_live_manager(capsys) -> None:
+    from types import SimpleNamespace
+
+    class _Manager:
+        def tools(self):
+            return [
+                (SimpleNamespace(name="fs"), object()),
+                (SimpleNamespace(name="fs"), object()),
+                (SimpleNamespace(name="web"), object()),
+            ]
+
+    agent = _agent(skills=[])
+    agent.session.mcp_manager = _Manager()
+
+    await dispatch("/status", agent, NullUI(), [])
+
+    assert "mcp servers 2" in capsys.readouterr().out

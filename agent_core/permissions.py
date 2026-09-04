@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from agent_core.managed_policy import FileManagedPolicyProvider, ManagedPolicyProvider
+from agent_core.managed_policy import (
+    FileManagedPolicyProvider,
+    ManagedPolicyDefinition,
+    ManagedPolicyProvider,
+)
 from agent_core.models import ToolRisk
 from agent_core.permission_rules import (
     _SHELL_COMMAND_TOOLS,
@@ -111,6 +115,9 @@ class PermissionPolicy:
         managed_policy_provider: ManagedPolicyProvider | None = None,
         plan_state: Any | None = None,
         allow_unsandboxed_unattended: bool | None = None,
+        managed_policy_listener: (
+            "Callable[[ManagedPolicySnapshot, ManagedPolicyDefinition], None] | None"
+        ) = None,
     ) -> None:
         self.mode = PermissionMode(mode)
         self.prompter = prompter
@@ -129,6 +136,9 @@ class PermissionPolicy:
         self._managed_snapshot_override = managed_policy
         self.managed_policy = managed_policy or managed_definition.snapshot()
         self._managed_reload_error: str | None = None
+        # Optional observability hook: notified once per successful reload whose
+        # policy digest actually changed (never on the constructor's initial load).
+        self._managed_policy_listener = managed_policy_listener
         self.plan_state = plan_state
         if allow_unsandboxed_unattended is None:
             opt_out = os.getenv("AGENT_SANDBOX_ALLOW_UNATTENDED", "")
@@ -512,9 +522,13 @@ class PermissionPolicy:
         except Exception as exc:  # policy I/O/parser failures may never retain stale grants
             self._managed_reload_error = f"{type(exc).__name__}: {exc}"
             return self._managed_reload_error
-        self.managed_policy = definition.snapshot()
+        snapshot = definition.snapshot()
+        previous_digest = self.managed_policy.policy_digest
+        self.managed_policy = snapshot
         self.rules = definition.rules().merge(self._base_rules).merge(self._session_rules)
         self._managed_reload_error = None
+        if self._managed_policy_listener is not None and snapshot.policy_digest != previous_digest:
+            self._managed_policy_listener(snapshot, definition)
         return None
 
     def _allow_match(self, tool_name: str, arguments: dict[str, Any]) -> PermissionRule | None:

@@ -510,29 +510,78 @@ class CompressionPipeline:
         )
         if estimate < threshold:
             # Not over the line: nothing to do and the breaker resets (a later genuine
-            # spike starts from a clean failure count).
-            self._consecutive_autocompact_failures = 0
+            # spike starts from a clean failure count). A reset after real failures is
+            # surfaced once so the recovery is observable.
+            if self._consecutive_autocompact_failures:
+                event = self._breaker_event("reset", estimate, threshold, messages)
+                self._consecutive_autocompact_failures = 0
+                return messages, [event]
             return messages, []
 
         if self._consecutive_autocompact_failures >= self.config.max_consecutive_autocompact_failures:
             # Tripped breaker: context is irrecoverably over and compaction keeps failing.
-            # Short-circuit silently rather than spin (mirrors the reference breaker).
+            # Short-circuit rather than spin (mirrors the reference breaker); the
+            # transition itself was already surfaced as a "tripped" breaker event.
             return messages, []
 
         try:
             result, events = await self._run_stages(
                 messages, aggressive=False, summarizer=summarizer, on_stage=on_stage, attachments=attachments
             )
-        except Exception:  # noqa: BLE001 - a stage failure counts as a breaker failure, never crashes the loop
-            self._consecutive_autocompact_failures += 1
-            return messages, []
+        except Exception as exc:  # noqa: BLE001 - a stage failure counts as a breaker failure, never crashes the loop
+            return messages, [
+                self._breaker_failure_event(estimate, threshold, messages, f"stage error: {type(exc).__name__}")
+            ]
 
         if self._estimate(result, token_estimator) >= threshold:
             # Stages ran but couldn't pull the estimate below the line: a failure.
-            self._consecutive_autocompact_failures += 1
-        else:
+            return result, [
+                *events,
+                self._breaker_failure_event(estimate, threshold, messages, "still over threshold"),
+            ]
+        if self._consecutive_autocompact_failures:
+            event = self._breaker_event("reset", estimate, threshold, messages)
             self._consecutive_autocompact_failures = 0
+            events = [*events, event]
         return result, events
+
+    def _breaker_failure_event(
+        self, estimate: int, threshold: int, messages: list[Message], reason: str
+    ) -> CompressionEvent:
+        """Count one breaker failure and describe it as an event.
+
+        The ``tripped`` state is emitted exactly once - on the call whose failure
+        pushes the counter to ``max_consecutive_autocompact_failures``; later calls
+        hit the short-circuit above and stay silent.
+        """
+        self._consecutive_autocompact_failures += 1
+        failures = self._consecutive_autocompact_failures
+        maximum = self.config.max_consecutive_autocompact_failures
+        state = "tripped" if failures >= maximum else f"failure {failures}/{maximum}"
+        return self._breaker_event(state, estimate, threshold, messages, reason)
+
+    def _breaker_event(
+        self,
+        state: str,
+        estimate: int,
+        threshold: int,
+        messages: list[Message],
+        reason: str = "",
+    ) -> CompressionEvent:
+        """Observability-only event; nothing was compacted, so before == after."""
+        chars = sum(len(message.content) for message in messages)
+        return CompressionEvent(
+            stage="autocompact_breaker",
+            before_chars=chars,
+            after_chars=chars,
+            detail=f"{state}: {reason}" if reason else state,
+            metadata={
+                "estimate_tokens": estimate,
+                "threshold_tokens": threshold,
+                "consecutive_failures": self._consecutive_autocompact_failures,
+                "max_consecutive_failures": self.config.max_consecutive_autocompact_failures,
+            },
+        )
 
     async def reactive_compact(
         self,

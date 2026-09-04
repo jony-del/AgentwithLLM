@@ -119,9 +119,10 @@ async def test_auto_compact_uses_injected_estimator() -> None:
     )
     # Stages run (events may be empty if nothing shrinks), but the gate was crossed:
     # a single tiny message can't fold, so it returns unchanged — the point is the gate
-    # tripped. Verify the inverse: a low estimator never trips on a large history.
+    # tripped. Verify the inverse on a fresh pipeline (no accumulated breaker failures):
+    # a low estimator never trips on a large history.
     big = [Message("user", "x" * 4000) for _ in range(5)]
-    compacted2, events2 = await pipeline.auto_compact(
+    compacted2, events2 = await CompressionPipeline(_gate_config()).auto_compact(
         big, model="claude-haiku", token_estimator=lambda msgs: 1
     )
     assert compacted2 is big
@@ -687,10 +688,15 @@ async def test_circuit_breaker_short_circuits_after_consecutive_failures() -> No
     def over(msgs):  # always over the ~400 threshold
         return 10_000
 
-    # First 3 attempts run the stages but stay over → counted as failures.
+    # First 3 attempts run the stages but stay over → counted as failures, each
+    # surfacing exactly one breaker event; the third trips the breaker.
     for n in range(1, 4):
-        out, _ = await pipeline.auto_compact(messages, model="m", token_estimator=over)
+        out, events = await pipeline.auto_compact(messages, model="m", token_estimator=over)
         assert pipeline._consecutive_autocompact_failures == n
+        breaker = [e for e in events if e.stage == "autocompact_breaker"]
+        assert len(breaker) == 1
+        expected = "tripped" if n == 3 else f"failure {n}/3"
+        assert breaker[0].detail.startswith(expected)
 
     # Breaker tripped: subsequent calls short-circuit silently — input returned as-is,
     # no events, counter not incremented past the cap.
@@ -729,6 +735,8 @@ async def test_circuit_breaker_resets_on_success() -> None:
     out, events = await pipeline.auto_compact(big, model="m", token_estimator=estimator)
     assert events
     assert pipeline._consecutive_autocompact_failures == 0
+    # The recovery is observable: a breaker reset event rides along with the fold.
+    assert any(e.stage == "autocompact_breaker" and e.detail == "reset" for e in events)
 
 
 async def test_gate_below_threshold_resets_breaker() -> None:
@@ -743,8 +751,43 @@ async def test_gate_below_threshold_resets_breaker() -> None:
     out, events = await pipeline.auto_compact(
         [Message("user", "tiny")], model="m", token_estimator=lambda msgs: 1
     )
-    assert out is not None and events == []
+    # The reset is now observable: exactly one breaker event, no compaction stages.
+    assert [event.stage for event in events] == ["autocompact_breaker"]
+    assert events[0].detail == "reset"
     assert pipeline._consecutive_autocompact_failures == 0
+
+
+async def test_circuit_breaker_counts_stage_errors_as_failures() -> None:
+    pipeline = CompressionPipeline(
+        CompressionConfig(
+            context_window_tokens=600,
+            autocompact_buffer_tokens=100,
+            reserved_output_tokens_for_summary=100,
+            max_consecutive_autocompact_failures=2,
+        )
+    )
+    messages = [Message("user", "x" * 4000)]
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("stage exploded")
+
+    pipeline._run_stages = boom  # type: ignore[assignment]
+
+    def over(msgs):
+        return 10_000
+
+    out, events = await pipeline.auto_compact(messages, model="m", token_estimator=over)
+    assert out is messages
+    assert [e.stage for e in events] == ["autocompact_breaker"]
+    assert events[0].detail == "failure 1/2: stage error: RuntimeError"
+
+    out, events = await pipeline.auto_compact(messages, model="m", token_estimator=over)
+    assert events[0].detail == "tripped: stage error: RuntimeError"
+
+    # Tripped: silent short-circuit (the transition already surfaced the event).
+    out, events = await pipeline.auto_compact(messages, model="m", token_estimator=over)
+    assert out is messages
+    assert events == []
 
 
 # --- Phase 3D: reactive 413 gap parsing + head truncation ---------------------

@@ -689,6 +689,12 @@ def run_task(args: argparse.Namespace) -> int:
 
     try:
         result, scheduled = asyncio.run(run_once())
+    except KeyboardInterrupt:
+        # Ctrl-C in a one-shot run: exit quietly with the conventional 130 instead
+        # of dumping an asyncio traceback. run_once's finally already fired
+        # SessionEnd; the finally below still tears down sandbox/MCP/logger.
+        print("[interrupted] run cancelled by user", file=sys.stderr)
+        return 130
     except RuntimeError as exc:
         # Covers LLMTransientError (network exhausted retries) and API errors.
         print(f"[error] {exc}", file=sys.stderr)

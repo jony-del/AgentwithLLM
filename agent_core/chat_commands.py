@@ -135,7 +135,13 @@ async def _cmd_clear(agent: "ReActAgent", ui: AgentUI, args: str, history: list[
 
 
 async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
-    mcp_servers = [s for s in resolve_mcp_config().servers if s.enabled]
+    # Connected servers come from the live managers, not a re-parse of the config
+    # file (which may not be the file this agent was started with, e.g. --config).
+    mcp_servers: set[str] = set()
+    for manager in (getattr(agent.session, "mcp_manager", None), getattr(agent, "_plugin_mcp_manager", None)):
+        tools = getattr(manager, "tools", None)
+        if callable(tools):
+            mcp_servers.update(server.name for server, _tool in tools())
     thinking = agent.config.thinking_budget
     thinking_label = f"{thinking:,} tokens" if isinstance(thinking, int) and thinking > 0 else "off"
     print("Status:")
@@ -145,6 +151,18 @@ async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     print(f"  thinking    {thinking_label}")
     mode = PermissionMode(agent.config.permission)
     print(f"  permission  {mode.value} ({permission_mode_label(mode)})")
+    policy = agent.permissions.managed_policy
+    if (
+        policy.policy_digest
+        or policy.forbidden_modes
+        or policy.require_sandbox_for_unattended
+        or policy.allow_managed_rules_only
+        or policy.disable_persistent_grants
+    ):
+        forbidden = ", ".join(sorted(item.value for item in policy.forbidden_modes)) or "—"
+        print(f"  managed     digest {policy.policy_digest[:12] or '—'} · forbidden modes: {forbidden}")
+    else:
+        print("  managed     off")
     print(f"  session     {agent.session_id}")
     print(f"  workspace   {agent.session.workspace}")
     print(f"  skills      {len(agent.skills)}  ({len(agent.skills.model_invocable())} model-invocable)")
@@ -156,8 +174,19 @@ async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list
 async def _cmd_context(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     model = agent.config.model
     est = _estimate_tokens(agent, history)
+    cfg = agent.config.compression
     window = tokens.context_window_for_model(model)
-    threshold = tokens.auto_compact_threshold(model)
+    if cfg.context_window_tokens is not None and cfg.context_window_tokens > 0:
+        window = min(window, cfg.context_window_tokens)
+    # Same inputs as the live auto-compact gate (compression.auto_compact), so the
+    # displayed threshold is the one the run actually trips on.
+    threshold = tokens.auto_compact_threshold(
+        model,
+        context_window_override=cfg.context_window_tokens,
+        buffer_tokens=cfg.autocompact_buffer_tokens,
+        reserved_output_tokens=cfg.reserved_output_tokens_for_summary,
+        pct_override=cfg.autocompact_pct_override,
+    )
     pct_window = (est / window * 100) if window else 0.0
     pct_compact = (est / threshold * 100) if threshold else 0.0
     print(f"Context (model {model}):")

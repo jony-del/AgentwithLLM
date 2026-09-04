@@ -17,11 +17,14 @@ _NETWORK_TO_SHELL = re.compile(
 )
 _DESTRUCTIVE = (
     re.compile(r"(?i)\bgit\s+(?:reset\s+--hard|clean\s+-[^\s]*f)\b"),
-    re.compile(r"(?i)\b(?:mkfs|diskpart|format)\b"),
     re.compile(r"(?i)\bdd\s+.*\bof="),
     re.compile(r"(?i)\bRemove-Item\b.*(?:-Recurse.*-Force|-Force.*-Recurse)"),
     re.compile(r"(?i)\brm\s+-[^\s]*r[^\s]*f[^\s]*\s+(?:/|~|[A-Za-z]:[\\/])"),
 )
+# Disk-destructive utilities are matched only in executable position (first token of a
+# segment, after shell-wrapper unwrapping). Matching the bare words anywhere would
+# misclassify development commands such as ``ruff format .`` or ``npm run format``.
+_DESTRUCTIVE_EXECUTABLES = frozenset({"format", "mkfs", "diskpart"})
 _PERSISTENCE = re.compile(
     r"(?i)(?:\.git[\\/]hooks|schtasks\s+/create|\bsc(?:\.exe)?\s+create|"
     r"\breg(?:\.exe)?\s+add\b.*\\Run\b|Set-ExecutionPolicy)"
@@ -77,6 +80,8 @@ def analyze_command(command: str, *, _depth: int = 0) -> CommandAnalysis:
     if _PERSISTENCE.search(command):
         return CommandAnalysis(PermissionBehavior.DENY, "persistence operation is prohibited", segments, "persistence")
     if any(pattern.search(command) for pattern in _DESTRUCTIVE):
+        return CommandAnalysis(PermissionBehavior.DENY, "destructive command is prohibited", segments, "destructive")
+    if any(_is_destructive_executable(segment) for segment in segments):
         return CommandAnalysis(PermissionBehavior.DENY, "destructive command is prohibited", segments, "destructive")
     if _HIJACK_ASSIGNMENT.search(command) or _POWERSHELL_HIJACK.search(command):
         return CommandAnalysis(
@@ -186,6 +191,27 @@ def _wrapped_command(segment: str) -> str | None:
             payload = tokens[index + 1 :]
             return " ".join(payload) if payload else ""
     return ""
+
+
+def _segment_executable(segment: str) -> str:
+    """Return the lowercased executable basename of a segment's first token."""
+    normalized = _normalize_subcommand(segment)
+    try:
+        tokens = shlex.split(normalized, posix=True)
+    except ValueError:
+        return ""
+    if not tokens:
+        return ""
+    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in (".exe", ".com", ".bat"):
+        executable = executable.removesuffix(suffix)
+    return executable
+
+
+def _is_destructive_executable(segment: str) -> bool:
+    """True when the segment directly invokes a disk-destructive utility."""
+    executable = _segment_executable(segment)
+    return executable in _DESTRUCTIVE_EXECUTABLES or executable.startswith("mkfs.")
 
 
 def _segment_category(segment: str) -> str:

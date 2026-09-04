@@ -83,3 +83,54 @@ def test_capabilities_status_reports_configured_mode(tmp_path, monkeypatch, caps
     output = capsys.readouterr().out
     assert "mode=autonomous-trusted" in output
     assert "trusted_marketplaces=team" in output
+
+
+def test_run_task_ctrl_c_exits_130_without_traceback(monkeypatch, capsys) -> None:
+    # A KeyboardInterrupt out of the one-shot run must surface as a clean
+    # single-line note + exit 130, never as an asyncio traceback.
+    import argparse
+
+    from agent_core import cli
+    from agent_core.ui import NullUI
+
+    class _Session:
+        should_background = None
+
+    class _Sandbox:
+        def teardown(self) -> None:
+            pass
+
+    class _Logger:
+        def close(self) -> None:
+            pass
+
+    class _FakeAgent:
+        transcript = None
+        session = _Session()
+        sandbox = _Sandbox()
+        logger = _Logger()
+
+        async def scheduler_heartbeat(self) -> None:
+            pass
+
+        async def run(self, *args, **kwargs):
+            raise KeyboardInterrupt
+
+        async def drain_scheduler_deliveries(self, messages):
+            return messages, []
+
+        async def fire_session_end(self, reason: str) -> None:
+            pass
+
+    monkeypatch.setattr(
+        cli,
+        "build_agent",
+        lambda _args: cli.BuiltAgent(_FakeAgent(), NullUI(), None, [], []),
+    )
+
+    code = cli.run_task(argparse.Namespace(task="do something"))
+
+    assert code == 130
+    err = capsys.readouterr().err
+    assert "[interrupted]" in err
+    assert "Traceback" not in err
