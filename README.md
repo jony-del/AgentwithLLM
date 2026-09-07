@@ -3,19 +3,68 @@
 ## Reliability and retention defaults
 
 Session cleanup is enabled by default. Resumable transcripts are retained for 90 days
-and capped at 200 per project; verified terminal recovery journals are retained for
-7 days and capped at 500 per session. Cleanup runs at most once per day. The current
-session, active sessions, tagged transcripts, malformed transcripts, and unfinished
-recovery journals are always protected. Preview or apply the same transcript plan with:
+and capped at 200 per project. Transcript cleanup runs at most once per day and
+protects the current session, active sessions, tagged and malformed transcripts.
+Preview or apply the transcript plan with:
 
 ```console
 polaris sessions prune
 polaris sessions prune --apply
 ```
 
-Set `[session.retention] enabled = false` to disable both transcript and recovery-journal
-automatic deletion. The remaining limits and protection switches are documented in
-`agent.toml.example`.
+Set `[session.retention] enabled = false` to disable transcript automatic deletion.
+Automatic terminal-journal cleanup is suspended during P0 containment. The journal
+retention settings remain readable for compatibility and explicit library maintenance.
+The remaining limits and protection switches are documented in `agent.toml.example`.
+
+### Recovery containment
+
+Startup and `/resume` inspect recovery state without deleting overlays, restoring
+workspace files, writing recovered transcript rounds, repairing indexes, or pruning
+journals. Only a separate recovery audit record may be appended. Unfinished or
+unverifiable recovery state pauses the selected session before model/tool execution;
+`/resume` keeps the current session when its target is blocked.
+Active parent/sibling tool rounds are recognized only through this process's real
+locked journal objects, so subagents can continue normally. On-disk PID or process
+token fields never exempt an abandoned journal from the startup check. Legacy open
+indexes are no longer updated; recovery scans the session's shallow run partitions
+so an incomplete index cannot conceal an unfinished journal.
+
+From the owning project directory, review and explicitly apply recovery:
+
+```console
+polaris recovery --session-id SESSION_ID
+polaris recovery --session-id SESSION_ID --dry-run --json
+polaris recovery --session-id SESSION_ID --apply
+```
+
+The recovery command does not construct an Agent or start providers, hooks, MCP or
+sandbox processes. It examines only that project's specified session, across prior
+runs. Supply `--session-dir PATH` when the session used a custom transcript root;
+the default is `AGENT_SESSION_DIR` or `~/.polaris/projects`. This standalone command
+does not load repository configuration. An empty `--session-dir ""` disables history
+writes. The journal's recorded transcript target must match the runtime-derived path.
+`--apply` never overrides validation; busy, foreign, corrupt or incomplete recovery
+returns exit code 1, invalid arguments return 2, and a valid preview or successful
+apply returns 0. Preview and apply re-read the journal; close other processes using
+the session before applying.
+
+Journals stay under `POLARIS_HOME/recovery-journals` (default
+`~/.polaris/recovery-journals`), partitioned by project/session/run. The state directory
+must be outside the workspace, privately writable, and free of symlink/junction
+redirects. An unavailable private directory fails explicitly without a shared-temp
+fallback. Existing workspace `runs/.turn-journals` files are never imported, executed
+or removed automatically. v3/v4 checksum chains remain readable; checksums detect
+corruption and do not authenticate the author.
+
+Embedding APIs `recover_all()` and `recover_turn_journals()` now default to
+`dry_run=True`; actual recovery requires an explicit `dry_run=False` call. Use
+`inspect_recovery()` for a structured `RecoveryReport`; blocked `run()` calls raise
+`RecoveryRequiredError`. Recovery never retries external tool calls. Failures preserve
+the journal and backups, and leave a diagnostic in `recovery-audit.log`. A durable
+versioned recovery checkpoint permits retrying cleanup after workspace/history
+actions succeeded. Unverifiable journals and indeterminate external effects require
+manual investigation; do not delete their evidence to bypass the startup check.
 
 Automatic memory extraction processes model output item by item. Permanently invalid or
 secret-bearing items go to a bounded 1,000-entry diagnostic dead-letter queue without

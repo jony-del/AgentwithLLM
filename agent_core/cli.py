@@ -66,7 +66,9 @@ from agent_core.session import SessionDescriptor, SessionSelection
 from agent_core.sandbox import SandboxManager, SandboxRequiredError, get_shared_manager
 from agent_core.tools.base import ExecutionScope
 from agent_core.tools.registry import ToolRegistry
+from agent_core.tools.transaction import JournalStorage, TurnExecutionJournal
 from agent_core.transcript import (
+    TranscriptStore,
     build_chain,
     fork_chain,
     latest_session,
@@ -344,6 +346,16 @@ def _constant_factory(value: Any) -> Callable[[], Any]:
 
 
 def build_agent(args: argparse.Namespace) -> "BuiltAgent":
+    # Check the selected session before provider, sandbox, MCP, hooks or scheduler startup.
+    session_dir = _session_dir(args)
+    selection = _resolve_session(args, session_dir)
+    TurnExecutionJournal.require_recovered(
+        JournalStorage.user_state(selection.descriptor.workspace, selection.descriptor.session_id, "startup-check"),
+        history_path=(
+            project_dir(session_dir, selection.descriptor.workspace) / f"{selection.descriptor.session_id}.jsonl"
+            if session_dir else None
+        ),
+    )
     values = _resolve(args)
     config_file = _config_file(args)
     tool_suite = resolve_tool_suite_config(config_file)
@@ -397,7 +409,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         max_wall_seconds=max_wall_seconds,
         max_steps=max_steps,
         soft_deadline_fraction=float(limits["soft_deadline_fraction"]),
-        session_dir=_session_dir(args),
+        session_dir=session_dir,
         persist_compaction_boundary=resolve_persist_compaction_boundary(config_file),
         session_retention=resolve_session_retention_config(config_file),
         skills=resolve_skills_config(config_file),
@@ -418,7 +430,6 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
     # load any prior conversation to seed it. ``seed`` is the fork's cloned chain that
     # must be written into the fresh transcript before the run; for plain resume it is
     # empty because the history already lives on disk.
-    selection = _resolve_session(args, config.session_dir)
     agent = ReActAgent(
         provider=provider,
         config=config,
@@ -1055,6 +1066,61 @@ def chat_command(args: argparse.Namespace) -> int:
         if mcp is not None:
             mcp.close()
     return 0
+
+
+def _recovery_session_id(value: str) -> str:
+    if TurnExecutionJournal._safe_relative(value) != value or "/" in value:
+        raise argparse.ArgumentTypeError("session id must be a single safe filename component")
+    return value
+
+
+def recovery_command(args: argparse.Namespace) -> int:
+    """Inspect/apply recovery without constructing a provider or Agent runtime."""
+    try:
+        workspace = Path.cwd().resolve()
+        storage = JournalStorage.user_state(workspace, args.session_id, "explicit-recovery")
+        root = args.session_dir
+        history_path = (
+            (project_dir(root, workspace) / f"{args.session_id}.jsonl").absolute() if root else None
+        )
+        report = TurnExecutionJournal.inspect_recovery(storage, history_path=history_path)
+        result = report.to_dict()
+        result["dry_run"] = not args.apply
+        outcomes = report.outcomes
+        if args.apply:
+            transcript = TranscriptStore(root, workspace, args.session_id) if root else None
+            outcomes = TurnExecutionJournal.recover_all(
+                storage, dry_run=False,
+                history_writer=transcript.recover_tool_round if transcript is not None else None,
+                history_path=history_path, authorization_source="explicit_cli",
+            )
+            result["outcomes"] = outcomes
+            result["blocked"] = TurnExecutionJournal.inspect_recovery(storage, history_path=history_path).blocked
+        acceptable = {"rolled_back", "history_persisted"} if args.apply else {
+            "would_rollback_workspace", "would_recover_history", "would_cleanup_overlay",
+        }
+        failed = any(item["status"] not in acceptable for item in outcomes)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f"Recovery for session {args.session_id} in {workspace} ({'apply' if args.apply else 'preview'}):")
+            for plan in report.plans:
+                print(f"  Turn {plan['turn_id']} / run {plan['run_id']}: {plan['action']}")
+                for action in plan["actions"]:
+                    print(f"    {action['action']}: {action['target']}")
+            for outcome in outcomes:
+                print(f"  {outcome['turn_id'] or 'state directory'}: {outcome['status']} {outcome.get('reason', '')}".rstrip())
+            if not outcomes:
+                print("  No unfinished recovery journals.")
+            elif not args.apply:
+                print("Review these actions, then use --apply to execute. Rejected records are never applied.")
+        return 1 if failed or (args.apply and result["blocked"]) else 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        if args.json:
+            print(json.dumps({"schema_version": 1, "status": "rejected", "reason": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[recovery] {exc}", file=sys.stderr)
+        return 1
 
 
 def sessions_command(args: argparse.Namespace) -> int:
@@ -2098,6 +2164,18 @@ def main(argv: list[str] | None = None) -> int:
     add_common(chat_parser)
     add_session_flags(chat_parser)
     chat_parser.set_defaults(func=chat_command)
+
+    recovery_parser = subparsers.add_parser("recovery", help="Preview or explicitly apply this project's session recovery.")
+    recovery_parser.add_argument("--session-id", required=True, type=_recovery_session_id)
+    recovery_parser.add_argument(
+        "--session-dir", default=os.getenv("AGENT_SESSION_DIR", "~/.polaris/projects"),
+        help="Transcript root (default: AGENT_SESSION_DIR or ~/.polaris/projects); pass an empty string to disable history writes.",
+    )
+    recovery_mode = recovery_parser.add_mutually_exclusive_group()
+    recovery_mode.add_argument("--dry-run", action="store_true", help="Preview only (the default).")
+    recovery_mode.add_argument("--apply", action="store_true", help="Explicitly execute validated recovery actions.")
+    recovery_parser.add_argument("--json", action="store_true", help="Print a structured recovery report.")
+    recovery_parser.set_defaults(func=recovery_command)
 
     sessions_parser = subparsers.add_parser(
         "sessions", help="List resumable sessions saved for the current project."

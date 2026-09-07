@@ -52,9 +52,9 @@ def _run_blocked(script: str, tmp_path: Path) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=120,
-        env={"PYTHONPATH": str(_REPO_ROOT), "TMPDIR": str(tmp_path), "SYSTEMROOT": "C:\\Windows"}
+        env={"PYTHONPATH": str(_REPO_ROOT), "TMPDIR": str(tmp_path), "POLARIS_HOME": str(tmp_path / "state"), "SYSTEMROOT": "C:\\Windows"}
         if sys.platform == "win32"
-        else {"PYTHONPATH": str(_REPO_ROOT), "TMPDIR": str(tmp_path)},
+        else {"PYTHONPATH": str(_REPO_ROOT), "TMPDIR": str(tmp_path), "POLARIS_HOME": str(tmp_path / "state")},
     )
 
 

@@ -800,30 +800,29 @@ class ReActAgent:
             counters={"input_tokens": 0, "output_tokens": 0},
         )
 
-    def recover_turn_journals(self, *, dry_run: bool = False) -> list[dict[str, str]]:
+    def recover_turn_journals(self, *, dry_run: bool = True) -> list[dict[str, str]]:
         """Recover this project/session's verified journals and emit run audit events."""
 
-        retention = self.config.session_retention
-        if not dry_run and retention.enabled:
-            journal_report = TurnExecutionJournal.prune_terminal(
-                self.executor.journal_storage,
-                retention_days=retention.terminal_journal_days,
-                max_per_session=retention.max_terminal_journals_per_session,
-                scan_interval_seconds=retention.scan_interval_seconds,
-            )
-            if journal_report.get("deleted") or journal_report.get("errors"):
-                self.logger.write_nowait("journal_retention", journal_report)
-        outcomes = TurnExecutionJournal.recover_all(
-            self.executor.journal_storage,
-            history_writer=(
-                self.transcript.recover_tool_round if self.transcript is not None else None
-            ),
-            dry_run=dry_run,
-            audit_writer=lambda payload: self.logger.write_nowait(
+        def audit_writer(payload: dict[str, Any]) -> None:
+            self.logger.write_nowait(
                 "turn_recovery_audit",
                 {key: value for key, value in payload.items() if key != "event"},
-            ),
-        )
+            )
+
+        if dry_run:
+            outcomes = TurnExecutionJournal.inspect_recovery(
+                self.executor.journal_storage,
+                history_path=self.transcript.path if self.transcript is not None else None,
+                audit_writer=audit_writer, _include_active=False,
+            ).outcomes
+        else:
+            outcomes = TurnExecutionJournal.recover_all(
+                self.executor.journal_storage,
+                history_writer=self.transcript.recover_tool_round if self.transcript is not None else None,
+                dry_run=False,
+                history_path=self.transcript.path if self.transcript is not None else None,
+                audit_writer=audit_writer,
+            )
         for outcome in outcomes:
             self.logger.write_nowait("turn_recovery", outcome)
         return outcomes
@@ -860,6 +859,11 @@ class ReActAgent:
             raise RuntimeError(
                 f"session belongs to {source_workspace}; change to that project and resume again"
             )
+
+        TurnExecutionJournal.require_recovered(
+            JournalStorage.user_state(workspace, loaded.session_id, self.logger.run_id),
+            history_path=loaded.path,
+        )
 
         old_runtime = self.runtime
         new_transcript = (
@@ -1315,6 +1319,11 @@ class ReActAgent:
         """Run within one root/inherited execution budget, including preflight work."""
 
         started = time.monotonic()
+        await asyncio.to_thread(
+            TurnExecutionJournal.require_recovered,
+            self.executor.journal_storage,
+            history_path=self.transcript.path if self.transcript is not None else None,
+        )
         owned_scope = execution_scope is None
         if execution_scope is None:
             if deadline is None and self.config.max_wall_seconds is not None:

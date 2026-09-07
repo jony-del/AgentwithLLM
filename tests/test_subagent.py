@@ -182,6 +182,8 @@ async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> No
     staying within the cap.
     """
 
+    child_calls = threading.Barrier(2, timeout=2)
+
     class TrackingProvider:
         def __init__(self) -> None:
             self._lock = threading.Lock()
@@ -209,7 +211,10 @@ async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> No
                 if last.role == "tool":
                     return LLMResult("parent done", stop_reason="end")
                 if last.role == "user" and last.content.startswith("child "):
-                    time.sleep(0.05)
+                    # Wait for actual overlap, rather than assuming both children's
+                    # filesystem/security preflight finishes within a 50ms window.
+                    # Serialized provider access still breaks the barrier and fails.
+                    child_calls.wait()
                     return LLMResult(f"answer: {last.content}", stop_reason="end")
                 return LLMResult("done", stop_reason="end")
             finally:

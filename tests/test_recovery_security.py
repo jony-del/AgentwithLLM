@@ -169,7 +169,7 @@ def test_foreign_owner_cannot_consume_or_finalize_journal(tmp_path: Path, foreig
     assert overlay.exists()
     assert TurnExecutionJournal.load(journal.path)[-1]["state"] == "transaction_opened"
 
-    assert TurnExecutionJournal.recover_all(owner) == [{"turn_id": journal.turn_id, "status": "rolled_back"}]
+    assert TurnExecutionJournal.recover_all(owner, dry_run=False) == [{"turn_id": journal.turn_id, "status": "rolled_back"}]
 
 
 def test_same_session_can_recover_prior_run_but_foreign_session_cannot(
@@ -187,7 +187,7 @@ def test_same_session_can_recover_prior_run_but_foreign_session_cannot(
     assert overlay.exists()
 
     next_run = JournalStorage.user_state(workspace, "session-a", "run-b")
-    assert TurnExecutionJournal.recover_all(next_run) == [
+    assert TurnExecutionJournal.recover_all(next_run, dry_run=False) == [
         {"turn_id": journal.turn_id, "status": "rolled_back"}
     ]
     assert not overlay.exists()
@@ -266,7 +266,7 @@ def test_dry_run_audits_plan_without_mutating_then_recovery_restores(
     canonical = json.dumps(audit_lines[-1], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     assert audit_checksum == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    assert TurnExecutionJournal.recover_all(storage) == [
+    assert TurnExecutionJournal.recover_all(storage, dry_run=False) == [
         {"turn_id": journal.turn_id, "status": "rolled_back"}
     ]
     assert target.read_text(encoding="utf-8") == "old"

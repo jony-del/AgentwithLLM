@@ -506,10 +506,12 @@ def test_committed_history_recovery_is_idempotent(tmp_path: Path) -> None:
 
     first = TurnExecutionJournal.recover_all(
         journal.storage,
+        dry_run=False,
         history_writer=lambda payload: not recovered.append(payload),
     )
     second = TurnExecutionJournal.recover_all(
         journal.storage,
+        dry_run=False,
         history_writer=lambda payload: not recovered.append(payload),
     )
 
@@ -544,8 +546,8 @@ def test_recovery_restores_partially_applied_commit(
     assert target.read_text(encoding="utf-8") == "new"
     journal._release_for_later_recovery()
 
-    first = TurnExecutionJournal.recover_all(journal.storage)
-    second = TurnExecutionJournal.recover_all(journal.storage)
+    first = TurnExecutionJournal.recover_all(journal.storage, dry_run=False)
+    second = TurnExecutionJournal.recover_all(journal.storage, dry_run=False)
 
     assert target.read_text(encoding="utf-8") == "old"
     assert first == [{"turn_id": journal.turn_id, "status": "rolled_back"}]

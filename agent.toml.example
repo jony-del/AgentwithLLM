@@ -123,7 +123,7 @@ dir = "~/.polaris/projects"
 persist_compaction_boundary = true
 
 [session.retention]
-enabled = true # false disables BOTH transcript and terminal-journal automatic deletion
+enabled = true # false disables transcript automatic deletion
 # Cleanup always protects the current/active session, tagged or malformed transcripts,
 # and unfinished/corrupt recovery journals. `polaris sessions prune` is dry-run by
 # default; add `--apply` to execute exactly the reported transcript selection.
@@ -132,6 +132,8 @@ max_transcripts_per_project = 200
 preserve_tagged = true
 terminal_journal_days = 7
 max_terminal_journals_per_session = 500
+# P0 containment suspends automatic terminal-journal cleanup; these two settings
+# remain accepted for compatibility. Recovery itself requires explicit --apply.
 scan_interval_seconds = 86400
 
 # --- One-time project context (CLAUDE.md + git) -----------------------------
