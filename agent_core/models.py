@@ -17,6 +17,24 @@ class ToolRisk(str, Enum):
 
 @dataclass(slots=True)
 class Message:
+    """Frozen identity contract (schema v4):
+
+    - ``uuid``: instance identity within one transcript chain. Stable across
+      compression-derived copies; regenerated only when absent on load.
+    - ``origin_id``: logical identity across compressions; points at the first
+      version of the message (defaults to ``uuid``).
+    - ``version``: content version, bumped by ``_evolve_message`` on every
+      compression derivation.
+    - ``round_id``: provider tool-round identity (defaults to ``uuid`` for
+      assistant messages carrying ``tool_calls``).
+
+    Provider serialization pairs tool calls purely via ``metadata``
+    (``tool_calls`` / ``tool_call_id``); the identity fields above belong to the
+    persistence/recovery layer only. ``compare=False`` keeps equality based on
+    role/content/name/metadata, so two messages with the same content but
+    distinct ids still compare equal.
+    """
+
     role: Role
     content: str
     name: str | None = None
@@ -26,8 +44,6 @@ class Message:
     # tree the reference project stores per session. Appended last with defaults so all
     # existing positional ``Message(role, content, ...)`` construction stays valid, and
     # providers (which only read role/content/metadata/name) are unaffected.
-    # ``compare=False`` keeps equality based on role/content/name/metadata as before, so
-    # two messages with the same content but distinct ids still compare equal.
     uuid: str = field(default_factory=lambda: _uuid.uuid4().hex, compare=False)
     parent_uuid: str | None = field(default=None, compare=False)
     origin_id: str | None = field(default=None, compare=False)

@@ -48,6 +48,7 @@ from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.transaction import (
     JournalStorage,
     JournalWriteError,
+    RecoveryState,
     TurnExecutionJournal,
     WorkspaceTransaction,
     WorkspaceRecoveryRequired,
@@ -1087,7 +1088,7 @@ class StreamingToolBatch:
                 repr(sorted(tool_call.arguments.items())).encode("utf-8", errors="replace")
             ).hexdigest()
             self.journal.record_telemetry(
-                "discovered",
+                RecoveryState.DISCOVERED,
                 ordinal=ordinal,
                 tool_call_id=tool_call.id,
                 tool=tool_call.name,
@@ -1155,7 +1156,7 @@ class StreamingToolBatch:
             try:
                 await asyncio.to_thread(
                     self.journal.record,
-                    "admitted",
+                    RecoveryState.ADMITTED,
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     safety=prepared.policy.safety.value,
@@ -1359,7 +1360,7 @@ class StreamingToolBatch:
                 ).hexdigest()
                 await asyncio.to_thread(
                     self.journal.record,
-                    "external_intent",
+                    RecoveryState.EXTERNAL_INTENT,
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     idempotency_key=stable_key,
@@ -1403,7 +1404,7 @@ class StreamingToolBatch:
                     )
                     await asyncio.to_thread(
                         self.journal.record,
-                        "cleanup_required" if cleanup_pending else "cleanup_complete",
+                        RecoveryState.CLEANUP_REQUIRED if cleanup_pending else RecoveryState.CLEANUP_COMPLETE,
                         ordinal=tracked.ordinal,
                         tool=prepared.tool.name,
                         indeterminate=True,
@@ -1426,7 +1427,7 @@ class StreamingToolBatch:
                 )
                 await asyncio.to_thread(
                     self.journal.record,
-                    "staged",
+                    RecoveryState.STAGED,
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     ok=result.ok,
@@ -1435,7 +1436,7 @@ class StreamingToolBatch:
                 recovery_payload = self._build_recovery_payload(tracked, result)
                 await asyncio.to_thread(
                     self.journal.record,
-                    "external_outcome_committed",
+                    RecoveryState.EXTERNAL_OUTCOME_COMMITTED,
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     ok=result.ok,
@@ -1631,7 +1632,7 @@ class StreamingToolBatch:
 
         try:
             await asyncio.to_thread(
-                self.journal.record, "turn_validated", calls=len(final_calls)
+                self.journal.record, RecoveryState.TURN_VALIDATED, calls=len(final_calls)
             )
         except JournalWriteError as exc:
             self._journal_error = str(exc)
@@ -1823,7 +1824,7 @@ class StreamingToolBatch:
             try:
                 await asyncio.to_thread(
                     self.journal.record,
-                    "authorized",
+                    RecoveryState.AUTHORIZED,
                     ordinal=tracked.ordinal,
                     tool=prepared.tool.name,
                     safety=prepared.policy.safety.value,
@@ -1845,7 +1846,7 @@ class StreamingToolBatch:
             return
         await asyncio.to_thread(
             self.journal.record,
-            "history_ready",
+            RecoveryState.HISTORY_READY,
             history_payload=payload,
             precommit=True,
         )
@@ -1943,7 +1944,7 @@ class StreamingToolBatch:
                 pass
         else:
             try:
-                await asyncio.to_thread(self.journal.record, "rolled_back", reason=reason)
+                await asyncio.to_thread(self.journal.record, RecoveryState.ROLLED_BACK, reason=reason)
             except JournalWriteError:
                 pass
 
@@ -2090,19 +2091,19 @@ class StreamingToolBatch:
         self._history_context = dict(payload)
 
     def record_history_payload(self, payload: dict[str, object]) -> None:
-        self.journal.record("history_ready", history_payload=payload)
+        self.journal.record(RecoveryState.HISTORY_READY, history_payload=payload)
 
     async def record_history_payload_async(self, payload: dict[str, object]) -> None:
         await asyncio.to_thread(
-            self.journal.record, "history_ready", history_payload=payload
+            self.journal.record, RecoveryState.HISTORY_READY, history_payload=payload
         )
 
     def mark_history_persisted(self) -> None:
-        self.journal.record("history_persisted")
+        self.journal.record(RecoveryState.HISTORY_PERSISTED)
         self.journal.close()
 
     async def mark_history_persisted_async(self) -> None:
-        await asyncio.to_thread(self.journal.record, "history_persisted")
+        await asyncio.to_thread(self.journal.record, RecoveryState.HISTORY_PERSISTED)
         await asyncio.to_thread(self.journal.close)
 
     async def _write_metrics(self, abort_reason: str | None = None) -> None:

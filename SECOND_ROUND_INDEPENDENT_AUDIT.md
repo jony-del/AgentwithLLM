@@ -651,7 +651,7 @@ parent_id       durable chain parent
 - one-shot Ctrl-C 输出体验；
 - managed policy/compression breaker 可观测事件；
 - CLI/status/config 一致性；
-- `plugins.py` 拆分和死代码清理。
+- `plugins.py` 拆分和死ss代码清理。
 
 ## 11. 推荐下一阶段路线图
 

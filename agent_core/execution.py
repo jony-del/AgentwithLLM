@@ -1,3 +1,32 @@
+"""Frozen contract (schema v1): the unified execution scope for one run tree.
+
+``ExecutionScope`` is the single authority for deadline, cancellation, and owned
+resources of an execution tree (run loop, provider attempts, tool batches, hooks,
+MCP calls, sub-agents). The invariants below are contractual — pinned by
+``tests/test_contracts.py`` — and must not change without a schema bump:
+
+1. ``child()`` only ever tightens: deadline takes the min, ``network`` can never
+   widen from ``deny`` to ``allow``, ``workspace_writable`` can never widen from
+   False to True.
+2. One execution tree shares exactly one ``CancellationToken`` and one
+   ``ExecutionTaskRegistry``; ``child()`` carries both over unchanged.
+3. Cancellation has three layers with a fixed relationship: ``cancel_probe``
+   (external async signal, e.g. Esc) folds into the token on first observation;
+   the token provides cooperative cancellation (``raise_if_cancelled`` raises
+   ``asyncio.CancelledError``); ``asyncio.Task.cancel`` is structural and reserved
+   for the executor's ``safely_cancellable`` tasks. The run loop converts only
+   its own scope's token cancellation into an interrupted result.
+4. ``remaining_budget(requested)`` returns ``min(requested, wall-clock left)``;
+   ``run_awaitable`` enforces that bound and raises ``TimeoutError`` past it.
+5. Whoever creates a scope closes it: ``close()`` cancels the token and reaps
+   every registered task and cleanup callback.
+
+Known bypasses that do NOT yet draw from the scope budget (phase-3 integration
+targets, not part of this contract): the httpx ``ProviderConfig.timeout``, the
+MCP client thread-side future, prompt/agent hook ``wait_for`` calls, and
+``ProcessSupervisor._enforce_timeout``.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +41,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 
 
 class CancellationToken:
-    """Thread-safe cooperative cancellation shared by one execution tree."""
+    """Frozen contract (schema v1): thread-safe cooperative cancellation shared by one execution tree."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -35,7 +64,7 @@ class CancellationToken:
 
 
 class ExecutionTaskRegistry:
-    """Own async tasks and cleanup callbacks created by an execution tree."""
+    """Frozen contract (schema v1): own async tasks and cleanup callbacks created by an execution tree."""
 
     def __init__(self) -> None:
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -73,7 +102,7 @@ class ExecutionTaskRegistry:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionScope:
-    """Provider-neutral authority and lifecycle budget for one execution tree."""
+    """Frozen contract (schema v1): provider-neutral authority and lifecycle budget for one execution tree."""
 
     workspace: Path
     git_common_dir: Path | None = None

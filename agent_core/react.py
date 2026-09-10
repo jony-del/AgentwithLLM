@@ -2161,14 +2161,17 @@ class ReActAgent:
     ) -> None:
         """Persist a compaction boundary when a context-collapse fold actually happened.
 
-        Mirrors the reference: the new summary becomes a transcript root
+        Frozen contract (transcript schema v4): the new summary becomes a transcript root
         (``parent_uuid=None`` + ``compact_boundary`` tag), the kept tail's first message is
         relinked onto it, and post-compact file attachments are chained on — so a
         ``--resume`` loads only the *compacted* state (turns after the last boundary), not
-        the full pre-fold history. The fold is detected by diffing message uuids, so
-        snip/microcompact (which truncate content in place, same uuids) are correctly
-        ignored. No-op when persistence or the boundary feature is off; best-effort and
-        decoupled from the loop's correctness, exactly like ``_emit``.
+        the full pre-fold history. The fold is detected by diffing ``(uuid, version)``
+        pairs: compression derives new content in place (same uuid, bumped version), so a
+        changed message still shows up in the diff — the real guard that keeps
+        snip/microcompact from writing a boundary is "no summary in the diff means no
+        fold happened, so there is nothing to persist". No-op when persistence or the
+        boundary feature is off; best-effort and decoupled from the loop's correctness,
+        exactly like ``_emit``.
         """
         if self.transcript is None or not self.config.persist_compaction_boundary:
             return

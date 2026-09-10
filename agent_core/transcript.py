@@ -17,11 +17,16 @@ git_branch, ts}`` for conversation turns; ``{"type": <kind>, ...}`` for metadata
 
 Messages form a tree via ``uuid``/``parent_uuid``; a linear conversation is reconstructed
 by following ``parent_uuid`` back from a leaf (the root's ``parent_uuid`` is ``None``).
-The transcript is the *faithful* record of the conversation: compaction is an in-memory
-optimization the running loop applies to what it sends the model, and never touches what
-is written here — so a resume always reconstructs the true history and the live loop
-re-compacts it as needed. Forking clones a chain under a fresh ``session_id`` with new,
-re-linked uuids, leaving the source file untouched.
+The transcript is append-only: nothing already written is ever rewritten. Compaction is
+persisted as ``compaction_snapshot`` records (schema v4, sha256-checksummed), and a resume
+reconstructs the conversation from the last snapshot — the pre-boundary messages stay
+on disk but are no longer loaded. Forking clones a chain under a fresh ``session_id``
+with new, re-linked uuids, leaving the source file untouched.
+
+Frozen contract (schema v4): ``compaction_snapshot`` is the only authoritative compaction
+boundary record. ``relink`` records are legacy read-only compatibility — the load path
+still applies them (last-wins), but no production code writes them any more; the read
+support is scheduled for removal at schema v5.
 """
 
 from __future__ import annotations
@@ -217,7 +222,14 @@ class TranscriptStore:
         *,
         source_head: str | None,
     ) -> bool:
-        """Persist the complete ordered resumable conversation as one record."""
+        """Persist the complete ordered resumable conversation as one record.
+
+        Frozen contract (schema v4): this is the only authoritative compaction
+        boundary record. The snapshot carries the full post-fold chain (parents
+        re-linked onto the new summary root) plus a sha256 checksum over the
+        canonical ``messages`` + ``source_head`` body; on load, a valid snapshot
+        replaces everything before it (last boundary wins).
+        """
 
         serialized: list[dict[str, object]] = []
         parent: str | None = None
@@ -432,9 +444,9 @@ class TranscriptStore:
     async def append_relink(self, uuid: str, parent_uuid: str | None) -> bool:
         """Record that ``uuid``'s parent should be re-pointed to ``parent_uuid`` on load.
 
-        Written at a compaction boundary to re-attach the kept tail's first message to the
-        summary (the append-only file can't mutate the original line). ``load_transcript``
-        applies these last-wins after parsing all messages.
+        LEGACY (schema v4, frozen): ``compaction_snapshot`` is the only authoritative
+        boundary record; no production code calls this any more. The load path still
+        applies relinks last-wins for old transcripts; removal is scheduled at schema v5.
         """
         return await self.append_meta(_RELINK, {"uuid": uuid, "parent_uuid": parent_uuid})
 

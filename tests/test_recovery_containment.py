@@ -196,7 +196,7 @@ def test_audit_failure_prevents_workspace_and_journal_mutations(storage, monkeyp
 def test_busy_journal_reports_busy_without_finalizing(storage):
     journal = TurnExecutionJournal(storage)
     try:
-        journal.record("turn_opened")
+        journal.record("discovered")
         raw = journal.path.read_bytes()
         assert TurnExecutionJournal.recover_all(storage, dry_run=False) == [{"turn_id": journal.turn_id, "status": "busy"}]
         assert journal.path.read_bytes() == raw
@@ -434,7 +434,7 @@ def test_workspace_parent_redirected_after_preview_cannot_escape(storage, tmp_pa
 
 def test_only_live_in_memory_owners_are_exempt_from_run_gate(storage):
     journal = TurnExecutionJournal(storage)
-    journal.record("turn_opened")
+    journal.record("discovered")
     try:
         # A parent's active journal must not block its own subagents.
         assert not TurnExecutionJournal.require_recovered(storage).blocked

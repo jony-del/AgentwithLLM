@@ -1071,7 +1071,7 @@ async def test_transcript_failure_is_sticky_and_keeps_durable_head(
 def test_journal_open_index_tracks_only_unfinished(tmp_path: Path) -> None:
     storage = JournalStorage.local(tmp_path / "journals", workspace=tmp_path)
     open_journal = TurnExecutionJournal(storage)
-    open_journal.record("turn_opened")
+    open_journal.record("discovered")
     assert TurnExecutionJournal._journal_paths(storage) == [open_journal.path]
     open_journal.close()
     assert TurnExecutionJournal._journal_paths(storage) == []
@@ -1080,14 +1080,14 @@ def test_journal_open_index_tracks_only_unfinished(tmp_path: Path) -> None:
 def test_terminal_journal_retention_deletes_only_verified_terminal(tmp_path: Path) -> None:
     storage = JournalStorage.local(tmp_path / "journals", workspace=tmp_path)
     terminal = TurnExecutionJournal(storage)
-    terminal.record("turn_opened")
+    terminal.record("discovered")
     terminal.close()
     old = time.time() - 10 * 86_400
     os.utime(terminal.path, (old, old))
     corrupt = storage.run_root / ("f" * 32 + ".jsonl")
     corrupt.write_text("not-json\n", encoding="utf-8")
     unfinished = TurnExecutionJournal(storage)
-    unfinished.record("turn_opened")
+    unfinished.record("discovered")
     unfinished._release_for_later_recovery()
     os.utime(unfinished.path, (old, old))
 

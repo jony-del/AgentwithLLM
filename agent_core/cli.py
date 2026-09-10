@@ -471,6 +471,15 @@ def _resolve_session(
     Returns ``(session_id, history, seed)``: ``history`` is fed to ``run(history=...)``;
     ``seed`` is the (cloned) chain that still needs writing to a fresh transcript (fork),
     empty when the history already exists on disk.
+
+    Frozen product contract:
+    - ``--resume`` continues an existing session in the CURRENT project only;
+      a session found in another project is rejected with guidance (never
+      silently continued or partially imported).
+    - ``--continue`` picks the newest session of the current project only.
+    - ``--fork-session`` is the ONLY cross-project channel: it clones the
+      message chain with fresh uuids/re-linked parents and carries nothing
+      else — no permissions, todos, plans, or any other runtime state.
     """
     fork = getattr(args, "fork_session", False)
     explicit = getattr(args, "session_id", None)

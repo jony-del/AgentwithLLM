@@ -36,7 +36,13 @@ _TODO_MARK = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
 
 @dataclass(frozen=True, slots=True)
 class SessionDescriptor:
-    """Stable identity of one resumable session and its owning project."""
+    """Frozen contract: stable identity of one resumable session and its owning project.
+
+    ``session_id`` + ``workspace`` + ``transcript_path`` + ``project_id`` together
+    identify who owns a transcript and its recovery journals; the descriptor is
+    immutable for the lifetime of a session and is the only acceptable source of
+    these values (never re-derive them from the current cwd at use time).
+    """
 
     session_id: str
     workspace: Path
@@ -92,7 +98,15 @@ class SessionRetentionConfig:
 
 @dataclass(slots=True)
 class DurableHead:
-    """Separate live conversation state from the last confirmed transcript record."""
+    """Frozen contract: separate live conversation state from the last confirmed transcript record.
+
+    - ``memory_head_id``: head of the in-memory chain (may be ahead of disk).
+    - ``durable_head_id``: head of the last record confirmed written to the
+      transcript; it must never advance past a failed write.
+    - ``persistence_degraded``: sticky once set — after a transcript write failure
+      the durable head freezes and the run reports the degradation instead of
+      silently building on a broken chain.
+    """
 
     memory_head_id: str | None = None
     durable_head_id: str | None = None
@@ -103,7 +117,16 @@ class DurableHead:
 
 @dataclass(slots=True)
 class SessionRuntime:
-    """All mutable state and owned resources for one active session."""
+    """Frozen contract: all mutable state and owned resources for one active session.
+
+    Resume semantics (see ``ReActAgent.resume_loaded_session``): build a complete
+    new runtime (context, transcript, permissions, supervisor, executor), close
+    the old one, then swap the agent's pointers in one step. Session-scoped
+    grants and state never survive a resume: session permission rules, session
+    allow-lists, todos, plan state, approved workflow digests, read-file state,
+    scheduler jobs, and session counters all belong to the old runtime and die
+    with it.
+    """
 
     descriptor: SessionDescriptor
     context: "SessionContext"

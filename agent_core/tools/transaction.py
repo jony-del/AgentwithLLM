@@ -22,6 +22,7 @@ import time
 import uuid
 import weakref
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
@@ -351,6 +352,61 @@ class JournalWriteError(RuntimeError):
     """A required execution-journal transition could not be made durable."""
 
 
+class RecoveryState(str, Enum):
+    """Frozen contract (journal schema v4): every state a turn-journal record may carry.
+
+    The write path (``record`` / ``record_telemetry``) validates against this enum, so
+    journals can only ever contain states defined here. The read path maps
+    ``LEGACY_STATE_ALIASES`` after checksum verification, so older records keep their
+    on-disk bytes while all downstream logic sees canonical states only.
+    """
+
+    # Tool-call lifecycle (written by ToolExecutor).
+    DISCOVERED = "discovered"  # telemetry only, never gating
+    ADMITTED = "admitted"
+    AUTHORIZED = "authorized"
+    STAGED = "staged"
+    CLEANUP_REQUIRED = "cleanup_required"
+    CLEANUP_COMPLETE = "cleanup_complete"
+    EXTERNAL_INTENT = "external_intent"
+    EXTERNAL_OUTCOME_COMMITTED = "external_outcome_committed"
+    TURN_VALIDATED = "turn_validated"
+    HISTORY_READY = "history_ready"
+    HISTORY_PERSISTED = "history_persisted"  # terminal
+    # Workspace-transaction lifecycle (written by WorkspaceTransaction).
+    TRANSACTION_OPENED = "transaction_opened"
+    COMMIT_STARTED = "commit_started"
+    COMMITTED = "committed"
+    RECOVERY_REQUIRED = "recovery_required"
+    ROLLED_BACK = "rolled_back"  # terminal
+    # Recovery bookkeeping.
+    RECOVERY_ACTIONS_APPLIED = "recovery_actions_applied"
+    JOURNAL_CLOSED = "journal_closed"  # terminal
+    # Legacy terminal states: readable from pre-v4 journals, never written now.
+    INDETERMINATE_EXTERNAL_EFFECT = "indeterminate_external_effect"  # terminal
+    EXTERNAL_EFFECT_HISTORY_MISSING = "external_effect_history_missing"  # terminal
+
+
+# Terminal states as plain strings (frozenset[str]) so JSON-loaded records compare
+# directly. A journal whose last record is in this set is finished and skipped by
+# recovery scans.
+TERMINAL_RECOVERY_STATES = frozenset(
+    state.value
+    for state in (
+        RecoveryState.HISTORY_PERSISTED,
+        RecoveryState.ROLLED_BACK,
+        RecoveryState.JOURNAL_CLOSED,
+        RecoveryState.INDETERMINATE_EXTERNAL_EFFECT,
+        RecoveryState.EXTERNAL_EFFECT_HISTORY_MISSING,
+    )
+)
+
+# Schema v3 names accepted on the read path only; writes must use RecoveryState.
+LEGACY_STATE_ALIASES = {
+    "external_outcome": RecoveryState.EXTERNAL_OUTCOME_COMMITTED.value,
+}
+
+
 class WorkspaceRecoveryRequired(RuntimeError):
     """Commit failed and immediate restoration could not prove consistency."""
 
@@ -404,10 +460,7 @@ class TurnExecutionJournal:
     MAX_BYTES = 16 * 1024 * 1024
     MAX_RECORDS = 10_000
     MAX_LINE_BYTES = 1024 * 1024
-    TERMINAL_STATES = frozenset({
-        "history_persisted", "rolled_back", "indeterminate_external_effect",
-        "external_effect_history_missing", "journal_closed",
-    })
+    TERMINAL_STATES = TERMINAL_RECOVERY_STATES
 
     def __init__(
         self,
@@ -453,11 +506,21 @@ class TurnExecutionJournal:
         if _ownership is None:
             _LIVE_JOURNALS[self.path] = self
 
+    @staticmethod
+    def _validated_state(state: str) -> str:
+        """Return the canonical state string, rejecting anything outside the contract."""
+
+        try:
+            return RecoveryState(state).value
+        except ValueError:
+            raise JournalWriteError(f"unknown recovery state {state!r}") from None
+
     def record(self, state: str, **payload: Any) -> None:
         """Enqueue a required transition and wait for its durable fsync ack."""
 
         if self._closed:
             raise JournalWriteError("turn journal is closed")
+        state = self._validated_state(state)
         ack = threading.Event()
         errors: list[BaseException] = []
         self._requests.put((state, _redact_recovery_payload(payload), ack, errors))
@@ -471,6 +534,7 @@ class TurnExecutionJournal:
         """Queue non-gating telemetry without blocking the SSE consumer."""
 
         if not self._closed:
+            state = self._validated_state(state)
             self._requests.put((state, _redact_recovery_payload(payload), None, []))
 
     def _writer_loop(self) -> None:
@@ -537,7 +601,7 @@ class TurnExecutionJournal:
             return
         # A durable no-op makes every earlier telemetry request visible first.
         try:
-            self.record("journal_closed")
+            self.record(RecoveryState.JOURNAL_CLOSED)
         except JournalWriteError:
             pass
         self._closed = True
@@ -661,6 +725,9 @@ class TurnExecutionJournal:
             if not hmac.compare_digest(checksum, actual):
                 return [], "checksum_mismatch"
             previous_checksum = checksum
+            # Checksum verified over the original bytes; only now normalize legacy
+            # state names so every downstream reader sees canonical RecoveryState values.
+            value["state"] = LEGACY_STATE_ALIASES.get(value["state"], value["state"])
             records.append(value)
         if any(item.get("turn_id") != records[0].get("turn_id") for item in records):
             return [], "turn_id_changed"
@@ -732,13 +799,13 @@ class TurnExecutionJournal:
         records: list[dict[str, Any]],
     ) -> tuple[dict[str, Any] | None, str | None]:
         storage.validate(path)
-        completion = next((item for item in reversed(records) if item["state"] == "recovery_actions_applied"), None)
+        completion = next((item for item in reversed(records) if item["state"] == RecoveryState.RECOVERY_ACTIONS_APPLIED), None)
         if completion is not None and (
             completion.get("recovery_version") != 1
-            or completion.get("outcome") not in ("history_persisted", "rolled_back")
+            or completion.get("outcome") not in (RecoveryState.HISTORY_PERSISTED, RecoveryState.ROLLED_BACK)
         ):
             return None, "invalid_recovery_checkpoint"
-        is_committed = completion is not None or any(item["state"] == "committed" for item in records)
+        is_committed = completion is not None or any(item["state"] == RecoveryState.COMMITTED for item in records)
         overlay_values: list[str] = []
         for record in records:
             if "overlay" not in record:
@@ -764,7 +831,7 @@ class TurnExecutionJournal:
                 return None, "unsafe_overlay_kind"
             cls._validate_overlay_tree(overlay)
 
-        opened = [item for item in records if item.get("state") == "transaction_opened"]
+        opened = [item for item in records if item.get("state") == RecoveryState.TRANSACTION_OPENED]
         for record in opened:
             workspace = record.get("workspace")
             if not isinstance(workspace, str) or _canonical(workspace) != storage.workspace:
@@ -773,7 +840,7 @@ class TurnExecutionJournal:
             return None, "transaction_missing_overlay"
 
         commit = next(
-            (item for item in reversed(records) if item.get("state") == "commit_started"),
+            (item for item in reversed(records) if item.get("state") == RecoveryState.COMMIT_STARTED),
             None,
         )
         replacements: list[dict[str, Any]] = []
@@ -822,7 +889,7 @@ class TurnExecutionJournal:
                 )
 
         committed = next(
-            (item for item in reversed(records) if item.get("state") == "committed"),
+            (item for item in reversed(records) if item.get("state") == RecoveryState.COMMITTED),
             None,
         )
         if committed is not None:
@@ -969,14 +1036,10 @@ class TurnExecutionJournal:
         except (OSError, ValueError, TypeError, AttributeError):
             pass
         terminal: list[tuple[Path, float, int]] = []
-        terminal_states = {
-            "history_persisted", "rolled_back", "indeterminate_external_effect",
-            "external_effect_history_missing", "journal_closed",
-        }
         for path in cls._all_journal_paths(storage):
             storage.validate(path)
             records, error = cls._load_verified(path)
-            if error is not None or not records or records[-1].get("state") not in terminal_states:
+            if error is not None or not records or records[-1].get("state") not in cls.TERMINAL_STATES:
                 continue
             _owner, error = cls._validate_owner(storage, path, records)
             if error is not None:
@@ -1028,13 +1091,13 @@ class TurnExecutionJournal:
         outcomes = {
             int(item["ordinal"])
             for item in records
-            if item.get("state") in {"external_outcome", "external_outcome_committed"}
+            if item.get("state") == RecoveryState.EXTERNAL_OUTCOME_COMMITTED
             and isinstance(item.get("ordinal"), int)
         }
         uncertain = {
             int(item["ordinal"])
             for item in records
-            if item.get("state") == "external_intent"
+            if item.get("state") == RecoveryState.EXTERNAL_INTENT
             and isinstance(item.get("ordinal"), int)
             and int(item["ordinal"]) not in outcomes
         }
@@ -1089,11 +1152,11 @@ class TurnExecutionJournal:
                 return {"turn_id": path.stem, "status": "rejected", "reason": error or "invalid_plan"}, None
             known_outcomes = {
                 item.get("ordinal") for item in records
-                if item["state"] in {"external_outcome", "external_outcome_committed"}
+                if item["state"] == RecoveryState.EXTERNAL_OUTCOME_COMMITTED
                 and type(item.get("ordinal")) is int
             }
             if not plan["completed_status"] and any(
-                item["state"] == "external_intent" and (
+                item["state"] == RecoveryState.EXTERNAL_INTENT and (
                     type(item.get("ordinal")) is not int or item["ordinal"] not in known_outcomes
                 ) for item in records
             ):
@@ -1101,7 +1164,7 @@ class TurnExecutionJournal:
             payload = next(
                 (item.get("history_payload") for item in reversed(records) if item.get("history_payload")), None,
             )
-            needs_history = not plan["completed_status"] and bool(states & {"committed", "external_outcome", "external_outcome_committed"})
+            needs_history = not plan["completed_status"] and bool(states & {RecoveryState.COMMITTED.value, RecoveryState.EXTERNAL_OUTCOME_COMMITTED.value})
             if isinstance(payload, dict):
                 payload = cls._reconcile_history_payload(records, payload)
             if needs_history and isinstance(payload, dict):
@@ -1338,17 +1401,17 @@ class TurnExecutionJournal:
                         cls._check_history_target(history_path)
                     if history_writer is None or not history_writer(plan["payload"]):
                         raise OSError("history writer did not persist the recovered round")
-                    terminal_status = "history_persisted"
-                elif "external_intent" in plan["states"]:
+                    terminal_status = RecoveryState.HISTORY_PERSISTED.value
+                elif RecoveryState.EXTERNAL_INTENT.value in plan["states"]:
                     # Preserve the evidence: external outcomes need manual reconciliation.
                     outcomes.append({"turn_id": path.stem, "status": "IndeterminateExternalEffect"})
                     continue
                 else:
-                    terminal_status = "rolled_back"
+                    terminal_status = RecoveryState.ROLLED_BACK.value
                 if not plan["completed_status"]:
                     # Retrying after cleanup/final-journal failure must not require
                     # backups already removed by that cleanup, nor undo later edits.
-                    journal.record("recovery_actions_applied", recovery_version=1, outcome=terminal_status)
+                    journal.record(RecoveryState.RECOVERY_ACTIONS_APPLIED, recovery_version=1, outcome=terminal_status)
                 if plan["overlay"] is not None:
                     journal.discard_overlay(plan["overlay"])
                 # Only terminalize after ALL recovery actions succeed.
@@ -1406,7 +1469,7 @@ class WorkspaceTransaction:
         self._write_scopes: list[tuple[str, bool]] = []
         self._declared_scopes: set[tuple[str, str, bool]] = set()
         self.overlay.mkdir(parents=True, exist_ok=True)
-        self.journal.record("transaction_opened", overlay=str(self._container), workspace=str(self.workspace))
+        self.journal.record(RecoveryState.TRANSACTION_OPENED, overlay=str(self._container), workspace=str(self.workspace))
 
     def execution_root(self) -> Path:
         return self.overlay
@@ -1566,7 +1629,7 @@ class WorkspaceTransaction:
             relative: (self.workspace / Path(relative)).exists() for relative in changed
         }
         self.journal.record(
-            "commit_started",
+            RecoveryState.COMMIT_STARTED,
             changed=changed,
             existed=existed_map,
             overlay=str(self._container),
@@ -1601,7 +1664,7 @@ class WorkspaceTransaction:
                     os.replace(temporary, target)
                 elif existed:
                     target.unlink()
-            self.journal.record("committed", changed=changed)
+            self.journal.record(RecoveryState.COMMITTED, changed=changed)
         except Exception as commit_error:
             restore_errors: list[str] = []
             for item in reversed(applied):
@@ -1616,7 +1679,7 @@ class WorkspaceTransaction:
             if restore_errors:
                 self._recovery_required = True
                 try:
-                    self.journal.record("recovery_required", errors=restore_errors)
+                    self.journal.record(RecoveryState.RECOVERY_REQUIRED, errors=restore_errors)
                 except JournalWriteError:
                     pass
                 raise WorkspaceRecoveryRequired(
@@ -1636,4 +1699,4 @@ class WorkspaceTransaction:
             return
         self.journal.discard_overlay(self._container)
         self._closed = True
-        self.journal.record("rolled_back", reason=reason)
+        self.journal.record(RecoveryState.ROLLED_BACK, reason=reason)

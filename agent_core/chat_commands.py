@@ -932,6 +932,14 @@ async def _cmd_memory(agent: "ReActAgent", ui: AgentUI, args: str, history: list
 
 
 async def _cmd_resume(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    """Switch the live agent to another session of the CURRENT project.
+
+    Frozen product contract: same-project only (cross-project targets are
+    rejected with a pointer to ``/branch``); the switch rebuilds the whole
+    ``SessionRuntime`` via ``agent.resume_loaded_session`` — session permission
+    grants, todos, plans, workflow approvals, read state, scheduler jobs, and
+    session counters never carry over.
+    """
     session_dir = agent.config.session_dir
     if not session_dir:
         print("Session persistence is disabled; cannot resume.")
