@@ -23,7 +23,7 @@ from copy import deepcopy
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from agent_core import tokens
 from agent_core.config import resolve_mcp_config
@@ -486,6 +486,105 @@ async def _cmd_sandbox(
     return ChatTurn()
 
 
+_PROMPT_ONLY_PLUGIN_COMPONENTS = frozenset(
+    {"skills", "agents", "output-styles", "themes", "user-config"}
+)
+
+
+async def _gather_plugin_grants(
+    manager: Any, record: Any, ui: AgentUI
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], bool, bool] | None:
+    """Interactively grant a plugin's executable capabilities, category by category.
+
+    Returns ``(components, allowed_hooks, allowed_permission_hooks, env_access,
+    network_unrestricted)``, or ``None`` when the plugin declares nothing beyond
+    prompt-only components (legacy enable path applies).  ``confirm_action`` fails
+    closed on non-interactive sinks, so headless runs grant no executable capability.
+    """
+    from agent_core.plugins import validate_plugin
+    from agent_core.plugins.components import (
+        declared_hook_ids,
+        declared_permission_hooks,
+        declared_remote_mcp,
+        declared_sensitive_env_refs,
+    )
+
+    plugin_id = record.plugin_id
+    root = Path(record.path).resolve()
+    manifest = (
+        dict(record.manifest) if isinstance(record.manifest, dict) else validate_plugin(root)
+    )
+    declared = set(record.components)
+    permission_hooks = declared_permission_hooks(root, manifest, plugin_id)
+    env_refs = declared_sensitive_env_refs(root, manifest)
+    remote_mcp = declared_remote_mcp(root, manifest)
+    executable = sorted(declared - _PROMPT_ONLY_PLUGIN_COMPONENTS)
+    if not executable and not permission_hooks and not env_refs and not remote_mcp:
+        return None
+
+    granted: list[str] = []
+    denied: list[str] = []
+    for category in executable:
+        if await asyncio.to_thread(
+            ui.confirm_action,
+            f"Enable {category} components from {plugin_id}? (executable capability)",
+        ):
+            granted.append(category)
+        else:
+            denied.append(category)
+    allowed_hooks: tuple[str, ...] = ()
+    if "hooks" in granted:
+        # Grant every declared hook id; PermissionRequest hooks still require the
+        # separate grant below and never load through this allowlist.
+        allowed_hooks = declared_hook_ids(root, manifest, plugin_id)
+    granted_permission_hooks: tuple[str, ...] = ()
+    if permission_hooks:
+        if await asyncio.to_thread(
+            ui.confirm_action,
+            f"Plugin {plugin_id} declares PermissionRequest hooks that can auto-approve "
+            f"permission prompts ({', '.join(permission_hooks)}). Grant?",
+        ):
+            granted_permission_hooks = permission_hooks
+        else:
+            denied.append("permission-request-hooks")
+    env_access = False
+    if env_refs:
+        env_access = await asyncio.to_thread(
+            ui.confirm_action,
+            f"Plugin {plugin_id} references sensitive host variables "
+            f"({', '.join(env_refs)}). Grant env access?",
+        )
+        if not env_access:
+            denied.append("env-access")
+    network_unrestricted = False
+    if remote_mcp:
+        network_unrestricted = await asyncio.to_thread(
+            ui.confirm_action,
+            f"Plugin {plugin_id} declares remote MCP servers ({', '.join(remote_mcp)}); "
+            "they default to public-only (public HTTPS, no credentials). "
+            "Grant unrestricted network instead?",
+        )
+        if not network_unrestricted:
+            denied.append("network-unrestricted")
+
+    components = tuple([*sorted(declared & _PROMPT_ONLY_PLUGIN_COMPONENTS), *granted])
+    manager.audit.write(
+        "capability_granted",
+        {
+            "plugin_id": plugin_id,
+            "components": list(components),
+            "permission_hooks": list(granted_permission_hooks),
+            "env_access": env_access,
+            "network_unrestricted": network_unrestricted,
+        },
+    )
+    if denied:
+        manager.audit.write(
+            "capability_denied", {"plugin_id": plugin_id, "components": denied}
+        )
+    return components, allowed_hooks, granted_permission_hooks, env_access, network_unrestricted
+
+
 async def _cmd_plugin(
     agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]
 ) -> ChatTurn:
@@ -596,17 +695,16 @@ async def _cmd_plugin(
                 record = await asyncio.to_thread(manager.install_dependency_plan, plan)
             else:
                 record = await asyncio.to_thread(manager.install, plugin_name, marketplace)
-            allow_enable = True
-            if manager.executable_components(record.plugin_id):
-                allow_enable = await asyncio.to_thread(
-                    ui.confirm_action,
-                    f"Enable executable hooks/MCP components from {record.plugin_id}?",
-                )
             default_enabled = not (
                 isinstance(record.manifest, dict)
                 and record.manifest.get("defaultEnabled") is False
             )
-            if allow_enable and default_enabled:
+            grants = None
+            if default_enabled:
+                grants = await _gather_plugin_grants(manager, record, ui)
+            if not default_enabled:
+                state = "installed but disabled"
+            elif grants is None:
                 await asyncio.to_thread(
                     manager.set_enabled,
                     record.plugin_id,
@@ -615,7 +713,23 @@ async def _cmd_plugin(
                 )
                 state = "enabled for this project"
             else:
-                state = "installed but disabled"
+                components, allowed_hooks, permission_hooks, env_access, network = grants
+                await asyncio.to_thread(
+                    manager.set_enabled, record.plugin_id, True, scope="project"
+                )
+                await asyncio.to_thread(
+                    manager.set_activation,
+                    record.plugin_id,
+                    components,
+                    allowed_hooks=allowed_hooks,
+                    allowed_permission_hooks=permission_hooks,
+                    env_access=env_access,
+                    network_unrestricted=network,
+                )
+                state = (
+                    "enabled for this project with components: "
+                    + (", ".join(components) if components else "(none)")
+                )
             print(f"Plugin {record.plugin_id} {state}; run /reload-plugins to apply.")
         elif action in {"uninstall", "remove"}:
             if not rest:
@@ -626,21 +740,35 @@ async def _cmd_plugin(
             if not rest:
                 raise PluginError(f"usage: /plugin {action} <plugin@marketplace> [project|user]")
             scope = rest[1].casefold() if len(rest) > 1 else "project"
-            if action == "enable" and manager.executable_components(rest[0]):
-                confirmed = await asyncio.to_thread(
-                    ui.confirm_action,
-                    f"Enable executable hooks/MCP components from {rest[0]}?",
-                )
-                if not confirmed:
-                    print("Plugin enable was not confirmed.")
-                    return ChatTurn()
+            grants = None
+            if action == "enable":
+                target_record = manager.records().get(rest[0])
+                if target_record is not None:
+                    grants = await _gather_plugin_grants(manager, target_record, ui)
             await asyncio.to_thread(
                 manager.set_enabled,
                 rest[0],
                 action == "enable",
                 scope=scope,
             )
-            print(f"{rest[0]} {action}d for {scope}; run /reload-plugins to apply.")
+            if grants is not None:
+                components, allowed_hooks, permission_hooks, env_access, network = grants
+                await asyncio.to_thread(
+                    manager.set_activation,
+                    rest[0],
+                    components,
+                    allowed_hooks=allowed_hooks,
+                    allowed_permission_hooks=permission_hooks,
+                    env_access=env_access,
+                    network_unrestricted=network,
+                )
+                print(
+                    f"{rest[0]} enabled with components: "
+                    + (", ".join(components) if components else "(none)")
+                    + "; run /reload-plugins to apply."
+                )
+            else:
+                print(f"{rest[0]} {action}d for {scope}; run /reload-plugins to apply.")
         elif action == "update":
             if not rest:
                 raise PluginError("usage: /plugin update <plugin@marketplace>")

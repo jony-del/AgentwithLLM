@@ -1,4 +1,12 @@
-"""Export model changes as an official SWE-bench prediction patch."""
+"""Export model changes as an official SWE-bench prediction patch.
+
+This module deliberately keeps its own lenient header scanner instead of reusing
+``agent_core.unified_diff.parse_unified_diff``: benchmark patches are git-generated
+output that may contain renames or binary diffs, which the canonical parser rejects
+by design. Nothing here authorizes or applies patches — it only exports and sanity
+checks text for submission, so the strict shared parser stays the single authority
+on the apply_patch security path.
+"""
 
 from __future__ import annotations
 

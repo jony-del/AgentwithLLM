@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
 from agent_core.config import user_settings_path
+from agent_core.env_security import (
+    expand_host_env,
+    is_sensitive_env_name,
+    referenced_host_variables,
+)
 from .models import PluginError
 from .store import _KEYCHAIN_PREFIX
 
@@ -42,14 +46,36 @@ def _plugin_option_env(values: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _expand_executable_env(value: str) -> str:
-    """Resolve host variables only for an explicit executable environment value."""
+def _expand_executable_env(
+    value: str,
+    *,
+    plugin_id: str | None = None,
+    env_access_granted: bool = False,
+    audit: Any = None,
+) -> str:
+    """Resolve host variables only for an explicit executable environment value.
 
-    return re.sub(
-        r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-        lambda match: os.getenv(match.group(1), match.group(2) or ""),
-        value,
-    )
+    Plugin-sourced values (``plugin_id`` set) may reference sensitive host variables
+    (API keys, tokens, …) only when the project granted that plugin ``env-access``;
+    otherwise loading fails closed with the variable name (never its value).  Granted
+    expansions are audited by name.
+    """
+
+    if plugin_id is None:
+        return expand_host_env(value)
+    names = referenced_host_variables(value)
+    sensitive = [name for name in names if is_sensitive_env_name(name)]
+    if sensitive and not env_access_granted:
+        raise PluginError(
+            f"plugin {plugin_id} references sensitive host variable "
+            f"{sensitive[0]} without an env-access grant"
+        )
+    if sensitive and audit is not None:
+        audit.write(
+            "env_expansion",
+            {"plugin_id": plugin_id, "variables": sorted(sensitive)},
+        )
+    return expand_host_env(value)
 
 
 def _expand_plugin_vars(

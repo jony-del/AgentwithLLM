@@ -184,6 +184,9 @@ def activate_plugin(
     *,
     components: tuple[str, ...],
     allowed_hooks: tuple[str, ...] = (),
+    allowed_permission_hooks: tuple[str, ...] = (),
+    env_access: bool = False,
+    network_unrestricted: bool = False,
 ) -> tuple[int, int, int]:
     """Build a proposed component-scoped state, persist it, then publish it."""
 
@@ -195,6 +198,18 @@ def activate_plugin(
     selections[plugin_id] = tuple(dict.fromkeys(components))
     hook_ids = manager.hook_selections()
     hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_hooks))
+    permission_hook_ids = manager.permission_hook_selections()
+    permission_hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_permission_hooks))
+    env_grants = (
+        (set(manager.env_access_grants()) | {plugin_id})
+        if env_access
+        else (set(manager.env_access_grants()) - {plugin_id})
+    )
+    network_grants = (
+        (set(manager.network_unrestricted_grants()) | {plugin_id})
+        if network_unrestricted
+        else (set(manager.network_unrestricted_grants()) - {plugin_id})
+    )
     generation = _prepare_generation(
         agent,
         manager.build_bundle(
@@ -202,6 +217,9 @@ def activate_plugin(
             enabled_ids=enabled,
             component_selections=selections,
             hook_selections=hook_ids,
+            permission_hook_selections=permission_hook_ids,
+            env_access_grants=env_grants,
+            network_unrestricted_grants=network_grants,
         ),
     )
     local_path = manager.workspace / "agent.local.toml"
@@ -211,6 +229,9 @@ def activate_plugin(
             plugin_id,
             selections[plugin_id],
             allowed_hooks=hook_ids[plugin_id],
+            allowed_permission_hooks=permission_hook_ids[plugin_id],
+            env_access=env_access,
+            network_unrestricted=network_unrestricted,
         )
         return _commit_generation(agent, generation)
     except Exception:

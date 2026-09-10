@@ -290,15 +290,8 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
 
 # --- unified-diff parsing/application (stdlib only) ------------------------------
 
-# Compatibility helpers retained for callers that imported the old private parser;
+# Compatibility shim retained for callers that imported the old private parser;
 # all authorization and execution paths above use ``parse_unified_diff``.
-_PatchError = PatchError
-
-
-def _strip_ab_prefix(path: str) -> str:
-    path = path.strip().split("\t", 1)[0]
-    return path[2:] if path.startswith(("a/", "b/")) else path
-
 def _parse_unified_diff(patch_text: str):
     """Parse into ``[(target_path, hunks, is_new_file), ...]``.
 
@@ -315,51 +308,6 @@ def _parse_unified_diff(patch_text: str):
         )
         for file in patch_set.files
     ]
-
-    # Kept below only to preserve blame context for the pre-canonical implementation.
-    lines = patch_text.splitlines()
-    files: list[tuple[str, list[tuple[list[str], list[str]]], bool]] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        if line.startswith("--- "):
-            old_path = line[4:]
-            if i + 1 >= n or not lines[i + 1].startswith("+++ "):
-                raise _PatchError("'---' header not followed by '+++'")
-            new_path = lines[i + 1][4:]
-            is_new = old_path.strip().endswith("/dev/null")
-            target = _strip_ab_prefix(new_path if not new_path.strip().endswith("/dev/null") else old_path)
-            i += 2
-            hunks: list[tuple[list[str], list[str]]] = []
-            while i < n and lines[i].startswith("@@"):
-                i += 1
-                old_block: list[str] = []
-                new_block: list[str] = []
-                while i < n and not lines[i].startswith("@@") and not lines[i].startswith("--- "):
-                    hline = lines[i]
-                    if hline.startswith("\\"):  # "\ No newline at end of file"
-                        i += 1
-                        continue
-                    tag, body = (hline[0], hline[1:]) if hline else (" ", "")
-                    if tag == " ":
-                        old_block.append(body)
-                        new_block.append(body)
-                    elif tag == "-":
-                        old_block.append(body)
-                    elif tag == "+":
-                        new_block.append(body)
-                    else:
-                        # Unknown line inside a hunk — treat as context to be lenient.
-                        old_block.append(hline)
-                        new_block.append(hline)
-                    i += 1
-                hunks.append((old_block, new_block))
-            if hunks or is_new:
-                files.append((target, hunks, is_new))
-        else:
-            i += 1  # skip 'diff --git', 'index', and other noise
-    return files
 
 
 def _apply_hunks(original: str, hunks: tuple[PatchHunk, ...]) -> str:

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from pydantic import FileUrl
 
+from agent_core.env_security import expand_host_env
 from agent_core.mcp.config import MCPConfig, MCPServerConfig
 
 
@@ -158,7 +159,11 @@ class MCPClientManager:
             if server.headers or server.headers_helper or server.env or server.oauth:
                 raise ValueError("untrusted remote MCP must not receive credentials or host environment")
             public_addresses = _validate_public_remote(server.url)
-        headers = {key: _expand_env(value) for key, value in server.headers.items()}
+        allow_sensitive = (not server.discovered) or server.allow_sensitive_env
+        headers = {
+            key: _expand_env(value, allow_sensitive=allow_sensitive)
+            for key, value in server.headers.items()
+        }
         if server.headers_helper:
             headers.update(_run_headers_helper(server))
         if transport == "stdio":
@@ -303,9 +308,6 @@ class MCPClientManager:
             raise TimeoutError(f"MCP resource read timed out after {bounded:.3f}s") from None
 
 
-_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-
-
 def _minimal_stdio_env(server: MCPServerConfig) -> dict[str, str]:
     baseline_names = {
         "PATH", "PATHEXT", "SystemRoot", "COMSPEC", "WINDIR",
@@ -316,7 +318,10 @@ def _minimal_stdio_env(server: MCPServerConfig) -> dict[str, str]:
         for name in baseline_names
         if (value := os.environ.get(name)) is not None
     }
-    result.update({key: _expand_env(value) for key, value in server.env.items()})
+    allow_sensitive = (not server.discovered) or server.allow_sensitive_env
+    result.update(
+        {key: _expand_env(value, allow_sensitive=allow_sensitive) for key, value in server.env.items()}
+    )
     return result
 
 
@@ -405,12 +410,8 @@ def _public_http_client(
     )
 
 
-def _expand_env(value: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        name, default = match.group(1), match.group(2)
-        return os.environ.get(name, default or "")
-
-    return _ENV.sub(replace, value)
+def _expand_env(value: str, *, allow_sensitive: bool = True) -> str:
+    return expand_host_env(value, allow_sensitive=allow_sensitive)
 
 
 def _run_headers_helper(server: MCPServerConfig) -> dict[str, str]:

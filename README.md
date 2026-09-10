@@ -247,6 +247,16 @@ skill、agents、hooks、MCP、LSP、workflows、monitors、channels 和展示/�
 失败时继续使用旧代。插件组件使用 `plugin:component` 命名空间，安装 ID 使用
 `plugin@marketplace`。
 
+启用授权按能力类别逐项确认（prompt-only 的 skills/agents/展示组件默认放行；hooks、mcp、lsp、
+workflows、monitors、channels、bin、settings 等可执行类别逐项询问），授权结果持久化在
+`agent.local.toml` 的 `[plugins]` 表：`components`（组件选择）、`allowed_hooks`（hook 白名单）、
+`allowed_permission_hooks`（可自动批准权限询问的 PermissionRequest hook，独立授权通道，
+通用 hook 白名单不能授予）、`env_access`（允许插件在 env/headers 中解析敏感宿主环境变量）、
+`network_unrestricted`（允许插件远程 MCP 保持 default 网络策略）。未获授权时：PermissionRequest
+hook 不加载，敏感变量引用导致加载失败，插件远程 MCP 一律降级为 `public-only`（仅公网 HTTPS、
+无凭据、DNS/IP 固定校验）。每次授予与拒绝都写入能力审计日志（`~/.polaris/plugins/audit/`）。
+非交互场景全部 fail-closed：仅安装并启用 prompt-only 组件。
+
 ## 运行时能力发现
 
 Agent 可通过 `capability_search` 自行检索当前 skills、已连接但尚未暴露的 MCP tools、已安装

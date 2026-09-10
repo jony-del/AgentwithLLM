@@ -164,6 +164,12 @@ def test_top_level_provider_model_and_privileged_modes_are_tofu_gated() -> None:
     assert trust.widening_subset(tightening) == {}
     assert trust.strip_widening(tightening) == tightening
 
+    # dontask converts ASK into DENY, so it only ever tightens policy and must stay
+    # outside the widening set — gating it would be a false positive, not a gap.
+    dontask = {"permission": "dontask"}
+    assert trust.widening_subset(dontask) == {}
+    assert trust.strip_widening(dontask) == dontask
+
 
 def test_unknown_privilege_key_fails_closed_and_prompt_redacts_value(tmp_path: Path) -> None:
     secret = "Bearer must-not-appear"

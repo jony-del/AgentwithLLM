@@ -38,6 +38,9 @@ class MCPServerConfig:
     discovered: bool = False
     trust_tier: str = "local_user_declared"
     network_policy: str = "default"  # default | public-only
+    # Plugin-sourced (discovered) servers may resolve sensitive host variables in
+    # env/headers only when the project granted the plugin env-access.
+    allow_sensitive_env: bool = False
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any] | None) -> "MCPServerConfig":

@@ -371,3 +371,22 @@ async def test_stdio_roundtrip_through_manager(tmp_path: Path) -> None:
         assert out.content == "hello mcp"
     finally:
         manager.close()
+
+
+# --- host env expansion policy -------------------------------------------------
+
+
+def test_expand_env_blocks_sensitive_names_only_for_plugin_servers(monkeypatch) -> None:
+    from agent_core.mcp.client import _expand_env
+
+    monkeypatch.setenv("MY_API_KEY", "secret")
+    monkeypatch.setenv("MY_REGION", "eu")
+    # User-configured servers keep the legacy behavior.
+    assert _expand_env("${MY_API_KEY}") == "secret"
+    # Plugin-sourced (discovered) servers without an env-access grant fail closed.
+    with pytest.raises(ValueError) as excinfo:
+        _expand_env("${MY_API_KEY}", allow_sensitive=False)
+    assert "MY_API_KEY" in str(excinfo.value)
+    assert "secret" not in str(excinfo.value)
+    # Non-sensitive references still resolve under the restriction.
+    assert _expand_env("${MY_REGION}", allow_sensitive=False) == "eu"

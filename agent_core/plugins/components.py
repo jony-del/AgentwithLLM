@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from agent_core.capability_security import TrustTier
+from agent_core.env_security import is_sensitive_env_name, referenced_host_variables
 from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapter
 from agent_core.hooks import ExternalHookSpec
 from agent_core.mcp import MCPServerConfig
@@ -176,6 +178,99 @@ def _load_plugin_agents(
     return definitions, skills
 
 
+def _iter_hook_tables(root: Path, manifest: dict[str, Any]) -> list[Any]:
+    raw_hooks = manifest.get("hooks")
+    inline_tables: list[dict[str, Any]] = []
+    if isinstance(raw_hooks, dict):
+        inline_tables.append(raw_hooks.get("hooks", raw_hooks))
+    elif isinstance(raw_hooks, list):
+        inline_tables.extend(item.get("hooks", item) for item in raw_hooks if isinstance(item, dict))
+    tables: list[Any] = list(inline_tables)
+    for location in _component_paths(root, manifest, "hooks", root / "hooks"):
+        path = location / "hooks.json" if location.is_dir() else location
+        data = _read_json(path, {})
+        tables.append(data.get("hooks", data) if isinstance(data, dict) else {})
+    return tables
+
+
+def _iter_hook_entries(root: Path, manifest: dict[str, Any]):
+    """Yield ``(event, entry)`` for every hook a plugin declares."""
+
+    for table in _iter_hook_tables(root, manifest):
+        if not isinstance(table, dict):
+            continue
+        for event, groups in table.items():
+            if event not in LIFECYCLE_EVENT_ATTRS or not isinstance(groups, list):
+                continue
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                entries = group.get("hooks", [group])
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        yield event, entry
+
+
+def declared_hook_ids(
+    root: Path, manifest: dict[str, Any], plugin_id: str, *, event: str | None = None
+) -> tuple[str, ...]:
+    """Qualified ids of a plugin's declared hooks, optionally filtered by event."""
+
+    ids: list[str] = []
+    for hook_event, entry in _iter_hook_entries(root, manifest):
+        if event is not None and hook_event != event:
+            continue
+        entry_id = str(entry.get("id") or "").strip()
+        if entry_id:
+            ids.append(f"{plugin_id}:{entry_id}")
+    return tuple(dict.fromkeys(ids))
+
+
+def declared_permission_hooks(
+    root: Path, manifest: dict[str, Any], plugin_id: str
+) -> tuple[str, ...]:
+    """Qualified ids of PermissionRequest hooks a plugin declares (for grant prompts)."""
+
+    return declared_hook_ids(root, manifest, plugin_id, event="PermissionRequest")
+
+
+def declared_sensitive_env_refs(root: Path, manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Sensitive host variables referenced by a plugin's executable declarations.
+
+    Scans the raw hook/MCP/LSP declarations (the places ``_expand_executable_env``
+    resolves ``${VAR}``) so the activation prompt can name what an env-access grant
+    would expose.  Over-detection is deliberate: it only widens the prompt.
+    """
+
+    texts: list[str] = []
+    for key in ("hooks", "mcpServers", "lspServers"):
+        value = manifest.get(key)
+        if value is not None:
+            texts.append(json.dumps(value, ensure_ascii=False, default=str))
+    defaults = (
+        ("hooks", root / "hooks" / "hooks.json"),
+        ("mcpServers", root / ".mcp.json"),
+        ("lspServers", root / ".lsp.json"),
+    )
+    for key, default in defaults:
+        for location in _component_paths(root, manifest, key, default):
+            path = location / "hooks.json" if key == "hooks" and location.is_dir() else location
+            if not path.is_file():
+                continue
+            try:
+                texts.append(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+    found: set[str] = set()
+    for text in texts:
+        for name in referenced_host_variables(text):
+            if is_sensitive_env_name(name):
+                found.add(name)
+    return tuple(sorted(found))
+
+
 def _load_plugin_hooks(
     root: Path,
     agent: "ReActAgent",
@@ -188,6 +283,9 @@ def _load_plugin_hooks(
     user_config: dict[str, Any],
     runtime_config: dict[str, Any] | None = None,
     allowed_hook_ids: tuple[str, ...] | None = None,
+    allowed_permission_hook_ids: tuple[str, ...] = (),
+    env_access_granted: bool = False,
+    audit: Any = None,
 ) -> list[tuple[str, Any]]:
     result: list[tuple[str, Any]] = []
     # command_argv is an internal post-sandbox transport and must never be supplied
@@ -195,17 +293,7 @@ def _load_plugin_hooks(
     valid_fields = {
         field.name for field in fields(ExternalHookSpec) if field.name != "command_argv"
     }
-    raw_hooks = manifest.get("hooks")
-    inline_tables: list[dict[str, Any]] = []
-    if isinstance(raw_hooks, dict):
-        inline_tables.append(raw_hooks.get("hooks", raw_hooks))
-    elif isinstance(raw_hooks, list):
-        inline_tables.extend(item.get("hooks", item) for item in raw_hooks if isinstance(item, dict))
-    tables: list[Any] = list(inline_tables)
-    for location in _component_paths(root, manifest, "hooks", root / "hooks"):
-        path = location / "hooks.json" if location.is_dir() else location
-        data = _read_json(path, {})
-        tables.append(data.get("hooks", data) if isinstance(data, dict) else {})
+    tables = _iter_hook_tables(root, manifest)
     for table in tables:
         if not isinstance(table, dict):
             continue
@@ -221,9 +309,20 @@ def _load_plugin_hooks(
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
-                    if allowed_hook_ids is not None:
-                        entry_id = str(entry.get("id") or "").strip()
-                        qualified = f"{plugin_id}:{entry_id}" if entry_id else ""
+                    entry_id = str(entry.get("id") or "").strip()
+                    qualified = f"{plugin_id}:{entry_id}" if entry_id else ""
+                    if event == "PermissionRequest":
+                        # PermissionRequest hooks programmatically approve permission
+                        # prompts: they load only through their own explicit grant,
+                        # never through the generic hook allowlist.
+                        if not qualified or qualified not in allowed_permission_hook_ids:
+                            if audit is not None:
+                                audit.write(
+                                    "permission_hook_rejected",
+                                    {"plugin_id": plugin_id, "hook_id": qualified or "(anonymous)"},
+                                )
+                            continue
+                    elif allowed_hook_ids is not None:
                         if not qualified or qualified not in allowed_hook_ids:
                             continue
                     values = dict(entry)
@@ -237,7 +336,12 @@ def _load_plugin_hooks(
                     )
                     values["env"] = {
                         **{
-                            str(key): _expand_executable_env(str(value))
+                            str(key): _expand_executable_env(
+                                str(value),
+                                plugin_id=plugin_id,
+                                env_access_granted=env_access_granted,
+                                audit=audit,
+                            )
                             for key, value in dict(values.get("env") or {}).items()
                         },
                         **_plugin_option_env(runtime_config or user_config),
@@ -317,12 +421,7 @@ def _restrict_autonomous_hook(
     return spec
 
 
-def _load_plugin_mcp(
-    root: Path, namespace: str, manifest: dict[str, Any], workspace: Path,
-    plugin_data: Path, user_config: dict[str, Any],
-    runtime_config: dict[str, Any] | None = None,
-) -> list[MCPServerConfig]:
-    result: list[MCPServerConfig] = []
+def _merged_mcp_bodies(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     raw_mcp = manifest.get("mcpServers")
     tables: list[Any] = []
     if isinstance(raw_mcp, dict):
@@ -343,22 +442,91 @@ def _load_plugin_mcp(
         if not isinstance(table, dict):
             continue
         merged.update(table)
+    return merged
+
+
+def declared_remote_mcp(root: Path, manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Names of declared MCP servers using a remote (non-stdio) transport."""
+
+    names: list[str] = []
+    for name, body in _merged_mcp_bodies(root, manifest).items():
+        if not isinstance(body, dict):
+            continue
+        transport = str(body.get("type") or body.get("transport") or "stdio").casefold()
+        if transport != "stdio":
+            names.append(str(name))
+    return tuple(sorted(names))
+
+
+def _load_plugin_mcp(
+    root: Path, namespace: str, manifest: dict[str, Any], workspace: Path,
+    plugin_data: Path, user_config: dict[str, Any],
+    runtime_config: dict[str, Any] | None = None,
+    env_access_granted: bool = False,
+    audit: Any = None,
+    plugin_id: str = "",
+    network_unrestricted_granted: bool = False,
+) -> list[MCPServerConfig]:
+    result: list[MCPServerConfig] = []
+    merged = _merged_mcp_bodies(root, manifest)
     for name, body in merged.items():
         if not isinstance(body, dict):
             continue
         expanded = _expand_plugin_vars(
             body, root, workspace, plugin_data, user_config
         )
+        # Headers stay literal until connect time (client-side expansion), so
+        # validate their host-variable references here at load time.
+        headers = expanded.get("headers")
+        if isinstance(headers, dict):
+            sensitive = sorted(
+                {
+                    ref
+                    for value in headers.values()
+                    for ref in referenced_host_variables(str(value))
+                    if is_sensitive_env_name(ref)
+                }
+            )
+            if sensitive and not env_access_granted:
+                raise PluginError(
+                    f"plugin {plugin_id or namespace} MCP server {name} references "
+                    f"sensitive host variable {sensitive[0]} in headers without an "
+                    "env-access grant"
+                )
+            if sensitive and audit is not None:
+                audit.write(
+                    "env_expansion",
+                    {"plugin_id": plugin_id or namespace, "variables": sensitive},
+                )
         expanded["env"] = {
             **{
-                str(key): _expand_executable_env(str(value))
+                str(key): _expand_executable_env(
+                    str(value),
+                    plugin_id=plugin_id or namespace,
+                    env_access_granted=env_access_granted,
+                    audit=audit,
+                )
                 for key, value in dict(expanded.get("env") or {}).items()
             },
             **_plugin_option_env(runtime_config or user_config),
         }
-        result.append(
-            MCPServerConfig.from_dict(f"{namespace}:{name}", expanded)
-        )
+        server = MCPServerConfig.from_dict(f"{namespace}:{name}", expanded)
+        transport = (server.transport or "stdio").casefold()
+        if (
+            transport != "stdio"
+            and server.network_policy == "default"
+            and not network_unrestricted_granted
+        ):
+            # Plugin remote MCP defaults to public-only on every trust tier.  An
+            # explicit ``network_policy = "default"`` request only survives when the
+            # project granted the plugin unrestricted networking.
+            if "network_policy" in body and audit is not None:
+                audit.write(
+                    "mcp_network_policy_downgraded",
+                    {"plugin_id": plugin_id or namespace, "server": server.name},
+                )
+            server.network_policy = "public-only"
+        result.append(server)
     return result
 
 
@@ -406,6 +574,10 @@ def _load_non_mcp_components(
     plugin_data: Path,
     user_config: dict[str, Any],
     runtime_config: dict[str, Any] | None = None,
+    env_access_granted: bool = False,
+    audit: Any = None,
+    plugin_id: str = "",
+    network_unrestricted_granted: bool = False,
 ) -> dict[str, Any]:
     from agent_core.tool_config import LSPServerConfig
 
@@ -424,7 +596,12 @@ def _load_non_mcp_components(
                 )
                 expanded["env"] = {
                     **{
-                        str(key): _expand_executable_env(str(value))
+                        str(key): _expand_executable_env(
+                            str(value),
+                            plugin_id=plugin_id or namespace,
+                            env_access_granted=env_access_granted,
+                            audit=audit,
+                        )
                         for key, value in dict(expanded.get("env") or {}).items()
                     },
                     **_plugin_option_env(runtime_config or user_config),
@@ -483,6 +660,10 @@ def _load_non_mcp_components(
                 for item in _load_plugin_mcp(
                     root, namespace, manifest, workspace, plugin_data, user_config,
                     runtime_config,
+                    env_access_granted=env_access_granted,
+                    audit=audit,
+                    plugin_id=plugin_id,
+                    network_unrestricted_granted=network_unrestricted_granted,
                 )
             }
         for item in manifest["channels"]:

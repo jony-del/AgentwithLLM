@@ -210,6 +210,30 @@ kind = "github"
 repo = "anthropics/knowledge-work-plugins"
 ref = "main"
 
+# --- Plugin capability grants -------------------------------------------------
+# Plugin activation grants are written by the /plugin install|enable flow into the
+# gitignored agent.local.toml only — a repository agent.toml cannot grant these
+# (the whole [plugins] table is TOFU-gated, and the grant readers below only ever
+# consult agent.local.toml). Enabling a plugin confirms each executable component
+# category separately; prompt-only components (skills/agents/output-styles/themes/
+# user-config) activate without prompting.
+#
+# [plugins] keys managed in agent.local.toml:
+#   enabled / disabled          — per-project enablement
+#   components                  — {plugin@marketplace = [component, ...]} selection
+#   allowed_hooks               — {plugin@marketplace = [plugin@marketplace:id, ...]}
+#   allowed_permission_hooks    — separate grant channel for PermissionRequest hooks
+#                                 (they auto-approve permission prompts; the generic
+#                                 allowed_hooks list can never load them)
+#   env_access                  — [plugin@marketplace] allowed to resolve sensitive
+#                                 host variables (API keys/tokens/…) in hook/MCP/LSP
+#                                 env maps and MCP headers; without it, referencing
+#                                 one fails plugin loading
+#   network_unrestricted        — [plugin@marketplace] allowed to keep remote MCP on
+#                                 network_policy = "default"; otherwise every plugin
+#                                 remote MCP server is forced to "public-only"
+#                                 (public HTTPS only, no credentials, pinned DNS/IP)
+
 # --- Lifecycle hooks --------------------------------------------------------
 # Two sources feed the lifecycle hooks (UserPromptSubmit / PostSampling /
 # PreCompact / PostCompact / Stop, plus the observational SessionStart /

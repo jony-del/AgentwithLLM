@@ -1596,6 +1596,47 @@ class PluginManager:
             if isinstance(values, list)
         }
 
+    def _local_plugins_table(self) -> dict[str, Any]:
+        path = self.workspace / "agent.local.toml"
+        if not path.is_file():
+            return {}
+        try:
+            import tomllib
+
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return {}
+        plugins = data.get("plugins")
+        return plugins if isinstance(plugins, dict) else {}
+
+    def permission_hook_selections(self) -> dict[str, tuple[str, ...]]:
+        """Per-plugin grants for PermissionRequest hooks (auto-approve prompts)."""
+
+        raw = self._local_plugins_table().get("allowed_permission_hooks", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(plugin_id): tuple(str(value) for value in values if isinstance(value, str))
+            for plugin_id, values in raw.items()
+            if isinstance(values, list)
+        }
+
+    def env_access_grants(self) -> frozenset[str]:
+        """Plugins allowed to resolve sensitive host variables in env/headers maps."""
+
+        raw = self._local_plugins_table().get("env_access", [])
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(str(value) for value in raw if isinstance(value, str))
+
+    def network_unrestricted_grants(self) -> frozenset[str]:
+        """Plugins allowed to keep remote MCP servers on the default network policy."""
+
+        raw = self._local_plugins_table().get("network_unrestricted", [])
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(str(value) for value in raw if isinstance(value, str))
+
     def set_enabled(
         self,
         plugin_id: str,
@@ -1673,6 +1714,9 @@ class PluginManager:
         components: tuple[str, ...],
         *,
         allowed_hooks: tuple[str, ...] = (),
+        allowed_permission_hooks: tuple[str, ...] = (),
+        env_access: bool = False,
+        network_unrestricted: bool = False,
     ) -> None:
         """Atomically enable a plugin with a project-local component selection."""
 
@@ -1690,6 +1734,18 @@ class PluginManager:
             selected[plugin_id] = tuple(dict.fromkeys(components))
             hook_ids = self.hook_selections()
             hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_hooks))
+            permission_hook_ids = self.permission_hook_selections()
+            permission_hook_ids[plugin_id] = tuple(dict.fromkeys(allowed_permission_hooks))
+            env_grants = sorted(
+                (set(self.env_access_grants()) | {plugin_id})
+                if env_access
+                else (set(self.env_access_grants()) - {plugin_id})
+            )
+            network_grants = sorted(
+                (set(self.network_unrestricted_grants()) | {plugin_id})
+                if network_unrestricted
+                else (set(self.network_unrestricted_grants()) - {plugin_id})
+            )
             update_local_table(
                 self.workspace,
                 "plugins",
@@ -1698,6 +1754,11 @@ class PluginManager:
                     "disabled": disabled,
                     "components": {key: list(value) for key, value in selected.items()},
                     "allowed_hooks": {key: list(value) for key, value in hook_ids.items()},
+                    "allowed_permission_hooks": {
+                        key: list(value) for key, value in permission_hook_ids.items()
+                    },
+                    "env_access": env_grants,
+                    "network_unrestricted": network_grants,
                 },
             )
 
@@ -1717,6 +1778,9 @@ class PluginManager:
         enabled_ids: list[str] | None = None,
         component_selections: dict[str, tuple[str, ...]] | None = None,
         hook_selections: dict[str, tuple[str, ...]] | None = None,
+        permission_hook_selections: dict[str, tuple[str, ...]] | None = None,
+        env_access_grants: set[str] | frozenset[str] | None = None,
+        network_unrestricted_grants: set[str] | frozenset[str] | None = None,
     ) -> PluginBundle:
         # Deferred: tests monkeypatch the package-level MCPClientManager.
         from agent_core.plugins import MCPClientManager
@@ -1734,6 +1798,19 @@ class PluginManager:
             self.component_selections() if component_selections is None else component_selections
         )
         selected_hooks = self.hook_selections() if hook_selections is None else hook_selections
+        selected_permission_hooks = (
+            self.permission_hook_selections()
+            if permission_hook_selections is None
+            else permission_hook_selections
+        )
+        env_grants = (
+            self.env_access_grants() if env_access_grants is None else frozenset(env_access_grants)
+        )
+        network_grants = (
+            self.network_unrestricted_grants()
+            if network_unrestricted_grants is None
+            else frozenset(network_unrestricted_grants)
+        )
         for plugin_id in self.enabled_ids() if enabled_ids is None else enabled_ids:
             record = records.get(plugin_id)
             if record is None:
@@ -1786,6 +1863,11 @@ class PluginManager:
                         manifest,
                         plugin_id=plugin_id,
                         allowed_hook_ids=allowed,
+                        allowed_permission_hook_ids=selected_permission_hooks.get(
+                            plugin_id, ()
+                        ),
+                        env_access_granted=plugin_id in env_grants,
+                        audit=self.audit,
                         workspace=agent.session.workspace,
                         plugin_data=plugin_data,
                         user_config=public_config,
@@ -1796,24 +1878,31 @@ class PluginManager:
                 plugin_mcp = _load_plugin_mcp(
                     root, namespace, manifest, agent.session.workspace,
                     plugin_data, public_config, configured,
+                    env_access_granted=plugin_id in env_grants,
+                    audit=self.audit,
+                    plugin_id=plugin_id,
+                    network_unrestricted_granted=plugin_id in network_grants,
                 )
                 if plugin_id in selected_components:
                     plugin_mcp = _restrict_autonomous_mcp(agent, root, plugin_mcp)
                 for server in plugin_mcp:
                     server.discovered = True
                     server.trust_tier = record.trust_tier
+                    server.allow_sensitive_env = plugin_id in env_grants
                     if record.trust_tier not in {
                         TrustTier.ANTHROPIC_FIRST_PARTY.value,
                         TrustTier.LOCAL_USER_DECLARED.value,
                     }:
                         server.risk = "dangerous"
-                        if (server.transport or "stdio").casefold() != "stdio":
-                            server.network_policy = "public-only"
                 mcp_servers.extend(plugin_mcp)
 
             metadata = _load_non_mcp_components(
                 root, namespace, manifest, components, agent.session.workspace,
                 plugin_data, public_config, configured,
+                env_access_granted=plugin_id in env_grants,
+                audit=self.audit,
+                plugin_id=plugin_id,
+                network_unrestricted_granted=plugin_id in network_grants,
             )
             if plugin_id in selected_components and metadata["lsp"]:
                 if not agent.sandbox.is_enabled():
