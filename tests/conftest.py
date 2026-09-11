@@ -77,3 +77,12 @@ def _fresh_shared_sandbox_managers():
     reset_shared_managers()
     yield
     reset_shared_managers()
+
+
+def pytest_collection_modifyitems(items):
+    """Auto-mark everything under tests/nightly/ so the directory needs no boilerplate."""
+
+    nightly_dir = Path(__file__).parent / "nightly"
+    for item in items:
+        if Path(str(item.fspath)).is_relative_to(nightly_dir):
+            item.add_marker(pytest.mark.nightly)

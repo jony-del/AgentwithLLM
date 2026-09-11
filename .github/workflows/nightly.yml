@@ -1,0 +1,30 @@
+# Nightly: the full suite INCLUDING the process-level crash-injection matrix
+# (tests/nightly/, marker `nightly`), which PR CI excludes via `-m "not nightly"`.
+# Also runnable by hand via workflow_dispatch.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (all capability extras + dev tooling)
+        run: pip install -e .[all,dev]
+      - name: Full tests (including the nightly crash matrix)
+        env:
+          FORCE_COLOR: "1"
+        run: python -m pytest -q

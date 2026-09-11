@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -1099,6 +1100,9 @@ def session_label(info: SessionInfo) -> str:
 class SessionLocation:
     path: Path
     workspace: Path
+    # Non-fatal findings about how the session was located (e.g. it was only found
+    # under a legacy, pre-hash project directory name). Empty on the normal path.
+    diagnostics: tuple[TranscriptDiagnostic, ...] = ()
 
 
 class AmbiguousSessionError(RuntimeError):
@@ -1110,9 +1114,10 @@ def locate_session(root: str | Path, cwd: str | Path, session_id: str) -> Sessio
 
     current = Path(cwd).resolve()
     base = Path(root).expanduser()
+    legacy_dir = base / _legacy_sanitize_project(current)
     current_dirs = {
         project_dir(base, current),
-        base / _legacy_sanitize_project(current),
+        legacy_dir,
     }
     candidates = [folder / f"{session_id}.jsonl" for folder in current_dirs]
     if base.is_dir():
@@ -1139,7 +1144,36 @@ def locate_session(root: str | Path, cwd: str | Path, session_id: str) -> Sessio
     if len(matches) > 1:
         paths = ", ".join(str(item.path) for item in matches.values())
         raise AmbiguousSessionError(f"session id {session_id!r} is ambiguous: {paths}")
-    return next(iter(matches.values()), None)
+    location = next(iter(matches.values()), None)
+    if location is None:
+        return None
+    # A hit under the legacy (pre-hash) project dir still resolves, but it is worth
+    # surfacing: the legacy naming collides across distinct cwds (P1-N3), so the
+    # operator should migrate it with ``migrate_legacy_project_dir``. Lookup and
+    # rejection semantics are unchanged — this only annotates the result.
+    if legacy_dir != project_dir(base, current) and os.path.normcase(
+        str(location.path.resolve())
+    ) == os.path.normcase(str((legacy_dir / f"{session_id}.jsonl").resolve())):
+        logging.getLogger(__name__).warning(
+            "session %s resolved via the legacy project directory %s; migrate it with "
+            "agent_core.transcript.migrate_legacy_project_dir to the hashed project name",
+            session_id,
+            legacy_dir,
+        )
+        location = SessionLocation(
+            location.path,
+            location.workspace,
+            (
+                TranscriptDiagnostic(
+                    code="legacy_project_dir",
+                    detail=(
+                        f"session found only in the legacy project directory {legacy_dir}; "
+                        "migrate it with migrate_legacy_project_dir"
+                    ),
+                ),
+            ),
+        )
+    return location
 
 
 def find_session(root: str | Path, cwd: str | Path, session_id: str) -> Path | None:
@@ -1147,6 +1181,33 @@ def find_session(root: str | Path, cwd: str | Path, session_id: str) -> Path | N
 
     location = locate_session(root, cwd, session_id)
     return location.path if location is not None else None
+
+
+def migrate_legacy_project_dir(root: str | Path, cwd: str | Path) -> Path | None:
+    """Move a legacy-named project directory to the modern hashed name.
+
+    Explicit, caller-driven migration for session stores written before project
+    directories gained their collision-proof sha256 suffix (P1-N3): the
+    ``_legacy_sanitize_project(cwd)`` directory under ``root`` is renamed to the
+    ``sanitize_project(cwd)`` directory in a single filesystem rename. Returns the
+    new directory path, or ``None`` when no legacy directory exists (nothing to
+    migrate). Raises ``FileExistsError`` when the modern directory already exists —
+    migration never overwrites or merges. Never invoked automatically on any
+    startup or load path.
+    """
+
+    base = Path(root).expanduser()
+    current = Path(cwd).resolve()
+    source = base / _legacy_sanitize_project(current)
+    target = project_dir(base, current)
+    if source == target or not source.is_dir():
+        return None
+    if target.exists():
+        raise FileExistsError(
+            f"refusing to migrate {source} over the existing project directory {target}"
+        )
+    source.rename(target)
+    return target
 
 
 def fork_chain(loaded: LoadedTranscript, leaf: str | None = None) -> tuple[str, list[Message]]:

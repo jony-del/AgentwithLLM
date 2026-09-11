@@ -9,13 +9,15 @@ import pytest
 
 from agent_core.cli import main
 from agent_core.memory.config import MemoryConfig
-from agent_core.models import Message
+from agent_core.models import Message, ToolResult, ToolRisk
 from agent_core.providers.fake import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
+from agent_core.tools.base import Tool
+from agent_core.tools.registry import ToolRegistry
 from agent_core.tools.transaction import (
     JournalStorage, JournalWriteError, RecoveryRequiredError, TurnExecutionJournal,
 )
-from agent_core.transcript import TranscriptStore, load_transcript
+from agent_core.transcript import TranscriptStore, build_chain, load_transcript
 
 
 @pytest.fixture
@@ -445,3 +447,82 @@ def test_only_live_in_memory_owners_are_exempt_from_run_gate(storage):
     assert journal.path.read_bytes() == raw
     with pytest.raises(RecoveryRequiredError):
         TurnExecutionJournal.require_recovered(storage)
+
+
+class _CountingExternalTool(Tool):
+    name = "counting_external"
+    description = "record one external side effect"
+    input_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    risk = ToolRisk.WRITE
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _invoke(self, arguments: dict) -> ToolResult:
+        self.calls += 1
+        return ToolResult(self.name, f"count={self.calls}")
+
+
+async def test_journal_payload_failure_keeps_journal_ahead_of_transcript(storage, tmp_path, monkeypatch):
+    # core-contracts §3: the journal must never lag the transcript. When the final
+    # history payload cannot be journaled, the transcript write is skipped and the
+    # round stays pending for startup recovery.
+    tool = _CountingExternalTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), session_dir=str(tmp_path / "transcripts"),
+                    permission="bypass", memory=MemoryConfig(enabled=False),
+                    project_instructions=False, git_context=False),
+        workspace=storage.workspace, tools=registry, session_id=storage.session_id,
+    )
+    batches = []
+    original_begin = agent.executor.begin_batch
+
+    def capturing_begin(*args, **kwargs):
+        batch = original_begin(*args, **kwargs)
+        batches.append(batch)
+        return batch
+
+    original_record = TurnExecutionJournal.record
+
+    def fail_final_payload(self, state, **payload):
+        if getattr(state, "value", state) == "history_ready" and not payload.get("precommit"):
+            raise JournalWriteError("simulated journal failure")
+        return original_record(self, state, **payload)
+
+    monkeypatch.setattr(agent.executor, "begin_batch", capturing_begin)
+    monkeypatch.setattr(TurnExecutionJournal, "record", fail_final_payload)
+    try:
+        result = await agent.run("tool:counting_external once")
+        assert result.answer
+        assert tool.calls == 1
+        transcript_path = agent.transcript.path
+        assert [message.role for message in build_chain(load_transcript(transcript_path))] == ["user"]
+    finally:
+        monkeypatch.setattr(TurnExecutionJournal, "record", original_record)
+        agent.logger.close()
+
+    # Simulated crash: the process dies with the round still pending in the journal.
+    journal = batches[0].journal
+    journal._release_for_later_recovery()
+    transcript = TranscriptStore(tmp_path / "transcripts", storage.workspace, storage.session_id)
+    outcomes = TurnExecutionJournal.recover_all(
+        storage, dry_run=False, history_writer=transcript.recover_tool_round,
+    )
+    assert outcomes == [{"turn_id": journal.turn_id, "status": "history_persisted"}]
+    assert TurnExecutionJournal.recover_all(storage, dry_run=False) == []
+    # The replayed round links the final answer (written during the run with a
+    # dangling parent) back into one whole chain — no reordering, no duplicates.
+    chain = build_chain(load_transcript(transcript_path))
+    assert [message.role for message in chain] == ["user", "assistant", "tool", "assistant"]
+    tool_message = next(message for message in chain if message.role == "tool")
+    assert "count=1" in tool_message.content
+    assert tool_message.metadata["ok"] is True
+    assert tool.calls == 1  # recovery replays history; it never re-executes the tool
+    transcript.close()

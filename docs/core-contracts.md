@@ -43,6 +43,8 @@ MCP client 线程侧 future、prompt/agent hook 的裸 `wait_for`、`ProcessSupe
   置位后 durable head 冻结并上报 `transcript_persistence_degraded` 事件）。
 - **SessionRuntime**：一个活跃会话的全部可变状态与持有资源。resume = 构造新 runtime →
   关闭旧 runtime → 原子替换 agent 指针（`ReActAgent.resume_loaded_session`）。
+  `ReActAgent` 的 `session_id`/`session`/`transcript`/`permissions`/`process_supervisor`
+  是转发 `runtime.*` 的派生只读 property，单一数据源为 SessionRuntime。
   以下 session 级状态**一律不跨 resume 存活**：session 权限规则与 allow-list、todo、
   plan state、approved workflow digests、read-file state、scheduler jobs、session 计数器。
 
@@ -61,6 +63,11 @@ MCP client 线程侧 future、prompt/agent hook 的裸 `wait_for`、`ProcessSupe
   sha256 checksum 链；foreign journal 只能报告为 `foreign`，不得被当前 session 消耗或终结。
 - **外部效应安全**：含未决 `external_intent` 的 journal 绝不重放、绝不终结，
   报告 `IndeterminateExternalEffect` 等待人工对账。
+- **提交顺序（journal-first）**：turn 收尾按 `history_ready`(最终 payload) →
+  transcript `append_tool_round` → `history_persisted` 推进。journal payload 写失败时
+  **必须跳过 transcript 写入**并保持 journal 未决——journal 绝不落后于 transcript。
+  transcript 的 round checksum 是幂等提交点；`history_persisted` 仅是终态标记，
+  它写失败时 journal 保持未决，恢复路径幂等回放，不产生重复行。
 
 ## 4. Message identity 与 compaction snapshot
 
@@ -100,7 +107,10 @@ Provider 序列化的 tool_use/tool_result 配对只依赖 `metadata.tool_calls`
 ## 阶段外事项（明确不属于本 contract）
 
 以下属于路线图的后续阶段，本文档不作规定：TOFU trust matrix、patch parser 单一化、
-plugin capability manifest（阶段 1）；external outcome/history 原子提交、
-ReActAgent 平行指针重构为 SessionRuntime 单一数据源（阶段 2）；上述 ExecutionScope
+plugin capability manifest（阶段 1）；上述 ExecutionScope
 旁路的接入（阶段 3）；prompt ingress 统一（阶段 4）；journal/transcript retention 接线、
 MCP 版本矩阵与 CI 门禁（阶段 5）。
+
+阶段 2 的两项已落地：external outcome/history 原子提交（journal-first 提交顺序不变量
+见 §3）；ReActAgent 平行指针重构为 SessionRuntime 单一数据源（agent 侧同名指针均为
+runtime 派生 property，见 §2）。

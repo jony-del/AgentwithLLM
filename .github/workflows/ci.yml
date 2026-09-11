@@ -58,7 +58,9 @@ jobs:
           # The renderer contract is "color=False emits zero ANSI" even when the
           # runner injects FORCE_COLOR; keep the lane honest about that.
           FORCE_COLOR: "1"
-        run: python -m pytest -q
+        # Process-level crash-matrix tests (tests/nightly/, marker `nightly`) run
+        # in the nightly workflow, not on every PR.
+        run: python -m pytest -q -m "not nightly"
       - name: Installer dry-run
         run: python installer/install.py --source . --dry-run --skip-sandbox --non-interactive
       - name: Validate uninstall recovery core

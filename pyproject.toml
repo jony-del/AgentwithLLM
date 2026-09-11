@@ -116,4 +116,8 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error::RuntimeWarning"]
+markers = [
+    "crash: in-process crash-injection matrix (runs in normal CI)",
+    "nightly: process-level crash/chaos tests (nightly workflow only)",
+]
 

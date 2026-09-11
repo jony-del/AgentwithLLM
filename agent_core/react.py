@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_core.agents.team import TeamStore
 from agent_core.capabilities import CapabilitiesConfig, CapabilityManager
@@ -473,16 +473,16 @@ class ReActAgent:
         # Resumable session transcript (distinct from the event logger above). An injected
         # store wins; otherwise build one from config unless ``session_dir`` is disabled
         # (empty). ``parent_uuid`` chaining is tracked across appends by ``_emit``.
-        self.session_id = session_id or new_session_id()
+        session_id = session_id or new_session_id()
         if transcript is not None:
-            self.transcript: TranscriptStore | None = transcript
+            resolved_transcript: TranscriptStore | None = transcript
         elif self.config.session_dir:
-            self.transcript = TranscriptStore(
-                self.config.session_dir, self._initial_workspace, self.session_id
+            resolved_transcript = TranscriptStore(
+                self.config.session_dir, self._initial_workspace, session_id
             )
         else:
-            self.transcript = None
-        if self.transcript is not None:
+            resolved_transcript = None
+        if resolved_transcript is not None:
             try:
                 from agent_core.retention import maybe_prune_sessions
 
@@ -490,7 +490,7 @@ class ReActAgent:
                     self.config.session_dir,
                     self._initial_workspace,
                     self.config.session_retention,
-                    current_session_id=self.session_id,
+                    current_session_id=session_id,
                 )
                 if retention_report is not None:
                     self.logger.write_nowait("session_retention", retention_report)
@@ -499,9 +499,6 @@ class ReActAgent:
                     "session_retention",
                     {"status": "failed", "error": type(exc).__name__},
                 )
-        # uuid of the last message appended to the transcript, so each new message links
-        # back to its predecessor. Reset at the top of every run().
-        self._last_message_uuid: str | None = None
         self.compression = CompressionPipeline(self.config.compression)
         # Track A summarizer (or None → deterministic Track B). Built from the gated
         # provider so summary calls share the fan-out's API budget; None for
@@ -535,9 +532,9 @@ class ReActAgent:
         # Per-run shared state for session-aware tools (planning, sub-agents). The
         # registry may have been built before this agent existed (the CLI path), so we
         # rebind every session-aware tool to *this* session below.
-        self.session = SessionContext(
+        session = SessionContext(
             workspace=self._initial_workspace,
-            session_id=self.session_id,
+            session_id=session_id,
             agent_id=self.logger.run_id,
             subagent_factory=self._spawn_subagent,
             teammate_factory=self._spawn_teammate,
@@ -554,12 +551,29 @@ class ReActAgent:
             registry=self.registry,
             plugin_skill_invoked=self._start_skill_monitors,
         )
-        self.process_supervisor = ProcessSupervisor(
+        process_supervisor = ProcessSupervisor(
             self.config.tools.shell,
-            Path(self.config.run_dir) / "tasks" / self.session_id,
+            Path(self.config.run_dir) / "tasks" / session_id,
             event_sink=self._audit_event,
         )
-        self.session.process_supervisor = self.process_supervisor
+        session.process_supervisor = process_supervisor
+        # The runtime is the single source of truth for the session-scoped pointers
+        # (``session_id``/``session``/``transcript``/``permissions``/``process_supervisor``
+        # are read-only properties derived from it). It must exist before any of those
+        # names are used below, so it is built as soon as its pieces are; ``permissions``
+        # is attached once the policy object exists.
+        self.runtime = SessionRuntime(
+            descriptor=SessionDescriptor(
+                session_id,
+                session.workspace,
+                resolved_transcript.path if resolved_transcript is not None else None,
+            ),
+            context=session,
+            transcript=resolved_transcript,
+            process_supervisor=process_supervisor,
+            scheduler_store=session.scheduler_store,
+            counters={"input_tokens": 0, "output_tokens": 0},
+        )
         if PermissionMode(self.config.permission) is PermissionMode.PLAN:
             self.session.plan_state.enter(
                 PermissionMode.DEFAULT.value,
@@ -672,7 +686,7 @@ class ReActAgent:
         # Only wire an interactive prompter when the UI can actually ask the user;
         # otherwise an "ask" decision collapses to a denial (non-interactive behavior).
         # The fine-grained rule set + sandbox make the policy argument-aware.
-        self.permissions = PermissionPolicy(
+        self.runtime.permissions = PermissionPolicy(
             self.config.permission,
             prompter=self.ui.request_permission if self.ui.is_live else None,
             rules=self.config.permission_rules,
@@ -696,7 +710,8 @@ class ReActAgent:
         # (lifecycle hooks: user-prompt / post-sampling / pre-/post-compact / stop). An
         # injected pipeline (tests/library use) wins; otherwise assemble the default from
         # config — the MaxOutput tool hook plus the enabled built-in + external lifecycle
-        # hooks. Built after session/logger exist so hooks can close over them.
+        # hooks. Built after session/logger exist so hooks can close over them (the stop
+        # hook holds a session getter so it follows the live runtime across a resume).
         self.hooks = hooks or self._build_hook_pipeline()
         self.permission_classifier = permission_classifier or ProviderAutoPermissionClassifier(
             self.provider,
@@ -740,12 +755,11 @@ class ReActAgent:
         # auto-compact gate thresholds against this (parity with the reference) instead
         # of a char ratio; 0 until the first response with usage arrives.
         self._last_usage_tokens: int = 0
-        # Session-cumulative token totals, surfaced by the chat ``/cost``/``/status``
-        # commands. Summed across every run() on this agent (a chat session reuses one).
-        self._session_input_tokens: int = 0
-        self._session_output_tokens: int = 0
+        # Session-cumulative token totals live in ``runtime.counters`` (exposed via the
+        # ``_session_*_tokens`` properties) and are surfaced by the chat
+        # ``/cost``/``/status`` commands. Summed across every run() on this agent.
         # Per-run token totals (reset each run() — see below), surfaced in the final recap.
-        # Unlike the ``_session_*`` counters these reflect only the current run.
+        # Unlike the session counters these reflect only the current run.
         self._run_input_tokens: int = 0
         self._run_output_tokens: int = 0
         self._run_context_tokens: int = 0
@@ -786,19 +800,61 @@ class ReActAgent:
             )
         self.capability_manager = CapabilityManager(self, self.config.capabilities)
         self.session.capability_manager = self.capability_manager
-        self.runtime = SessionRuntime(
-            descriptor=SessionDescriptor(
-                self.session_id,
-                self.session.workspace,
-                self.transcript.path if self.transcript is not None else None,
-            ),
-            context=self.session,
-            transcript=self.transcript,
-            permissions=self.permissions,
-            process_supervisor=self.process_supervisor,
-            scheduler_store=self.session.scheduler_store,
-            counters={"input_tokens": 0, "output_tokens": 0},
-        )
+
+    # --- SessionRuntime-derived pointers ----------------------------------------
+    #
+    # SessionRuntime is the single source of truth for session-scoped state; these
+    # properties are read-only views so the rest of the agent (and hosts embedding
+    # it) keep their long-standing attribute access while a resume only swaps
+    # ``self.runtime``.
+
+    @property
+    def session_id(self) -> str:
+        return self.runtime.descriptor.session_id
+
+    @property
+    def session(self) -> SessionContext:
+        return self.runtime.context
+
+    @property
+    def transcript(self) -> TranscriptStore | None:
+        return self.runtime.transcript
+
+    @property
+    def permissions(self) -> PermissionPolicy:
+        return cast(PermissionPolicy, self.runtime.permissions)
+
+    @property
+    def process_supervisor(self) -> ProcessSupervisor:
+        return cast(ProcessSupervisor, self.runtime.process_supervisor)
+
+    # uuid of the last message appended to the transcript, so each new message links
+    # back to its predecessor. This IS ``durable_head.memory_head_id`` (the in-memory
+    # chain head may lead the disk-confirmed durable head); the property keeps the
+    # long-standing private name as a read/write alias. Reset at the top of run().
+    @property
+    def _last_message_uuid(self) -> str | None:
+        return self.runtime.durable_head.memory_head_id
+
+    @_last_message_uuid.setter
+    def _last_message_uuid(self, value: str | None) -> None:
+        self.runtime.durable_head.memory_head_id = value
+
+    @property
+    def _session_input_tokens(self) -> int:
+        return self.runtime.counters["input_tokens"]
+
+    @_session_input_tokens.setter
+    def _session_input_tokens(self, value: int) -> None:
+        self.runtime.counters["input_tokens"] = value
+
+    @property
+    def _session_output_tokens(self) -> int:
+        return self.runtime.counters["output_tokens"]
+
+    @_session_output_tokens.setter
+    def _session_output_tokens(self, value: int) -> None:
+        self.runtime.counters["output_tokens"] = value
 
     def recover_turn_journals(self, *, dry_run: bool = True) -> list[dict[str, str]]:
         """Recover this project/session's verified journals and emit run audit events."""
@@ -826,17 +882,6 @@ class ReActAgent:
         for outcome in outcomes:
             self.logger.write_nowait("turn_recovery", outcome)
         return outcomes
-
-    def rebind_turn_journal_session(self) -> list[dict[str, str]]:
-        """Switch journal ownership after an explicit in-process session resume."""
-
-        storage = JournalStorage.user_state(
-            self.session.workspace,
-            self.session_id,
-            self.logger.run_id,
-        )
-        self.executor.rebind_journal_storage(storage)
-        return self.recover_turn_journals()
 
     async def resume_loaded_session(self, loaded: LoadedTranscript) -> list[Message]:
         """Atomically replace mutable session state at an idle boundary."""
@@ -953,15 +998,11 @@ class ReActAgent:
         )
 
         # Candidate construction above is side-effect free with respect to the live
-        # bindings. Close old owned resources, then publish every pointer together.
+        # bindings. Close old owned resources, then publish the new runtime in one
+        # step — the derived properties make every session pointer follow it.
         await old_runtime.close()
-        self.session_id = loaded.session_id
-        self.session = new_session
-        self.transcript = new_transcript
-        self.process_supervisor = new_process_supervisor
-        self.permissions = new_permissions
-        self.executor = new_executor
         self.runtime = candidate
+        self.executor = new_executor
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(new_session)
@@ -975,13 +1016,13 @@ class ReActAgent:
         new_session.capability_manager = self.capability_manager
         self.fast_mode = False
         self.session_title = loaded.title
-        self._session_input_tokens = 0
-        self._session_output_tokens = 0
+        # Session-scoped counters and the chain head start at the new runtime's
+        # zero/None defaults; the unsandboxed-ack must be re-earned per runtime.
+        self._unsandboxed_permission_ack = False
         self._last_usage_tokens = 0
         self._session_started = time.monotonic()
         self._session_start_fired = False
         self._reported_missed_jobs.clear()
-        self._last_message_uuid = None
         self.recover_turn_journals()
         return build_chain(loaded)
 
@@ -1412,7 +1453,6 @@ class ReActAgent:
         """
         scope.raise_if_cancelled()
         self._last_message_uuid = None
-        self.runtime.durable_head.memory_head_id = None
         self._pending_tool_use_summary = None
         self._background_hook_tasks = set()
         self._run_start_time = started
@@ -1477,7 +1517,6 @@ class ReActAgent:
                 messages.insert(insert_at, past)
                 insert_at += 1
                 self._last_message_uuid = past.uuid
-                self.runtime.durable_head.memory_head_id = past.uuid
                 if not self.runtime.durable_head.persistence_degraded:
                     self.runtime.durable_head.durable_head_id = past.uuid
         # The new batch was present while recall/project context found its anchor.
@@ -1868,7 +1907,6 @@ class ReActAgent:
                 assistant_message.parent_uuid = self._last_message_uuid
                 messages.append(assistant_message)
                 self._last_message_uuid = assistant_message.uuid
-                self.runtime.durable_head.memory_head_id = assistant_message.uuid
             else:
                 await self._emit(messages, assistant_message)
 
@@ -2004,7 +2042,6 @@ class ReActAgent:
                 tool_message.parent_uuid = self._last_message_uuid
                 messages.append(tool_message)
                 self._last_message_uuid = tool_message.uuid
-                self.runtime.durable_head.memory_head_id = tool_message.uuid
                 tool_messages.append(tool_message)
                 # Record read-file state HERE (not in the read tool — its mixin shape
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
@@ -2020,14 +2057,22 @@ class ReActAgent:
                 "session_id": self.session_id,
                 "transcript_path": str(self.transcript.path) if self.transcript is not None else "",
             }
+            # The journal must never lag the transcript: its durable payload is the
+            # only truthful source of this round for crash recovery. When it cannot
+            # be recorded, the transcript write is skipped and the journal stays
+            # pending so startup recovery can replay the round instead of building
+            # on an unrecoverable one.
             try:
                 await tool_batch.record_history_payload_async(history_payload)
             except Exception as exc:
+                history_journaled = False
                 await self.logger.write(
                     "tool_round_history",
                     {"status": "journal_failed", "error": f"{type(exc).__name__}: {exc}"},
                 )
-            if self.transcript is not None and not self.runtime.durable_head.persistence_degraded:
+            else:
+                history_journaled = True
+            if history_journaled and self.transcript is not None and not self.runtime.durable_head.persistence_degraded:
                 persisted = await self.transcript.append_tool_round(
                     assistant_message, tool_messages, manifest
                 )
@@ -2036,6 +2081,9 @@ class ReActAgent:
                     try:
                         await tool_batch.mark_history_persisted_async()
                     except Exception as exc:
+                        # Best-effort finalization: the journal keeps the payload
+                        # and stays pending, so startup recovery replays the round
+                        # (idempotent via the transcript round checksum).
                         await self.logger.write(
                             "tool_round_history",
                             {
@@ -2045,7 +2093,10 @@ class ReActAgent:
                         )
                 else:
                     await self._degrade_transcript("append_tool_round")
-            else:
+            elif history_journaled:
+                # Transcripts disabled or persistence degraded: closing the journal
+                # is best-effort for the same reason — a failure leaves it pending
+                # for idempotent replay rather than falsely claiming persistence.
                 try:
                     await tool_batch.mark_history_persisted_async()
                 except Exception:
@@ -2136,7 +2187,6 @@ class ReActAgent:
             else:
                 await self._degrade_transcript("append_message")
         self._last_message_uuid = message.uuid
-        self.runtime.durable_head.memory_head_id = message.uuid
 
     async def _degrade_transcript(self, operation: str) -> None:
         head = self.runtime.durable_head
@@ -2214,7 +2264,6 @@ class ReActAgent:
             else:
                 await self._degrade_transcript("append_compaction_snapshot")
         self._last_message_uuid = parent
-        self.runtime.durable_head.memory_head_id = parent
         return
 
     async def _stopped(self, messages: list[Message], step: int, reason: str, human: str) -> AgentRunResult:
@@ -2384,7 +2433,6 @@ class ReActAgent:
             else:
                 await self._degrade_transcript("append_user_message")
         self._last_message_uuid = user_message.uuid
-        self.runtime.durable_head.memory_head_id = user_message.uuid
         if not self.hooks.user_prompt_hooks:
             return None, False
         if outcome.block:
@@ -3246,7 +3294,7 @@ class ReActAgent:
 
         builtin = hooks_config.builtin
         if builtin.stop_completion:
-            pipeline.stop_hooks.append(StopCompletionHook(self.session))
+            pipeline.stop_hooks.append(StopCompletionHook(lambda: self.session))
         if builtin.post_sampling_observer:
             pipeline.post_sampling_hooks.append(PostSamplingObserverHook(self.logger))
         if builtin.compaction_logger:

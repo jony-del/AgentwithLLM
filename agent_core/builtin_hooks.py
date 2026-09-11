@@ -16,6 +16,7 @@ sink a run — the pipeline awaits them directly in the loop.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from agent_core.hooks import HookContext, HookOutcome, PromptValidationConfig
@@ -46,8 +47,14 @@ class StopCompletionHook:
     a model that deliberately stops with open items is never pinned in a loop.
     """
 
-    def __init__(self, session: "SessionContext") -> None:
-        self.session = session
+    def __init__(self, session: "SessionContext | Callable[[], SessionContext]") -> None:
+        # A getter is dereferenced at call time so the hook follows an in-process
+        # resume (which swaps the agent's SessionRuntime, hence its SessionContext);
+        # a plain context is held as-is.
+        if callable(session):
+            self._session_getter: Callable[[], SessionContext] = session
+        else:
+            self._session_getter = lambda: session
 
     async def on_stop(self, ctx: HookContext) -> HookOutcome:
         try:
@@ -55,7 +62,7 @@ class StopCompletionHook:
                 return HookOutcome()
             open_items = [
                 todo
-                for todo in self.session.todos.items()
+                for todo in self._session_getter().todos.items()
                 if todo.status in _OPEN_TODO_STATUSES
             ]
             if not open_items:

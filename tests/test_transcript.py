@@ -1,17 +1,25 @@
 import json
+import logging
 from pathlib import Path
+
+import pytest
 
 from agent_core.memory import MemoryConfig
 from agent_core.models import LLMResult, Message, ToolCall
 from agent_core.providers.fake import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 from agent_core.transcript import (
+    AmbiguousSessionError,
+    TranscriptStore,
+    _legacy_sanitize_project,
     build_chain,
     find_session,
     fork_chain,
     latest_session,
     list_sessions,
     load_transcript,
+    locate_session,
+    migrate_legacy_project_dir,
     project_dir,
     sanitize_project,
 )
@@ -247,3 +255,156 @@ async def test_subagent_transcript_is_sidechain_not_listed(tmp_path: Path) -> No
     infos = list_sessions(project_dir(str(tmp_path), Path.cwd()))
     assert all(i.session_id != "agentABC" for i in infos)
     assert "subagents" in str(child.path)
+
+
+# --------------------------------------------------------------------------- project dirs
+
+
+def test_sanitize_project_same_slug_collision_distinguishes_cwds(tmp_path: Path) -> None:
+    # P1-N3 regression: cwds whose names differ only by non-alphanumerics share the
+    # readable slug; the sha256 suffix must still keep their project dirs apart.
+    dot = tmp_path / "proj.one"
+    dash = tmp_path / "proj-one"
+    dot.mkdir()
+    dash.mkdir()
+
+    slug_a = sanitize_project(dot)
+    slug_b = sanitize_project(dash)
+
+    assert slug_a.rsplit("-", 1)[0] == slug_b.rsplit("-", 1)[0]  # the slugs collide
+    assert slug_a != slug_b  # the hash suffixes do not
+    assert project_dir(tmp_path / "s", dot) != project_dir(tmp_path / "s", dash)
+
+
+async def _write_session(root: Path, cwd: Path, session_id: str, text: str) -> None:
+    store = TranscriptStore(root, cwd, session_id)
+    try:
+        assert await store.append_message(Message("user", text))
+    finally:
+        store.close()
+
+
+async def test_locate_session_legacy_project_dir_read_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "s"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    session_id = "d" * 32
+    await _write_session(root, cwd, session_id, "legacy hello")
+    # Re-home the transcript under the pre-hash legacy directory name.
+    legacy_dir = root / _legacy_sanitize_project(cwd)
+    project_dir(root, cwd).rename(legacy_dir)
+    legacy_bytes = (legacy_dir / f"{session_id}.jsonl").read_bytes()
+
+    location = locate_session(root, cwd, session_id)
+
+    assert location is not None
+    assert location.path == legacy_dir / f"{session_id}.jsonl"
+    assert location.workspace == cwd.resolve()
+    loaded = load_transcript(location.path)
+    assert loaded.session_id == session_id
+    assert [m.content for m in build_chain(loaded)] == ["legacy hello"]
+    # The fallback is read-only: the legacy file is found and loaded, never rewritten.
+    assert (legacy_dir / f"{session_id}.jsonl").read_bytes() == legacy_bytes
+
+
+async def test_locate_session_legacy_only_hit_carries_diagnostic(tmp_path: Path, caplog) -> None:
+    root = tmp_path / "s"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    session_id = "d" * 32
+    await _write_session(root, cwd, session_id, "legacy hello")
+    legacy_dir = root / _legacy_sanitize_project(cwd)
+    project_dir(root, cwd).rename(legacy_dir)
+
+    with caplog.at_level(logging.WARNING, logger="agent_core.transcript"):
+        location = locate_session(root, cwd, session_id)
+
+    assert location is not None
+    assert [d.code for d in location.diagnostics] == ["legacy_project_dir"]
+    assert any(
+        record.name == "agent_core.transcript" and "legacy" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+async def test_locate_session_modern_hit_has_no_legacy_diagnostic(tmp_path: Path, caplog) -> None:
+    root = tmp_path / "s"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    session_id = "f" * 32
+    await _write_session(root, cwd, session_id, "modern hello")
+
+    with caplog.at_level(logging.WARNING, logger="agent_core.transcript"):
+        location = locate_session(root, cwd, session_id)
+
+    assert location is not None
+    assert location.diagnostics == ()
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "agent_core.transcript" and record.levelno >= logging.WARNING
+    ]
+
+
+async def test_locate_session_ambiguous_across_project_dirs(tmp_path: Path) -> None:
+    root = tmp_path / "s"
+    cwd_a = tmp_path / "a"
+    cwd_b = tmp_path / "b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+    session_id = "e" * 32
+    # The same session id exists as a valid transcript in two different projects.
+    await _write_session(root, cwd_a, session_id, "hello from a")
+    await _write_session(root, cwd_b, session_id, "hello from b")
+
+    with pytest.raises(AmbiguousSessionError):
+        locate_session(root, cwd_a, session_id)
+
+
+async def test_migrate_legacy_project_dir_renames_and_relocates(tmp_path: Path) -> None:
+    root = tmp_path / "s"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    session_id = "d" * 32
+    await _write_session(root, cwd, session_id, "legacy hello")
+    legacy_dir = root / _legacy_sanitize_project(cwd)
+    project_dir(root, cwd).rename(legacy_dir)
+
+    migrated = migrate_legacy_project_dir(root, cwd)
+
+    assert migrated == project_dir(root, cwd)
+    assert not legacy_dir.exists()
+    assert (migrated / f"{session_id}.jsonl").is_file()
+    # After migration the modern lookup hits with no legacy diagnostic.
+    location = locate_session(root, cwd, session_id)
+    assert location is not None
+    assert location.path == migrated / f"{session_id}.jsonl"
+    assert location.diagnostics == ()
+
+
+def test_migrate_legacy_project_dir_missing_source_returns_none(tmp_path: Path) -> None:
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    assert migrate_legacy_project_dir(tmp_path / "s", cwd) is None
+
+
+async def test_migrate_legacy_project_dir_never_overwrites(tmp_path: Path) -> None:
+    root = tmp_path / "s"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    await _write_session(root, cwd, "a" * 32, "modern hello")
+    legacy_dir = root / _legacy_sanitize_project(cwd)
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / f"{'b' * 32}.jsonl"
+    legacy_file.write_text(
+        json.dumps({"type": "session", "v": 4, "session_id": "b" * 32, "cwd": str(cwd.resolve())})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileExistsError):
+        migrate_legacy_project_dir(root, cwd)
+
+    # Both directories are left exactly as they were.
+    assert legacy_file.is_file()
+    assert project_dir(root, cwd).is_dir()
