@@ -148,6 +148,10 @@ class TranscriptStore:
         self.last_error: str | None = None
         self._round_checksums: set[str] | None = None
         self._round_index_size: int | None = None
+        # Observability: how often the cold full-transcript scan fallback ran (sidecar
+        # missing/invalid). Stays 0 when the round-index sidecar does its job.
+        self.round_index_full_scans = 0
+        self.last_round_index_scan: dict[str, int] | None = None
         self._round_index_path = self.path.with_suffix(self.path.suffix + ".round-index.json")
         self._process_lock_path = self.path.with_suffix(self.path.suffix + ".write.lock")
         self._activity_path = self.path.with_suffix(
@@ -383,9 +387,11 @@ class TranscriptStore:
         except (OSError, ValueError, TypeError):
             pass
         checksums: set[str] = set()
+        lines_scanned = 0
         try:
             with self.path.open("r", encoding="utf-8", errors="replace") as file:
                 for line in file:
+                    lines_scanned += 1
                     if '"type": "tool_round"' not in line:
                         continue
                     try:
@@ -397,6 +403,8 @@ class TranscriptStore:
                         checksums.add(checksum)
         except OSError:
             pass
+        self.round_index_full_scans += 1
+        self.last_round_index_scan = {"lines": lines_scanned}
         self._round_checksums = checksums
         try:
             self._round_index_size = self.path.stat().st_size if self.path.exists() else 0

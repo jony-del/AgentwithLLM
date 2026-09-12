@@ -147,20 +147,33 @@ _UNTRUSTED_TRANSCRIPT_PREAMBLE = (
 SUMMARY_SYSTEM = _NO_TOOLS_PREAMBLE + "\n" + _BASE_COMPACT_PROMPT + _NO_TOOLS_TRAILER
 
 
-def render_prefix(prefix: list[Message], max_chars: int) -> str:
+def render_prefix(
+    prefix: list[Message], max_chars: int, stats: dict[str, Any] | None = None
+) -> str:
     """Render the to-be-folded prefix as one plain-text transcript for the summarizer.
 
     Wrapped in an untrusted-data preamble + <transcript> delimiters so transcript text
     that looks like instructions can't hijack the summary task. Hard-capped at
     ``max_chars`` (head + tail kept) so the summary call itself can't overflow — the
     prefix has already been snipped/microcompacted, but a long run can still exceed a
-    comfortable single-call budget.
+    comfortable single-call budget. When ``stats`` is given it is populated with
+    ``original_chars`` / ``truncated`` / ``omitted_chars`` so the defensive head/tail
+    cut is observable instead of silent.
     """
     lines = [f"[{message.role}] {message.content}" for message in prefix]
     convo = defang_reserved_tags("\n".join(lines))
+    original_chars = len(convo)
+    truncated = False
     if max_chars > 0 and len(convo) > max_chars:
         half = max(200, max_chars // 2)
         convo = f"{convo[:half]}\n...[transcript truncated]...\n{convo[-half:]}"
+        truncated = True
+    if stats is not None:
+        stats["original_chars"] = original_chars
+        stats["truncated"] = truncated
+        stats["omitted_chars"] = (
+            max(0, original_chars - 2 * max(200, max_chars // 2)) if truncated else 0
+        )
     return f"{_UNTRUSTED_TRANSCRIPT_PREAMBLE}\n\n<transcript>\n{convo}\n</transcript>"
 
 
@@ -246,7 +259,11 @@ def build_summarizer(
         # The ReAct loop hands its scope in; other callers fall back to the ambient
         # scope set for the duration of ``Agent.run`` (None outside any run).
         scope = scope or current_execution_scope()
-        convo = render_prefix(prefix, config.summary_input_max_chars)
+        render_stats: dict[str, Any] | None = None
+        if prefix:
+            candidate = prefix[0].metadata.pop("_summary_render_stats", None)
+            render_stats = candidate if isinstance(candidate, dict) else None
+        convo = render_prefix(prefix, config.summary_input_max_chars, stats=render_stats)
         messages = [Message("system", SUMMARY_SYSTEM), Message("user", convo)]
         model = provider_config.model
         ceiling = tokens.model_output_tokens(model)[1]

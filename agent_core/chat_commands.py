@@ -1036,7 +1036,7 @@ async def _cmd_memory(agent: "ReActAgent", ui: AgentUI, args: str, history: list
             sources=[f"run:{agent.logger.run_id}"],
         )
         if agent.extractor is not None:
-            agent.extractor.mark_direct_write()
+            agent.extractor.mark_direct_write(agent.session_id)
         print(f"Added {document.id}")
     elif action == "edit" and len(parts) >= 2:
         document = await asyncio.to_thread(

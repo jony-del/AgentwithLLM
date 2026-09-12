@@ -100,7 +100,9 @@ class MemoryExtractor:
             "skipped": 0,
         }
         self._extract_lock: asyncio.Lock | None = None
-        self._direct_write_since_extract = False
+        # Direct-write markers, keyed by cursor_key (session): a direct write in
+        # session A must not short-circuit extraction for session B after /resume.
+        self._direct_write_keys: set[str] = set()
 
     def _load_state(self) -> None:
         loaded: object = None
@@ -132,9 +134,12 @@ class MemoryExtractor:
                     str(key): value for key, value in cursors.items() if isinstance(value, str)
                 }
 
-    def mark_direct_write(self) -> None:
-        """Prevent automatic extraction from duplicating an explicit memory tool write."""
-        self._direct_write_since_extract = True
+    def mark_direct_write(self, cursor_key: str | None = None) -> None:
+        """Prevent automatic extraction from duplicating an explicit memory tool write.
+
+        Scoped to ``cursor_key`` (session); the ``__default__`` key matches extraction
+        calls that carry no cursor key, mirroring the keying in ``extract``."""
+        self._direct_write_keys.add(cursor_key or "__default__")
 
     async def extract(
         self,
@@ -165,8 +170,8 @@ class MemoryExtractor:
             final_uuid = eligible[-1].uuid
             expected_cursor = self._cursor_uuid
             ordered_uuids = [message.uuid for message in eligible]
-            if self._direct_write_since_extract:
-                self._direct_write_since_extract = False
+            if key in self._direct_write_keys:
+                self._direct_write_keys.discard(key)
                 self._cursor_uuid = await self._commit_cursor(
                     key, final_uuid, expected_cursor, ordered_uuids
                 )
@@ -403,6 +408,17 @@ class MemoryExtractor:
                     self._dead_letter(
                         item, cursor_key, source_run_id, message_uuid, ordinal,
                         operation, str(exc), [],
+                    )
+                )
+            except ValueError as exc:
+                # Permanent repository validation failures (oversize content, blank
+                # name/description, ...) reject this one item; the rest of the batch
+                # and the cursor still advance. Transient IO (OSError) is NOT caught:
+                # infrastructure failure aborts the batch with the cursor unchanged.
+                dead_letters.append(
+                    self._dead_letter(
+                        item, cursor_key, source_run_id, message_uuid, ordinal,
+                        operation, f"repository_rejected: {str(exc)[:120]}", [],
                     )
                 )
         if items:

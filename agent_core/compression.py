@@ -5,9 +5,11 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from math import floor
+from typing import Any
 
 from agent_core import tokens
 from agent_core.models import Message
+from agent_core.prompt_ingress import defang_reserved_tags
 
 # Called after each compaction stage so a UI can drive a progress bar:
 # (completed_stages, total_stages, event).
@@ -30,6 +32,21 @@ TokenEstimator = Callable[[list[Message]], int]
 # foldable on the next pass, so repeated compactions re-summarize rather than pile up.
 _COLLAPSE_MARKERS = frozenset({"context_collapse", "llm_summary"})
 
+# render_prefix wraps chunk content with "[role] " labels (~4 chars/message) plus a
+# fixed untrusted-preamble + <transcript> wrapper; chunk input budgets are kept net of
+# this overhead so a packed chunk never triggers the defensive head/tail cut.
+_SUMMARY_RENDER_OVERHEAD = 384
+
+
+def _summary_render_overhead(gross_budget: int) -> int:
+    """Fixed render-wrapper margin reserved from a chunk input budget.
+
+    Tiny budgets keep nearly the full gross amount — reserving the whole wrapper would
+    starve the band projection below usefulness; large budgets reserve the full fixed
+    margin so rendered output stays under ``summary_input_max_chars``.
+    """
+    return min(_SUMMARY_RENDER_OVERHEAD, max(0, gross_budget - 800))
+
 # Re-injection wrapper for a folded summary (mirrors ``getCompactUserSummaryMessage``).
 # The summary is re-injected as a USER message, not a system message: the model reads
 # it as continued conversation context, not as authoritative instructions.
@@ -51,8 +68,11 @@ def build_summary_user_message(summary: str, *, marker: str, messages_collapsed:
     the block stays re-foldable on the next pass via ``_COLLAPSE_MARKERS``. The message
     is a USER turn carrying the "This session is being continued…" framing — mirrors
     the reference ``getCompactUserSummaryMessage`` + ``suppressFollowUpQuestions`` path.
+    The summary text is model output (Track A): reserved framework tags are defanged
+    before re-injection so a verbatim ``<system-reminder>`` can't smuggle control
+    framing into the continued conversation.
     """
-    body = f"{_SUMMARY_WRAPPER_HEADER}\n\n{summary.strip()}\n\n{_SUMMARY_WRAPPER_FOOTER}"
+    body = f"{_SUMMARY_WRAPPER_HEADER}\n\n{defang_reserved_tags(summary.strip())}\n\n{_SUMMARY_WRAPPER_FOOTER}"
     metadata: dict[str, object] = {
         "compressed": marker,
         "messages_collapsed": messages_collapsed,
@@ -188,6 +208,19 @@ def is_summary_message(message: Message) -> bool:
     boundary without duplicating the marker set.
     """
     return message.metadata.get("compressed") in _COLLAPSE_MARKERS
+
+
+def new_messages_after(before: list[Message], after: list[Message]) -> list[Message]:
+    """Messages in ``after`` that are new or content-changed relative to ``before``.
+
+    Identity is the ``(uuid, version)`` pair: compression derives new content in place
+    (same uuid, bumped version via ``_evolve_message``), so a rewritten message shows up
+    in the diff while an untouched one does not. Single source of truth for the
+    compaction diff — shared by the transcript boundary commit and the PostCompact hook
+    seam so both layers agree on what changed.
+    """
+    before_versions = {(message.uuid, message.version) for message in before}
+    return [m for m in after if (m.uuid, m.version) not in before_versions]
 
 
 # Regex for the Anthropic "prompt is too long" 413/400 error body (case-insensitive,
@@ -756,6 +789,8 @@ class CompressionPipeline:
             "output_chars": 0,
             "output_budget_tokens": 0,
             "omitted_chars": 0,
+            "render_truncated": False,
+            "render_omitted_chars": 0,
             "fallback": False,
             "output_truncated": False,
         }
@@ -801,7 +836,10 @@ class CompressionPipeline:
             metadata["calls"] = 1
             metadata["input_chars"] = self._char_count(chunks[0])
             metadata["output_budget_tokens"] = budget
-            value = await summarizer(self._with_summary_budget(chunks[0], budget))
+            render_stats: dict[str, Any] = {}
+            request = self._with_render_stats(chunks[0], render_stats)
+            value = await summarizer(self._with_summary_budget(request, budget))
+            self._record_render_stats(metadata, render_stats)
             metadata["output_chars"] = len(value)
             return value
 
@@ -829,7 +867,10 @@ class CompressionPipeline:
             )
             spent_output += budget
             try:
-                value = await summarizer(self._with_summary_budget(chunk, budget))
+                render_stats = {}
+                request = self._with_render_stats(chunk, render_stats)
+                value = await summarizer(self._with_summary_budget(request, budget))
+                self._record_render_stats(metadata, render_stats)
                 if not value.strip():
                     raise ValueError("empty map summary")
                 metadata["output_chars"] = int(str(metadata["output_chars"])) + len(value)
@@ -851,7 +892,14 @@ class CompressionPipeline:
             self.config.summary_total_input_max_chars
             - int(str(metadata["input_chars"])),
         )
-        synthesis_limit = min(self.config.summary_input_max_chars, remaining_input)
+        synthesis_limit = min(
+            max(
+                1,
+                self.config.summary_input_max_chars
+                - _summary_render_overhead(self.config.summary_input_max_chars),
+            ),
+            remaining_input,
+        )
         synthesis = self._synthesis_messages(map_summaries, synthesis_limit)
         if not synthesis:
             raise ValueError("summary input budget exhausted")
@@ -861,21 +909,30 @@ class CompressionPipeline:
         metadata["output_budget_tokens"] = (
             int(str(metadata["output_budget_tokens"])) + synthesis_budget
         )
-        value = await summarizer(self._with_summary_budget(synthesis, synthesis_budget))
+        render_stats = {}
+        synthesis_request = self._with_render_stats(synthesis, render_stats)
+        value = await summarizer(self._with_summary_budget(synthesis_request, synthesis_budget))
+        self._record_render_stats(metadata, render_stats)
         metadata["output_chars"] = int(str(metadata["output_chars"])) + len(value)
         return value
 
     def _summary_chunks(
         self, prefix: list[Message]
     ) -> tuple[list[list[Message]], int, int]:
-        per_call = max(1, self.config.summary_input_max_chars)
+        per_call = max(
+            1,
+            self.config.summary_input_max_chars
+            - _summary_render_overhead(self.config.summary_input_max_chars),
+        )
         total_cap = max(1, self.config.summary_total_input_max_chars)
         rounds = group_into_rounds(prefix)
         chunks: list[list[Message]] = []
         current: list[Message] = []
         current_chars = 0
         for round_messages in rounds:
-            round_chars = self._char_count(round_messages)
+            # Pack in rendered units: content + the "[role] " label render_prefix adds
+            # per message, so a packed chunk stays under the render cap.
+            round_chars = self._char_count(round_messages) + 4 * len(round_messages)
             if current and current_chars + round_chars > per_call:
                 chunks.append(current)
                 current = []
@@ -885,7 +942,8 @@ class CompressionPipeline:
         if current:
             chunks.append(current)
         raw_chars = self._char_count(prefix)
-        if len(chunks) == 1 and raw_chars <= min(per_call, total_cap):
+        raw_rendered = raw_chars + 4 * len(prefix)
+        if len(chunks) == 1 and raw_rendered <= min(per_call, total_cap):
             return chunks, raw_chars, 0
         if len(chunks) > 1:
             synthesis_reserve = min(
@@ -895,7 +953,9 @@ class CompressionPipeline:
             if (
                 len(chunks) <= self.config.summary_max_chunks
                 and raw_chars <= total_cap - synthesis_reserve
-                and all(self._char_count(chunk) <= per_call for chunk in chunks)
+                and all(
+                    self._char_count(chunk) + 4 * len(chunk) <= per_call for chunk in chunks
+                )
             ):
                 return chunks, raw_chars, 0
 
@@ -1016,6 +1076,28 @@ class CompressionPipeline:
         metadata = dict(first.metadata)
         metadata["_summary_output_tokens"] = max(1, int(budget))
         return [replace(first, metadata=metadata), *messages[1:]]
+
+    @staticmethod
+    def _with_render_stats(
+        messages: list[Message], stats: dict[str, Any]
+    ) -> list[Message]:
+        """Hand a mutable render-stats dict to the summarizer through the same
+        copy-on-write metadata channel as ``_with_summary_budget`` — the live
+        conversation messages keep no reference to it."""
+        if not messages:
+            return messages
+        first = messages[0]
+        metadata = dict(first.metadata)
+        metadata["_summary_render_stats"] = stats
+        return [replace(first, metadata=metadata), *messages[1:]]
+
+    @staticmethod
+    def _record_render_stats(metadata: dict[str, object], stats: dict[str, Any]) -> None:
+        if stats.get("truncated"):
+            metadata["render_truncated"] = True
+        metadata["render_omitted_chars"] = int(str(metadata["render_omitted_chars"])) + int(
+            stats.get("omitted_chars", 0)
+        )
 
     @staticmethod
     def _cap_text(value: str, limit: int) -> tuple[str, bool]:

@@ -17,7 +17,7 @@ import yaml
 from agent_core.file_lock import FileLock
 from agent_core.memory.models import MEMORY_TYPES, MemoryChange, MemoryDocument, MemoryRecord, utc_now
 from agent_core.memory.paths import validate_memory_root
-from agent_core.memory.security import require_secret_free
+from agent_core.memory.security import require_secret_free, scan_secrets
 
 if TYPE_CHECKING:
     from agent_core.memory.config import MemoryConfig
@@ -55,6 +55,8 @@ class MigrationReport:
     imported: int = 0
     skipped: int = 0
     corrupt_lines: list[int] = field(default_factory=list)
+    # Line numbers of records withheld by secret scanning (content is never stored).
+    quarantined: list[int] = field(default_factory=list)
     already_complete: bool = False
 
 
@@ -560,6 +562,7 @@ class MemoryRepository:
                     report.imported = int(old.get("imported", 0))
                     report.skipped = int(old.get("skipped", 0))
                     report.corrupt_lines = list(old.get("corrupt_lines", []))
+                    report.quarantined = [int(n) for n in old.get("quarantined", [])]
                     report.already_complete = True
                     return report
             staging = self.root / f".migration-staging-{checksum[:12]}"
@@ -604,6 +607,12 @@ class MemoryRepository:
                             "source_run_id": data.get("source_run_id"),
                         },
                     )
+                    if scan_secrets("\n".join([document.content, *document.tags])):
+                        # Never import a poisoned legacy record: it would re-fail
+                        # repository validation on every dream/commit and permanently
+                        # stall consolidation. Record only the line number.
+                        report.quarantined.append(line_number)
+                        continue
                     stage_path = staging / destination.name
                     _atomic_write(stage_path, _render_document(document))
                     staged.append((stage_path, destination))
@@ -626,6 +635,7 @@ class MemoryRepository:
                         "imported": report.imported,
                         "skipped": report.skipped,
                         "corrupt_lines": report.corrupt_lines,
+                        "quarantined": report.quarantined,
                     },
                     ensure_ascii=False,
                     indent=2,

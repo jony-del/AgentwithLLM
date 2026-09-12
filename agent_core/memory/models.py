@@ -344,6 +344,7 @@ class DreamReport:
     forgotten: int = 0
     merged: int = 0
     insights_added: int = 0
+    quarantined: int = 0
     details: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -352,5 +353,6 @@ class DreamReport:
             "forgotten": self.forgotten,
             "merged": self.merged,
             "insights_added": self.insights_added,
+            "quarantined": self.quarantined,
             "details": list(self.details),
         }

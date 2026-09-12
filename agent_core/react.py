@@ -22,6 +22,7 @@ from agent_core.compression import (
     CompressionEvent,
     CompressionPipeline,
     is_summary_message,
+    new_messages_after,
     parse_prompt_too_long_gap,
     shrink_oversize_messages,
     truncate_head_for_ptl_retry,
@@ -761,8 +762,13 @@ class ReActAgent:
         recall_engine = getattr(self.retriever, "engine", None)
         if recall_engine is not None:
             self.session.memory_retrievers["private"] = recall_engine
+        memory_extractor = self.extractor
         self.session.memory_direct_write = (
-            self.extractor.mark_direct_write if self.extractor is not None else None
+            # Late-bound lambda: /resume mutates self.session_id, and the marker must
+            # be scoped to whichever session is current when the direct write happens.
+            (lambda: memory_extractor.mark_direct_write(self.session_id))
+            if memory_extractor is not None
+            else None
         )
         if repository is None:
             for name in ("memory_search", "memory_write", "memory_forget"):
@@ -2288,12 +2294,7 @@ class ReActAgent:
         """
         if self.transcript is None or not self.config.persist_compaction_boundary:
             return
-        before_versions = {(message.uuid, message.version) for message in before}
-        new_msgs = [
-            message
-            for message in after
-            if (message.uuid, message.version) not in before_versions
-        ]
+        new_msgs = new_messages_after(before, after)
         if not new_msgs:
             return  # snip/microcompact only, or nothing changed — no boundary to write.
         summary = next((m for m in new_msgs if is_summary_message(m)), None)
@@ -2453,6 +2454,20 @@ class ReActAgent:
             outcome = await self.hooks.run_user_prompt(ctx)
             if outcome.transformed_prompt is not None:
                 user_message.content = outcome.transformed_prompt
+        # Hard ingress budget, independent of hook registration: the configured cap
+        # keeps applying even when the hooks subsystem or the validation hook itself
+        # is disabled. When PromptValidationHook is active it blocks first with the
+        # same limit and reason, so this never double-counts.
+        budget = self.config.hooks.prompt_validation.max_chars
+        if not outcome.block and budget and len(user_message.content) > budget:
+            outcome = HookOutcome(
+                block=True,
+                reason=(
+                    f"Prompt rejected: {len(user_message.content)} chars exceeds the "
+                    f"{budget}-char limit (paste-bomb / context-overflow guard)."
+                ),
+                metadata={"ingress_budget": True},
+            )
         envelope = canonicalize_user_prompt(
             user_message.content,
             source,
@@ -2509,7 +2524,7 @@ class ReActAgent:
             else:
                 await self._degrade_transcript("append_user_message")
         self._last_message_uuid = user_message.uuid
-        if not self.hooks.user_prompt_hooks:
+        if not self.hooks.user_prompt_hooks and not outcome.block:
             return None, False
         if outcome.block:
             answer = outcome.reason or "Request blocked by a UserPromptSubmit hook."
@@ -2562,8 +2577,7 @@ class ReActAgent:
         inject any returned additional_context to ground the next turn."""
         if not self.hooks.post_compact_hooks:
             return
-        before_uuids = {m.uuid for m in before}
-        new_msgs = [m for m in messages if m.uuid not in before_uuids]
+        new_msgs = new_messages_after(before, messages)
         summary = next((m.content for m in new_msgs if is_summary_message(m)), None)
         ctx = HookContext(
             event=HookEvent.POST_COMPACT,

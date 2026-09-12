@@ -141,6 +141,34 @@ def test_jsonl_migration_is_idempotent_and_non_destructive(tmp_path: Path) -> No
     assert source.read_bytes() == original
 
 
+def test_jsonl_migration_quarantines_secret_records(tmp_path: Path) -> None:
+    source = tmp_path / "memory.jsonl"
+    rows = [
+        {"id": "good1", "content": "prefers dark mode", "kind": "preference", "tags": []},
+        {
+            "id": "bad1",
+            "content": "api key sk-abcdefghijklmnopqrstuvwxyz123456",
+            "kind": "fact",
+            "tags": [],
+        },
+    ]
+    source.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    repository = MemoryRepository(tmp_path / "markdown")
+
+    first = repository.migrate_jsonl(source)
+
+    assert (first.total, first.imported) == (2, 1)
+    assert first.quarantined == [2]  # 1-based line number, content never stored
+    assert len(repository.list()) == 1
+    assert not (repository.root / "legacy-bad1.md").exists()
+    # Idempotent: the marker replays the quarantine without re-reading the poison.
+    second = repository.migrate_jsonl(source)
+    assert second.already_complete
+    assert second.quarantined == [2]
+
+
 def test_path_resolver_scopes_and_rejects_dangerous_roots(tmp_path: Path) -> None:
     resolver = MemoryPathResolver(tmp_path, user_root=tmp_path / "user")
     private = resolver.resolve("private")

@@ -104,3 +104,62 @@ async def test_decayed_importance_is_persisted(tmp_path: Path) -> None:
     faded = store.get(record.id)
     assert faded is not None
     assert 0.6 < faded.importance < 0.9
+
+
+async def test_insight_with_secret_is_quarantined(tmp_path: Path) -> None:
+    import json
+
+    from agent_core.models import LLMResult
+
+    store = _store(tmp_path)
+    await store.add("user lives in Tokyo", importance=0.5)
+    await store.add("user codes primarily in Rust", importance=0.5)
+
+    class _InsightProvider:
+        async def complete(self, *args, **kwargs) -> LLMResult:
+            return LLMResult(json.dumps([
+                {"content": "their key is sk-abcdefghijklmnopqrstuvwxyz123456"},
+                {"content": "enjoys hiking on weekends"},
+            ]))
+
+    report = await Dreamer(store, MemoryConfig(), provider=_InsightProvider()).dream()
+
+    assert report.quarantined == 1
+    assert report.insights_added == 1
+    contents = [r.content for r in store.all()]
+    assert any("hiking" in content for content in contents)
+    assert not any("sk-" in content for content in contents)
+
+
+async def test_dream_quarantines_poisoned_existing_record(tmp_path: Path, monkeypatch) -> None:
+    from agent_core.memory.repository import MemoryRepository
+    from agent_core.memory.store import RepositoryMemoryStore
+
+    repository = MemoryRepository(tmp_path / "memory")
+    # Plant a poisoned record the way a pre-quarantine legacy import could have.
+    monkeypatch.setattr(
+        "agent_core.memory.repository.require_secret_free", lambda *values: None
+    )
+    repository.write(
+        name="legacy import",
+        description="imported without scanning",
+        type="project",
+        content="token sk-abcdefghijklmnopqrstuvwxyz123456",
+    )
+    monkeypatch.undo()
+    repository.write(
+        name="clean", description="durable fact", type="project", content="prefers tea"
+    )
+    store = RepositoryMemoryStore(repository)
+    assert len(store.all()) == 2
+
+    # Before the fix this raised SecretDetectedError out of replace_records on every
+    # pass, so mark_dream_succeeded never ran and consolidation stalled forever.
+    report = await Dreamer(store, MemoryConfig(), provider=None).dream()
+
+    assert report.quarantined == 1
+    remaining = store.all()
+    assert [record.content for record in remaining] == ["prefers tea"]
+    # The poisoned record was archived out of the active set: the next pass is clean.
+    again = await Dreamer(store, MemoryConfig(), provider=None).dream()
+    assert again.quarantined == 0

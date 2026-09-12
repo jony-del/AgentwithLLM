@@ -160,6 +160,65 @@ async def test_memory_infrastructure_failure_does_not_advance_cursor(
     assert not (repository.root / ".extraction-state.json").exists()
 
 
+async def test_memory_repository_rejection_is_dead_lettered_and_cursor_advances(
+    tmp_path: Path,
+) -> None:
+    """A permanent repository validation error (>64KB content) is per-item poison,
+    not infrastructure failure: the item is dead-lettered, the rest of the batch is
+    stored, and the cursor advances (no permanent stall, no partial-batch retry)."""
+    repository = MemoryRepository(tmp_path / "memory")
+    store = RepositoryMemoryStore(repository)
+    oversized = "x" * (65 * 1024)
+    provider = _Provider(json.dumps([
+        {"operation": "create", "content": oversized, "kind": "fact"},
+        {"operation": "create", "content": "valid durable fact", "kind": "fact"},
+    ]))
+    message = Message("user", "remember these")
+    extractor = MemoryExtractor(provider, store)
+
+    stored = await extractor.extract([message], source_run_id="run", cursor_key="session")
+
+    assert [record.content for record in stored] == ["valid durable fact"]
+    state_text = (repository.root / ".extraction-state.json").read_text(encoding="utf-8")
+    state = json.loads(state_text)
+    assert state["cursors"]["session"] == message.uuid
+    assert len(state["dead_letters"]) == 1
+    assert state["dead_letters"][0]["reason"].startswith("repository_rejected:")
+    assert oversized not in state_text  # DLQ stays content-free
+    again = MemoryExtractor(provider, store)
+    assert await again.extract([message], cursor_key="session") == []
+    assert provider.calls == 1
+
+
+async def test_memory_direct_write_marker_is_scoped_per_session(tmp_path: Path) -> None:
+    """A direct write in session A must not short-circuit extraction for session B:
+    the marker is keyed by cursor_key, so /resume can't leak it across sessions."""
+    repository = MemoryRepository(tmp_path / "memory")
+    store = RepositoryMemoryStore(repository)
+    provider = _Provider(json.dumps([
+        {"operation": "create", "content": "session B durable fact", "kind": "fact"},
+    ]))
+    extractor = MemoryExtractor(provider, store)
+    msg_a = Message("user", "a")
+    msg_b = Message("user", "b")
+
+    extractor.mark_direct_write("session-a")
+    # Session B extracts normally (not short-circuited by A's marker).
+    stored_b = await extractor.extract([msg_b], cursor_key="session-b")
+    assert [record.content for record in stored_b] == ["session B durable fact"]
+    assert provider.calls == 1
+    # A's marker was not consumed by B: A's next extract only advances the cursor
+    # (no LLM call), as a direct-write marker demands.
+    stored_a = await extractor.extract([msg_a], cursor_key="session-a")
+    assert stored_a == []
+    assert provider.calls == 1
+    state = json.loads(
+        (repository.root / ".extraction-state.json").read_text(encoding="utf-8")
+    )
+    assert state["cursors"]["session-a"] == msg_a.uuid
+    assert state["cursors"]["session-b"] == msg_b.uuid
+
+
 async def test_memory_all_poison_batch_advances_with_content_free_bounded_dlq(
     tmp_path: Path,
 ) -> None:
@@ -405,6 +464,40 @@ async def test_transcript_round_index_avoids_cold_full_scans(
         cold.close()
 
     assert transcript_reads == 0
+
+
+async def test_transcript_round_index_full_scan_is_observable(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path / "sessions", tmp_path, "indexed")
+    assistant = Message("assistant", "call", metadata={"tool_calls": [{"id": "c"}]})
+    result = Message("tool", "result", metadata={"tool_call_id": "c"})
+    assert await store.append_tool_round(assistant, [result], {"calls": []})
+    store.close()
+    sidecar = store.path.with_suffix(store.path.suffix + ".round-index.json")
+
+    def round_messages(suffix: str) -> tuple[Message, list[Message]]:
+        return (
+            Message("assistant", f"call-{suffix}", metadata={"tool_calls": [{"id": f"c{suffix}"}]}),
+            [Message("tool", f"result-{suffix}", metadata={"tool_call_id": f"c{suffix}"})],
+        )
+
+    # Warm sidecar: no full scan.
+    warm = TranscriptStore(tmp_path / "sessions", tmp_path, "indexed")
+    assert await warm.append_tool_round(*round_messages("w"), {"calls": []})
+    assert warm.round_index_full_scans == 0
+    assert warm.last_round_index_scan is None
+    warm.close()
+
+    # Sidecar deleted: exactly one cold full scan, observable with its line count...
+    sidecar.unlink()
+    cold = TranscriptStore(tmp_path / "sessions", tmp_path, "indexed")
+    assert await cold.append_tool_round(*round_messages("x"), {"calls": []})
+    assert cold.round_index_full_scans == 1
+    assert cold.last_round_index_scan is not None
+    assert cold.last_round_index_scan["lines"] >= 2
+    # ...and the rebuilt sidecar keeps later appends scan-free.
+    assert await cold.append_tool_round(*round_messages("y"), {"calls": []})
+    assert cold.round_index_full_scans == 1
+    cold.close()
 
 
 def test_process_supervisor_marks_interrupted_history_lost(tmp_path: Path) -> None:

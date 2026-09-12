@@ -8,6 +8,7 @@ from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.memory.config import MemoryConfig
 from agent_core.memory.extraction import MEMORY_EXTRACTION_MARKER, parse_memory_items
 from agent_core.memory.models import MemoryRecord, DreamReport
+from agent_core.memory.security import scan_secrets
 from agent_core.memory.text import lexical_relevance, tokenize
 from agent_core.models import Message
 from agent_core.providers.base import LLMProvider, ProviderConfig, _supports_scope
@@ -64,9 +65,28 @@ class Dreamer:
         report = DreamReport(scanned=len(self.store))
         survivors = self._consolidate(report)
         insights = await self._synthesize_insights(survivors, report, scope=scope)
+        clean = self._quarantine_poisoned([*survivors, *insights], report)
         if commit:
-            await self.store.replace_all([*survivors, *insights])
+            await self.store.replace_all(clean)
         return report
+
+    def _quarantine_poisoned(
+        self, records: list[MemoryRecord], report: DreamReport
+    ) -> list[MemoryRecord]:
+        """Drop records failing secret scanning so one poisoned entry can no longer
+        stall every consolidation pass: excluded records are archived out of the active
+        set by the commit (``replace_records``), never re-validated, never re-dreamed.
+        Only rule names and the record id are reported, never the content."""
+        clean: list[MemoryRecord] = []
+        for record in records:
+            if scan_secrets("\n".join([record.content, *record.tags])):
+                report.quarantined += 1
+                report.details.append(
+                    f"quarantined [{record.kind}] id={record.id}: secret_detected"
+                )
+                continue
+            clean.append(record)
+        return clean
 
     def _consolidate(self, report: DreamReport) -> list[MemoryRecord]:
         """Run the two pure (no-LLM) stages: forgetting curve, then duplicate merge."""
@@ -183,6 +203,11 @@ class Dreamer:
             content = str(item.get("content", "")).strip()
             if not content:
                 continue
+            tags = [str(tag) for tag in (item.get("tags") or []) if str(tag).strip()]
+            if scan_secrets("\n".join([content, *tags])):
+                report.quarantined += 1
+                report.details.append("insight quarantined: secret_detected")
+                continue
             tokens = tokenize(content)
             if any(
                 lexical_relevance(tokens, tokenize(record.content)) >= self.config.dedup_threshold
@@ -194,7 +219,7 @@ class Dreamer:
                     content=content,
                     kind="insight",
                     importance=self._clamp(item.get("importance"), default=0.6),
-                    tags=[str(tag) for tag in (item.get("tags") or []) if str(tag).strip()],
+                    tags=tags,
                 )
             )
         report.insights_added = len(insights)

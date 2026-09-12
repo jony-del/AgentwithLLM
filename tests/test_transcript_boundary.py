@@ -105,7 +105,8 @@ async def test_no_fold_writes_nothing(tmp_path: Path) -> None:
     a, b, c, d = await _emit_conversation(agent, msgs)
     before = list(msgs)
     size_before = agent.transcript.path.stat().st_size
-    # snip/microcompact mutate content in place — same uuid set, no new messages.
+    # snip/microcompact derive new content in place (same uuid, bumped version) — and
+    # with no summary in the (uuid, version) diff, no fold happened: nothing to write.
     await agent._commit_compaction_boundary(before, list(msgs))
     assert agent.transcript.path.stat().st_size == size_before
 
@@ -158,6 +159,47 @@ async def test_reactive_compact_real_fold_writes_boundary(tmp_path: Path) -> Non
     # The resumed chain is shorter than the pre-fold history and starts at the summary.
     assert len(chain) < len(before)
     assert chain[0].metadata.get("compressed") in {"context_collapse", "llm_summary"}
+
+
+async def test_fold_with_bumped_tail_tool_result_resume_pairing(tmp_path: Path) -> None:
+    """Fold while the recent tail holds an oversized tool result (snipped in place:
+    same uuid, bumped version). Resume must preserve order, uniqueness, and the
+    assistant tool_call ↔ tool result pairing."""
+    agent = _agent(tmp_path)
+    msgs: list[Message] = [Message("system", "sys")]
+    for i in range(12):
+        await agent._emit(msgs, Message("user" if i % 2 == 0 else "assistant", f"turn {i}"))
+    call = Message(
+        "assistant",
+        "calling",
+        metadata={"tool_calls": [{"id": "c1", "name": "echo", "arguments": {}}]},
+    )
+    result = Message("tool", "x" * 9000, name="echo", metadata={"tool_call_id": "c1"})
+    tail_u, tail_a = Message("user", "next"), Message("assistant", "final")
+    for m in (call, result, tail_u, tail_a):
+        await agent._emit(msgs, m)
+    before = list(msgs)
+
+    after, events = await agent.compression.reactive_compact(
+        msgs, model=agent.config.model, summarizer=agent._summarizer
+    )
+    assert any(e.stage == "context_collapse" for e in events)
+    # The oversized tool result survived in the recent tail, rewritten in place.
+    bumped = [m for m in after if m.uuid == result.uuid]
+    assert len(bumped) == 1 and bumped[0].version > 1
+
+    await agent._commit_compaction_boundary(before, after)
+
+    chain = build_chain(load_transcript(agent.transcript.path))
+    uuids = [m.uuid for m in chain]
+    # No duplicates: the bumped result was not re-appended as an attachment.
+    assert len(set(uuids)) == len(uuids)
+    # Order matches the post-fold in-memory chain exactly.
+    assert uuids == _in_memory_chain(after, tail_a)
+    # Tool round intact and adjacent: assistant call immediately followed by its result.
+    idx = uuids.index(call.uuid)
+    assert chain[idx + 1].uuid == result.uuid
+    assert chain[idx + 1].metadata.get("tool_call_id") == "c1"
 
 
 # --------------------------------------------------------------------------- read side

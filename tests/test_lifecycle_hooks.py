@@ -411,6 +411,28 @@ async def test_pre_and_post_compact_fire_on_fold(tmp_path: Path) -> None:
     assert isinstance(result, AgentRunResult)
 
 
+async def test_post_compact_summary_with_version_bumped_tail(tmp_path: Path) -> None:
+    """A microcompacted recent message keeps its uuid with a bumped version; the
+    PostCompact seam must still identify the folded summary (shared (uuid, version)
+    diff semantics with the transcript boundary commit)."""
+    hook = RecordingCompactHook()
+    agent = ReActAgent(
+        FakeProvider(), _force_compact_config(tmp_path),
+        hooks=HookPipeline(post_compact_hooks=[hook]),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    # The huge tail message lands in the recent window and gets microcompacted in
+    # place (same uuid, bumped version) while the older prefix folds into a summary.
+    history = [*_big_history(), Message("user", "tail " + "y" * 9000)]
+    result = await agent.run("hello", history=history)
+    assert hook.post, "PostCompact should fire after a real fold"
+    _, summary = hook.post[0]
+    assert summary is not None
+    assert "This session is being continued" in summary
+    assert "y" * 100 not in summary  # the bumped tail was not mistaken for the summary
+    assert isinstance(result, AgentRunResult)
+
+
 async def test_pre_compact_block_skips_compaction(tmp_path: Path) -> None:
     hook = BlockingPreCompactHook()
     agent = ReActAgent(
@@ -522,3 +544,36 @@ async def test_observational_hook_crash_never_sinks_the_run(tmp_path: Path) -> N
     result = await agent.run("tool: no_such_tool x")  # session start + tool failure crash
     assert result.answer  # run completed anyway (fail-open)
     assert await agent._spawn_subagent("probe") != ""  # spawn survives crashing observers
+
+
+async def test_ingress_budget_blocks_oversize_prompt_with_hooks_disabled(
+    tmp_path: Path,
+) -> None:
+    """The 100k-char cap lives at the canonical ingress, so it still blocks when the
+    hooks subsystem (and with it PromptValidationHook) is switched off entirely."""
+    from agent_core.hooks import HooksConfig
+
+    agent = ReActAgent(
+        FakeProvider(),
+        _hermetic_config(tmp_path, hooks=HooksConfig(enabled=False)),
+        logger=JSONLRunLogger(tmp_path),
+    )
+    assert agent.hooks.user_prompt_hooks == []  # sanity: no validation hook registered
+
+    result = await agent.run("x" * 100_001)
+
+    assert "exceeds the 100000-char limit" in result.answer
+
+
+async def test_ingress_budget_blocks_oversize_prompt_with_hooks_enabled(
+    tmp_path: Path,
+) -> None:
+    """Same block when the hooks subsystem is on (PromptValidationHook fires first,
+    same limit, same reason — no double counting)."""
+    agent = ReActAgent(
+        FakeProvider(), _hermetic_config(tmp_path), logger=JSONLRunLogger(tmp_path)
+    )
+
+    result = await agent.run("x" * 100_001)
+
+    assert "exceeds the 100000-char limit" in result.answer
