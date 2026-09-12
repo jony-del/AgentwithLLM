@@ -129,15 +129,15 @@ async def _read_frame(stream: asyncio.StreamReader) -> dict[str, Any]:
 async def _terminate_workflow_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         if os.name == "nt":
-            from agent_core.hook_adapters import (
-                _windows_descendant_pids,
-                _windows_terminate_pid,
+            from agent_core.process_tree import (
+                windows_descendant_pids,
+                windows_terminate_pid,
             )
 
             def terminate_windows() -> None:
-                descendants = _windows_descendant_pids(process.pid)
+                descendants = windows_descendant_pids(process.pid)
                 for pid in [*reversed(descendants), process.pid]:
-                    if _windows_terminate_pid(pid):
+                    if windows_terminate_pid(pid):
                         continue
                     subprocess.run(
                         ["taskkill", "/PID", str(pid), "/T", "/F"],

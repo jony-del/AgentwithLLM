@@ -7,12 +7,13 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.memory.config import MemoryConfig
 from agent_core.memory.models import MEMORY_KINDS, MemoryRecord
 from agent_core.memory.security import SecretDetectedError, require_secret_free
 from agent_core.memory.text import lexical_relevance, tokenize
 from agent_core.models import Message
-from agent_core.providers.base import LLMProvider, ProviderConfig
+from agent_core.providers.base import LLMProvider, ProviderConfig, _supports_scope
 
 # Embedded verbatim in the extraction/dreaming system prompts. Providers can detect
 # it to behave deterministically (FakeProvider does), and it documents intent inline.
@@ -141,6 +142,7 @@ class MemoryExtractor:
         source_run_id: str | None = None,
         *,
         cursor_key: str | None = None,
+        scope: ExecutionScope | None = None,
     ) -> list[MemoryRecord]:
         """Distil and store durable memories from a finished conversation.
 
@@ -148,6 +150,8 @@ class MemoryExtractor:
         agent's loop it flows through the shared ``GatedProvider`` (concurrency cap +
         rate limit). ``should_cancel`` is intentionally not forwarded: only
         ``GatedProvider`` accepts it, and post-run extraction is best-effort regardless.
+        ``scope`` binds the call to the run's execution budget; when omitted the ambient
+        ``current_execution_scope()`` (set for the duration of ``Agent.run``) applies.
         """
         if self._extract_lock is None:
             self._extract_lock = asyncio.Lock()
@@ -173,7 +177,16 @@ class MemoryExtractor:
                     key, final_uuid, expected_cursor, ordered_uuids
                 )
                 return []
-            result = await self.provider.complete(request, [], self.provider_config)
+            # Legacy providers (without a ``scope`` parameter) take no scope kwarg —
+            # the same tolerance the GatedProvider applies.
+            scope_kwargs: dict[str, Any] = (
+                {"scope": scope or current_execution_scope()}
+                if _supports_scope(self.provider)
+                else {}
+            )
+            result = await self.provider.complete(
+                request, [], self.provider_config, **scope_kwargs
+            )
             stored, dead_letters, skipped = await self._store_items(
                 parse_memory_items(result.content), source_run_id, key, final_uuid
             )

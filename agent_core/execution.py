@@ -21,10 +21,8 @@ MCP calls, sub-agents). The invariants below are contractual — pinned by
 5. Whoever creates a scope closes it: ``close()`` cancels the token and reaps
    every registered task and cleanup callback.
 
-Known bypasses that do NOT yet draw from the scope budget (phase-3 integration
-targets, not part of this contract): the httpx ``ProviderConfig.timeout``, the
-MCP client thread-side future, prompt/agent hook ``wait_for`` calls, and
-``ProcessSupervisor._enforce_timeout``.
+Remaining bypass that does NOT yet draw from the scope budget (not part of
+this contract): the httpx ``ProviderConfig.timeout`` transport timeout.
 """
 
 from __future__ import annotations
@@ -213,7 +211,12 @@ class ExecutionScope:
         *,
         timeout: float | None = None,
     ) -> Any:
-        self.raise_if_cancelled()
+        try:
+            self.raise_if_cancelled()
+        except BaseException:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise
         bounded = self.remaining_budget(timeout)
         if bounded is not None:
             if bounded <= 0:
@@ -224,7 +227,23 @@ class ExecutionScope:
         return await awaitable
 
     async def sleep(self, delay: float) -> None:
-        await self.run_awaitable(asyncio.sleep(max(0.0, delay)))
+        """Bounded sleep that also wakes early on cooperative cancellation.
+
+        Polls the shared token (and probe) at a short interval so a backoff
+        sleep wakes promptly on cancellation without parking threads.
+        """
+        self.raise_if_cancelled()
+        requested = max(0.0, float(delay))
+        end = time.monotonic() + requested
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            bounded = self.remaining_budget(min(remaining, 0.05))
+            if bounded is not None and bounded <= 0:
+                raise TimeoutError("execution deadline exceeded")
+            await asyncio.sleep(bounded if bounded is not None else min(remaining, 0.05))
+            self.raise_if_cancelled()
 
     def create_task(self, awaitable: Awaitable[Any], *, name: str | None = None) -> asyncio.Task[Any]:
         self.raise_if_cancelled()

@@ -8,16 +8,25 @@ Three layers:
   right pipeline lists, and that the default Stop completion hook blocks open to-dos.
 """
 
+import asyncio
 import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+import pytest
 
 from agent_core.builtin_hooks import (
     PostSamplingObserverHook,
     PromptValidationHook,
     StopCompletionHook,
 )
+from agent_core.execution import ExecutionScope
 from agent_core.hook_adapters import (
     CommandHookAdapter,
+    HttpHookAdapter,
     build_external_adapter,
     outcome_from_output,
     project_hook_input,
@@ -358,3 +367,76 @@ async def test_builtin_stop_completion_forces_continuation(tmp_path: Path) -> No
     continues = [m for m in result.messages if m.metadata.get("stop_hook") == "continue"]
     assert len(continues) == 1
     assert "finish the work" in continues[0].content
+
+
+# --- http adapter (execution-scope integration) -------------------------------
+
+
+class _FakeHttpResponse:
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self.status = status
+        self._body = body
+
+    def __enter__(self) -> "_FakeHttpResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body if size < 0 else self._body[:size]
+
+
+def _http_adapter(tmp_path: Path, *, timeout: float) -> HttpHookAdapter:
+    spec = ExternalHookSpec(
+        event="UserPromptSubmit", type="http", url="http://127.0.0.1:9/hook", timeout=timeout
+    )
+    return HttpHookAdapter(spec, JSONLRunLogger(tmp_path / "http-logs"))
+
+
+async def test_http_adapter_scope_success_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout=0: _FakeHttpResponse(b'{"additionalContext": "scoped-ok"}'),
+    )
+    adapter = _http_adapter(tmp_path, timeout=10)
+    scope = ExecutionScope.for_workspace(tmp_path)
+    ctx = HookContext(HookEvent.USER_PROMPT_SUBMIT, [], execution_scope=scope)
+
+    outcome = await adapter._invoke(ctx)
+
+    assert outcome.additional_context == "scoped-ok"
+    await scope.close()
+    adapter.logger.close()
+
+
+async def test_http_adapter_scope_cancellation_abandons_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+
+    def slow_urlopen(request: object, timeout: float = 0) -> bytes:
+        # Stands in for a slow socket: blocks until the test releases it.
+        release.wait(30)
+        raise urllib.error.URLError("released by test teardown")
+
+    monkeypatch.setattr(urllib.request, "urlopen", slow_urlopen)
+    adapter = _http_adapter(tmp_path, timeout=30)
+    scope = ExecutionScope.for_workspace(tmp_path)
+    ctx = HookContext(HookEvent.USER_PROMPT_SUBMIT, [], execution_scope=scope)
+    invocation = asyncio.create_task(adapter._invoke(ctx))
+    await asyncio.sleep(0.2)  # let the worker thread enter urlopen
+    scope.cancellation.cancel("test cancellation")
+    started = time.monotonic()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(invocation, timeout=5)
+    finally:
+        release.set()
+        adapter.logger.close()
+        await scope.close()
+    # Abandoned promptly by the token poll, not after the 30s socket timeout.
+    assert time.monotonic() - started < 2

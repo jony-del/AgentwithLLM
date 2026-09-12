@@ -4,12 +4,13 @@ import time
 from dataclasses import replace
 from typing import Any, Protocol
 
+from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.memory.config import MemoryConfig
 from agent_core.memory.extraction import MEMORY_EXTRACTION_MARKER, parse_memory_items
 from agent_core.memory.models import MemoryRecord, DreamReport
 from agent_core.memory.text import lexical_relevance, tokenize
 from agent_core.models import Message
-from agent_core.providers.base import LLMProvider, ProviderConfig
+from agent_core.providers.base import LLMProvider, ProviderConfig, _supports_scope
 
 _SECONDS_PER_DAY = 86400.0
 
@@ -49,18 +50,20 @@ class Dreamer:
         self.provider = provider
         self.provider_config = provider_config or ProviderConfig()
 
-    async def dream(self, *, commit: bool = True) -> DreamReport:
+    async def dream(self, *, commit: bool = True, scope: ExecutionScope | None = None) -> DreamReport:
         """Run the consolidation pass and return a report.
 
         The decay/merge stages are pure in-memory work; insight synthesis goes through
         the gated ``complete`` so an in-loop caller shares the provider gate, and the commit
         rewrite runs off the loop inside the store. With ``commit=False`` (dry run)
         the report is computed exactly as normal but nothing is persisted — the store
-        is left untouched, so callers can preview what dreaming *would* do.
+        is left untouched, so callers can preview what dreaming *would* do. ``scope``
+        binds the synthesis call to the caller's execution budget (ambient run scope
+        when omitted).
         """
         report = DreamReport(scanned=len(self.store))
         survivors = self._consolidate(report)
-        insights = await self._synthesize_insights(survivors, report)
+        insights = await self._synthesize_insights(survivors, report, scope=scope)
         if commit:
             await self.store.replace_all([*survivors, *insights])
         return report
@@ -139,13 +142,24 @@ class Dreamer:
 
     # --- stage 3: insight synthesis (the "dream") -----------------------------
 
-    async def _synthesize_insights(self, survivors: list[MemoryRecord], report: DreamReport) -> list[MemoryRecord]:
+    async def _synthesize_insights(
+        self,
+        survivors: list[MemoryRecord],
+        report: DreamReport,
+        *,
+        scope: ExecutionScope | None = None,
+    ) -> list[MemoryRecord]:
         request = self._build_insight_request(survivors)
         provider = self.provider
         if request is None or provider is None:
             return []
         try:
-            result = await provider.complete(request, [], self.provider_config)
+            # Legacy providers (without a ``scope`` parameter) take no scope kwarg —
+            # the same tolerance the GatedProvider applies.
+            scope_kwargs: dict[str, Any] = (
+                {"scope": scope or current_execution_scope()} if _supports_scope(provider) else {}
+            )
+            result = await provider.complete(request, [], self.provider_config, **scope_kwargs)
         except Exception as exc:  # noqa: BLE001 - dreaming is best-effort; never fail the pass
             report.details.append(f"insight synthesis skipped: {type(exc).__name__}")
             return []

@@ -28,11 +28,9 @@ Invariants (aligned with the project's timeout / degrade discipline):
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import re
-import signal
 import subprocess
 import urllib.request
 from collections.abc import Awaitable, Callable
@@ -42,10 +40,12 @@ from typing import TYPE_CHECKING, Any
 from agent_core.hooks import ExternalHookSpec, HookContext, HookLimitsConfig, HookOutcome
 from agent_core.models import Message
 from agent_core.permission_rules import ParsedRule, RuleSet, parse_rule
+from agent_core.process_tree import terminate_process_tree
 from agent_core.providers.base import ProviderConfig
 from agent_core.prompt_ingress import defang_reserved_tags
 
 if TYPE_CHECKING:
+    from agent_core.execution import ExecutionScope
     from agent_core.providers.base import LLMProvider
     from agent_core.storage import JSONLRunLogger
 
@@ -552,7 +552,7 @@ async def _bounded_communicate(
         # ``wait_for`` waits for cancellation cleanup. Kill the complete process
         # tree first so inherited pipe handles close and cancelled Proactor reads
         # cannot hold the timeout path open until a grandchild exits naturally.
-        await _terminate_process_tree(proc)
+        await terminate_process_tree(proc)
         raise
     finally:
         for task in reads:
@@ -563,125 +563,6 @@ async def _bounded_communicate(
         raise ValueError("command hook output exceeded configured byte limit")
     await proc.wait()
     return stdout, stderr
-
-
-def _windows_descendant_pids(root_pid: int) -> list[int]:
-    """Snapshot descendant PIDs before the root exits (``taskkill /T`` race guard)."""
-
-    if os.name != "nt":
-        return []
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class ProcessEntry(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
-        kernel32.Process32FirstW.restype = wintypes.BOOL
-        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
-        kernel32.Process32NextW.restype = wintypes.BOOL
-        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-        if snapshot in {None, wintypes.HANDLE(-1).value}:
-            return []
-        children: dict[int, list[int]] = {}
-        entry = ProcessEntry()
-        entry.dwSize = ctypes.sizeof(entry)
-        try:
-            present = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
-            while present:
-                children.setdefault(int(entry.th32ParentProcessID), []).append(
-                    int(entry.th32ProcessID)
-                )
-                present = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
-        finally:
-            kernel32.CloseHandle(snapshot)
-        descendants: list[int] = []
-        pending = list(children.get(root_pid, []))
-        while pending:
-            pid = pending.pop()
-            descendants.append(pid)
-            pending.extend(children.get(pid, []))
-        return descendants
-    except (AttributeError, OSError, ValueError):
-        return []
-
-
-def _windows_terminate_pid(pid: int) -> bool:
-    """Terminate one same-user process through a native handle and wait for exit."""
-
-    if os.name != "nt":
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        kernel32.TerminateProcess.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x0001 | 0x00100000, False, pid)
-        if not handle:
-            return False
-        try:
-            terminated = bool(kernel32.TerminateProcess(handle, 1))
-            if terminated:
-                kernel32.WaitForSingleObject(handle, 3000)
-            return terminated
-        finally:
-            kernel32.CloseHandle(handle)
-    except (AttributeError, OSError, ValueError):
-        return False
-
-
-async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """Best-effort cleanup on success, timeout, cancellation, and pipe failure."""
-
-    if os.name == "nt":
-        if proc.returncode is None:
-            def terminate_windows() -> None:
-                descendants = _windows_descendant_pids(proc.pid)
-                # Kill leaves first. If taskkill terminates the root before walking
-                # its children, the saved PID list still closes inherited pipe handles.
-                for pid in [*reversed(descendants), proc.pid]:
-                    if _windows_terminate_pid(pid):
-                        continue
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                        timeout=3,
-                    )
-
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                await asyncio.to_thread(terminate_windows)
-    else:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            getattr(os, "killpg")(proc.pid, signal.SIGTERM)
-        await asyncio.sleep(0)
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            getattr(os, "killpg")(proc.pid, getattr(signal, "SIGKILL", 9))
-    if proc.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=1)
 
 
 class CommandHookAdapter(_ExternalHookAdapter):
@@ -730,10 +611,36 @@ class CommandHookAdapter(_ExternalHookAdapter):
         except ValueError as exc:
             raise HookFailedError(str(exc)) from exc
         finally:
-            await _terminate_process_tree(proc)
+            await terminate_process_tree(proc)
         return outcome_from_output(
             stdout.decode("utf-8", "replace"), proc.returncode or 0, self.limits
         )
+
+
+async def _post_within_scope(
+    scope: ExecutionScope, post: Callable[[], tuple[int, str]], timeout: float
+) -> tuple[int, str]:
+    """Run a blocking urlopen POST inside the scope's cancellation/budget authority.
+
+    ``scope.run_awaitable`` bounds the wait by the run's remaining budget; the poll
+    loop folds token cancellation into a prompt ``CancelledError``. The urlopen
+    worker thread cannot be killed mid-request — it stays bounded by its own socket
+    timeout, and on abandon the wrapper task is cancelled so the late result is
+    discarded quietly.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(post))
+
+    async def _polled() -> tuple[int, str]:
+        while not worker.done():
+            scope.raise_if_cancelled()
+            await asyncio.sleep(0.05)
+        return worker.result()
+
+    try:
+        return await scope.run_awaitable(_polled(), timeout=timeout)
+    finally:
+        if not worker.done():
+            worker.cancel()
 
 
 class HttpHookAdapter(_ExternalHookAdapter):
@@ -758,7 +665,10 @@ class HttpHookAdapter(_ExternalHookAdapter):
                 return status, body.decode("utf-8", "replace")
 
         try:
-            status, body = await asyncio.to_thread(_post)
+            if ctx.execution_scope is None:
+                status, body = await asyncio.to_thread(_post)
+            else:
+                status, body = await _post_within_scope(ctx.execution_scope, _post, timeout)
         except Exception as exc:  # noqa: BLE001 - network/timeout → fail_mode decides.
             await self._log("http_error", f"{type(exc).__name__}: {exc}")
             raise HookFailedError(f"{type(exc).__name__}: {exc}") from exc

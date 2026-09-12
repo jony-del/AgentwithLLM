@@ -107,6 +107,32 @@ async def test_scope_close_cancels_token_and_reaps_tasks(tmp_path: Path) -> None
     assert task.done()
 
 
+async def test_scope_sleep_returns_normally(tmp_path: Path) -> None:
+    scope = ExecutionScope.for_workspace(tmp_path)
+    await scope.sleep(0.01)
+
+
+async def test_scope_sleep_wakes_early_on_token_cancellation(tmp_path: Path) -> None:
+    scope = ExecutionScope.for_workspace(tmp_path)
+    started = time.monotonic()
+
+    async def cancel_soon() -> None:
+        await asyncio.sleep(0.05)
+        scope.cancellation.cancel("test cancel")
+
+    canceller = asyncio.create_task(cancel_soon())
+    with pytest.raises(asyncio.CancelledError):
+        await scope.sleep(30.0)
+    await canceller
+    assert time.monotonic() - started < 5.0
+
+
+async def test_scope_sleep_enforces_deadline(tmp_path: Path) -> None:
+    scope = ExecutionScope.for_workspace(tmp_path, deadline=time.monotonic() + 0.05)
+    with pytest.raises(TimeoutError):
+        await scope.sleep(30.0)
+
+
 # --------------------------------------------------------------------------
 # RecoveryState contract
 # --------------------------------------------------------------------------

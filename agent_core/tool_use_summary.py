@@ -27,18 +27,29 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from typing import Any, Awaitable, Callable
+from typing import Any, Protocol
 
 from agent_core import tokens
 from agent_core.compression_summary import _NullStreamHandler, _unwrap
+from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.models import Message, ToolCall, ToolResult
-from agent_core.providers.base import LLMProvider, ProviderConfig
+from agent_core.providers.base import LLMProvider, ProviderConfig, _supports_scope
 from agent_core.providers.fake import FakeProvider
+
 
 # Injected async callback: given this turn's (call, result) pairs plus the assistant text
 # that preceded them, return a one-line progress label — or ``None`` to emit nothing. The
-# ReAct loop fires this fire-and-forget after a tool batch and awaits it next turn.
-ToolUseSummarizer = Callable[[list[tuple[ToolCall, ToolResult]], str], Awaitable[str | None]]
+# ReAct loop fires this fire-and-forget after a tool batch and awaits it next turn. The
+# optional ``scope`` binds the call to the firing run's execution budget; when omitted the
+# ambient ``current_execution_scope()`` (set for the duration of ``Agent.run``) is used.
+class ToolUseSummarizer(Protocol):
+    async def __call__(
+        self,
+        batch: list[tuple[ToolCall, ToolResult]],
+        last_assistant_text: str,
+        *,
+        scope: ExecutionScope | None = None,
+    ) -> str | None: ...
 
 
 @dataclass(slots=True)
@@ -156,9 +167,15 @@ def build_tool_use_summarizer(
     if isinstance(_unwrap(provider), FakeProvider):
         return None
 
-    async def summarize(batch: list[tuple[ToolCall, ToolResult]], last_assistant_text: str) -> str | None:
+    async def summarize(
+        batch: list[tuple[ToolCall, ToolResult]],
+        last_assistant_text: str,
+        *,
+        scope: ExecutionScope | None = None,
+    ) -> str | None:
         if not batch:
             return None
+        scope = scope or current_execution_scope()
         convo = render_tool_batch(batch, last_assistant_text, config.max_input_chars_per_tool)
         messages = [Message("system", TOOL_USE_SUMMARY_SYSTEM), Message("user", convo)]
         ceiling = tokens.model_output_tokens(config.model)[1]
@@ -171,13 +188,25 @@ def build_tool_use_summarizer(
             thinking_budget=None,
         )
         sink = _NullStreamHandler()
+        # Legacy providers (without a ``scope`` parameter) take no scope kwarg — the
+        # same tolerance the GatedProvider applies. The run_awaitable wrap below still
+        # hard-bounds their call envelope by the scope's remaining wall budget.
+        scope_kwargs: dict[str, Any] = {"scope": scope} if _supports_scope(provider) else {}
         try:
             # Single, non-stacked timeout around the whole (streamed, no-tools) call so a
-            # hung Haiku request can never make the next-turn flush await forever.
-            result = await asyncio.wait_for(
-                provider.complete(messages, [], label_config, stream=sink),
-                config.timeout_seconds,
-            )
+            # hung Haiku request can never make the next-turn flush await forever. With a
+            # scope the run's own budget enforces the bound; without one, a bare wait_for.
+            if scope is not None:
+                scope.raise_if_cancelled()
+                result = await scope.run_awaitable(
+                    provider.complete(messages, [], label_config, stream=sink, **scope_kwargs),
+                    timeout=config.timeout_seconds,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    provider.complete(messages, [], label_config, stream=sink),
+                    config.timeout_seconds,
+                )
         except asyncio.CancelledError:
             # BaseException: an outer run cancellation must still propagate (and the loop
             # cancels+reaps this task on stop). Never swallow it.

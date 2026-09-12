@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import threading
 import time
@@ -390,3 +391,172 @@ def test_expand_env_blocks_sensitive_names_only_for_plugin_servers(monkeypatch) 
     assert "secret" not in str(excinfo.value)
     # Non-sensitive references still resolve under the restriction.
     assert _expand_env("${MY_REGION}", allow_sensitive=False) == "eu"
+
+
+# --- client timeout recovery / scope-aware cancellation ------------------------
+
+
+class _StubSession:
+    """Duck-typed ClientSession stand-in: no SDK, fully deterministic."""
+
+    def __init__(self, *, hang=False, ping_error=None):
+        self.hang = hang
+        self.ping_error = ping_error
+        self.calls = 0
+        self.pings = 0
+        self.cancelled = threading.Event()
+
+    async def call_tool(self, tool, arguments):
+        self.calls += 1
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return _Result([_Block(text="ok")])
+
+    async def send_ping(self):
+        self.pings += 1
+        if self.ping_error is not None:
+            raise self.ping_error
+
+    async def initialize(self):
+        return SimpleNamespace(capabilities=SimpleNamespace(experimental={}))
+
+
+def _started_manager(**kwargs):
+    from agent_core.mcp.client import MCPClientManager
+
+    return MCPClientManager(MCPConfig(servers=[]), **kwargs).start()
+
+
+def test_call_tool_timeout_cancels_future_and_marks_session_suspect() -> None:
+    manager = _started_manager()
+    try:
+        session = _StubSession(hang=True)
+        manager._sessions["s"] = session
+        with pytest.raises(TimeoutError, match="MCP tool call timed out"):
+            manager.call_tool("s", "t", {}, timeout=0.2)
+        assert session.cancelled.wait(2)  # future.cancel() reached the in-flight coroutine
+        assert "s" in manager._suspect
+    finally:
+        manager.close()
+
+
+def test_suspect_session_passing_health_check_is_reused_without_reconnect() -> None:
+    manager = _started_manager(health_timeout=0.5)
+    try:
+        session = _StubSession(hang=True)
+        manager._sessions["s"] = session
+        with pytest.raises(TimeoutError):
+            manager.call_tool("s", "t", {}, timeout=0.2)
+        assert "s" in manager._suspect
+
+        session.hang = False
+        result = manager.call_tool("s", "t", {})
+        assert session.pings == 1  # a health check ran before the call
+        assert session.calls == 2
+        assert result.content[0].text == "ok"
+        assert "s" not in manager._suspect
+        assert manager._sessions["s"] is session  # no reconnect happened
+    finally:
+        manager.close()
+
+
+def test_suspect_session_failing_health_check_is_reconnected_once(monkeypatch) -> None:
+    from agent_core.mcp.client import MCPClientManager
+
+    config = MCPConfig(servers=[MCPServerConfig(name="s", enabled=False)])
+    manager = MCPClientManager(config, health_timeout=0.5, connect_timeout=5)
+    manager.start()
+    try:
+        stale = _StubSession(hang=True, ping_error=RuntimeError("desynced"))
+        manager._sessions["s"] = stale
+        with pytest.raises(TimeoutError):
+            manager.call_tool("s", "t", {}, timeout=0.2)
+
+        fresh = _StubSession()
+        opened = []
+
+        async def fake_open_session(self, stack, server):
+            opened.append(server.name)
+            return fresh
+
+        monkeypatch.setattr(MCPClientManager, "_open_session", fake_open_session)
+        result = manager.call_tool("s", "t", {})
+        assert opened == ["s"]  # exactly one reconnect attempt for this call
+        assert manager._sessions["s"] is fresh
+        assert fresh.calls == 1
+        assert result.content[0].text == "ok"
+        assert "s" not in manager._suspect
+    finally:
+        manager.close()
+
+
+def test_call_fails_when_the_reconnect_fails(monkeypatch) -> None:
+    from agent_core.mcp.client import MCPClientManager
+
+    config = MCPConfig(servers=[MCPServerConfig(name="s", enabled=False)])
+    manager = MCPClientManager(config, health_timeout=0.5, connect_timeout=5)
+    manager.start()
+    try:
+        manager._sessions["s"] = _StubSession(hang=True, ping_error=RuntimeError("desynced"))
+        with pytest.raises(TimeoutError):
+            manager.call_tool("s", "t", {}, timeout=0.2)
+
+        async def failing_open_session(self, stack, server):
+            raise RuntimeError("cannot reconnect")
+
+        monkeypatch.setattr(MCPClientManager, "_open_session", failing_open_session)
+        with pytest.raises(RuntimeError, match="cannot reconnect"):
+            manager.call_tool("s", "t", {})
+        assert "s" in manager._suspect  # still marked so the next call retries recovery
+    finally:
+        manager.close()
+
+
+def test_close_with_hung_call_completes_bounded() -> None:
+    manager = _started_manager()
+    session = _StubSession(hang=True)
+    manager._sessions["s"] = session
+    outcome = []
+
+    def caller() -> None:
+        try:
+            manager.call_tool("s", "t", {}, timeout=30)
+        except BaseException as exc:  # released by close(), not by the 30s timeout
+            outcome.append(type(exc).__name__)
+
+    worker = threading.Thread(target=caller, daemon=True)
+    worker.start()
+    time.sleep(0.3)  # let the call park on the future
+    started = time.monotonic()
+    manager.close()  # must not raise
+    assert time.monotonic() - started < 20  # worst case: 10s serve + 5s drain + 5s join
+    worker.join(timeout=5)
+    assert not worker.is_alive()  # the parked caller thread was released
+    assert outcome
+
+
+async def test_tool_run_is_interrupted_by_scope_cancellation(tmp_path: Path) -> None:
+    from agent_core.execution import ExecutionScope, execution_scope_context
+
+    manager = _started_manager()
+    try:
+        session = _StubSession(hang=True)
+        manager._sessions["s"] = session
+        tool = MCPTool(manager, MCPServerConfig(name="s"), _Descriptor("t"))
+        scope = ExecutionScope.for_workspace(tmp_path)
+        with execution_scope_context(scope):
+            run = asyncio.ensure_future(tool.run({}))
+            await asyncio.sleep(0.3)  # let the worker thread park on the wait
+            scope.cancellation.cancel("test stop")
+            # The wait thread polls the token at a short interval, so the run task
+            # finishes well inside this bound instead of after the 60s default.
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, timeout=5)
+        assert session.cancelled.wait(2)  # future.cancel() reached the hung coroutine
+        assert "s" in manager._suspect
+    finally:
+        manager.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -9,8 +10,10 @@ import pytest
 
 from agent_core.cli import build_agent
 from agent_core.config import resolve_limits_config
+from agent_core.execution import ExecutionScope
 from agent_core.memory import MemoryConfig
 from agent_core.models import LLMResult, ToolCall
+from agent_core.providers.base import GatedProvider, provider_attempt
 from agent_core.providers.fake import FakeProvider
 from agent_core.react import AgentRunResult, ReActAgent, ReActConfig
 from agent_core.storage import JSONLRunLogger
@@ -116,6 +119,97 @@ async def test_subagent_inherits_parent_deadline(tmp_path: Path) -> None:
     out = await agent._spawn_subagent("subtask", "read_only")
     assert out == "child done"
     assert recorded["deadline"] == sentinel
+
+
+async def test_scope_cancellation_propagates_to_subagent(tmp_path: Path) -> None:
+    """Cancelling the shared token unwinds an in-flight child run cooperatively."""
+    agent = ReActAgent(FakeProvider(), _config(tmp_path))
+    scope = ExecutionScope.for_workspace(tmp_path)
+    agent._active_scope = scope
+    observed: dict[str, object] = {"ends": []}
+
+    class SlowChild:
+        async def run(self, task, should_cancel=None, deadline=None, execution_scope=None) -> AgentRunResult:
+            try:
+                await execution_scope.sleep(60)
+            except asyncio.CancelledError:
+                observed["cancelled"] = execution_scope.cancelled()
+                return AgentRunResult("child stopped", [], 0, "run-x")
+            return AgentRunResult("child done", [], 0, "run-x")
+
+        async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+            observed["ends"].append(reason)
+
+    agent._make_subagent_child = lambda preset, model=None: SlowChild()  # type: ignore[assignment]
+    started_at = time.monotonic()
+    spawn = asyncio.create_task(agent._spawn_subagent("subtask", "read_only"))
+    await asyncio.sleep(0.05)  # let the child park inside its bounded sleep
+    scope.cancellation.cancel("test cancel")
+    out = await asyncio.wait_for(spawn, timeout=5)
+
+    assert time.monotonic() - started_at < 5  # nowhere near the child's 60s sleep
+    assert observed["cancelled"] is True
+    # Cooperative cancellation is a normal child exit, not an error: one teardown.
+    assert observed["ends"] == ["subagent_exit"]
+    assert out == "child stopped"
+
+
+async def test_subagent_cancellation_releases_gate_and_leaves_no_tasks(tmp_path: Path) -> None:
+    """§9.2 residuals for the row above: after a cancelled child unwinds, the shared
+    provider gate slot is free again and no unfinished asyncio task leaks."""
+    agent = ReActAgent(FakeProvider(), _config(tmp_path, max_api_concurrency=1))
+    provider = agent.provider
+    assert isinstance(provider, GatedProvider)
+    gate = provider.gate
+    scope = ExecutionScope.for_workspace(tmp_path)
+    agent._active_scope = scope
+    entered = asyncio.Event()
+    ends: list[str] = []
+
+    class GatedParkingChild:
+        """Parks mid-API-call: holds the shared gate slot until the scope cancels it."""
+
+        async def run(self, task, should_cancel=None, deadline=None, execution_scope=None) -> AgentRunResult:
+            assert execution_scope is not None
+            gated_scope = execution_scope.with_provider_gate(gate)
+            try:
+                async with provider_attempt(gated_scope):
+                    entered.set()
+                    await gated_scope.sleep(60)
+            except asyncio.CancelledError:
+                return AgentRunResult("child stopped", [], 0, "run-x")
+            return AgentRunResult("child done", [], 0, "run-x")
+
+        async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+            ends.append(reason)
+
+    agent._make_subagent_child = lambda preset, model=None: GatedParkingChild()  # type: ignore[assignment]
+    before = asyncio.all_tasks()
+    spawn = asyncio.create_task(agent._spawn_subagent("subtask", "read_only"))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    # While the child is parked mid-call it holds the fan-out's only gate slot.
+    semaphore = gate._semaphore
+    assert semaphore is not None and semaphore.locked()
+    started_at = time.monotonic()
+    scope.cancellation.cancel("test cancel")
+    out = await asyncio.wait_for(spawn, timeout=5)
+
+    assert time.monotonic() - started_at < 5  # nowhere near the child's 60s park
+    assert out == "child stopped"
+    assert ends == ["subagent_exit"]  # single teardown, as in the sibling test
+    # The gate slot was released on the way out and can be re-acquired (probe with
+    # no scope: the cancelled one would reject the attempt before touching the gate).
+    assert not semaphore.locked()
+
+    async def reacquire() -> bool:
+        async with gate.attempt(None):
+            return True
+
+    assert await asyncio.wait_for(reacquire(), timeout=1)
+    leaked = [task for task in asyncio.all_tasks() - before if not task.done()]
+    assert leaked == []
+    assert agent.session.process_supervisor.running() == []
+    await scope.close()
 
 
 # --- config precedence ------------------------------------------------------

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import ipaddress
+import logging
 import os
 import re
 import socket
 import subprocess
 import threading
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -18,6 +21,13 @@ from pydantic import FileUrl
 
 from agent_core.env_security import expand_host_env
 from agent_core.mcp.config import MCPConfig, MCPServerConfig
+from agent_core.process_tree import terminate_pid_tree
+
+
+logger = logging.getLogger(__name__)
+
+# How often a scope-aware wait wakes to check the cancellation token.
+_CANCEL_POLL_INTERVAL = 0.05
 
 
 class MCPClientManager:
@@ -43,12 +53,14 @@ class MCPClientManager:
         *,
         connect_timeout: float = 30.0,
         call_timeout: float = 60.0,
+        health_timeout: float = 5.0,
         channel_servers: set[str] | None = None,
         notification_sink: Callable[[str, str, dict[str, str]], None] | None = None,
     ) -> None:
         self._config = config
         self._connect_timeout = connect_timeout
         self._call_timeout = call_timeout
+        self._health_timeout = health_timeout
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._serve_future: Any = None  # concurrent.futures.Future
@@ -60,6 +72,12 @@ class MCPClientManager:
         self._closed = False
         self._channel_servers = set(channel_servers or ())
         self._notification_sink = notification_sink
+        # Sessions left possibly desynced by a timed-out/cancelled in-flight call;
+        # the next call on one health-checks it (and reconnects once) first.
+        self._suspect: set[str] = set()
+        self._health_lock = threading.Lock()
+        # Exit stacks owned by reconnects (the original sessions live in _serve's).
+        self._extra_stacks: dict[str, AsyncExitStack] = {}
 
     # -- lifecycle -----------------------------------------------------------------
 
@@ -100,6 +118,21 @@ class MCPClientManager:
             self._ready.set()
 
     async def _connect(self, stack: AsyncExitStack, server: MCPServerConfig) -> None:
+        session = await self._open_session(stack, server)
+        initialized = await session.initialize()
+        if server.name in self._channel_servers:
+            experimental = getattr(initialized.capabilities, "experimental", None) or {}
+            if "claude/channel" not in experimental:
+                raise RuntimeError(
+                    f"configured channel MCP server {server.name} did not declare claude/channel"
+                )
+        self._sessions[server.name] = session
+        listed = await session.list_tools()
+        for descriptor in listed.tools:
+            self._tools.append((server, descriptor))
+
+    async def _open_session(self, stack: AsyncExitStack, server: MCPServerConfig):
+        """Open the transport and enter a ``ClientSession`` onto ``stack``."""
         from mcp import ClientSession, types
 
         read, write = await self._open_transport(stack, server)
@@ -132,23 +165,12 @@ class MCPClientManager:
                 roots.append(types.Root(uri=FileUrl(uri), name=Path(expanded).name or None))
             return types.ListRootsResult(roots=roots)
 
-        session = await stack.enter_async_context(ClientSession(
+        return await stack.enter_async_context(ClientSession(
             read,
             write,
             message_handler=handle_message,
             list_roots_callback=cast(Any, list_roots) if server.roots else None,
         ))
-        initialized = await session.initialize()
-        if server.name in self._channel_servers:
-            experimental = getattr(initialized.capabilities, "experimental", None) or {}
-            if "claude/channel" not in experimental:
-                raise RuntimeError(
-                    f"configured channel MCP server {server.name} did not declare claude/channel"
-                )
-        self._sessions[server.name] = session
-        listed = await session.list_tools()
-        for descriptor in listed.tools:
-            self._tools.append((server, descriptor))
 
     async def _open_transport(self, stack: AsyncExitStack, server: MCPServerConfig):
         transport = (server.transport or "stdio").lower()
@@ -233,14 +255,42 @@ class MCPClientManager:
             try:
                 self._serve_future.result(timeout=10)
             except Exception:
-                pass
+                # A wedged transport exit (e.g. an unresponsive stdio child) must
+                # not hang shutdown: cancel the serve task so the stack unwinds
+                # through CancelledError instead.
+                logger.warning("MCP close: serve task did not unwind within 10s; cancelling it")
+                self._serve_future.cancel()
+        # Close reconnect-owned stacks and cancel anything still pending (a hung
+        # call_tool coroutine, a wedged unwind) so loop.stop() is actually reached.
+        try:
+            asyncio.run_coroutine_threadsafe(self._shutdown_tasks(), loop).result(timeout=5)
+        except Exception:
+            logger.warning("MCP close: event loop did not drain pending tasks within 5s")
         loop.call_soon_threadsafe(loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                logger.warning("MCP close: loop thread is still alive after 5s")
         try:
             loop.close()
         except Exception:
             pass
+
+    async def _shutdown_tasks(self) -> None:
+        """Runs on the MCP loop: close reconnect stacks, then cancel stragglers."""
+        stacks, self._extra_stacks = list(self._extra_stacks.values()), {}
+        for stack in stacks:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+        current = asyncio.current_task()
+        pending = [
+            task for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # -- query / call --------------------------------------------------------------
 
@@ -248,26 +298,45 @@ class MCPClientManager:
         """The ``(server_config, tool_descriptor)`` pairs discovered across all servers."""
         return list(self._tools)
 
-    def call_tool(self, server: str, tool: str, arguments: dict[str, Any] | None, timeout: float | None = None):
-        """Invoke a tool on a connected server, blocking for the ``CallToolResult``."""
+    def call_tool(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any] | None,
+        timeout: float | None = None,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ):
+        """Invoke a tool on a connected server, blocking for the ``CallToolResult``.
+
+        ``should_cancel`` (e.g. an execution scope's ``cancelled``) is polled at a
+        short interval while waiting; when it reports cancellation the in-flight
+        future is cancelled and ``asyncio.CancelledError`` is raised instead of
+        parking this thread until the timeout.
+        """
         if self._loop is None or self._closed:
             raise RuntimeError("MCP manager is not running")
-        session = self._sessions.get(server)
-        if session is None:
+        if server not in self._sessions:
             raise KeyError(f"Unknown MCP server: {server}")
+        self._ensure_healthy(server)
+        session = self._sessions[server]
         future = asyncio.run_coroutine_threadsafe(
             session.call_tool(tool, arguments or {}), self._loop
         )
         bounded = timeout if timeout is not None else server_config.timeout if (server_config := next((item for item in self._config.servers if item.name == server), None)) is not None else self._call_timeout
-        try:
-            return future.result(bounded)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"MCP tool call timed out after {bounded:.3f}s") from None
+        return self._bounded_result(
+            future,
+            bounded,
+            suspect=server,
+            should_cancel=should_cancel,
+            message=f"MCP tool call timed out after {bounded:.3f}s",
+        )
 
     def list_resources(self, server: str | None = None, timeout: float | None = None) -> list[dict[str, Any]]:
         if self._loop is None or self._closed:
             raise RuntimeError("MCP manager is not running")
+        if server is not None:
+            self._ensure_healthy(server)
 
         async def collect() -> list[dict[str, Any]]:
             records: list[dict[str, Any]] = []
@@ -287,25 +356,124 @@ class MCPClientManager:
 
         future = asyncio.run_coroutine_threadsafe(collect(), self._loop)
         bounded = timeout if timeout is not None else self._call_timeout
-        try:
-            return future.result(bounded)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"MCP resource listing timed out after {bounded:.3f}s") from None
+        # Only a single-server listing can attribute a timeout to that session;
+        # a fan-out listing leaves the suspect set untouched.
+        return self._bounded_result(
+            future,
+            bounded,
+            suspect=server,
+            message=f"MCP resource listing timed out after {bounded:.3f}s",
+        )
 
     def read_resource(self, server: str, uri: str, timeout: float | None = None) -> Any:
         if self._loop is None or self._closed:
             raise RuntimeError("MCP manager is not running")
-        session = self._sessions.get(server)
-        if session is None:
+        if server not in self._sessions:
             raise KeyError(f"Unknown MCP server: {server}")
+        self._ensure_healthy(server)
+        session = self._sessions[server]
         future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
         bounded = timeout if timeout is not None else self._call_timeout
+        return self._bounded_result(
+            future,
+            bounded,
+            suspect=server,
+            message=f"MCP resource read timed out after {bounded:.3f}s",
+        )
+
+    # -- timeout recovery ----------------------------------------------------------
+
+    def _bounded_result(
+        self,
+        future: concurrent.futures.Future[Any],
+        bounded: float,
+        *,
+        suspect: str | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        message: str,
+    ) -> Any:
+        """Block the calling thread on an MCP-loop future, bounded by ``bounded``.
+
+        On timeout the future is cancelled and ``suspect`` (a server name, if the
+        wait was attributable to one session) is marked for a health check before
+        its next use. With ``should_cancel`` the wait wakes at a short interval so
+        a cancelled execution scope interrupts it promptly; the thread never parks
+        longer than ``bounded`` either way.
+        """
+        if should_cancel is None:
+            try:
+                return future.result(bounded)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                if suspect is not None:
+                    self._suspect.add(suspect)
+                raise TimeoutError(message) from None
+        deadline = time.monotonic() + bounded
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                if suspect is not None:
+                    self._suspect.add(suspect)
+                raise TimeoutError(message) from None
+            try:
+                return future.result(min(remaining, _CANCEL_POLL_INTERVAL))
+            except concurrent.futures.TimeoutError:
+                if should_cancel():
+                    future.cancel()
+                    if suspect is not None:
+                        self._suspect.add(suspect)
+                    raise asyncio.CancelledError("cancelled") from None
+
+    def _ensure_healthy(self, server: str) -> None:
+        """Health-check a suspect session, dropping and reconnecting it once on failure."""
+        if self._closed or self._loop is None or server not in self._suspect:
+            return
+        with self._health_lock:
+            if server not in self._suspect:
+                return  # another worker thread already recovered it
+            session = self._sessions.get(server)
+            probe = None
+            if session is not None:
+                probe = getattr(session, "send_ping", None) or getattr(session, "list_tools", None)
+            if probe is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(probe(), self._loop).result(self._health_timeout)
+                    self._suspect.discard(server)
+                    return
+                except Exception:
+                    pass
+            server_config = next(
+                (item for item in self._config.servers if item.name == server), None
+            )
+            if server_config is None:
+                raise KeyError(f"Unknown MCP server: {server}")
+            asyncio.run_coroutine_threadsafe(
+                self._reconnect_session(server_config), self._loop
+            ).result(self._connect_timeout)
+            self._suspect.discard(server)
+
+    async def _reconnect_session(self, server: MCPServerConfig) -> None:
+        """Runs on the MCP loop: replace one server's session with a fresh one.
+
+        The old session's context stays on its original exit stack (anyio requires
+        exiting in the entering task); the new stack is owned here and unwound by
+        ``close()``.
+        """
+        stack = AsyncExitStack()
         try:
-            return future.result(bounded)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"MCP resource read timed out after {bounded:.3f}s") from None
+            session = await self._open_session(stack, server)
+            await session.initialize()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            raise
+        previous = self._extra_stacks.get(server.name)
+        self._extra_stacks[server.name] = stack
+        self._sessions[server.name] = session
+        if previous is not None:
+            with contextlib.suppress(Exception):
+                await previous.aclose()
 
 
 def _minimal_stdio_env(server: MCPServerConfig) -> dict[str, str]:
@@ -421,23 +589,36 @@ def _run_headers_helper(server: MCPServerConfig) -> dict[str, str]:
         "CLAUDE_CODE_MCP_SERVER_URL": server.url,
     }
     try:
-        completed = subprocess.run(
+        # Popen (not subprocess.run) so the timeout path can kill the whole tree;
+        # run() would only kill the shell and leak the helper's children.
+        proc = subprocess.Popen(
             server.headers_helper,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=10,
-            check=False,
+            # A dedicated session makes the shell a group leader, so the timeout
+            # path can signal the helper's whole process group (POSIX).
+            start_new_session=os.name != "nt",
         )
+    except OSError as exc:
+        raise RuntimeError(f"MCP headersHelper failed: {type(exc).__name__}") from exc
+    try:
+        stdout, _stderr = proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        terminate_pid_tree(proc.pid)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1)
+        raise RuntimeError(f"MCP headersHelper failed: {type(exc).__name__}") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"MCP headersHelper failed: {type(exc).__name__}") from exc
-    if completed.returncode != 0:
+    if proc.returncode != 0:
         raise RuntimeError("MCP headersHelper returned a non-zero exit status")
     try:
-        value = json.loads(completed.stdout)
+        value = json.loads(stdout)
     except ValueError as exc:
         raise RuntimeError("MCP headersHelper did not return JSON") from exc
     if not isinstance(value, dict) or not all(

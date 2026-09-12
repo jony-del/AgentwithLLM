@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from typing import Any
 
 from agent_core import tokens
 from agent_core.compression import CompressionConfig, Summarizer
+from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.models import Message
 from agent_core.prompt_ingress import defang_reserved_tags
-from agent_core.providers.base import GatedProvider, LLMProvider, ProviderConfig
+from agent_core.providers.base import GatedProvider, LLMProvider, ProviderConfig, _supports_scope
 from agent_core.providers.fake import FakeProvider
 
 # Aggressive no-tools preamble (ported from the reference ``NO_TOOLS_PREAMBLE``). Put
@@ -238,7 +240,12 @@ def build_summarizer(
     if isinstance(_unwrap(provider), FakeProvider):
         return None
 
-    async def summarize(prefix: list[Message]) -> str:
+    async def summarize(
+        prefix: list[Message], *, scope: ExecutionScope | None = None
+    ) -> str:
+        # The ReAct loop hands its scope in; other callers fall back to the ambient
+        # scope set for the duration of ``Agent.run`` (None outside any run).
+        scope = scope or current_execution_scope()
         convo = render_prefix(prefix, config.summary_input_max_chars)
         messages = [Message("system", SUMMARY_SYSTEM), Message("user", convo)]
         model = provider_config.model
@@ -247,6 +254,9 @@ def build_summarizer(
         requested_cap = int(requested) if isinstance(requested, int) and requested > 0 else None
         ladder = _budget_ladder(config, ceiling, requested_cap)
         sink = _NullStreamHandler()
+        # Legacy providers (without a ``scope`` parameter) take no scope kwarg — the
+        # same tolerance the GatedProvider applies.
+        scope_kwargs: dict[str, Any] = {"scope": scope} if _supports_scope(provider) else {}
         # Escalation ladder: try the steady-state budget first; only when the model
         # actually truncated (stop_reason "max_tokens") retry at the next, larger tier.
         # All attempts run inside the single asyncio.wait_for the caller wraps us in, so
@@ -264,7 +274,7 @@ def build_summarizer(
                 stream=True,
                 thinking_budget=None,
             )
-            result = await provider.complete(messages, [], summary_config, stream=sink)
+            result = await provider.complete(messages, [], summary_config, stream=sink, **scope_kwargs)
             result_content = result.content
             if result.stop_reason != "max_tokens":
                 break

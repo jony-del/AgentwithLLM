@@ -12,12 +12,13 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
 import uuid
 
+from agent_core.execution import current_execution_scope
+from agent_core.process_tree import terminate_process_tree
 from agent_core.tool_config import ShellToolConfig
 
 EventSink = Callable[[str, dict[str, object]], Awaitable[None]]
@@ -248,6 +249,7 @@ class ProcessSupervisor:
             raise RuntimeError("process supervisor is closed")
         if len(self.running()) >= self.config.max_tasks:
             raise RuntimeError(f"background task limit reached ({self.config.max_tasks})")
+        scope = current_execution_scope()
         deadline = time.monotonic() + timeout if timeout is not None else None
         executable = ""
         if not skip_syntax_check or argv is None:
@@ -264,6 +266,11 @@ class ProcessSupervisor:
         remaining_timeout = deadline - time.monotonic() if deadline is not None else None
         if remaining_timeout is not None and remaining_timeout <= 0:
             raise TimeoutError(f"{dialect} command deadline expired during syntax analysis")
+        # An ambient execution scope clamps the timeout to the run's remaining
+        # budget, so the run's deadline binds background tasks too.
+        bounded_timeout = (
+            scope.remaining_budget(remaining_timeout) if scope is not None else remaining_timeout
+        )
         if argv is None:
             if dialect == "bash":
                 argv = [executable, "-lc", command]
@@ -305,11 +312,25 @@ class ProcessSupervisor:
         )
         self._tasks[task_id] = task
         self._persist(task)
-        task.drain_task = asyncio.create_task(self._drain(task), name=f"polaris-task-{task_id}")
-        if remaining_timeout is not None:
-            task.timeout_task = asyncio.create_task(
-                self._enforce_timeout(task, remaining_timeout), name=f"polaris-timeout-{task_id}"
-            )
+        if scope is None:
+            task.drain_task = asyncio.create_task(self._drain(task), name=f"polaris-task-{task_id}")
+        else:
+            # Registered with the ambient scope so scope close reaps the drain task.
+            task.drain_task = scope.tasks.create_task(self._drain(task), name=f"polaris-task-{task_id}")
+        if bounded_timeout is not None:
+            if scope is None:
+                task.timeout_task = asyncio.create_task(
+                    self._enforce_timeout(task, bounded_timeout), name=f"polaris-timeout-{task_id}"
+                )
+            else:
+                task.timeout_task = scope.tasks.create_task(
+                    self._enforce_timeout(task, bounded_timeout), name=f"polaris-timeout-{task_id}"
+                )
+        if scope is not None:
+            # Let the registered tasks reach their first await, so a scope close
+            # racing this start() cancels them mid-flight instead of abandoning a
+            # never-started coroutine (which would warn at GC).
+            await asyncio.sleep(0)
         await self._event("task_started", task, pid=process.pid)
         return task
 
@@ -438,31 +459,7 @@ class ProcessSupervisor:
     async def _kill_process_tree(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
-        if os.name == "nt":
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill", "/PID", str(process.pid), "/T", "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await killer.wait()
-        else:
-            try:
-                getattr(os, "killpg")(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            try:
-                await asyncio.wait_for(process.wait(), self.config.shutdown_grace_seconds)
-                return
-            except asyncio.TimeoutError:
-                try:
-                    getattr(os, "killpg")(process.pid, getattr(signal, "SIGKILL", 9))
-                except ProcessLookupError:
-                    pass
-        try:
-            await asyncio.wait_for(process.wait(), self.config.shutdown_grace_seconds)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+        await terminate_process_tree(process, grace=self.config.shutdown_grace_seconds)
 
     async def shutdown(self) -> None:
         self._closed = True

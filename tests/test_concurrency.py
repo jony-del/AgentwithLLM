@@ -6,13 +6,22 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Callable
 
 import pytest
 
 from agent_core.agents.multi import MultiAgentCoordinator
-from agent_core.models import LLMResult, ToolCall, ToolResult, ToolRisk
+from agent_core.execution import CancellationToken, ExecutionScope
+from agent_core.models import LLMResult, LLMTransientError, ToolCall, ToolResult, ToolRisk
 from agent_core.permissions import PermissionMode, PermissionPolicy
-from agent_core.providers.base import GatedProvider, ProviderConfig, _TokenBucket, gated_provider
+from agent_core.providers.base import (
+    GatedProvider,
+    ProviderConfig,
+    ProviderGate,
+    _TokenBucket,
+    gated_provider,
+    provider_attempt,
+)
 from agent_core.storage import JSONLRunLogger
 from agent_core.tools.base import ConcurrencySpec, ResourceLock, Tool
 from agent_core.tools.executor import ToolExecutor
@@ -90,6 +99,113 @@ def test_gate_refuses_to_start_after_cancel() -> None:
 
     asyncio.run(drive())
     assert inner.calls == 0  # the inner provider was never invoked
+
+
+# --- gate: per-attempt scope contract -----------------------------------------
+
+
+class _ScopeAwareRetryer:
+    """Scope-aware fake provider: first attempt fails, backs off, then succeeds.
+
+    Mirrors the first-party retry loops (see ``ClaudeProvider``): the gate is
+    acquired per physical attempt via ``provider_attempt(scope)`` and the backoff
+    sleep goes through ``scope.sleep``.
+    """
+
+    def __init__(
+        self,
+        backoff: float,
+        in_backoff: asyncio.Event,
+        on_backoff: Callable[[], None] | None = None,
+    ) -> None:
+        self.backoff = backoff
+        self.in_backoff = in_backoff
+        self.on_backoff = on_backoff
+        self.calls = 0
+
+    async def complete(self, messages, tools, config, stream=None, scope=None) -> LLMResult:
+        attempt = 0
+        while True:
+            try:
+                async with provider_attempt(scope):
+                    self.calls += 1
+                    if attempt == 0:
+                        raise LLMTransientError("simulated retryable failure")
+                    return LLMResult("ok", stop_reason="end")
+            except LLMTransientError:
+                self.in_backoff.set()
+                if self.on_backoff is not None:
+                    self.on_backoff()
+                if scope is None:
+                    await asyncio.sleep(self.backoff)
+                else:
+                    await scope.sleep(self.backoff)
+                attempt += 1
+
+
+async def test_scope_aware_provider_releases_gate_during_backoff(tmp_path) -> None:
+    gate = ProviderGate(max_concurrency=1)
+    inner = _ScopeAwareRetryer(backoff=0.3, in_backoff=asyncio.Event())
+    provider = GatedProvider(inner, gate)
+    scope = ExecutionScope.for_workspace(tmp_path)
+
+    async def try_acquire() -> bool:
+        async with gate.attempt(scope):
+            return True
+
+    task = asyncio.create_task(provider.complete([], [], ProviderConfig(), scope=scope))
+    await asyncio.wait_for(inner.in_backoff.wait(), timeout=1)
+    try:
+        semaphore = gate._semaphore
+        assert semaphore is not None
+        assert not semaphore.locked()  # the slot is free while the provider backs off
+        assert await asyncio.wait_for(try_acquire(), timeout=0.2)  # and re-acquirable
+    finally:
+        result = await task
+    assert result.content == "ok"
+    assert inner.calls == 2  # failed attempt + successful retry
+
+
+async def test_scope_aware_backoff_sleep_wakes_on_cancellation(tmp_path) -> None:
+    token = CancellationToken()
+    in_backoff = asyncio.Event()
+    inner = _ScopeAwareRetryer(
+        backoff=30.0,
+        in_backoff=in_backoff,
+        on_backoff=lambda: token.cancel("test cancellation"),
+    )
+    provider = GatedProvider(inner, ProviderGate(max_concurrency=1))
+    scope = ExecutionScope.for_workspace(tmp_path, cancellation=token)
+
+    start = time.perf_counter()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(provider.complete([], [], ProviderConfig(), scope=scope), timeout=2)
+    assert time.perf_counter() - start < 1.0  # woke promptly, not after the 30s backoff
+    assert in_backoff.is_set()  # the failure really reached the backoff path
+    assert inner.calls == 1  # the retry never happened
+
+
+async def test_legacy_provider_envelope_bounded_by_scope_deadline(tmp_path) -> None:
+    class _LegacyStall:
+        """No ``scope`` parameter -> the legacy whole-envelope gate path."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tools, config, stream=None) -> LLMResult:
+            self.calls += 1
+            await asyncio.sleep(30)
+            return LLMResult("never", stop_reason="end")
+
+    inner = _LegacyStall()
+    provider = GatedProvider(inner, ProviderGate(max_concurrency=1))
+    scope = ExecutionScope.for_workspace(tmp_path, deadline=time.monotonic() + 0.2)
+
+    with pytest.raises(TimeoutError):
+        await provider.complete([], [], ProviderConfig(), scope=scope)
+    assert inner.calls == 1  # entered the envelope, then the deadline cut it off
+    semaphore = provider.gate._semaphore
+    assert semaphore is not None and not semaphore.locked()  # slot released on the way out
 
 
 # --- rate limiter ------------------------------------------------------------

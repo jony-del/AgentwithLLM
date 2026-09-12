@@ -1,6 +1,10 @@
 import asyncio
+import json
 import threading
 import time
+from pathlib import Path
+
+import pytest
 
 from agent_core.agents.multi import MultiAgentCoordinator
 from agent_core.memory import MemoryConfig
@@ -8,7 +12,7 @@ from agent_core.models import LLMResult, ToolCall, ToolResult, ToolRisk
 from agent_core.permission_classifier import AutoPermissionVerdict
 from agent_core.permissions import PermissionMode, PermissionPolicy
 from agent_core.providers import FakeProvider
-from agent_core.react import ReActAgent, ReActConfig
+from agent_core.react import AgentRunResult, ReActAgent, ReActConfig
 from agent_core.session import SessionContext
 from agent_core.tools.base import ConcurrencySpec, Tool, WorkspacePathMixin
 from agent_core.tools.executor import ToolExecutor
@@ -436,3 +440,96 @@ async def test_coordinator_overlaps_agents_and_keeps_declared_order() -> None:
 
 async def test_coordinator_empty() -> None:
     assert await MultiAgentCoordinator([]).run_all("x") == {}
+
+
+# --- spawn lifecycle: single teardown, per-child supervisor dir (phase 3) -----
+
+
+def _spawn_stub_config(tmp_path: Path) -> ReActConfig:
+    return ReActConfig(
+        run_dir=str(tmp_path),
+        session_dir="",
+        memory=MemoryConfig(enabled=False),
+        project_instructions=False,
+        git_context=False,
+    )
+
+
+async def test_subagent_error_path_fires_session_end_exactly_once(tmp_path: Path) -> None:
+    agent = ReActAgent(FakeProvider(), _spawn_stub_config(tmp_path))
+    ends: list[str] = []
+
+    class FailingChild:
+        async def run(self, task: str, should_cancel=None, deadline=None) -> AgentRunResult:
+            raise RuntimeError("child exploded")
+
+        async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+            ends.append(reason)
+
+    agent._make_subagent_child = lambda preset, model=None: FailingChild()  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="child exploded"):
+        await agent._spawn_subagent("subtask", "read_only")
+    # Exactly one teardown, carrying the error reason (no trailing "subagent_exit").
+    assert ends == ["subagent_error"]
+
+
+async def test_subagent_success_path_fires_session_end_exit_once(tmp_path: Path) -> None:
+    agent = ReActAgent(FakeProvider(), _spawn_stub_config(tmp_path))
+    ends: list[str] = []
+
+    class OkChild:
+        async def run(self, task: str, should_cancel=None, deadline=None) -> AgentRunResult:
+            return AgentRunResult("child done", [], 0, "run-x")
+
+        async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+            ends.append(reason)
+
+    agent._make_subagent_child = lambda preset, model=None: OkChild()  # type: ignore[assignment]
+    assert await agent._spawn_subagent("subtask", "read_only") == "child done"
+    assert ends == ["subagent_exit"]
+
+
+async def test_teammate_error_path_fires_session_end_exactly_once(tmp_path: Path) -> None:
+    agent = ReActAgent(FakeProvider(), _spawn_stub_config(tmp_path))
+    ends: list[str] = []
+
+    class FailingChild:
+        async def run(self, task: str, should_cancel=None, deadline=None) -> AgentRunResult:
+            raise RuntimeError("teammate exploded")
+
+        async def fire_session_end(self, reason: str = "host_shutdown") -> None:
+            ends.append(reason)
+
+    async def fake_make_child(*args, **kwargs):
+        return FailingChild(), "prompt"
+
+    agent._make_teammate_child = fake_make_child  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="teammate exploded"):
+        await agent._spawn_teammate("team-1", "worker", "researcher")
+    assert ends == ["teammate_error"]
+
+
+def test_child_supervisor_dir_is_scoped_per_child(tmp_path: Path) -> None:
+    agent = ReActAgent(FakeProvider(), _spawn_stub_config(tmp_path))
+    parent_root = agent.session.process_supervisor.root
+    parent_root.mkdir(parents=True, exist_ok=True)
+    # A still-running parent task record, per the lost-state fixture pattern: any
+    # supervisor constructed over the same root marks it "lost" at scan time.
+    record = parent_root / "parent-task.json"
+    record.write_text(
+        json.dumps({
+            "task_id": "parent-task", "state": "running", "exit_code": None,
+            "output_path": str(parent_root / "parent-task.log"),
+        }),
+        encoding="utf-8",
+    )
+
+    child = agent._make_subagent_child("read_only")
+    assert not isinstance(child, str)
+
+    child_root = child.session.process_supervisor.root
+    assert child_root != parent_root
+    assert child_root.parent == parent_root
+    # The child's constructor restart-scan must not condemn the parent's live task.
+    assert child.session.process_supervisor.recovered_lost_count == 0
+    assert json.loads(record.read_text(encoding="utf-8"))["state"] == "running"

@@ -323,9 +323,14 @@ def _supports_scope(provider: object) -> bool:
 class GatedProvider(LLMProvider):
     """Wrap a provider so concurrent children share one bounded API-call budget.
 
-    ``complete`` acquires the shared semaphore and rate-limit token before issuing
-    the call, so N concurrent children run up to ``max_concurrency`` at a time
-    instead of one.
+    For scope-aware providers (``complete`` accepts ``scope``) the gate travels
+    through the scope and is acquired per physical attempt inside the provider's
+    own retry loop, so the slot is released during retry backoff. Legacy
+    providers are opaque and cannot be split that way: as a documented
+    limitation they hold the gate slot for the entire call envelope, internal
+    retries included. Either way the call is hard-bounded by the scope's
+    remaining wall budget, so N concurrent children run up to
+    ``max_concurrency`` attempts at a time instead of one.
     """
 
     def __init__(self, inner: LLMProvider, gate: ProviderGate | None = None) -> None:
@@ -353,7 +358,9 @@ class GatedProvider(LLMProvider):
             result = self.inner.complete(messages, tools, config, stream, **kwargs)
             return await call_scope.run_awaitable(result) if call_scope is not None else await result
 
-        # Compatibility path: a legacy provider is one opaque physical attempt.
+        # Compatibility path: a legacy provider is one opaque physical attempt, so
+        # it holds the slot for the whole envelope (documented limitation); the
+        # run_awaitable wrap still hard-bounds it by the scope's wall budget.
         async with self.gate.attempt(call_scope):
             result = self.inner.complete(messages, tools, config, stream, **kwargs)
             return await call_scope.run_awaitable(result) if call_scope is not None else await result

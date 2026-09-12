@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_core.hooks import HookResult
+from agent_core.hooks import HookContext, HookPipeline, HookResult
 from agent_core.memory import MemoryConfig
 from agent_core.models import LLMContextTooLongError, LLMResult, Message, ToolCall, ToolResult, ToolRisk
 from agent_core.providers.fake import FakeProvider
@@ -633,3 +633,105 @@ def test_estimate_tokens_falls_back_when_anchor_folded_away(tmp_path: Path) -> N
         Message("user", "y" * 8),  # 8//4 = 2
     ]
     assert agent._estimate_tokens(msgs) == 12
+
+
+class _BlockingPostSamplingHook:
+    """A PostSampling observer that parks until cancelled (stands in for a slow hook)."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def after_sampling(self, ctx: HookContext) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class _BlockingLabelSummarizer:
+    """A tool-use label summarizer that parks until cancelled."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def __call__(self, batch, last_assistant_text: str, *, scope=None) -> str | None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class _ExplodingMidTurnProvider:
+    """Turn 1 requests the echo tool; turn 2 fails once the background tasks started."""
+
+    def __init__(self, background_started: list[asyncio.Event]) -> None:
+        self.calls = 0
+        self._background_started = background_started
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                "calling echo",
+                tool_calls=[ToolCall("echo", {"text": "hi"}, id="toolu_1")],
+                stop_reason="tool_use",
+            )
+        for started in self._background_started:
+            await asyncio.wait_for(started.wait(), timeout=2)
+        raise RuntimeError("provider exploded mid-turn")
+
+
+class _LiveUIStub(AgentUI):
+    is_live = True
+
+
+async def test_provider_error_reaps_run_scoped_tasks_and_session_end_fires_once(tmp_path: Path) -> None:
+    post_sampling = _BlockingPostSamplingHook()
+    summarizer = _BlockingLabelSummarizer()
+    session_end_scopes: list[object] = []
+
+    class SessionEndSpy:
+        async def on_session_end(self, ctx: HookContext) -> None:
+            session_end_scopes.append(ctx.execution_scope)
+
+    agent = ReActAgent(
+        _ExplodingMidTurnProvider([post_sampling.started, summarizer.started]),
+        ReActConfig(
+            run_dir=str(tmp_path),
+            session_dir="",
+            permission="auto",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False,
+            git_context=False,
+        ),
+        hooks=HookPipeline(
+            post_sampling_hooks=[post_sampling],
+            session_end_hooks=[SessionEndSpy()],
+        ),
+        ui=_LiveUIStub(),
+    )
+    agent._tool_use_summarizer = summarizer
+
+    before = asyncio.all_tasks()
+    with pytest.raises(RuntimeError, match="provider exploded mid-turn"):
+        await agent.run("explode on the second turn")
+
+    # The exception escape ran the _run_scoped finally: both fire-and-forget tasks
+    # were cancelled and reaped instead of leaking past the crashed run.
+    assert post_sampling.cancelled.is_set()
+    assert summarizer.cancelled.is_set()
+    leaked = [task for task in asyncio.all_tasks() - before if not task.done()]
+    assert leaked == []
+
+    # Host-driven session end still fires exactly once after the crashed run, with a
+    # standalone execution scope on the hook context even though no run is active.
+    await agent.fire_session_end("test_exit")
+    await agent.fire_session_end("test_exit")
+    assert len(session_end_scopes) == 1
+    assert session_end_scopes[0] is not None

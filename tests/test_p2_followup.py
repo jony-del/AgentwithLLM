@@ -16,6 +16,7 @@ import pytest
 
 from agent_core.compression import CompressionConfig, CompressionPipeline
 from agent_core.compression_summary import build_summarizer
+from agent_core.execution import ExecutionScope, current_execution_scope, execution_scope_context
 from agent_core.hook_adapters import (
     CommandHookAdapter,
     HookFailedError,
@@ -444,6 +445,77 @@ def test_process_supervisor_preserves_all_non_running_terminal_states(tmp_path: 
     assert supervisor.recovered_lost_count == 0
     for state, payload in before.items():
         assert json.loads((root / f"{state}.json").read_text(encoding="utf-8")) == payload
+
+
+async def test_process_supervisor_registers_tasks_with_ambient_scope(tmp_path: Path) -> None:
+    supervisor = ProcessSupervisor(ShellToolConfig(), tmp_path / "tasks")
+    scope = ExecutionScope.for_workspace(tmp_path)
+    with execution_scope_context(scope):
+        task = await supervisor.start(
+            "python", "sleep", tmp_path,
+            argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=30, skip_syntax_check=True,
+        )
+    assert task.drain_task is not None and not task.drain_task.done()
+    assert task.timeout_task is not None and not task.timeout_task.done()
+
+    await scope.close()
+
+    # Scope close reaps the registered supervisor tasks.
+    assert task.drain_task.done()
+    assert task.timeout_task.done()
+    await supervisor.shutdown()
+
+
+async def test_process_supervisor_scope_deadline_kills_process_tree(tmp_path: Path) -> None:
+    script = tmp_path / "supervised_tree.py"
+    pid_file = tmp_path / "supervised-pids.json"
+    script.write_text(
+        "import json, os, pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({'parent': os.getpid(), 'child': child.pid}), encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    supervisor = ProcessSupervisor(ShellToolConfig(), tmp_path / "tasks")
+    scope = ExecutionScope.for_workspace(tmp_path, deadline=time.monotonic() + 0.5)
+    with execution_scope_context(scope):
+        task = await supervisor.start(
+            "python", "supervised tree", tmp_path,
+            argv=[sys.executable, str(script), str(pid_file)],
+            timeout=30, skip_syntax_check=True,
+        )
+    parent, child = await _wait_for_pid_file(pid_file)
+
+    await supervisor.wait(task.id, 10)
+
+    # The scope deadline clamped the 30s tool timeout to ~0.5s.
+    assert task.state == "timed_out"
+    await _wait_for_processes_to_exit(parent, child)
+    await scope.close()
+    await supervisor.shutdown()
+
+
+async def test_process_supervisor_without_ambient_scope_unchanged(tmp_path: Path) -> None:
+    assert current_execution_scope() is None
+    supervisor = ProcessSupervisor(ShellToolConfig(), tmp_path / "tasks")
+    task = await supervisor.start(
+        "python", "quick", tmp_path,
+        argv=[sys.executable, "-c", "print('hello')"],
+        timeout=10, skip_syntax_check=True,
+    )
+    await supervisor.wait(task.id, 10)
+    assert task.state == "completed" and task.returncode == 0
+    assert "hello" in bytes(task.preview).decode("utf-8", "replace")
+
+    slow = await supervisor.start(
+        "python", "slow", tmp_path,
+        argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+        timeout=0.3, skip_syntax_check=True,
+    )
+    await supervisor.wait(slow.id, 10)
+    assert slow.state == "timed_out"
+    await supervisor.shutdown()
 
 
 def test_scheduler_retries_then_dead_letters_and_redrives(tmp_path: Path) -> None:

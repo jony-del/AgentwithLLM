@@ -42,6 +42,7 @@ from agent_core.builtin_hooks import (
 )
 from agent_core.hook_adapters import LIFECYCLE_EVENT_ATTRS, build_external_adapter
 from agent_core.hooks import (
+    ExternalHookSpec,
     HookContext,
     HookEvent,
     HookOutcome,
@@ -165,6 +166,12 @@ _MODE_CONTEXT_END = "\n</permission-mode-context>"
 # prevents a 413 → compact → 413 → … infinite loop — once the retries are exhausted (or
 # nothing is left to drop) the overflow error propagates instead of spinning forever.
 MAX_PTL_RETRIES = 5
+
+# Outer bound for the standalone scope wrapped around SessionEnd hooks fired outside a
+# run; tracks the per-hook default timeout (``ExternalHookSpec.timeout``) so a stuck
+# session-end hook can never hang host shutdown. (The spec's ``event``/``type`` are
+# required, so the default is read off a placeholder instance.)
+SESSION_END_SCOPE_TIMEOUT = ExternalHookSpec(event="", type="").timeout
 
 
 def _child_permission_mode(parent_mode: PermissionMode | str, preset: str) -> PermissionMode:
@@ -425,6 +432,7 @@ class ReActAgent:
         mcp_manager: object | None = None,
         workspace: str | Path | None = None,
         ask_user: Callable[[list[dict[str, Any]]], Awaitable[list[dict[str, Any]]]] | None = None,
+        supervisor_dir: str | Path | None = None,
     ) -> None:
         self.config = config or ReActConfig()
         self._initial_workspace = Path(workspace or Path.cwd()).resolve()
@@ -551,9 +559,17 @@ class ReActAgent:
             registry=self.registry,
             plugin_skill_invoked=self._start_skill_monitors,
         )
+        # ``supervisor_dir`` lets a spawned child take its own on-disk task root:
+        # children share the parent's session_id, and the ProcessSupervisor restart-scan
+        # marks every "running" record in its root "lost" — a child scanning the shared
+        # ``tasks/<session_id>`` dir would condemn the parent's live background tasks.
         process_supervisor = ProcessSupervisor(
             self.config.tools.shell,
-            Path(self.config.run_dir) / "tasks" / session_id,
+            (
+                Path(supervisor_dir)
+                if supervisor_dir is not None
+                else Path(self.config.run_dir) / "tasks" / session_id
+            ),
             event_sink=self._audit_event,
         )
         session.process_supervisor = process_supervisor
@@ -1360,11 +1376,6 @@ class ReActAgent:
         """Run within one root/inherited execution budget, including preflight work."""
 
         started = time.monotonic()
-        await asyncio.to_thread(
-            TurnExecutionJournal.require_recovered,
-            self.executor.journal_storage,
-            history_path=self.transcript.path if self.transcript is not None else None,
-        )
         owned_scope = execution_scope is None
         if execution_scope is None:
             if deadline is None and self.config.max_wall_seconds is not None:
@@ -1391,6 +1402,23 @@ class ReActAgent:
         self._active_deadline = execution_scope.deadline
         try:
             with execution_scope_context(execution_scope):
+                # Crash-recovery preflight draws from the same budget as the loop:
+                # a deadline or cancellation that trips here lands in the same
+                # stopped-result handlers as one tripping mid-run.
+                preflight = asyncio.to_thread(
+                    TurnExecutionJournal.require_recovered,
+                    self.executor.journal_storage,
+                    history_path=self.transcript.path if self.transcript is not None else None,
+                )
+                try:
+                    await execution_scope.run_awaitable(preflight)
+                except BaseException:
+                    # If the scope rejected the preflight before starting it (already
+                    # cancelled / past deadline), the coroutine never ran — close it
+                    # so it can't leak as an unawaited-coroutine warning. Closing is
+                    # a no-op once the coroutine has run.
+                    preflight.close()
+                    raise
                 return await self._run_scoped(
                     task,
                     history=history,
@@ -1425,6 +1453,41 @@ class ReActAgent:
                 await execution_scope.close()
 
     async def _run_scoped(
+        self,
+        task: str,
+        *,
+        history: list[Message] | None,
+        midturn_drain: Callable[[], list[Message]] | None,
+        _user_messages: list[Message] | None,
+        scope: ExecutionScope,
+        started: float,
+    ) -> AgentRunResult:
+        """Reap run-scoped fire-and-forget tasks on every exit, then return the result.
+
+        The natural-end and ``_stopped`` paths reap inline; this ``finally`` covers the
+        exception escapes (provider errors, transient protocol failures) so a background
+        hook or a pending tool-use label can never leak past the run that created it.
+        """
+        try:
+            return await self._run_scoped_loop(
+                task,
+                history=history,
+                midturn_drain=midturn_drain,
+                _user_messages=_user_messages,
+                scope=scope,
+                started=started,
+            )
+        finally:
+            await self._cancel_pending_tool_use_summary()
+            # The natural-end and ``_stopped`` paths already reaped inline (their
+            # awaits let slow hooks finish), so whatever is still registered here
+            # belongs to an exception escape — a dead run. Cancel before reaping so
+            # a stuck observational hook cannot pin the unwind.
+            for hook_task in list(self._background_hook_tasks):
+                hook_task.cancel()
+            await self._reap_background_hooks()
+
+    async def _run_scoped_loop(
         self,
         task: str,
         *,
@@ -2290,13 +2353,26 @@ class ReActAgent:
             return
         if self.session.depth != 0 and not self.config.tool_use_summary.include_subagents:
             return
+        scope = self._active_scope
         self._pending_tool_use_names = [call.name for call, _ in batch]
 
         async def summarize() -> str | None:
             assert self._tool_use_summarizer is not None
-            return await self._tool_use_summarizer(batch, last_assistant_text)
+            return await self._tool_use_summarizer(batch, last_assistant_text, scope=scope)
 
-        self._pending_tool_use_summary = asyncio.create_task(summarize())
+        coro = summarize()
+        if scope is None:
+            self._pending_tool_use_summary = asyncio.create_task(coro)
+            return
+        try:
+            # Register with the run scope so the task shares the run's budget and is
+            # reaped by the scope even if every in-loop flush/cancel path is skipped.
+            self._pending_tool_use_summary = scope.create_task(coro, name="tool-use-summary")
+        except (asyncio.CancelledError, TimeoutError):
+            # The scope is already winding down; the label is best-effort, so skip
+            # firing and let the loop's own cancel/deadline guards stop the run.
+            coro.close()
+            self._pending_tool_use_names = []
 
     async def _flush_pending_tool_use_summary(self) -> None:
         """Await the pending label task and emit it to the UI + event log (never the API).
@@ -2545,14 +2621,28 @@ class ReActAgent:
         """Schedule PostSampling fire-and-forget on a snapshot of the history."""
         if not self.hooks.post_sampling_hooks:
             return
+        scope = self._active_scope
         ctx = HookContext(
             event=HookEvent.POST_SAMPLING,
             messages=list(messages),
             session_id=self.session_id,
             last_assistant_message=last_assistant_text,
-            execution_scope=self._active_scope,
+            execution_scope=scope,
         )
-        task = asyncio.create_task(self._post_sampling_runner(ctx))
+        coro = self._post_sampling_runner(ctx)
+        if scope is None:
+            task = asyncio.create_task(coro)
+        else:
+            try:
+                # Register with the run scope: the task then shares the run's budget
+                # and the scope reaps it even if `_reap_background_hooks` is skipped.
+                task = scope.create_task(coro, name="post-sampling-hook")
+            except (asyncio.CancelledError, TimeoutError):
+                # The scope is already winding down; observational hooks are
+                # best-effort, so skip firing rather than divert the run's own
+                # cancel/deadline handling.
+                coro.close()
+                return
         self._background_hook_tasks.add(task)
         task.add_done_callback(self._background_hook_tasks.discard)
 
@@ -2565,13 +2655,20 @@ class ReActAgent:
             )
 
     async def _fire_observational(
-        self, event: HookEvent, detail: dict[str, object], messages: list[Message]
+        self,
+        event: HookEvent,
+        detail: dict[str, object],
+        messages: list[Message],
+        *,
+        scope: ExecutionScope | None = None,
     ) -> None:
         """Fire one C5 observational event: awaited, fail-open, always JSONL-logged.
 
         Subscribers run to completion (so an external watcher's side effect lands
         before the loop moves on), but any failure is reduced to a log field — these
-        events never alter control flow.
+        events never alter control flow. ``scope`` overrides the hook context's
+        execution scope (used when firing outside a run, e.g. host-driven SessionEnd);
+        the active run scope is the default.
         """
         runner = {
             HookEvent.SESSION_START: self.hooks.run_session_start,
@@ -2584,7 +2681,7 @@ class ReActAgent:
             messages=messages,
             session_id=self.session_id,
             detail=detail,
-            execution_scope=self._active_scope,
+            execution_scope=scope if scope is not None else self._active_scope,
         )
         error: str | None = None
         try:
@@ -2716,11 +2813,33 @@ class ReActAgent:
         if not self._session_start_fired:
             return
         self._session_start_fired = False
-        await self._fire_observational(
-            HookEvent.SESSION_END,
-            {"run_id": self.logger.run_id, "reason": reason, **self._trace_fields()},
-            [],
-        )
+        scope = self._active_scope
+        standalone_scope: ExecutionScope | None = None
+        if scope is None:
+            # Host-driven session end fires outside any run, so there is no ambient
+            # scope: give the SessionEnd hooks a short-lived one — bounded by the
+            # default external-hook timeout — so scoped hook adapters draw from a
+            # real budget instead of falling back to a bare ``asyncio.wait_for``.
+            standalone_scope = ExecutionScope.for_workspace(
+                self.session.workspace,
+                deadline=time.monotonic() + SESSION_END_SCOPE_TIMEOUT,
+                recovery_context={
+                    "session_id": self.session_id,
+                    "run_id": self.logger.run_id,
+                },
+            )
+            scope = standalone_scope
+        try:
+            with execution_scope_context(scope):
+                await self._fire_observational(
+                    HookEvent.SESSION_END,
+                    {"run_id": self.logger.run_id, "reason": reason, **self._trace_fields()},
+                    [],
+                    scope=scope,
+                )
+        finally:
+            if standalone_scope is not None:
+                await standalone_scope.close()
 
     def _scheduler_store(self) -> SchedulerStore | None:
         if not self.config.tools.scheduler.enabled:
@@ -2999,6 +3118,7 @@ class ReActAgent:
                 messages,
                 source_run_id=self.logger.run_id,
                 cursor_key=self.session_id,
+                scope=self._active_scope,
             )
         except Exception as exc:  # noqa: BLE001 - extraction must not fail a finished run
             await self.logger.write("memory_extract", {"error_type": type(exc).__name__})
@@ -3039,7 +3159,7 @@ class ReActAgent:
                 self.provider,
                 self._provider_config(),
             )
-            report = await dreamer.dream()
+            report = await dreamer.dream(scope=self._active_scope)
         except Exception as exc:  # noqa: BLE001 - background lifecycle cannot fail the run
             await self.logger.write(
                 "memory_dream",
@@ -3508,6 +3628,9 @@ class ReActAgent:
             managed_policy_provider=self.managed_policy_provider,
             sandbox=self.sandbox if child_workspace == self.session.workspace else None,
             workspace=child_workspace,
+            # Distinct task root per child: the supervisor's constructor restart-scan
+            # would otherwise mark this session's running parent tasks "lost".
+            supervisor_dir=Path(child_config.run_dir) / "tasks" / self.session_id / agent_id,
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -3599,6 +3722,7 @@ class ReActAgent:
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
+        session_end_fired = False
         try:
             child_parameters = inspect.signature(child.run).parameters
             if self._active_scope is not None and "execution_scope" in child_parameters:
@@ -3612,6 +3736,7 @@ class ReActAgent:
         except Exception:
             end = getattr(child, "fire_session_end", None)
             if end is not None:
+                session_end_fired = True
                 await end("subagent_error")
             await self._fire_observational(
                 HookEvent.SUBAGENT_STOP,
@@ -3625,9 +3750,12 @@ class ReActAgent:
                     logger.warning("sub-agent worktree finalization failed: %s", cleanup_exc)
             raise
         finally:
-            end = getattr(child, "fire_session_end", None)
-            if end is not None:
-                await end("subagent_exit")
+            # Session-end teardown fires exactly once: the error path already fired
+            # "subagent_error" above; every other exit gets "subagent_exit" here.
+            if not session_end_fired:
+                end = getattr(child, "fire_session_end", None)
+                if end is not None:
+                    await end("subagent_exit")
             child_sandbox = getattr(child, "sandbox", self.sandbox)
             if child_sandbox is not self.sandbox:
                 child_sandbox.teardown()
@@ -3720,6 +3848,7 @@ class ReActAgent:
         )
         if model:
             child_config = replace(child_config, model=model)
+        agent_id = new_session_id()
         child = ReActAgent(
             provider=self.provider,
             config=child_config,
@@ -3727,10 +3856,14 @@ class ReActAgent:
             team_store=store,
             ui=NullUI(),
             session_id=self.session_id,
-            transcript=self._child_transcript(new_session_id()),
+            transcript=self._child_transcript(agent_id),
             managed_policy_provider=self.managed_policy_provider,
             sandbox=self.sandbox if child_workspace == self.session.workspace else None,
             workspace=child_workspace,
+            # Distinct task root per teammate: the supervisor's constructor
+            # restart-scan would otherwise mark this session's running parent
+            # tasks "lost".
+            supervisor_dir=Path(child_config.run_dir) / "tasks" / self.session_id / agent_id,
         )
         child.session.depth = self.session.depth + 1
         child.session.max_depth = self.session.max_depth
@@ -3803,6 +3936,7 @@ class ReActAgent:
         }
         await self._fire_observational(HookEvent.SUBAGENT_START, detail, [])
         started = time.monotonic()
+        session_end_fired = False
         try:
             child_parameters = inspect.signature(child.run).parameters
             if self._active_scope is not None and "execution_scope" in child_parameters:
@@ -3816,6 +3950,7 @@ class ReActAgent:
         except Exception:
             end = getattr(child, "fire_session_end", None)
             if end is not None:
+                session_end_fired = True
                 await end("teammate_error")
             await self._fire_observational(
                 HookEvent.SUBAGENT_STOP,
@@ -3829,9 +3964,12 @@ class ReActAgent:
                     logger.warning("teammate worktree finalization failed: %s", cleanup_exc)
             raise
         finally:
-            end = getattr(child, "fire_session_end", None)
-            if end is not None:
-                await end("teammate_exit")
+            # Session-end teardown fires exactly once: the error path already fired
+            # "teammate_error" above; every other exit gets "teammate_exit" here.
+            if not session_end_fired:
+                end = getattr(child, "fire_session_end", None)
+                if end is not None:
+                    await end("teammate_exit")
             child_sandbox = getattr(child, "sandbox", self.sandbox)
             if child_sandbox is not self.sandbox:
                 child_sandbox.teardown()

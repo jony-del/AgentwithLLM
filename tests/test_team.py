@@ -378,3 +378,23 @@ async def test_teammate_unknown_model_refused(tmp_path: Path) -> None:
 
     answer = await agent._spawn_teammate(team["id"], "worker", "researcher", None, "read_only", "gpt-4")
     assert "unsupported model" in answer
+
+
+async def test_teammate_supervisor_dir_is_scoped_per_teammate(tmp_path: Path) -> None:
+    # A teammate shares the leader's session_id; its ProcessSupervisor must still get a
+    # distinct task root so its constructor restart-scan can't mark leader tasks "lost".
+    store = TeamStore(tmp_path / "teams")
+    team = await store.create_team("alpha", "coordinate")
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(run_dir=str(tmp_path / "runs"), permission="auto"),
+        team_store=store,
+    )
+
+    built = await agent._make_teammate_child(team["id"], "worker", "researcher", None, "read_only")
+    assert not isinstance(built, str)
+    child, _prompt = built
+    parent_root = agent.session.process_supervisor.root
+    child_root = child.session.process_supervisor.root
+    assert child_root != parent_root
+    assert child_root.parent == parent_root

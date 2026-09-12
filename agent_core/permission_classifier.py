@@ -16,8 +16,9 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
+from agent_core.execution import ExecutionScope, current_execution_scope
 from agent_core.models import Message, ToolCall
-from agent_core.providers.base import LLMProvider, ProviderConfig
+from agent_core.providers.base import LLMProvider, ProviderConfig, _supports_scope
 
 if TYPE_CHECKING:
     from agent_core.tools.base import Tool
@@ -109,6 +110,7 @@ class ProviderAutoPermissionClassifier:
         tool_call: ToolCall,
         messages: list[Message],
         should_cancel: Callable[[], bool] | None = None,
+        scope: ExecutionScope | None = None,
     ) -> AutoPermissionVerdict:
         config = replace(
             self.base_config(),
@@ -137,16 +139,36 @@ class ProviderAutoPermissionClassifier:
             + "\n</transcript_jsonl>\nClassify the CURRENT ACTION (the final JSON line)."
         )
         started = time.monotonic()
+        scope = scope or current_execution_scope()
+        # Legacy providers (without a ``scope`` parameter) take no scope kwarg — the
+        # same tolerance the GatedProvider applies. The run_awaitable wrap still
+        # hard-bounds their call envelope by the scope's remaining wall budget.
+        scope_kwargs: dict[str, Any] = {"scope": scope} if _supports_scope(self.provider) else {}
         try:
-            result = await asyncio.wait_for(
-                self.provider.complete(
-                    [Message("system", _CLASSIFIER_SYSTEM_PROMPT), Message("user", user_prompt)],
-                    [_CLASSIFIER_TOOL_SCHEMA],
-                    config,
-                    should_cancel=should_cancel,
-                ),
-                timeout=_CLASSIFIER_TIMEOUT_SECONDS,
-            )
+            # With a scope the run's own budget enforces the bound (mirroring the
+            # hook adapters); without one, keep the bare wait_for.
+            if scope is not None:
+                scope.raise_if_cancelled()
+                result = await scope.run_awaitable(
+                    self.provider.complete(
+                        [Message("system", _CLASSIFIER_SYSTEM_PROMPT), Message("user", user_prompt)],
+                        [_CLASSIFIER_TOOL_SCHEMA],
+                        config,
+                        should_cancel=should_cancel,
+                        **scope_kwargs,
+                    ),
+                    timeout=_CLASSIFIER_TIMEOUT_SECONDS,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    self.provider.complete(
+                        [Message("system", _CLASSIFIER_SYSTEM_PROMPT), Message("user", user_prompt)],
+                        [_CLASSIFIER_TOOL_SCHEMA],
+                        config,
+                        should_cancel=should_cancel,
+                    ),
+                    timeout=_CLASSIFIER_TIMEOUT_SECONDS,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # fail closed: the gate itself may never grant on error

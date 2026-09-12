@@ -78,16 +78,30 @@ class MCPTool(Tool):
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:
             scope = current_execution_scope()
-            timeout = scope.remaining_budget() if scope is not None else None
+            if scope is not None:
+                scope.raise_if_cancelled()
             # ``call_tool`` blocks on a future from the manager's background loop;
-            # park that wait on a worker thread.
-            result = await asyncio.to_thread(
-                self._manager.call_tool,
-                self._server,
-                self._remote,
-                arguments,
-                timeout,
-            )
+            # park that wait on a worker thread. Under an ambient scope the wait
+            # polls the scope token so cancellation interrupts the worker (as
+            # ``asyncio.CancelledError``, which propagates past the except below)
+            # instead of parking it until the budgeted timeout.
+            if scope is not None:
+                result = await asyncio.to_thread(
+                    self._manager.call_tool,
+                    self._server,
+                    self._remote,
+                    arguments,
+                    scope.remaining_budget(),
+                    should_cancel=scope.cancelled,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self._manager.call_tool,
+                    self._server,
+                    self._remote,
+                    arguments,
+                    None,
+                )
         except Exception as exc:  # noqa: BLE001 - surface transport/timeout errors as a failed result
             return ToolResult(self.name, f"MCP tool error: {exc}", ok=False)
         text = _flatten_content(getattr(result, "content", None))
