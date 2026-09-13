@@ -51,6 +51,11 @@ def _run_blocked(script: str, tmp_path: Path) -> subprocess.CompletedProcess:
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
+        # The child must emit UTF-8 regardless of the host locale: on a
+        # localized Windows the captured-text decode otherwise dies inside the
+        # reader thread before the assertions ever see the output.
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         env={"PYTHONPATH": str(_REPO_ROOT), "TMPDIR": str(tmp_path), "POLARIS_HOME": str(tmp_path / "state"), "SYSTEMROOT": "C:\\Windows"}
         if sys.platform == "win32"

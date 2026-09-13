@@ -1,6 +1,11 @@
-# CI (revision guide Q7/D6): full pytest on Windows, Linux, and macOS (Windows is the
-# primary dev environment, so it is a required lane), plus ruff E/F and mypy over
-# every production module.
+# CI (audit phase 5 layered gates): the PR-required lane installs exactly what
+# uv.lock pins (reproducible baseline) on Windows, Linux, and macOS — Windows is
+# the primary dev environment, so it is a required lane — and runs the ordinary
+# regression, the deterministic property tests, the in-process crash matrix and
+# the offline integration chain (marker `integration`) as two separate pytest
+# passes so nothing runs twice. Static checks run in their own locked lane, and
+# the MCP compatibility edges stay pinned. Floating-dependency drift detection
+# moved to the nightly workflow.
 name: CI
 
 on:
@@ -9,9 +14,31 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    # Static checks (audit phase 5): one locked Linux/3.12 environment. Ruff
+    # covers the benchmarks harness too — gate code is production code.
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lockfile freshness gate
+        run: uv lock --locked
+      - name: Install exactly from uv.lock
+        run: uv sync --locked --all-extras
+      - name: Lint (ruff E/F)
+        run: uv run --no-sync python -m ruff check agent_core tests installer benchmarks
+      - name: Type-check production modules (mypy)
+        run: uv run --no-sync python -m mypy
+
   mcp-compat:
     name: MCP 2.x (${{ matrix.mcp }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -28,43 +55,79 @@ jobs:
           pip install --upgrade "${{ matrix.mcp }}"
       - name: MCP 2.x import smoke test
         run: python -c "from mcp.server.mcpserver import MCPServer; from mcp.client.streamable_http import streamable_http_client"
+
+      - name: Locked MCP pin satisfies declared range
+        # Audit phase 5: the uv.lock pin must stay inside the range declared in
+        # pyproject.toml (read via a real version-spec parser, not a hardcoded
+        # major/minor comparison) so the locked lane and this compat matrix can
+        # never diverge.
+        run: |
+          python - <<'PY'
+          import tomllib
+          from packaging.requirements import Requirement
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as fh:
+              project = tomllib.load(fh)["project"]
+          declared = [
+              Requirement(dep)
+              for dep in project.get("dependencies", [])
+              + sum(project.get("optional-dependencies", {}).values(), [])
+          ]
+          requirement = next(item for item in declared if item.name == "mcp")
+          with open("uv.lock", "rb") as fh:
+              packages = tomllib.load(fh)["package"]
+          pinned = Version(str(next(p for p in packages if p["name"] == "mcp")["version"]))
+          assert pinned in requirement.specifier, (
+              f"uv.lock pins mcp=={pinned} outside declared {requirement.specifier}"
+          )
+          print(f"uv.lock mcp=={pinned} satisfies declared {requirement.specifier}")
+          PY
       - name: MCP integration tests
-        run: python -m pytest -q tests/test_mcp.py
+        run: python -m pytest -q tests/test_mcp.py tests/integration/test_mcp_integration.py
 
   test:
+    # PR-required lane (audit phase 5): locked dependencies, three OSes, both
+    # supported Pythons. The floating-resolution early-warning signal lives in
+    # the nightly workflow instead of here.
+    name: Locked tests (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.12"]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-      - name: Install (all capability extras + dev tooling)
-        # Core deps are the minimal library surface (D1/D9); the full suite needs the
-        # capability extras too. The core-only surface is covered by
+      - name: Lockfile freshness gate
+        run: uv lock --locked
+      - name: Install exactly from uv.lock
+        # Core deps are the minimal library surface (D1/D9); the full suite
+        # needs the capability extras too. The core-only surface is covered by
         # tests/test_import_boundary.py, which blocks the extras in a subprocess.
-        run: pip install -e .[all,dev]
-      - name: Lint (ruff E/F)
-        run: python -m ruff check agent_core tests installer
-      - name: Type-check production modules (mypy)
-        run: python -m mypy
-      - name: Tests
+        run: uv sync --locked --all-extras
+      - name: Dependency consistency and import smoke test
+        run: uv run --no-sync python -c "import agent_core; from mcp.server.mcpserver import MCPServer; print('locked imports ok')"
+      - name: Tests (regression, property, in-process crash)
         env:
-          # The renderer contract is "color=False emits zero ANSI" even when the
-          # runner injects FORCE_COLOR; keep the lane honest about that.
           FORCE_COLOR: "1"
-        # Process-level crash-matrix tests (tests/nightly/, marker `nightly`) run
-        # in the nightly workflow, not on every PR.
-        run: python -m pytest -q -m "not nightly"
+          # Explicit derandomized small property profile (50 examples).
+          HYPOTHESIS_PROFILE: "ci"
+        run: uv run --no-sync python -m pytest -q -m "not nightly and not integration" --junitxml=pytest-main.xml
+      - name: Integration tests (separate pass, never re-run)
+        env:
+          FORCE_COLOR: "1"
+          HYPOTHESIS_PROFILE: "ci"
+        run: uv run --no-sync python -m pytest -q -m "integration" --junitxml=pytest-integration.xml
       - name: Installer dry-run
-        run: python installer/install.py --source . --dry-run --skip-sandbox --non-interactive
+        run: uv run --no-sync python installer/install.py --source . --dry-run --skip-sandbox --non-interactive
       - name: Validate uninstall recovery core
-        run: python agent_core/uninstall.py --help
+        run: uv run --no-sync python agent_core/uninstall.py --help
       - name: Validate shell entrypoint
         if: runner.os != 'Windows'
         run: bash -n install.sh
@@ -72,3 +135,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Get-Command ./install.ps1 | Out-Null
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-${{ matrix.os }}-${{ matrix.python-version }}
+          path: |
+            pytest-main.xml
+            pytest-integration.xml
+          if-no-files-found: ignore
+          retention-days: 14

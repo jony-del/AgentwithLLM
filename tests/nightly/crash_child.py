@@ -5,6 +5,13 @@ immediately after the requested durable boundary is fsync'd — no atexit
 handlers, no buffer flushing, no cleanup, exactly like a power loss. The parent
 test then performs startup recovery against the same POLARIS_HOME/workspace.
 
+For ``compaction_boundary_committed`` the child instead drives two deterministic
+folds (``run_compaction_turn``) on a compression-tuned agent and dies inside the
+second boundary commit; there is no journal to recover, only the snapshot
+record. Before dying it durably writes the expected chain to
+``<session_dir.parent>/expected_chain.json`` so the parent never has to read its
+expectation back out of the transcript under test.
+
 Usage: crash_child.py <crash_point> <polaris_home> <workspace> <session_dir>
 
 Exit codes: 1 = died at the requested boundary (expected); 3 = the run
@@ -38,13 +45,30 @@ def main() -> int:
         root=Path(session_dir).parent,
         workspace=Path(workspace).resolve(),
     )
-    agent, _tool, _batches = crashkit.build_crash_agent(env)
+    point = crashkit.CrashPoint(point_name)
+    if point is crashkit.CrashPoint.COMPACTION_BOUNDARY_COMMITTED:
+        agent = crashkit.build_compaction_agent(env)
+    else:
+        agent, _tool, _batches = crashkit.build_crash_agent(env)
 
     def die() -> None:
         os.write(2, f"crash point reached: {point_name}\n".encode())
         os._exit(1)
 
-    crashkit.CrashInjector(crashkit.CrashPoint(point_name), crash=die).install()
+    if point is crashkit.CrashPoint.COMPACTION_BOUNDARY_COMMITTED:
+        crashkit.CrashInjector(
+            point,
+            crash=die,
+            boundary_hit=2,
+            expected_path=Path(session_dir).parent / "expected_chain.json",
+        ).install()
+    else:
+        crashkit.CrashInjector(point, crash=die).install()
+    if point is crashkit.CrashPoint.COMPACTION_BOUNDARY_COMMITTED:
+        asyncio.run(crashkit.run_compaction_turn(agent))
+        agent.logger.close()
+        print("compaction turn completed without crashing", flush=True)
+        return 3
     result = asyncio.run(agent.run(crashkit.PROMPT))
     agent.logger.close()
     print(f"run completed without crashing: {result.answer!r}", flush=True)

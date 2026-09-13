@@ -1,6 +1,13 @@
-# Nightly: the full suite INCLUDING the process-level crash-injection matrix
-# (tests/nightly/, marker `nightly`), which PR CI excludes via `-m "not nightly"`.
-# Also runnable by hand via workflow_dispatch.
+# Nightly (audit phase 5 layered gates), also runnable by hand via
+# workflow_dispatch. Four lanes:
+#   deps-compat  floating resolution on all platforms — the early-warning
+#                signal for upstream dependency drift (PR CI is locked).
+#   min-versions the declared lower bounds must actually work (lowest-direct
+#                on 3.11) plus the MCP support window edges on 3.12.
+#   deep         locked dependencies, enlarged hypothesis budgets (1000
+#                examples) and the process-level crash matrix (tests/nightly).
+#   benchmarks   locked dependencies, runtime-gate p95 ceilings from
+#                benchmarks/thresholds.json (per-OS calibration).
 name: Nightly
 
 on:
@@ -9,22 +16,160 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  deps-compat:
+    name: Floating deps (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.12"]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (all capability extras + dev tooling)
+      - name: Install (all capability extras + dev tooling, floating)
         run: pip install -e .[all,dev]
-      - name: Full tests (including the nightly crash matrix)
+      - name: Record resolved dependency versions
+        run: pip freeze > requirements-nightly.txt
+      - name: Full tests (regression + offline integration)
         env:
           FORCE_COLOR: "1"
-        run: python -m pytest -q
+          HYPOTHESIS_PROFILE: "ci"
+        # Process-level crash tests (marker `nightly`) run in the deep lane;
+        # property tests run there too at the enlarged profile, so this pass
+        # is the drift signal, not the coverage lane.
+        run: python -m pytest -q -m "not nightly" --ignore=tests/property --junitxml=pytest-nightly.xml
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-deps-${{ matrix.os }}-${{ matrix.python-version }}
+          path: |
+            pytest-nightly.xml
+            requirements-nightly.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  min-versions:
+    # Audit phase 5: the declared lower bounds in pyproject.toml must actually
+    # work. If this lane fails, raise the bound in pyproject.toml — never skip
+    # the failing test. The MCP rows pin the declared support-window edges.
+    name: Minimum declared versions (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: lowest-direct
+            python-version: "3.11"
+          - mode: mcp-2.1.0
+            python-version: "3.12"
+          - mode: mcp-latest-stable
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install lowest declared versions
+        run: |
+          uv venv .venv-min
+          uv pip install --python .venv-min --resolution=lowest-direct -e ".[all,dev]"
+          if [ "${{ matrix.mode }}" = "mcp-2.1.0" ]; then
+            uv pip install --python .venv-min "mcp==2.1.0"
+          elif [ "${{ matrix.mode }}" = "mcp-latest-stable" ]; then
+            uv pip install --python .venv-min --upgrade "mcp<3"
+          fi
+      - name: Record actually resolved versions
+        run: uv pip list --python .venv-min | tee requirements-min-${{ matrix.mode }}.txt
+      - name: Tests
+        env:
+          FORCE_COLOR: "1"
+          HYPOTHESIS_PROFILE: "ci"
+        run: .venv-min/bin/python -m pytest -q -m "not nightly" --ignore=tests/property --junitxml=pytest-min.xml
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-min-${{ matrix.mode }}
+          path: |
+            pytest-min.xml
+            requirements-min-${{ matrix.mode }}.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  deep:
+    # Locked dependencies; the expensive coverage: enlarged hypothesis budgets
+    # (1000 examples, unbounded deadline) and the process-level crash matrix.
+    name: Deep tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lockfile freshness gate
+        run: uv lock --locked
+      - name: Install exactly from uv.lock
+        run: uv sync --locked --all-extras
+      - name: Enlarged property tests + process-level crash matrix
+        env:
+          FORCE_COLOR: "1"
+          HYPOTHESIS_PROFILE: "nightly"
+        run: uv run --no-sync python -m pytest -q tests/property tests/nightly --junitxml=pytest-deep.xml
+      - name: Upload failure artifacts (reports + hypothesis repro database)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-deep-${{ matrix.os }}
+          path: |
+            pytest-deep.xml
+            .hypothesis/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  benchmarks:
+    # Runtime gates (audit phase 5): five timed scenarios, each in its own
+    # timeout-bounded subprocess, p95-checked against the per-OS ceilings in
+    # benchmarks/thresholds.json. Missing metrics, invalid thresholds, timeouts
+    # and semantic assertion failures all fail the gate. PR CI never gates on
+    # timing — shared runners are too noisy.
+    name: Runtime gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lockfile freshness gate
+        run: uv lock --locked
+      - name: Install exactly from uv.lock
+        run: uv sync --locked --all-extras
+      - name: Check runtime gates
+        run: uv run --no-sync python benchmarks/runtime_gates.py --check benchmarks/thresholds.json --json-out gates.json
+      - name: Upload gate measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-gates-${{ matrix.os }}
+          path: gates.json
+          if-no-files-found: warn
+          retention-days: 30

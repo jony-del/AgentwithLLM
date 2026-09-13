@@ -742,7 +742,7 @@ class TurnExecutionJournal:
 
     @staticmethod
     def _safe_relative(raw: object) -> str | None:
-        if not isinstance(raw, str) or not raw or "\x00" in raw or "\\" in raw:
+        if not isinstance(raw, str) or raw in {"", "."} or "\x00" in raw or "\\" in raw:
             return None
         if _WINDOWS_DEVICE_PATH.match(raw):
             return None

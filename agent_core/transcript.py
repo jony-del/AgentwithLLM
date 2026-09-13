@@ -594,13 +594,19 @@ class _Accumulator:
             )
         )
 
-    def feed(self, line: str, line_number: int | None = None) -> None:
+    def feed(self, line: str | bytes, line_number: int | None = None) -> None:
+        if isinstance(line, bytes):
+            try:
+                line = line.decode("utf-8")
+            except UnicodeDecodeError:
+                self._diagnose("invalid_utf8", line_number)
+                return
         line = line.strip()
         if not line:
             return
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             self._diagnose("invalid_json", line_number)
             return
         if not isinstance(entry, dict):
@@ -731,7 +737,7 @@ class _Accumulator:
         identity = value.get("message_id") or value.get("uuid")
         parent = value.get("parent_id", value.get("parent_uuid"))
         message_version = value.get("version", 1)
-        if role not in {"system", "user", "assistant", "tool"}:
+        if not isinstance(role, str) or role not in {"system", "user", "assistant", "tool"}:
             self._diagnose("invalid_message_role", line, entry_type)
             return None
         if not isinstance(content, str) or not isinstance(metadata, dict):
@@ -887,9 +893,9 @@ def load_transcript(path: str | Path, *, skip_precompact: bool = True) -> Loaded
         with path.open("rb") as file:
             file.seek(boundary_offset)
             for line_number, raw in enumerate(file, start=1):
-                acc.feed(raw.decode("utf-8", "ignore"), line_number)
+                acc.feed(raw, line_number)
     else:
-        with path.open("r", encoding="utf-8") as file:
+        with path.open("rb") as file:
             for line_number, line in enumerate(file, start=1):
                 acc.feed(line, line_number)
 
@@ -914,21 +920,13 @@ def _last_boundary_offset(path: Path) -> int:
                         entry = json.loads(raw)
                         if not isinstance(entry, dict):
                             raise ValueError("snapshot must be a JSON object")
-                        body = {
-                            "messages": entry.get("messages"),
-                            "source_head": entry.get("source_head"),
-                        }
-                        canonical = json.dumps(
-                            body,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                            default=str,
+                        probe = _Accumulator(path.stem)
+                        probe.feed(raw)
+                        is_valid_snapshot = (
+                            entry.get("type") == _COMPACTION_SNAPSHOT
+                            and not probe.diagnostics
                         )
-                        is_valid_snapshot = entry.get("checksum") == hashlib.sha256(
-                            canonical.encode("utf-8")
-                        ).hexdigest()
-                    except (UnicodeDecodeError, ValueError):
+                    except (UnicodeDecodeError, ValueError, RecursionError):
                         is_valid_snapshot = False
                 if is_valid_snapshot or (
                     _SNAPSHOT_MARKER not in raw and _BOUNDARY_MARKER in raw
@@ -941,7 +939,7 @@ def _last_boundary_offset(path: Path) -> int:
     return last if found else 0
 
 
-def _scan_pre_boundary_metadata(path: Path, end_offset: int) -> list[str]:
+def _scan_pre_boundary_metadata(path: Path, end_offset: int) -> list[bytes]:
     """Rescue session-metadata lines (title/tag) from ``[0, end_offset)``.
 
     Truncating at the boundary would otherwise drop these, since they may have been
@@ -949,7 +947,7 @@ def _scan_pre_boundary_metadata(path: Path, end_offset: int) -> list[str]:
     for the accumulator to JSON-parse.
     """
     markers = (b'"type": "%s"' % _TITLE.encode(), b'"type": "%s"' % _TAG.encode())
-    out: list[str] = []
+    out: list[bytes] = []
     consumed = 0
     try:
         with path.open("rb") as file:
@@ -957,7 +955,7 @@ def _scan_pre_boundary_metadata(path: Path, end_offset: int) -> list[str]:
                 if consumed >= end_offset:
                     break
                 if any(m in raw for m in markers):
-                    out.append(raw.decode("utf-8", "ignore"))
+                    out.append(raw)
                 consumed += len(raw)
     except OSError:
         return out

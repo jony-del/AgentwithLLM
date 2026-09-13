@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "_comment": "Nightly runtime gates (SECOND_ROUND_INDEPENDENT_AUDIT phase 5). Per-OS p95 ceilings in seconds, one entry per metric per platform. Calibration rule: run benchmarks/runtime_gates.py three times on independent runner executions of that OS, take each metric's maximum p95, double it, round up to 0.1s. win32 values were calibrated that way on 2026-09-12 (local dev machine, Python 3.12, 3x20 samples; maxima: cancellation 0.087s, resume_load 1.350s, resume_restore 1.399s, recovery_scan 1.555s, recovery_apply 0.395s). linux values are a PROVISIONAL upper bound carried over from the win32 measurement pending the first Linux runner execution -- they gate real regressions but are not a Linux measurement; recalibrate them from the first three nightly runs (Linux is expected to come in faster). Tighten only after three consecutive clean nightly runs show a value is noise-free; never loosen mid-flight. Metrics: cancellation_unwind (cancel -> run returns, incl. gate/task cleanup), resume_load (2000-message chain rebuild), resume_restore (load + resume_loaded_session swap), recovery_scan (200 terminal journals), recovery_apply (10 freshly prepared recoverable journals, real recovery, idempotence).",
+  "platforms": {
+    "linux": {
+      "cancellation_unwind_p95_seconds": 0.2,
+      "resume_load_p95_seconds": 2.7,
+      "resume_restore_p95_seconds": 2.8,
+      "recovery_scan_p95_seconds": 3.2,
+      "recovery_apply_p95_seconds": 0.8
+    },
+    "win32": {
+      "cancellation_unwind_p95_seconds": 0.2,
+      "resume_load_p95_seconds": 2.7,
+      "resume_restore_p95_seconds": 2.8,
+      "recovery_scan_p95_seconds": 3.2,
+      "recovery_apply_p95_seconds": 0.8
+    }
+  }
+}
