@@ -8,6 +8,7 @@ import pytest
 import agent_core.plugins as plugins_module
 from agent_core.memory import MemoryConfig
 from agent_core.plugins import PluginError, PluginManager, reload_plugins, validate_plugin
+from agent_core.plugins.store import plugin_tree_digest
 from agent_core.providers import FakeProvider
 from agent_core.react import ReActAgent, ReActConfig
 
@@ -24,6 +25,30 @@ def _write_plugin(root: Path, *, name: str = "demo") -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def _make_escape_link(link: Path, target: Path) -> str:
+    """Create a link at ``link`` pointing at ``target``; returns the kind used.
+
+    Symlinks first (POSIX, or Windows with Developer Mode); junctions as the
+    Windows fallback — creating a junction needs no privileges, which is exactly
+    why the containment checks must catch them too.
+    """
+    try:
+        link.symlink_to(target)
+        return "symlink"
+    except OSError:
+        pass
+    if link.exists() or link.is_symlink():
+        raise AssertionError("link creation failed but the path exists")
+    import os
+
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return "junction"
+    pytest.skip("symlink creation is unavailable")
 
 
 def test_plugin_install_enable_and_atomic_skill_reload(
@@ -61,14 +86,37 @@ def test_plugin_validation_rejects_symlink_escape(
     tmp_path: Path, monkeypatch
 ) -> None:
     root = _write_plugin(tmp_path / "source")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("secret", encoding="utf-8")
-    try:
-        (root / "escape").symlink_to(outside)
-    except OSError:
-        pytest.skip("symlink creation is unavailable")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    kind = _make_escape_link(root / "escape", outside)
+    assert kind in {"symlink", "junction"}
     with pytest.raises(PluginError, match="escapes"):
         validate_plugin(root)
+    with pytest.raises(PluginError, match="escapes"):
+        plugin_tree_digest(root)
+
+
+def test_marketplace_copy_excludes_escape_links(tmp_path: Path) -> None:
+    # An escape link (junction on unprivileged Windows) in a marketplace source
+    # must be excluded BEFORE the copy: copytree does not treat a junction as a
+    # symlink, so following it would pull host content into the plugin cache.
+    from agent_core.plugins.store import copy_marketplace_plugin_tree
+
+    market = tmp_path / "market"
+    source = _write_plugin(market / "demo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    kind = _make_escape_link(source / "escape", outside)
+    assert kind in {"symlink", "junction"}
+
+    destination = tmp_path / "cache" / "demo"
+    copy_marketplace_plugin_tree(source, destination, market)
+
+    assert (destination / "commands" / "hello.md").is_file()
+    assert not (destination / "escape").exists()
+    assert not (destination / "escape" / "secret.txt").exists()
 
 
 def test_no_default_marketplace(tmp_path: Path, monkeypatch) -> None:

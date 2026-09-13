@@ -7,12 +7,31 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
 from agent_core.plugin_spec import MarketplaceSourceConfig, SpecError, resolve_plugin_manifest
 from agent_core import secret_store
 from .models import _SAFE_NAME, PluginError
+
+# FILE_ATTRIBUTE_REPARSE_POINT. On Windows this covers junctions and volume
+# mounts in addition to symlinks — and creating a junction needs no privileges,
+# so every containment check must treat reparse points as links even though
+# ``Path.is_symlink()`` is False for them.
+_REPARSE_POINT = 0x400
+
+
+def _is_link(path: Path) -> bool:
+    """True for symlinks on every platform, plus junctions/reparse points on Windows."""
+
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
 
 _PLUGIN_COMPONENTS = frozenset({
     "skills", "agents", "hooks", "mcp", "lsp", "workflows", "monitors",
@@ -162,11 +181,11 @@ def plugin_tree_digest(root: str | Path) -> str:
         relative = path.relative_to(base)
         if ".git" in relative.parts:
             continue
-        if path.is_symlink():
+        if _is_link(path):
             try:
                 target = path.resolve(strict=True)
             except OSError as exc:
-                raise PluginError(f"broken symlink: {relative}") from exc
+                raise PluginError(f"broken link: {relative}") from exc
             if not _inside(target, base):
                 raise PluginError(f"symlink escapes plugin root: {relative}")
             digest.update(relative.as_posix().encode("utf-8"))
@@ -217,11 +236,11 @@ def validate_plugin(
     if not _SAFE_NAME.fullmatch(name):
         raise PluginError("plugin name must be filesystem-safe")
     for path in plugin_root.rglob("*"):
-        if path.is_symlink():
+        if _is_link(path):
             try:
                 target = path.resolve(strict=True)
             except OSError as exc:
-                raise PluginError(f"broken symlink: {path}") from exc
+                raise PluginError(f"broken link: {path}") from exc
             if not _inside(target, plugin_root):
                 raise PluginError(f"symlink escapes plugin root: {path}")
     if strict_warnings and warnings:
@@ -229,6 +248,42 @@ def validate_plugin(
     if warnings:
         manifest["_warnings"] = list(warnings)
     return manifest
+
+
+def _link_escape_relpaths(source: Path, boundary: Path) -> set[str]:
+    """Relative posix paths of links under ``source`` that resolve outside ``boundary``.
+
+    Walks without descending into any link: a junction is not a symlink for
+    ``shutil.copytree(symlinks=True)``, so the copy would follow it and pull
+    host content into the plugin cache. Collecting the offenders up front lets
+    the copy exclude them via an ``ignore`` callback before any traversal.
+    """
+    escapes: set[str] = set()
+    stack: list[Path] = [source]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            if _is_link(path):
+                try:
+                    target = path.resolve(strict=True)
+                except OSError:
+                    # A broken junction cannot be followed by copytree either — drop it.
+                    escapes.add(path.relative_to(source).as_posix())
+                    continue
+                if not _inside(target, boundary):
+                    escapes.add(path.relative_to(source).as_posix())
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(path)
+            except OSError:
+                continue
+    return escapes
 
 
 def copy_marketplace_plugin_tree(source: Path, destination: Path, marketplace_root: Path) -> None:
@@ -239,9 +294,20 @@ def copy_marketplace_plugin_tree(source: Path, destination: Path, marketplace_ro
     if not _inside(source, marketplace_root):
         # External Git/npm/archive sources are their own immutable artifact boundary.
         marketplace_root = source
-    shutil.copytree(source, destination, symlinks=True)
+    escapes = _link_escape_relpaths(source, marketplace_root)
+
+    def _ignore(directory: str, names: list[str]) -> list[str]:
+        try:
+            prefix = Path(directory).relative_to(source)
+        except ValueError:  # not under the source (never expected from copytree)
+            return []
+        return [
+            name for name in names if (prefix / name).as_posix() in escapes
+        ]
+
+    shutil.copytree(source, destination, symlinks=True, ignore=_ignore)
     for copied in sorted(destination.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if not copied.is_symlink():
+        if not _is_link(copied):
             continue
         relative = copied.relative_to(destination)
         original = source / relative
