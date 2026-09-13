@@ -26,6 +26,7 @@ from agent_core.permission_classifier import (
 )
 from agent_core.permissions import PermissionDecision, PermissionPolicy
 from agent_core.permission_safety import is_secret_path
+from agent_core.prompt_ingress import PromptSource, canonicalize_untrusted_context
 from agent_core.permission_types import (
     DecisionSource,
     PermissionBehavior,
@@ -734,9 +735,15 @@ class ToolExecutor:
             if updated_output is not None:
                 result = replace(result, content=str(updated_output))
             if outcome.additional_context:
+                # Hook-supplied context enters model-visible tool output through the
+                # same canonical ingress as every other non-user source: defanged,
+                # byte-bounded, and wrapped in an <untrusted-data> envelope.
+                envelope = canonicalize_untrusted_context(
+                    outcome.additional_context, PromptSource.HOOK_CONTEXT
+                )
                 result = replace(
                     result,
-                    content=result.content + "\n\n[PostToolUse hook]\n" + outcome.additional_context,
+                    content=result.content + "\n\n[PostToolUse hook]\n" + envelope.canonical_text,
                 )
         result = self.hooks.run_post(prepared.tool_call, result)
         return await self._finish(prepared.tool_call, result, prepared.reason, tool=prepared.tool)

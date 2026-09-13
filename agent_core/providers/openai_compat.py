@@ -42,20 +42,11 @@ from agent_core.providers.base import (
     provider_attempt,
 )
 from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
+from agent_core.providers.errors import is_context_overflow
 from agent_core.execution import ExecutionScope
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _MAX_RETRY_AFTER = 30.0
-
-# Substrings that identify a context-window overflow in an OpenAI-shaped 400 body
-# (OpenAI uses code "context_length_exceeded"; compat servers vary in wording).
-_CONTEXT_OVERFLOW_MARKERS = (
-    "context_length_exceeded",
-    "maximum context length",
-    "context window",
-    "too many tokens",
-    "prompt is too long",
-)
 
 
 _WARNED_DEPRECATED_ENV: set[str] = set()
@@ -501,8 +492,7 @@ class OpenAICompatProvider(LLMProvider):
 
     @staticmethod
     def _http_error(code: int, text: str, *, model: str | None = None) -> Exception:
-        lowered = text.lower()
-        if code == 400 and any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS):
+        if is_context_overflow(code, text):
             return LLMContextTooLongError(f"chat-completions context overflow: {text[:300]}")
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"chat-completions API error {code} after retries: {text[:300]}")

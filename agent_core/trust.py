@@ -30,12 +30,45 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
 # Default user-level trust store. Overridable via AGENT_TRUST_STORE (tests, odd homes).
 DEFAULT_TRUST_STORE = "~/.polaris/trusted.json"
+
+
+@dataclass(frozen=True)
+class RepoTrustDecision:
+    """Structured record of privilege-widening repo config being dropped (D2 audit).
+
+    Names the affected settings only — values can contain credentials, so they are
+    never copied into the decision (same rule as ``_render_prompt``).
+    """
+
+    project: str
+    action: str  # "declined_interactive" | "stripped_unattended" | "stripped_policy_error"
+    dropped: tuple[str, ...]
+
+
+# Config loading happens before any agent (and thus any run logger) exists, so strip
+# decisions land here and are drained once per process by the first ReActAgent to
+# write a structured ``repo_trust`` audit event into its run log.
+_REPO_TRUST_DECISIONS: list[RepoTrustDecision] = []
+
+
+def note_repo_trust_decision(project: Path, action: str, dropped: Iterable[str]) -> None:
+    _REPO_TRUST_DECISIONS.append(
+        RepoTrustDecision(str(project), action, tuple(sorted(dropped)))
+    )
+
+
+def take_repo_trust_decisions() -> list[RepoTrustDecision]:
+    """Drain pending repo-trust strip decisions (single consumer: run-log audit)."""
+
+    drained = list(_REPO_TRUST_DECISIONS)
+    _REPO_TRUST_DECISIONS.clear()
+    return drained
 
 
 class TrustClassification(str, Enum):
@@ -412,6 +445,7 @@ def apply_repo_trust_policy(
             "repo config widening DECLINED for %s; dropping: %s",
             project, ", ".join(sorted(subset)),
         )
+        note_repo_trust_decision(project, "declined_interactive", subset)
         return strip_widening(raw)
 
     logger.warning(
@@ -421,4 +455,5 @@ def apply_repo_trust_policy(
         ", ".join(sorted(subset)),
         "; NOTE: previously trusted config has CHANGED" if status == "changed" else "",
     )
+    note_repo_trust_decision(project, "stripped_unattended", subset)
     return strip_widening(raw)

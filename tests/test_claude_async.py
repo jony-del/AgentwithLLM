@@ -67,6 +67,36 @@ async def test_complete_context_too_long_maps_error() -> None:
         await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
 
 
+async def test_http_413_maps_to_context_overflow() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(413, json={"error": {"message": "prompt is too long"}})
+
+    provider = _provider(handler)
+    with pytest.raises(LLMContextTooLongError):
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
+
+
+async def test_http_413_with_uninformative_body_still_maps_to_context_overflow() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(413, text="Request Entity Too Large")
+
+    provider = _provider(handler)
+    with pytest.raises(LLMContextTooLongError):
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
+
+
+async def test_max_tokens_budget_error_is_not_context_overflow() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"message": "max_tokens exceeds the model limit of 64000"}}
+        )
+
+    provider = _provider(handler)
+    with pytest.raises(RuntimeError) as excinfo:
+        await provider.complete([Message("user", "hi")], [], ProviderConfig(stream=False))
+    assert not isinstance(excinfo.value, LLMContextTooLongError)
+
+
 # --- retry / backoff ---------------------------------------------------------
 
 

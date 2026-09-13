@@ -12,6 +12,7 @@ from typing import Any
 
 from agent_core.agents.team import FileLock
 from agent_core.config import load_agent_toml, user_settings_path
+from agent_core.execution import current_execution_scope
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_types import DecisionSource, PermissionContext, PermissionMode, PermissionResult
 from agent_core.session import SessionAwareMixin
@@ -386,7 +387,20 @@ class ListMCPResourcesTool(SessionAwareMixin, Tool):
         if manager is None:
             return ToolResult(self.name, "No MCP manager is connected.", ok=False)
         try:
-            resources = await asyncio.to_thread(manager.list_resources, arguments.get("server"))
+            # Under an ambient scope the thread-side wait polls the scope token
+            # (see MCPToolAdapter.run) so cancellation interrupts the worker
+            # promptly instead of parking it until the budgeted timeout.
+            scope = current_execution_scope()
+            if scope is not None:
+                scope.raise_if_cancelled()
+                resources = await asyncio.to_thread(
+                    manager.list_resources,
+                    arguments.get("server"),
+                    scope.remaining_budget(),
+                    should_cancel=scope.cancelled,
+                )
+            else:
+                resources = await asyncio.to_thread(manager.list_resources, arguments.get("server"))
         except Exception as exc:
             return ToolResult(self.name, f"MCP resource listing failed: {exc}", ok=False)
         return ToolResult(self.name, json.dumps(resources, ensure_ascii=False, indent=2), metadata={"count": len(resources)})
@@ -408,9 +422,20 @@ class ReadMCPResourceTool(SessionAwareMixin, Tool):
         if manager is None:
             return ToolResult(self.name, "No MCP manager is connected.", ok=False)
         try:
-            response = await asyncio.to_thread(
-                manager.read_resource, str(arguments.get("server", "")), str(arguments.get("uri", ""))
-            )
+            scope = current_execution_scope()
+            if scope is not None:
+                scope.raise_if_cancelled()
+                response = await asyncio.to_thread(
+                    manager.read_resource,
+                    str(arguments.get("server", "")),
+                    str(arguments.get("uri", "")),
+                    scope.remaining_budget(),
+                    should_cancel=scope.cancelled,
+                )
+            else:
+                response = await asyncio.to_thread(
+                    manager.read_resource, str(arguments.get("server", "")), str(arguments.get("uri", ""))
+                )
         except Exception as exc:
             return ToolResult(self.name, f"MCP resource read failed: {exc}", ok=False)
         content = json.dumps(_resource_payload(response), ensure_ascii=False, indent=2, default=str)

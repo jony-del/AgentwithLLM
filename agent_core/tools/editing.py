@@ -18,7 +18,14 @@ from typing import Any
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_safety import ordinary_read_permission, ordinary_write_permission
 from agent_core.permission_types import PermissionContext, PermissionResult
-from agent_core.tools.base import ConcurrencySpec, ExecutionSafety, Tool, WorkspacePathMixin, coerce_int
+from agent_core.tools.base import (
+    ConcurrencySpec,
+    ExecutionSafety,
+    Tool,
+    WorkspacePathMixin,
+    coerce_int,
+    write_text_exact,
+)
 from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
@@ -163,7 +170,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
                     metadata={"error_type": exc.error_type, "failed_edit": index, **exc.metadata},
                 )
             total += replaced
-        path.write_text(text, encoding="utf-8")
+        write_text_exact(path, text)
         rel = str(arguments.get("path", ""))
         return ToolResult(
             self.name,
@@ -271,7 +278,7 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
             if operation is PatchOperation.CREATE:
                 path.parent.mkdir(parents=True, exist_ok=True)
             assert planned_text is not None
-            path.write_text(planned_text, encoding="utf-8")
+            write_text_exact(path, planned_text)
         summary = ", ".join(p.relative_to(self.workspace).as_posix() for p, _, _ in planned)
         return ToolResult(self.name, f"Patched {len(planned)} file(s): {summary}")
 

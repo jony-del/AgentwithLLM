@@ -10,6 +10,7 @@ from agent_core.compression import (
     build_summary_user_message,
     group_into_rounds,
     is_preserved,
+    is_summary_message,
     new_messages_after,
     parse_prompt_too_long_gap,
     shrink_oversize_messages,
@@ -239,6 +240,65 @@ async def test_collapse_event_carries_detail() -> None:
     collapse = next(event for event in events if event.stage == "context_collapse")
     # 10 messages, keep_recent=4 → fold 6; no summarizer → deterministic Track B.
     assert collapse.detail == "collapsed 6 msgs (track_b)"
+
+
+def _wrapup_history() -> list[Message]:
+    """A foldable history with a mid-conversation deadline wrapup (P1-5 shape)."""
+    wrapup = Message("system", "WRAPUP: wind down and summarize", metadata={"deadline_wrapup": True})
+    return [
+        Message("system", "base directives"),
+        Message("user", "u0 " + "x" * 80),
+        _assistant_with_calls("running it", ["c1"]),
+        _tool_result("r1 " + "x" * 80, "c1"),
+        wrapup,
+        Message("user", "u2 " + "x" * 80),
+        _assistant_with_calls("running more", ["c2"]),
+        _tool_result("r2 " + "x" * 80, "c2"),
+        Message("assistant", "done"),
+    ]
+
+
+def _assert_wrapup_zoned_and_pairable(compacted: list[Message], original: list[Message]) -> None:
+    wrapup = next(m for m in original if m.metadata.get("deadline_wrapup"))
+    survivors = [m for m in compacted if m.metadata.get("deadline_wrapup")]
+    assert len(survivors) == 1 and survivors[0] is wrapup
+    assert compacted[-1] is wrapup  # the ephemeral zone is re-appended after the fold
+    assert compacted[0].content == "base directives"  # preserved front stays first
+    assert is_summary_message(compacted[1])  # the fold produced the summary block
+    # Provider serialization stays valid: every tool result is still glued to the
+    # assistant tool_call immediately before it.
+    for index, message in enumerate(compacted):
+        if message.role == "tool":
+            previous = compacted[index - 1]
+            call_ids = {call["id"] for call in previous.metadata.get("tool_calls", [])}
+            assert message.metadata["tool_call_id"] in call_ids
+
+
+async def test_mid_conversation_wrapup_survives_reactive_compact() -> None:
+    # P1-5 regression: a deadline wrapup injected mid-conversation (system role, not
+    # pinned) must not break compaction — it is zoned as ephemeral rather than being
+    # treated as part of the preserved prefix.
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=1000, collapsed_keep_recent=4))
+    messages = _wrapup_history()
+
+    compacted, events = await pipeline.reactive_compact(messages)
+
+    assert any(event.stage == "context_collapse" for event in events)
+    _assert_wrapup_zoned_and_pairable(compacted, messages)
+
+
+async def test_mid_conversation_wrapup_survives_auto_compact() -> None:
+    # Same shape through the gated proactive path: the estimator is forced over the
+    # line so the stages run; the wrapup must zone identically and nothing may raise.
+    pipeline = CompressionPipeline(_gate_config(max_message_chars=1000))
+    messages = _wrapup_history()
+
+    compacted, _events = await pipeline.auto_compact(
+        messages, model="claude-haiku", token_estimator=lambda _messages: 10_000
+    )
+
+    assert compacted is not messages
+    _assert_wrapup_zoned_and_pairable(compacted, messages)
 
 
 async def test_track_b_collapse_output_is_stable() -> None:

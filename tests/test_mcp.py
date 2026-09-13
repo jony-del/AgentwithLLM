@@ -416,6 +416,26 @@ class _StubSession:
                 raise
         return _Result([_Block(text="ok")])
 
+    async def list_resources(self):
+        self.calls += 1
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return SimpleNamespace(resources=[])
+
+    async def read_resource(self, uri):
+        self.calls += 1
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return SimpleNamespace(contents=[])
+
     async def send_ping(self):
         self.pings += 1
         if self.ping_error is not None:
@@ -554,6 +574,60 @@ async def test_tool_run_is_interrupted_by_scope_cancellation(tmp_path: Path) -> 
             scope.cancellation.cancel("test stop")
             # The wait thread polls the token at a short interval, so the run task
             # finishes well inside this bound instead of after the 60s default.
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, timeout=5)
+        assert session.cancelled.wait(2)  # future.cancel() reached the hung coroutine
+        assert "s" in manager._suspect
+    finally:
+        manager.close()
+
+
+async def test_list_resources_wait_is_interrupted_by_should_cancel() -> None:
+    manager = _started_manager()
+    try:
+        session = _StubSession(hang=True)
+        manager._sessions["s"] = session
+        stop = threading.Event()
+        outcome: list[str] = []
+
+        def caller() -> None:
+            try:
+                manager.list_resources("s", timeout=30, should_cancel=stop.is_set)
+            except BaseException as exc:  # released by should_cancel, not the 30s timeout
+                outcome.append(type(exc).__name__)
+
+        worker = threading.Thread(target=caller, daemon=True)
+        worker.start()
+        time.sleep(0.3)  # let the caller park on the future
+        started = time.monotonic()
+        stop.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()  # the polling wait woke well before the timeout
+        assert time.monotonic() - started < 5
+        assert outcome == ["CancelledError"]
+        assert session.cancelled.wait(2)  # future.cancel() reached the hung coroutine
+        assert "s" in manager._suspect
+    finally:
+        manager.close()
+
+
+async def test_resource_tool_run_is_interrupted_by_scope_cancellation(tmp_path: Path) -> None:
+    from agent_core.execution import ExecutionScope, execution_scope_context
+    from agent_core.session import SessionContext
+    from agent_core.tools.local import ListMCPResourcesTool
+
+    manager = _started_manager()
+    try:
+        session = _StubSession(hang=True)
+        manager._sessions["s"] = session
+        context = SessionContext(workspace=tmp_path)
+        context.mcp_manager = manager
+        tool = ListMCPResourcesTool(context)
+        scope = ExecutionScope.for_workspace(tmp_path)
+        with execution_scope_context(scope):
+            run = asyncio.ensure_future(tool.run({"server": "s"}))
+            await asyncio.sleep(0.3)  # let the worker thread park on the wait
+            scope.cancellation.cancel("test stop")
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(run, timeout=5)
         assert session.cancelled.wait(2)  # future.cancel() reached the hung coroutine

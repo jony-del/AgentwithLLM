@@ -39,6 +39,17 @@ def coerce_int(value: object) -> int:
     raise TypeError(f"expected an integer-compatible value, got {type(value).__name__}")
 
 
+def write_text_exact(path: Path, text: str) -> None:
+    """Write text with LF endings on every platform.
+
+    ``Path.write_text`` defaults to ``newline=None``, which translates every ``\\n``
+    to ``os.linesep`` — on Windows the model's LF-only content silently becomes
+    CRLF, so the file on disk no longer matches what the model believes it wrote.
+    """
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceLock:
     """A logical resource a tool call reads or writes.

@@ -201,3 +201,56 @@ async def test_apply_patch_deletes_file(tmp_path: Path) -> None:
 def test_canonical_patch_parser_rejects_ambiguous_targets(patch: str) -> None:
     with pytest.raises(PatchError):
         parse_unified_diff(patch)
+
+
+# --- byte-exact line endings (P2-13) -------------------------------------------
+# Windows ``Path.write_text`` defaults to ``newline=None`` and would translate the
+# model's LF-only content to CRLF; every editing tool must write bytes verbatim.
+
+
+async def test_write_text_file_keeps_lf_endings(tmp_path: Path) -> None:
+    from agent_core.tools.builtin import WriteTextFileTool
+
+    target = tmp_path / "lf.txt"
+    result = await WriteTextFileTool(tmp_path).run(
+        {"path": "lf.txt", "content": "one\ntwo\nthree\n"}
+    )
+    assert result.ok, result.content
+    assert target.read_bytes() == b"one\ntwo\nthree\n"
+
+
+async def test_edit_file_keeps_lf_endings(tmp_path: Path) -> None:
+    from agent_core.tools.builtin import EditFileTool
+
+    target = tmp_path / "lf.txt"
+    target.write_bytes(b"one\ntwo\n")
+    result = await EditFileTool(tmp_path).run(
+        {"path": "lf.txt", "old_string": "two", "new_string": "2\n2b"}
+    )
+    assert result.ok, result.content
+    assert target.read_bytes() == b"one\n2\n2b\n"
+
+
+async def test_multi_edit_keeps_lf_endings(tmp_path: Path) -> None:
+    target = tmp_path / "lf.txt"
+    target.write_bytes(b"alpha\nbeta\n")
+    result = await MultiEditTool(tmp_path).run(
+        {"path": "lf.txt", "edits": [{"old_string": "alpha", "new_string": "a1\na2"}]}
+    )
+    assert result.ok, result.content
+    assert target.read_bytes() == b"a1\na2\nbeta\n"
+
+
+async def test_apply_patch_keeps_lf_endings(tmp_path: Path) -> None:
+    target = tmp_path / "lf.txt"
+    target.write_bytes(b"line\n")
+    patch = (
+        "--- a/lf.txt\n"
+        "+++ b/lf.txt\n"
+        "@@ -1,1 +1,2 @@\n"
+        " line\n"
+        "+line two\n"
+    )
+    result = await ApplyPatchTool(tmp_path).run({"patch": patch})
+    assert result.ok, result.content
+    assert target.read_bytes() == b"line\nline two\n"

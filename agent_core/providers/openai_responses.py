@@ -39,17 +39,11 @@ from agent_core.providers.openai_capabilities import (
     reasoning_effort_for_model,
 )
 from agent_core.providers.openai_errors import format_openai_error, parse_openai_error
+from agent_core.providers.errors import is_context_overflow
 from agent_core.execution import ExecutionScope
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _MAX_RETRY_AFTER = 30.0
-_CONTEXT_OVERFLOW_MARKERS = (
-    "context_length_exceeded",
-    "maximum context length",
-    "context window",
-    "too many tokens",
-    "prompt is too long",
-)
 _REPLAY_OUTPUT_TYPES = {"message", "function_call", "reasoning", "output_text"}
 
 
@@ -692,8 +686,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
     @staticmethod
     def _http_error(code: int, text: str, *, model: str | None = None) -> Exception:
-        lowered = text.lower()
-        if code == 400 and any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS):
+        if is_context_overflow(code, text):
             return LLMContextTooLongError(f"OpenAI Responses context overflow: {text[:300]}")
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"OpenAI Responses API error {code} after retries: {text[:300]}")

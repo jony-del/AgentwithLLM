@@ -187,6 +187,9 @@ def _apply_repo_trust(config_path: Path, raw: dict[str, Any]) -> dict[str, Any]:
             "repo-config trust policy failed (%s: %s); stripping widening keys",
             type(exc).__name__, exc,
         )
+        trust.note_repo_trust_decision(
+            project, "stripped_policy_error", trust.widening_subset(raw)
+        )
         effective = trust.strip_widening(raw)
     _TRUST_CACHE[key] = effective
     return copy.deepcopy(effective)

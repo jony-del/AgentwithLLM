@@ -41,6 +41,7 @@ from agent_core.tools.base import (
     Tool,
     WorkspacePathMixin,
     coerce_int,
+    write_text_exact,
 )
 from agent_core.tools.catalog import builtin_tool
 
@@ -217,7 +218,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
             updated, replaced = _apply_exact_edit(text, old_string, new_string, replace_all)
         except ExactEditError as exc:
             return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": exc.error_type, **exc.metadata})
-        path.write_text(updated, encoding="utf-8")
+        write_text_exact(path, updated)
         rel = str(arguments.get("path", ""))
         return ToolResult(
             self.name,
@@ -769,7 +770,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
         before = path.read_text(encoding="utf-8") if path.exists() else ""
         path.parent.mkdir(parents=True, exist_ok=True)
         content = str(arguments.get("content", ""))
-        path.write_text(content, encoding="utf-8")
+        write_text_exact(path, content)
         rel = str(arguments.get("path", ""))
         verb = "Created" if before == "" else "Wrote"
         return ToolResult(

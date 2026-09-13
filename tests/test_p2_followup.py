@@ -1264,3 +1264,74 @@ def test_terminal_journal_retention_deletes_only_verified_terminal(tmp_path: Pat
     assert not terminal.path.exists()
     assert corrupt.exists()
     assert unfinished.path.exists()
+
+
+async def test_fire_session_end_prunes_stale_terminal_journals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARIS_HOME", str(tmp_path / "polaris-home"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    session_id = "sess-retention"
+    # A terminal journal from a previous run of the SAME session, past retention.
+    old_storage = JournalStorage.user_state(workspace, session_id, "run-old")
+    stale = TurnExecutionJournal(old_storage)
+    stale.record("discovered")
+    stale.close()
+    old = time.time() - 10 * 86_400
+    os.utime(stale.path, (old, old))
+
+    agent = ReActAgent(
+        _Provider("done"),
+        ReActConfig(
+            run_dir=str(tmp_path / "runs"), session_dir="",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False, git_context=False,
+            session_retention=SessionRetentionConfig(terminal_journal_days=7),
+        ),
+        workspace=workspace, session_id=session_id,
+    )
+    try:
+        await agent.run("hello")
+        assert stale.path.exists(), "running a turn must not prune journals"
+        await agent.fire_session_end("chat_exit")
+        assert not stale.path.exists(), "session end must prune stale terminal journals"
+        events = [
+            json.loads(line)
+            for line in agent.logger.path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(item["event"] == "journal_retention" for item in events)
+    finally:
+        agent.logger.close()
+
+
+async def test_fire_session_end_skips_journal_retention_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POLARIS_HOME", str(tmp_path / "polaris-home"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    session_id = "sess-retention-off"
+    old_storage = JournalStorage.user_state(workspace, session_id, "run-old")
+    stale = TurnExecutionJournal(old_storage)
+    stale.record("discovered")
+    stale.close()
+    old = time.time() - 10 * 86_400
+    os.utime(stale.path, (old, old))
+
+    agent = ReActAgent(
+        _Provider("done"),
+        ReActConfig(
+            run_dir=str(tmp_path / "runs"), session_dir="",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False, git_context=False,
+            session_retention=SessionRetentionConfig(enabled=False),
+        ),
+        workspace=workspace, session_id=session_id,
+    )
+    try:
+        await agent.run("hello")
+        await agent.fire_session_end("chat_exit")
+        assert stale.path.exists(), "disabled retention must not prune"
+    finally:
+        agent.logger.close()

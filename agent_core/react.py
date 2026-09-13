@@ -479,6 +479,20 @@ class ReActAgent:
         self.registry.rebind_workspace(str(self._initial_workspace))
         self.registry.set_policy_overrides(self.config.tools.execution_policies, trusted=True)
         self.logger = logger or JSONLRunLogger(self.config.run_dir)
+        # D2 audit: repo-config widening stripped at config-load time (before any
+        # logger existed) is reported here as structured run-log events, once per
+        # process; key names only — values may contain credentials.
+        from agent_core import trust as _trust
+
+        for _decision in _trust.take_repo_trust_decisions():
+            self.logger.write_nowait(
+                "repo_trust",
+                {
+                    "project": _decision.project,
+                    "action": _decision.action,
+                    "dropped": list(_decision.dropped),
+                },
+            )
         # Resumable session transcript (distinct from the event logger above). An injected
         # store wins; otherwise build one from config unless ``session_dir`` is disabled
         # (empty). ``parent_uuid`` chaining is tracked across appends by ``_emit``.
@@ -2827,6 +2841,7 @@ class ReActAgent:
         if not self._session_start_fired:
             return
         self._session_start_fired = False
+        await self._prune_terminal_journals()
         scope = self._active_scope
         standalone_scope: ExecutionScope | None = None
         if scope is None:
@@ -2854,6 +2869,33 @@ class ReActAgent:
         finally:
             if standalone_scope is not None:
                 await standalone_scope.close()
+
+    async def _prune_terminal_journals(self) -> None:
+        """Opportunistic terminal-journal retention at the host-owned session boundary.
+
+        Startup recovery must never prune (a pending journal is the recovery input,
+        see test_recovery_containment); session end is the first safe point. The
+        scan is throttled by ``scan_interval_seconds`` and bounded by the retention
+        lock, and always fails open — retention must not break session teardown.
+        """
+        retention = self.config.session_retention
+        if not retention.enabled:
+            return
+        storage = self.executor.journal_storage
+        try:
+            report = await asyncio.to_thread(
+                TurnExecutionJournal.prune_terminal,
+                storage,
+                retention_days=retention.terminal_journal_days,
+                max_per_session=retention.max_terminal_journals_per_session,
+                scan_interval_seconds=retention.scan_interval_seconds,
+            )
+            if report.get("deleted") or report.get("errors"):
+                self.logger.write_nowait("journal_retention", dict(report))
+        except Exception as exc:  # noqa: BLE001 - retention must fail open
+            self.logger.write_nowait(
+                "journal_retention", {"status": "failed", "error": type(exc).__name__}
+            )
 
     def _scheduler_store(self) -> SchedulerStore | None:
         if not self.config.tools.scheduler.enabled:

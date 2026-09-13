@@ -197,6 +197,7 @@ def test_tofu_store_roundtrip(tmp_path: Path) -> None:
 
 
 def test_unattended_drops_widening_with_audit(tmp_path: Path, caplog) -> None:
+    trust.take_repo_trust_decisions()  # isolate the decision sink from earlier tests
     raw = load_agent_toml(_write_repo(tmp_path) / "agent.toml")
     with caplog.at_level(logging.WARNING, logger="agent_core.trust"):
         effective = trust.apply_repo_trust_policy(
@@ -204,6 +205,48 @@ def test_unattended_drops_widening_with_audit(tmp_path: Path, caplog) -> None:
         )
     assert "allow" not in effective["permissions"]
     assert any("dropping untrusted" in record.message for record in caplog.records)
+    # The strip is also recorded as a structured decision (drained by the first agent).
+    decisions = trust.take_repo_trust_decisions()
+    assert len(decisions) == 1
+    assert decisions[0].action == "stripped_unattended"
+    assert decisions[0].project == str(tmp_path)
+
+
+def test_strip_decisions_drain_into_agent_run_log(tmp_path: Path) -> None:
+    from agent_core.memory.config import MemoryConfig
+    from agent_core.providers.fake import FakeProvider
+    from agent_core.react import ReActAgent, ReActConfig
+
+    trust.take_repo_trust_decisions()  # isolate the decision sink from earlier tests
+    secret_value = "sk-must-not-appear"
+    raw = {"permission": "bypass", "provider": "openai-compat"}
+    effective = trust.apply_repo_trust_policy(
+        raw, project=tmp_path, store=trust.TrustStore(tmp_path / "t.json"), interactive=False
+    )
+    assert effective == {}
+
+    agent = ReActAgent(
+        FakeProvider(),
+        ReActConfig(
+            run_dir=str(tmp_path / "runs"), session_dir="",
+            memory=MemoryConfig(enabled=False),
+            project_instructions=False, git_context=False,
+        ),
+    )
+    try:
+        events = [
+            json.loads(line)
+            for line in agent.logger.path.read_text(encoding="utf-8").splitlines()
+        ]
+        repo_trust = [item for item in events if item["event"] == "repo_trust"]
+        assert len(repo_trust) == 1
+        assert repo_trust[0]["action"] == "stripped_unattended"
+        assert sorted(repo_trust[0]["dropped"]) == ["permission", "provider"]
+        assert repo_trust[0]["project"] == str(tmp_path)
+        assert secret_value not in json.dumps(repo_trust)  # key names only, never values
+        assert trust.take_repo_trust_decisions() == []  # drained exactly once
+    finally:
+        agent.logger.close()
 
 
 def test_interactive_approval_records_and_keeps(tmp_path: Path) -> None:

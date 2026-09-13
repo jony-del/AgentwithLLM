@@ -332,7 +332,13 @@ class MCPClientManager:
             message=f"MCP tool call timed out after {bounded:.3f}s",
         )
 
-    def list_resources(self, server: str | None = None, timeout: float | None = None) -> list[dict[str, Any]]:
+    def list_resources(
+        self,
+        server: str | None = None,
+        timeout: float | None = None,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         if self._loop is None or self._closed:
             raise RuntimeError("MCP manager is not running")
         if server is not None:
@@ -362,10 +368,18 @@ class MCPClientManager:
             future,
             bounded,
             suspect=server,
+            should_cancel=should_cancel,
             message=f"MCP resource listing timed out after {bounded:.3f}s",
         )
 
-    def read_resource(self, server: str, uri: str, timeout: float | None = None) -> Any:
+    def read_resource(
+        self,
+        server: str,
+        uri: str,
+        timeout: float | None = None,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> Any:
         if self._loop is None or self._closed:
             raise RuntimeError("MCP manager is not running")
         if server not in self._sessions:
@@ -378,6 +392,7 @@ class MCPClientManager:
             future,
             bounded,
             suspect=server,
+            should_cancel=should_cancel,
             message=f"MCP resource read timed out after {bounded:.3f}s",
         )
 

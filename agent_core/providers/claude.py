@@ -29,6 +29,7 @@ from agent_core.providers.base import (
     notify_streamed_tool_call,
     provider_attempt,
 )
+from agent_core.providers.errors import is_context_overflow
 from agent_core.execution import ExecutionScope
 
 # HTTP statuses worth retrying: request timeout / lock conflict, rate limiting, and
@@ -446,8 +447,7 @@ class ClaudeProvider(LLMProvider):
         body["thinking"] = {"type": "adaptive", "display": "summarized"}
 
     def _http_error(self, code: int, text: str) -> Exception:
-        lowered = text.lower()
-        if code == 400 and ("context" in lowered or "token" in lowered):
+        if is_context_overflow(code, text):
             return LLMContextTooLongError(text)
         if code in _RETRYABLE_STATUS:
             return LLMTransientError(f"Claude API error {code} after retries: {text}")
