@@ -7,12 +7,13 @@ import json
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
 from agent_core.sandbox import SandboxConfig, SandboxManager
-from agent_core.sandbox.config import SandboxContainerConfig
+from agent_core.sandbox.config import validate_container_image
 
 _RUNTIME_DISTRIBUTIONS = (
     "agent-with-llm",
@@ -77,6 +78,8 @@ def collect_dependency_checks(
     *,
     bash_executable: str | None = None,
     powershell_executable: str | None = None,
+    sandbox_config: SandboxConfig | None = None,
+    workspace: Path | None = None,
 ) -> list[HealthCheck]:
     if profile not in {"runtime", "dev"}:
         raise ValueError(f"unknown health profile: {profile}")
@@ -130,29 +133,40 @@ def collect_dependency_checks(
             detail=str(scheduler_receipt) if scheduler_ok else "current-user service is not installed",
         )
     )
-    runtime = _usable_container_runtime()
+    config = deepcopy(sandbox_config) if sandbox_config is not None else SandboxConfig.from_dict(
+        {"enabled": True, "backend": "container"}
+    )
+    validation_error = ""
+    try:
+        validate_container_image(config.container)
+    except ValueError as exc:
+        validation_error = str(exc)
+    config.container.auto_start_machine = False
+    config.container.auto_pull = False
+    requested = config.container.runtime
+    runtime = (
+        _usable_container_runtime() if requested == "auto"
+        else requested if shutil.which(requested) and _probe([requested, "info"]) else None
+    )
     checks.append(
         HealthCheck(
             name="container-runtime",
             required=True,
             status="ok" if runtime else "error",
             version=_command_version(runtime) if runtime else "",
-            detail=runtime or "no usable podman/docker/nerdctl runtime",
+            detail=runtime or f"no usable container runtime (requested={requested})",
         )
     )
-    image = SandboxContainerConfig().image
+    image = config.container.image
     canary_ok = False
     canary_detail = f"{image} cannot be probed without a usable runtime"
-    if runtime:
-        config = SandboxConfig.from_dict(
-            {
-                "enabled": True,
-                "backend": "container",
-                "container": {"runtime": runtime, "image": image},
-            }
-        )
+    if validation_error:
+        canary_detail = validation_error
+    elif runtime:
+        config.container.runtime = runtime
+        manager = None
         try:
-            manager = SandboxManager(config, workspace=Path.cwd())
+            manager = SandboxManager(config, workspace=workspace or Path.cwd())
             manager.prepare()
         except RuntimeError as exc:
             canary_detail = str(exc)
@@ -169,6 +183,9 @@ def collect_dependency_checks(
                 if manifest is not None
                 else "guest manifest missing"
             )
+        finally:
+            if manager is not None:
+                manager.teardown()
     checks.append(
         HealthCheck(
             name="sandbox-canary",

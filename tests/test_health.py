@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from copy import deepcopy
+from types import SimpleNamespace
+
+from agent_core.sandbox import SandboxConfig
 
 from agent_core.cli import health_command
 from agent_core.health import HealthCheck, HealthReport, collect_dependency_checks
@@ -155,3 +159,66 @@ def test_cli_health_prefers_configured_bash_over_environment(
     assert health_command(_health_args(config=str(config))) == 0
     capsys.readouterr()
     assert seen["bash_executable"] == "D:/Configured/Git/bash.exe"
+
+
+def test_health_checks_project_image_without_mutating_or_starting(monkeypatch, tmp_path):
+    from agent_core import health
+
+    image = "sha256:" + "a" * 64
+    config = SandboxConfig.from_dict({"enabled": True, "backend": "container", "container": {
+        "runtime": "podman", "image": image, "auto_start_machine": True,
+    }})
+    original = deepcopy(config)
+    seen = []
+    class Manager:
+        requested = prepared = True
+        backend_name = "container"
+        runtime = "podman"
+        capabilities = {"bash", "python"}
+        guest_manifest = SimpleNamespace(guest_os="linux", architecture="amd64")
+        def __init__(self, candidate, workspace):
+            seen.append(candidate)
+            assert workspace == tmp_path
+            assert candidate.container.image == image
+            assert not candidate.container.auto_start_machine and not candidate.container.auto_pull
+            self.image = image
+        def prepare(self):
+            pass
+        def is_enabled(self):
+            return True
+        def teardown(self):
+            pass
+    monkeypatch.setattr(health, "SandboxManager", Manager)
+    monkeypatch.setattr(health, "_RUNTIME_DISTRIBUTIONS", ())
+    monkeypatch.setattr(health, "_HOST_COMMANDS", ())
+    monkeypatch.setattr(health, "_command_version", lambda _: "version")
+    monkeypatch.setattr(health.shutil, "which", lambda name: name)
+    monkeypatch.setattr(health, "_probe", lambda argv: argv == ["podman", "info"])
+    checks = collect_dependency_checks(sandbox_config=config, workspace=tmp_path)
+    canary = next(check for check in checks if check.name == "sandbox-canary")
+    assert canary.ok and image in canary.detail and "runtime=podman" in canary.detail
+    assert seen and config == original
+    config.container.auto_pull = True
+    seen.clear()
+    checks = collect_dependency_checks(sandbox_config=config, workspace=tmp_path)
+    assert not next(check for check in checks if check.name == "sandbox-canary").ok
+    assert not seen
+
+
+def test_cli_health_receives_resolved_local_image(monkeypatch, tmp_path, capsys):
+    image = "sha256:" + "b" * 64
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.toml").write_text('[sandbox.container]\nruntime="docker"\n', encoding="utf-8")
+    (tmp_path / "agent.local.toml").write_text(
+        f'[sandbox.container]\nruntime="podman"\nimage="{image}"\nauto_start_machine=true\n',
+        encoding="utf-8",
+    )
+    seen = []
+    def collect(profile, **overrides):
+        seen.append(overrides["sandbox_config"])
+        return []
+    monkeypatch.setattr("agent_core.health.collect_dependency_checks", collect)
+    assert health_command(_health_args()) == 0
+    capsys.readouterr()
+    assert seen[0].container.image == image and seen[0].container.runtime == "podman"
+    assert seen[0].container.auto_start_machine

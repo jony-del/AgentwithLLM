@@ -175,6 +175,8 @@ TRUST_MATRIX: tuple[TrustRule, ...] = (
     TrustRule(("sandbox", "container", "image"), "sandbox.container.image", _present),
     TrustRule(("sandbox", "container", "oci_runtime"), "sandbox.container.oci_runtime", _present),
     TrustRule(("sandbox", "container", "auto_pull"), "sandbox.container.auto_pull", _truthy),
+    TrustRule(("sandbox", "container", "auto_start_machine"), "sandbox.container.auto_start_machine", _truthy),
+    TrustRule(("sandbox", "container", "podman_machine_name"), "sandbox.container.podman_machine_name", _present),
     TrustRule(
         ("sandbox", "container", "read_only_rootfs"),
         "sandbox.container.read_only_rootfs",
@@ -247,7 +249,7 @@ _PROTECTED_KEYS: dict[tuple[str, ...], frozenset[str]] = {
         {
             "runtime", "image", "auto_pull", "oci_runtime", "read_only_rootfs",
             "drop_all_capabilities", "no_new_privileges", "memory", "cpus",
-            "pids_limit", "windows_isolation",
+            "pids_limit", "windows_isolation", "auto_start_machine", "podman_machine_name",
         }
     ),
     ("sandbox", "vm"): frozenset(

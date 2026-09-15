@@ -14,6 +14,7 @@ _GUEST_COMMAND_ALIASES = {
     "powershell": "pwsh",
     "python": "python",
     "python3": "python",
+    "mcp-python": "mcp-python",
     "node": "node",
     "npm": "npm",
     "npx": "npx",
@@ -71,8 +72,8 @@ def sandbox_runtime_environment() -> dict[str, str]:
     """Host environment needed by an OCI client, never forwarded into its guest."""
 
     names = (
-        "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME",
-        "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINERS_CONF",
+        "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINER_CONNECTION", "CONTAINERS_CONF",
         "CONTAINERS_STORAGE_CONF", "DOCKER_HOST", "DOCKER_CONTEXT",
     )
     return {name: value for name in names if (value := os.environ.get(name)) is not None}

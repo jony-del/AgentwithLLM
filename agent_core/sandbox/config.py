@@ -16,6 +16,11 @@ from typing import Any
 
 
 _DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-fA-F]{64}$")
+_LOCAL_IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def is_local_image_id(image: str) -> bool:
+    return _LOCAL_IMAGE_ID.fullmatch(image) is not None
 
 
 def locked_sandbox_image() -> str:
@@ -31,14 +36,25 @@ def locked_sandbox_image() -> str:
     return image
 
 
-def validate_image_reference(image: str) -> str:
+def validate_image_reference(image: str, *, allow_local: bool = False) -> str:
     """Require an OCI reference pinned to one complete SHA-256 digest."""
 
+    if allow_local and is_local_image_id(image):
+        return image
     if not _DIGEST_IMAGE.fullmatch(image.strip()):
         raise ValueError(
             "sandbox container image must be immutable and include @sha256:<64 hex digest>"
         )
     return image.strip()
+
+
+def validate_container_image(config: SandboxContainerConfig) -> str:
+    """Local IDs are usable only with an explicitly selected, offline Podman."""
+    if is_local_image_id(config.image):
+        runtime = config.runtime.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if runtime not in {"podman", "podman.exe"} or config.auto_pull:
+            raise ValueError("local sandbox image IDs require explicit Podman and auto_pull=false")
+    return validate_image_reference(config.image, allow_local=True)
 
 
 @dataclass(slots=True)
@@ -104,6 +120,9 @@ class SandboxContainerConfig:
     image: str = field(default_factory=locked_sandbox_image)
     # Pull the image at startup if it is missing.
     auto_pull: bool = False
+    # Windows only: wake an existing WSL2 machine after checking its connection.
+    auto_start_machine: bool = False
+    podman_machine_name: str = "podman-machine-default"
     # OCI runtime override for VM-grade isolation reused by the container launcher
     # (e.g. "kata-runtime", "runsc"). Empty → the runtime's default (runc/crun).
     oci_runtime: str = ""
@@ -123,11 +142,11 @@ class SandboxContainerConfig:
         if not data:
             return config
         for key in ("runtime", "image", "oci_runtime", "memory", "cpus", "pids_limit",
-                    "windows_isolation"):
+                    "windows_isolation", "podman_machine_name"):
             if key in data:
                 setattr(config, key, str(data[key]))
         for key in ("auto_pull", "read_only_rootfs", "drop_all_capabilities",
-                    "no_new_privileges"):
+                    "no_new_privileges", "auto_start_machine"):
             if key in data:
                 setattr(config, key, _as_bool(data[key]))
         return config

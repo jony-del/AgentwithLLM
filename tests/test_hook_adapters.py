@@ -231,6 +231,23 @@ async def test_command_adapter_exit_2_blocks(tmp_path: Path) -> None:
     assert outcome.block is True
 
 
+@pytest.mark.parametrize("fail_mode,blocked", [("open", False), ("closed", True)])
+async def test_missing_python_script_obeys_failure_policy(tmp_path: Path, fail_mode: str, blocked: bool) -> None:
+    spec = ExternalHookSpec(
+        event="UserPromptSubmit", type="command", command=_command(tmp_path / "missing.py"),
+        timeout=10, fail_mode=fail_mode,
+    )
+    logger = JSONLRunLogger(tmp_path)
+    try:
+        outcome = await CommandHookAdapter(spec, logger).on_user_prompt(
+            HookContext(event=HookEvent.USER_PROMPT_SUBMIT, messages=[], prompt="ordinary task")
+        )
+        assert outcome.block is blocked
+        assert "missing or inaccessible" in logger.path.read_text(encoding="utf-8")
+    finally:
+        logger.close()
+
+
 async def test_command_adapter_timeout_degrades_to_allow(tmp_path: Path) -> None:
     script = tmp_path / "slow.py"
     script.write_text("import time; time.sleep(5)\n", encoding="utf-8")

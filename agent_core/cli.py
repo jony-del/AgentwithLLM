@@ -314,9 +314,17 @@ def _sandbox_mcp_config(mcp_config, sandbox: SandboxManager, workspace=None):
                 )
             guest_roots.append(guest_path_to_uri(sandbox.translate_path(path)))
         scope = ExecutionScope.for_workspace(root, network="deny")
+        command = server.command
+        if (
+            command in {"python", "python3"}
+            and len(server.args) >= 2 and server.args[0] == "-m"
+            and server.args[1] in {"mcp_server_git", "mcp_server_fetch", "mcp_server_time"}
+            and "mcp-python" in sandbox.capabilities
+        ):
+            command = "mcp-python"
         invocation = sandboxed_guest_invocation(
             sandbox,
-            [server.command, *server.args],
+            [command, *server.args],
             mounted_roots=(root,),
             scope=scope,
         )
@@ -1502,9 +1510,11 @@ def health_command(args: argparse.Namespace) -> int:
 
     checks: list[HealthCheck] = []
     tool_suite = None
+    sandbox_config = None
     try:
         resolve_config({}, config_file=_config_file(args))
         tool_suite = resolve_tool_suite_config(_config_file(args))
+        sandbox_config = _sandbox_config(args)
         checks.append(HealthCheck("configuration", True, "ok", detail="loaded successfully"))
     except Exception as e:
         checks.append(HealthCheck("configuration", True, "error", detail=str(e)))
@@ -1634,6 +1644,8 @@ def health_command(args: argparse.Namespace) -> int:
             args.profile,
             bash_executable=bash_executable,
             powershell_executable=powershell_executable,
+            sandbox_config=sandbox_config,
+            workspace=Path.cwd(),
         )
     )
     report = HealthReport(args.profile, tuple(checks))

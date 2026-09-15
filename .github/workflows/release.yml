@@ -85,6 +85,13 @@ jobs:
         run: |
           podman machine stop
           python -m pytest -q tests/test_sandbox_oci_e2e.py::test_stopped_runtime_fails_closed_without_host_execution
+      - name: Opt-in startup restores the stopped machine and passes OCI probes
+        shell: pwsh
+        env:
+          POLARIS_SANDBOX_E2E_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ needs.sandbox-image.outputs.digest }}
+          POLARIS_SANDBOX_E2E_RUNTIME: podman
+          POLARIS_SANDBOX_E2E_AUTO_START: "1"
+        run: python -m pytest -q tests/test_sandbox_oci_e2e.py::test_real_oci_shell_unicode_pytest_node_and_security
       - name: Restore Podman Machine for the runner
         if: always()
         shell: pwsh

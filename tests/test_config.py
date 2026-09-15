@@ -203,6 +203,22 @@ def test_resolve_sandbox_config_backend_tables(tmp_path: Path, monkeypatch) -> N
     assert config.vm.reset_each_task is False
 
 
+def test_podman_autostart_defaults_and_local_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "agent.toml"
+    config_file.write_text('[sandbox.container]\nauto_start_machine = false\n', encoding="utf-8")
+    config = resolve_sandbox_config(config_file)
+    assert config.container.auto_start_machine is False
+    assert config.container.podman_machine_name == "podman-machine-default"
+    (tmp_path / "agent.local.toml").write_text(
+        '[sandbox.container]\nauto_start_machine = true\npodman_machine_name = "my-machine"\n',
+        encoding="utf-8",
+    )
+    config = resolve_sandbox_config(config_file)
+    assert config.container.auto_start_machine is True
+    assert config.container.podman_machine_name == "my-machine"
+
+
 def test_resolve_sandbox_config_backend_env_overrides_and_degrades(tmp_path: Path, monkeypatch) -> None:
     config_file = tmp_path / "agent.toml"
     config_file.write_text('[sandbox]\nbackend = "native"\n', encoding="utf-8")

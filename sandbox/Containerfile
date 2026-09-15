@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Multi-arch index digest for the official Python 3.12 slim-bookworm image.
-FROM docker.io/library/python:3.12-slim-bookworm@sha256:77d09d2d4b67b10199ac27ca3bdf23c4ba8e7951e67cc808a174c65507e9e52c
+FROM docker.io/library/python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 
 ARG TARGETARCH
 ARG NODE_VERSION=v24.14.1
@@ -25,6 +25,7 @@ RUN sed -ri \
 
 # Node and PowerShell are version-pinned and checked against their publishers'
 # release checksum manifests. TARGETARCH is supplied by buildx (amd64/arm64).
+# PowerShell 7.5.7 publishes UTF-16 hashes with binary-mode (*filename) entries.
 RUN set -eux; \
     case "$TARGETARCH" in amd64) node_arch=x64; pwsh_arch=x64 ;; arm64) node_arch=arm64; pwsh_arch=arm64 ;; *) exit 2 ;; esac; \
     node_file="node-${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
@@ -36,7 +37,8 @@ RUN set -eux; \
     pwsh_file="powershell-${POWERSHELL_VERSION}-linux-${pwsh_arch}.tar.gz"; \
     curl -fsSLO "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/${pwsh_file}"; \
     curl -fsSLO "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/hashes.sha256"; \
-    grep -i "  ${pwsh_file}$" hashes.sha256 | sha256sum -c -; \
+    python -c "from pathlib import Path; p=Path('hashes.sha256'); p.write_text(p.read_text(encoding='utf-16'), encoding='utf-8')"; \
+    awk -v file="$pwsh_file" '$2 == file || $2 == "*" file' hashes.sha256 | sha256sum -c -; \
     mkdir -p /opt/microsoft/powershell/7; \
     tar -xzf "$pwsh_file" -C /opt/microsoft/powershell/7; \
     chmod 0755 /opt/microsoft/powershell/7/pwsh; \
@@ -44,10 +46,14 @@ RUN set -eux; \
     rm -f "$pwsh_file" hashes.sha256
 
 COPY . /opt/polaris/src
+RUN python -m venv /opt/polaris/mcp \
+    && /opt/polaris/mcp/bin/python -m pip install -r /opt/polaris/src/sandbox/mcp-servers/requirements.txt \
+    && /opt/polaris/mcp/bin/python -m pip check
 RUN python -m pip install "setuptools==${SETUPTOOLS_VERSION}" \
     && python -m pip install --no-build-isolation \
         --constraint /opt/polaris/src/sandbox/constraints.txt \
         "/opt/polaris/src[all,dev]" \
+    && python -m pip check \
     && npm install --global --omit=dev "pyright@${PYRIGHT_VERSION}" \
     && install -D -m 0755 /opt/polaris/src/sandbox/sandbox_probe.py /opt/polaris/bin/sandbox-probe \
     && install -d -m 0777 /opt/polaris/rootfs-canary \

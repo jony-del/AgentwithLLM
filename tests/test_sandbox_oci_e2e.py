@@ -21,6 +21,7 @@ from agent_core.sandbox import (
     SandboxManager,
     SandboxUnavailableError,
 )
+from agent_core.sandbox.config import is_local_image_id
 from agent_core.tool_config import LSPServerConfig, LSPToolConfig
 from agent_core.tools.base import ExecutionScope
 from agent_core.workflow_runtime import WorkflowRuntime
@@ -40,13 +41,17 @@ def sandbox() -> SandboxManager:
     config = SandboxConfig.from_dict({
         "enabled": True,
         "backend": "container",
-        "container": {"runtime": RUNTIME, "image": IMAGE, "auto_pull": True},
+        "container": {
+            "runtime": RUNTIME, "image": IMAGE, "auto_pull": not is_local_image_id(IMAGE),
+            "auto_start_machine": os.getenv("POLARIS_SANDBOX_E2E_AUTO_START") == "1",
+        },
     })
     manager = SandboxManager(config, workspace=ROOT)
     manager.prepare()
     assert manager.requested and manager.prepared and manager.is_enabled()
     assert manager.backend_name == "container"
-    assert manager.image == IMAGE and re.search(r"@sha256:[0-9a-f]{64}$", manager.image)
+    assert manager.image == IMAGE
+    assert is_local_image_id(IMAGE) or re.search(r"@sha256:[0-9a-f]{64}$", IMAGE)
     yield manager
     manager.teardown()
 
@@ -67,7 +72,7 @@ def _run(
     argv, shell = sandbox.wrap_invocation(invocation)
     assert not shell and isinstance(argv, list)
     rendered = "\n".join(argv)
-    assert not re.search(r"[A-Za-z]:[\\/]", rendered)
+    assert not re.search(r"(?:^|[\s\"'=])[A-Za-z]:[\\/]", rendered)
     assert not re.search(r"\.(?:exe|cmd|bat)(?:$|\s)", rendered, re.IGNORECASE)
     return subprocess.run(
         argv, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=120
@@ -75,6 +80,11 @@ def _run(
 
 
 def test_real_oci_shell_unicode_pytest_node_and_security(sandbox: SandboxManager) -> None:
+    dependencies = _run(sandbox, ["@python", "-m", "pip", "check"], ("python",))
+    assert dependencies.returncode == 0, dependencies.stdout + dependencies.stderr
+    if "mcp-python" in sandbox.capabilities:
+        dependencies = _run(sandbox, ["@mcp-python", "-m", "pip", "check"], ("mcp-python",))
+        assert dependencies.returncode == 0, dependencies.stdout + dependencies.stderr
     bash = _run(sandbox, ["@bash", "-lc", "printf '沙箱-ok\\n'"], ("bash",))
     assert bash.returncode == 0 and bash.stdout == "沙箱-ok\n"
 
@@ -109,6 +119,9 @@ def test_real_oci_shell_unicode_pytest_node_and_security(sandbox: SandboxManager
             [
                 "@python", "-c",
                 "import os,pathlib; assert os.geteuid()!=0; "
+                "status=pathlib.Path('/proc/self/status').read_text(); "
+                "assert 'NoNewPrivs:\\t1' in status; "
+                "assert 'CapEff:\\t0000000000000000' in status; "
                 f"assert not pathlib.Path({guest_canary!r}).exists()",
             ],
             ("python",),
@@ -163,11 +176,16 @@ async def test_real_node_workflow_uses_guest_runtime(sandbox: SandboxManager) ->
     assert result == "工作流-ok"
 
 
-def test_real_guest_mcp_server(sandbox: SandboxManager) -> None:
+@pytest.mark.parametrize("name,args", [
+    ("time", ["-m", "mcp_server_time", "--local-timezone=UTC"]),
+    ("git", ["-m", "mcp_server_git", "--repository", "."]),
+    ("fetch", ["-m", "mcp_server_fetch"]),
+])
+def test_real_guest_mcp_server(sandbox: SandboxManager, name: str, args: list[str]) -> None:
     config = MCPConfig([MCPServerConfig(
-        name="time",
+        name=name,
         command="python",
-        args=["-m", "mcp_server_time", "--local-timezone=UTC"],
+        args=args,
         timeout=60.0,
     )])
     prepared = _sandbox_mcp_config(config, sandbox, ROOT)
@@ -175,9 +193,50 @@ def test_real_guest_mcp_server(sandbox: SandboxManager) -> None:
     try:
         manager.start()
         tools = MCPAdapter(manager).list_tools()
-        assert any("time" in tool.name.casefold() for tool in tools)
+        assert any(name in tool.name.casefold() for tool in tools)
+        if name == "time":
+            result = manager.call_tool(name, "get_current_time", {"timezone": "Asia/Shanghai"})
+            assert not result.is_error and "Asia/Shanghai" in str(result.content)
     finally:
         manager.close()
+
+
+async def test_real_agent_executes_offline_tool_with_fake_provider(sandbox: SandboxManager) -> None:
+    from agent_core.memory import MemoryConfig
+    from agent_core.models import LLMResult, ToolCall
+    from agent_core.providers.fake import FakeProvider
+    from agent_core.react import ReActAgent, ReActConfig
+
+    class OfflineProvider(FakeProvider):
+        def _compute(self, messages):
+            if messages[-1].role == "tool":
+                return super()._compute(messages)
+            return LLMResult(
+                content="Run the offline sandbox canary",
+                tool_calls=[ToolCall("bash", {"command": "uname -s && printf 'polaris-offline-ok'"})],
+                stop_reason="tool_use",
+            )
+
+    temporary = Path(tempfile.mkdtemp(prefix="agent e2e ", dir=ROOT))
+    agent = None
+    try:
+        agent = ReActAgent(
+            OfflineProvider(),
+            ReActConfig(
+                provider="fake", permission="bypass", sandbox=sandbox.config,
+                memory=MemoryConfig(enabled=False), run_dir=str(temporary), session_dir="",
+                project_instructions=False, git_context=False, max_steps=3,
+            ),
+            sandbox=sandbox, workspace=ROOT,
+        )
+        result = await agent.run("Verify the offline sandbox tool")
+        assert "polaris-offline-ok" in result.answer
+        assert "Linux" in result.answer
+        assert sandbox.is_enabled()
+    finally:
+        if agent is not None:
+            agent.logger.close()
+        shutil.rmtree(temporary, ignore_errors=True)
 
 
 @pytest.mark.skipif(

@@ -221,8 +221,8 @@ class WorkflowRuntime:
                 "PATH", "PATHEXT", "SystemRoot", "COMSPEC", "WINDIR", "TMP", "TEMP",
                 # OCI client configuration only; none of these are forwarded into
                 # the Linux guest because the wrapped argv has no --env flags.
-                "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME",
-                "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINERS_CONF",
+                "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR", "CONTAINER_HOST", "CONTAINER_CONNECTION", "CONTAINERS_CONF",
                 "CONTAINERS_STORAGE_CONF", "DOCKER_HOST", "DOCKER_CONTEXT",
             )
             if (value := os.environ.get(key)) is not None

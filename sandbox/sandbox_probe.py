@@ -16,6 +16,7 @@ TOOLS = {
     "bash": "/usr/bin/bash",
     "pwsh": "/usr/local/bin/pwsh",
     "python": "/usr/local/bin/python",
+    "mcp-python": "/opt/polaris/mcp/bin/python",
     "node": "/usr/local/bin/node",
     "npm": "/usr/local/bin/npm",
     "npx": "/usr/local/bin/npx",
@@ -62,6 +63,9 @@ def network_denied() -> int:
 def security() -> int:
     if os.geteuid() == 0:
         return 7
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+    if status.get("NoNewPrivs", "").strip() != "1" or int(status.get("CapEff", "1").strip(), 16):
+        return 9
     # This image directory is owned by the sandbox uid. A write succeeds without
     # ``--read-only`` and fails only when the root filesystem is actually immutable.
     target = Path("/opt/polaris/rootfs-canary/write-test")

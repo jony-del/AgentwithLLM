@@ -143,6 +143,18 @@ def test_strip_widening_keeps_tightening(tmp_path: Path) -> None:
     assert raw["permissions"]["allow"] == ["bash"]
 
 
+def test_podman_autostart_is_trusted_only_and_target_changes_reprompt() -> None:
+    raw = {"sandbox": {"container": {"auto_start_machine": True, "podman_machine_name": "one"}}}
+    subset = trust.widening_subset(raw)
+    assert set(subset) == {"sandbox.container.auto_start_machine", "sandbox.container.podman_machine_name"}
+    assert trust.strip_widening(raw)["sandbox"]["container"] == {}
+    raw["sandbox"]["container"]["podman_machine_name"] = "two"
+    assert trust.fingerprint(subset) != trust.fingerprint(trust.widening_subset(raw))
+    disabled = {"sandbox": {"container": {"auto_start_machine": False}}}
+    assert trust.widening_subset(disabled) == {}
+    assert trust.strip_widening(disabled) == disabled
+
+
 def test_fingerprint_is_stable_and_change_sensitive() -> None:
     a = {"permissions.allow": ["bash"], "hooks.external": [{"event": "Stop"}]}
     b = {"hooks.external": [{"event": "Stop"}], "permissions.allow": ["bash"]}

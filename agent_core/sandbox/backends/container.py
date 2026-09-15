@@ -15,7 +15,8 @@ import sys
 from pathlib import Path, PureWindowsPath
 
 from agent_core.sandbox.backends.base import SandboxBackend, SandboxTier, expand_paths, to_argv
-from agent_core.sandbox.config import SandboxConfig, validate_image_reference
+from agent_core.sandbox.backends.podman_machine import PodmanUnavailable, ensure_podman_ready
+from agent_core.sandbox.config import SandboxConfig, is_local_image_id, validate_container_image
 from agent_core.sandbox.invocation import (
     GuestCapabilityUnavailable,
     GuestRuntimeManifest,
@@ -78,7 +79,7 @@ class ContainerBackend(SandboxBackend):
 
         cfg = self._container
         try:
-            validate_image_reference(cfg.image)
+            validate_container_image(cfg)
             _validate_container_policy(self._config)
             guest_workspace = self.translate_path(self._workspace)
         except (ValueError, GuestCapabilityUnavailable) as exc:
@@ -95,15 +96,27 @@ class ContainerBackend(SandboxBackend):
 
         failures: list[str] = []
         for runtime in candidates:
-            if not _runtime_ready(runtime):
-                hint = ""
-                if runtime == "podman" and sys.platform == "win32":
-                    hint = " (Podman Machine is stopped; run 'podman machine start')"
-                failures.append(f"{runtime}: runtime unavailable{hint}")
+            if sys.platform == "win32" and Path(runtime).name.casefold() in {"podman", "podman.exe"}:
+                try:
+                    ensure_podman_ready(runtime, cfg)
+                except PodmanUnavailable as exc:
+                    failures.append(f"{runtime}: runtime unavailable ({exc})")
+                    continue
+            elif not _runtime_ready(runtime):
+                failures.append(f"{runtime}: runtime unavailable")
                 continue
             if not _image_exists(runtime, cfg.image):
+                if is_local_image_id(cfg.image):
+                    failures.append(
+                        f"{runtime}: local image ID is missing or mismatched: {cfg.image}; "
+                        "rebuild with 'python tools/build_sandbox.py'"
+                    )
+                    continue
                 if not cfg.auto_pull or not _pull_image(runtime, cfg.image):
-                    failures.append(f"{runtime}: immutable image is not present")
+                    failures.append(
+                        f"{runtime}: immutable image is not present: {cfg.image}; "
+                        f"prepare it with '{runtime} pull {cfg.image}' and verify registry access"
+                    )
                     continue
             try:
                 manifest = _probe_manifest(runtime, cfg)
@@ -183,6 +196,7 @@ class ContainerBackend(SandboxBackend):
 
 def _validate_container_policy(config: SandboxConfig) -> None:
     cfg = config.container
+    validate_container_image(cfg)
     if cfg.windows_isolation.casefold() != "wsl2":
         raise GuestCapabilityUnavailable(
             "guest_capability_unavailable: container backend only supports WSL2/Linux; "
@@ -215,6 +229,12 @@ def _runtime_ready(runtime: str) -> bool:
 
 
 def _image_exists(runtime: str, image: str) -> bool:
+    if is_local_image_id(image):
+        proc = _run_capture([runtime, "image", "inspect", "--format", "{{.Id}}", image])
+        if proc is None or proc.returncode:
+            return False
+        actual = (proc.stdout or b"").decode("ascii", errors="replace").strip()
+        return actual.removeprefix("sha256:") == image.removeprefix("sha256:")
     return _run_probe([runtime, "image", "inspect", image])
 
 
@@ -258,12 +278,14 @@ def _probe_run_prefix(runtime: str, cfg) -> list[str]:
 def _hardened_run_prefix(runtime: str, cfg) -> list[str]:
     user, keep_id = _container_identity(runtime)
     prefix = [
-        runtime, "run", "--rm", "--init", "--network", "none",
+        runtime, "run", "--rm", "--init", "--interactive", "--network", "none",
         "--user", user,
         "--env", "HOME=/tmp/polaris-home",
         "--env", "XDG_CACHE_HOME=/tmp/polaris-cache",
         "--env", "TMPDIR=/tmp",
     ]
+    if is_local_image_id(cfg.image):
+        prefix += ["--pull=never"]
     if keep_id:
         prefix += ["--userns", "keep-id"]
     if cfg.read_only_rootfs:

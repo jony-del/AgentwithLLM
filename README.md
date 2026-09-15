@@ -122,6 +122,12 @@ polaris run "Say hello without tools" --provider fake
 配置中设置 `[sandbox] enabled = true`。Windows Guest 协议、路径映射、fail-closed 状态和安全
 边界见 [WSL2 OCI sandbox](docs/sandbox-wsl2.md)。
 
+Windows 上激活 `.venv` 不会启动 Podman Machine。需要随 Polaris 按需唤醒已有 WSL2
+虚拟机时，在 `agent.local.toml` 的 `[sandbox.container]` 中设置
+`auto_start_machine = true`，并通过 `podman_machine_name` 指定机器（默认
+`podman-machine-default`）。启动最多等待 120 秒；不会自动初始化虚拟机或修改默认连接。
+镜像仍需由安装器或一次性拉取准备，`polaris health` 只检查，不自动启动虚拟机。
+
 ## 卸载
 
 正常卸载会删除 Polaris CLI、`uv tool` 的独立 Python 环境及安装器创建的私有 runtime；不会删除

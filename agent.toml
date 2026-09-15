@@ -555,7 +555,9 @@ allow_local_binding = false
 runtime = "auto"                       # "auto" probes podman → docker → nerdctl; or pin one
 # Default image comes from sandbox-image.lock.json and is pinned by an OCI index digest.
 # image = "ghcr.io/acme/polaris-sandbox@sha256:<64-hex>" # trusted derived image only
-auto_pull = false                     # ordinary startup never pulls or starts Podman Machine
+auto_pull = false                     # pull the pinned image only when explicitly enabled
+auto_start_machine = false            # Windows: opt in to waking an existing WSL2 Podman Machine
+# podman_machine_name = "podman-machine-default" # must match the active Podman connection
 oci_runtime = ""                       # OCI runtime override, e.g. "runsc" (gVisor) / "kata-runtime"
 read_only_rootfs = true                # mount rootfs read-only (+ tmpfs /tmp)
 drop_all_capabilities = true           # --cap-drop ALL

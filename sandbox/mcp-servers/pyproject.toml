@@ -1,0 +1,15 @@
+[project]
+name = "polaris-reference-mcp-servers"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+# These reference servers still use the SDK 1.x server API. The main Polaris
+# environment keeps SDK 2.x from the root uv.lock; stdio is the process boundary.
+dependencies = [
+    "mcp==1.28.1",
+    "mcp-server-git==2026.7.10",
+    "mcp-server-fetch==2026.7.10",
+    "mcp-server-time==2026.7.10",
+]
+
+[tool.uv]
+package = false

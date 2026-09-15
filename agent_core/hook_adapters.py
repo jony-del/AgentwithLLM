@@ -30,7 +30,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import re
+import shlex
 import subprocess
 import urllib.request
 from collections.abc import Awaitable, Callable
@@ -571,6 +573,25 @@ class CommandHookAdapter(_ExternalHookAdapter):
     async def _invoke(self, ctx: HookContext) -> HookOutcome:
         if not self.spec.command and not self.spec.command_argv:
             return HookOutcome()
+        # CPython also exits 2 when it cannot open a script. That is a launch
+        # failure (governed by fail_mode), not a decision made by the hook.
+        # Restrict preflight to a direct Python script invocation; shell compound
+        # commands, -c and -m retain their existing execution/decision semantics.
+        if self.spec.command:
+            try:
+                direct = shlex.split(self.spec.command, posix=os.name != "nt")
+            except ValueError:
+                direct = []
+            if len(direct) != 2:
+                direct = []
+        else:
+            direct = list(self.spec.command_argv or ())
+        if len(direct) >= 2:
+            executable = direct[0].strip('"').replace("\\", "/").rsplit("/", 1)[-1]
+            script = direct[1].strip('"')
+            if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)?)?(?:\.exe)?", executable, re.I) and script.endswith(".py"):
+                if not Path(script).is_file():
+                    raise HookFailedError(f"Python hook script is missing or inaccessible: {script}")
         payload = json.dumps(project_hook_input(ctx, limits=self.limits)).encode("utf-8")
         process_options: dict[str, Any] = {}
         if os.name == "nt":
