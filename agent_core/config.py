@@ -480,6 +480,11 @@ def resolve_compression_config(config_file: str | Path = "agent.toml") -> "Compr
     )
     config.summary_output_max_chars = max(256, int(config.summary_output_max_chars))
     config.track_b_max_chars = max(256, int(config.track_b_max_chars))
+    config.microcompact_keep_recent_tool_results = max(0, int(config.microcompact_keep_recent_tool_results))
+    config.microcompact_idle_keep_recent = max(1, int(config.microcompact_idle_keep_recent))
+    if config.microcompact_idle_gap_minutes is not None:
+        config.microcompact_idle_gap_minutes = max(0.0, float(config.microcompact_idle_gap_minutes))
+    config.tool_results_total_max_chars = max(0, int(config.tool_results_total_max_chars))
 
     disable = os.getenv("AGENT_DISABLE_LLM_SUMMARY")
     if disable is not None and coerce_to_type(bool, disable):

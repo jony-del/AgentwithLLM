@@ -412,18 +412,29 @@ async def test_pre_and_post_compact_fire_on_fold(tmp_path: Path) -> None:
 
 
 async def test_post_compact_summary_with_version_bumped_tail(tmp_path: Path) -> None:
-    """A microcompacted recent message keeps its uuid with a bumped version; the
-    PostCompact seam must still identify the folded summary (shared (uuid, version)
-    diff semantics with the transcript boundary commit)."""
+    """A recent message rewritten by the cheap hygiene stages keeps its uuid with a
+    bumped version; the PostCompact seam must still identify the folded summary
+    (shared (uuid, version) diff semantics with the transcript boundary commit)."""
     hook = RecordingCompactHook()
     agent = ReActAgent(
         FakeProvider(), _force_compact_config(tmp_path),
         hooks=HookPipeline(post_compact_hooks=[hook]),
         logger=JSONLRunLogger(tmp_path),
     )
-    # The huge tail message lands in the recent window and gets microcompacted in
-    # place (same uuid, bumped version) while the older prefix folds into a summary.
-    history = [*_big_history(), Message("user", "tail " + "y" * 9000)]
+    # The huge tail tool result lands in the recent window and gets snipped in place
+    # by per-turn hygiene (same uuid, bumped version) while the older prefix folds
+    # into a summary.
+    history = [
+        *_big_history(),
+        Message(
+            "assistant", "tail call",
+            metadata={"tool_calls": [{"id": "c99", "name": "echo", "arguments": {}}]},
+        ),
+        Message(
+            "tool", "tail " + "y" * 9000, name="echo",
+            metadata={"tool_call_id": "c99", "ok": True},
+        ),
+    ]
     result = await agent.run("hello", history=history)
     assert hook.post, "PostCompact should fire after a real fold"
     _, summary = hook.post[0]

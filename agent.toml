@@ -273,14 +273,22 @@ model = "claude-haiku-4-5-20251001"
 timeout = 30
 
 # --- Context compaction -----------------------------------------------------
-# How the history is shrunk when it grows large. Cheap deterministic stages (snip,
-# microcompact) run every turn; the prefix-collapse stage folds old turns into one
-# summary block. With a real provider and use_llm_summary on, that fold is an LLM
-# summary (Track A); with no API key / --provider fake / disabled, it is a
-# deterministic string join (Track B). Any summary failure degrades to Track B, so a
-# run never breaks. AGENT_DISABLE_LLM_SUMMARY=1 pins a run to Track B.
+# How the history is shrunk as it grows. The cheap deterministic stages (snip,
+# microcompact) run EVERY turn, ahead of the token gate; the lossy prefix-collapse
+# fold runs only when the post-hygiene token estimate still crosses the gate (the
+# reference pipeline order: cheap hygiene unconditionally, autocompact check last).
+# With a real provider and use_llm_summary on, that fold is an LLM summary (Track A);
+# with no API key / --provider fake / disabled, it is a deterministic string join
+# (Track B). Any summary failure degrades to Track B, so a run never breaks.
+# AGENT_DISABLE_LLM_SUMMARY=1 pins a run to Track B. A 413 overflow runs the same
+# stages aggressively plus bounded head-truncation retries (the reactive path).
 [compression]
-max_message_chars = 6000       # per-message size above which snip/microcompact trim
+max_message_chars = 6000       # tool-result size above which snip head/tail-truncates
+microcompact_keep_recent_tool_results = 5 # tool results older than the last N are cleared each turn
+# microcompact_idle_gap_minutes = 60   # after an idle break this long (minutes, in-process
+# microcompact_idle_keep_recent = 1    # monotonic clock), shrink the keep window to this many
+# tool_results_total_max_chars = 0     # aggregate cap on tool-result chars; oldest cleared first,
+                                      # the single most recent is always kept (0 = off, default)
 collapsed_keep_recent = 8      # recent turns kept verbatim by the Track B fold
 use_llm_summary = true         # false (or AGENT_DISABLE_LLM_SUMMARY=1) forces Track B
 summary_keep_recent = 8        # recent turns kept verbatim by the Track A fold
@@ -294,12 +302,13 @@ compact_summary_start_tokens = 8000  # first attempt (steady-state, ~ the refere
 compact_max_output_tokens = 20000    # middle tier (the reference's COMPACT_MAX_OUTPUT_TOKENS)
 compact_max_output_retries = 2       # escalations allowed after the first attempt
 summary_timeout_seconds = 120    # single (non-stacked) timeout (s) bounding the WHOLE ladder; omit/None disables
-# Token-based auto-compact gate (parity with the reference). The gate compares a
-# running token estimate (last response usage, else chars/4) against
+# Token-based auto-compact gate (parity with the reference). The gate is checked AFTER
+# the per-turn cheap stages (snip + stale-tool-result microcompact): a running token
+# estimate (last response usage, else chars/4) is compared against
 # `effective_window - autocompact_buffer_tokens`, where the effective window reserves
-# room for the summary output. The char fields below only bound per-message snip/
-# microcompact budgets — they no longer drive the trigger.
-# max_context_chars = 24000    # per-message microcompact budget basis (NOT the trigger)
+# room for the summary output. The char fields only bound per-message snip budgets —
+# they no longer drive the trigger.
+# max_context_chars = 24000    # LEGACY/inert: microcompact is staleness-based now
 # context_window_tokens caps the model's window for local auto-compact decisions.
 # tokens.py now recognises the native 1M family (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5)
 # and Haiku 4.5's 200k automatically, so this is only needed to MODEL A SMALLER deployment

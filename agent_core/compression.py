@@ -32,6 +32,12 @@ TokenEstimator = Callable[[list[Message]], int]
 # foldable on the next pass, so repeated compactions re-summarize rather than pile up.
 _COLLAPSE_MARKERS = frozenset({"context_collapse", "llm_summary"})
 
+# Placeholder body substituted for a stale tool result cleared by microcompact: the
+# message itself stays (tool_call/tool_result pairing intact for provider
+# serialization), only the payload is dropped. Mirrors the reference microcompact's
+# "[Old tool result content cleared]".
+_MICROCOMPACT_CLEARED = "[Old tool result content cleared]"
+
 # render_prefix wraps chunk content with "[role] " labels (~4 chars/message) plus a
 # fixed untrusted-preamble + <transcript> wrapper; chunk input budgets are kept net of
 # this overhead so a packed chunk never triggers the defensive head/tail cut.
@@ -411,9 +417,28 @@ class CompressionEvent:
 
 @dataclass(slots=True)
 class CompressionConfig:
+    # Legacy: was the microcompact length-budget basis. Microcompact is now
+    # staleness-based (clears old tool results), so this no longer drives any stage;
+    # kept so existing [compression] tables keep parsing.
     max_context_chars: int = 24000
     max_message_chars: int = 6000
     collapsed_keep_recent: int = 8
+    # Microcompact hygiene: tool results older than the last this-many tool messages
+    # are replaced by a fixed placeholder (their content is re-obtainable; the message
+    # stays so tool_call/tool_result pairing survives). Reactive/aggressive runs halve
+    # it. 0 keeps nothing — every stale tool result is cleared.
+    microcompact_keep_recent_tool_results: int = 5
+    # Idle-gap hygiene (reference parity: timeBasedMicrocompact). When the loop has
+    # been idle longer than ``microcompact_idle_gap_minutes`` (monotonic clock between
+    # turns — e.g. the user returns after lunch; the prompt cache is cold and old
+    # results are likely stale), the keep window shrinks to
+    # ``microcompact_idle_keep_recent`` for that pass. None disables (default).
+    microcompact_idle_gap_minutes: float | None = None
+    microcompact_idle_keep_recent: int = 1
+    # Aggregate second line of defence: hard cap on TOTAL tool-result chars. When
+    # exceeded, the oldest remaining results are cleared (pinned/rewritten skipped),
+    # always keeping the single most recent one. 0 disables (default).
+    tool_results_total_max_chars: int = 0
     # Track A (LLM summary) knobs. When a real summarizer is injected and
     # use_llm_summary is on, _context_collapse folds the old prefix into a model
     # summary instead of the deterministic Track B join; any failure degrades to
@@ -526,6 +551,11 @@ class CompressionPipeline:
         messages added since; default offline: ``rough_token_estimate_for_messages``) is
         compared against ``tokens.auto_compact_threshold(model)``.
         Below the line we return unchanged; at/above it we run the shrink stages.
+        The cheap deterministic stages (snip, microcompact) run first and the token
+        estimate is then re-checked: the lossy prefix-collapse fold (the only stage
+        that can call a model) runs only when the post-hygiene estimate is still over
+        the threshold — parity with the reference, whose autocompact gate is evaluated
+        AFTER the cheap every-turn stages.
 
         A circuit breaker tracks consecutive failures (stages ran but the result is
         still over, or the stage run raised). After
@@ -559,7 +589,13 @@ class CompressionPipeline:
 
         try:
             result, events = await self._run_stages(
-                messages, aggressive=False, summarizer=summarizer, on_stage=on_stage, attachments=attachments
+                messages,
+                aggressive=False,
+                summarizer=summarizer,
+                on_stage=on_stage,
+                attachments=attachments,
+                token_estimator=token_estimator,
+                collapse_threshold=threshold,
             )
         except Exception as exc:  # noqa: BLE001 - a stage failure counts as a breaker failure, never crashes the loop
             return messages, [
@@ -648,6 +684,8 @@ class CompressionPipeline:
         summarizer: Summarizer | None,
         on_stage: StageReporter | None,
         attachments: list[Message] | None = None,
+        token_estimator: TokenEstimator | None = None,
+        collapse_threshold: int | None = None,
     ) -> tuple[list[Message], list[CompressionEvent]]:
         total = 3
         events: list[CompressionEvent] = []
@@ -664,9 +702,52 @@ class CompressionPipeline:
         report(1, event)
         current, event = self._microcompact(current, aggressive)
         report(2, event)
+        if collapse_threshold is not None and self._estimate(current, token_estimator) < collapse_threshold:
+            # The cheap stages alone pulled the estimate back under the gate: skip the
+            # lossy fold (reference behavior — the autocompact gate is re-evaluated
+            # after snip/microcompact). Stage 3 is still REPORTED so the UI progress
+            # bracket completes; the no-change event filters out of the returned list.
+            skipped = CompressionEvent(
+                "context_collapse",
+                self._char_count(current),
+                self._char_count(current),
+                "skipped: under threshold after snip/microcompact",
+            )
+            report(3, skipped)
+            return current, [event for event in events if event.before_chars != event.after_chars]
         current, event = await self._context_collapse(current, aggressive, summarizer, attachments)
         report(3, event)
         return current, [event for event in events if event.before_chars != event.after_chars]
+
+    def run_cheap_stages(
+        self,
+        messages: list[Message],
+        *,
+        aggressive: bool = False,
+        keep_recent: int | None = None,
+    ) -> tuple[list[Message], list[CompressionEvent]]:
+        """Run the deterministic, model-free hygiene stages (snip + microcompact).
+
+        Cheap enough to run EVERY turn, ahead of the auto-compact gate — the gate (and
+        the PreCompact predicate built on it) then evaluate the post-hygiene state, so
+        a lossy LLM fold fires only when deletion alone cannot keep the context under
+        the threshold (the reference pipeline order: cheap stages unconditionally,
+        autocompact check last). Both stages skip messages already carrying a
+        ``compressed`` marker, so repeated calls are idempotent and never churn
+        message versions. No ``on_stage`` reporting: hygiene is not a fold and must
+        not drive the compaction progress bar. Only change events are returned.
+
+        ``keep_recent`` overrides the microcompact keep window for this pass — the
+        loop passes the shrunken idle-gap value after a long wall-clock idle break.
+        """
+        events: list[CompressionEvent] = []
+        current, event = self._snip(messages, aggressive)
+        if event.before_chars != event.after_chars:
+            events.append(event)
+        current, event = self._microcompact(current, aggressive, keep_recent=keep_recent)
+        if event.before_chars != event.after_chars:
+            events.append(event)
+        return current, events
 
     def _snip(self, messages: list[Message], aggressive: bool) -> tuple[list[Message], CompressionEvent]:
         before = self._char_count(messages)
@@ -674,7 +755,12 @@ class CompressionPipeline:
         snipped: list[Message] = []
         count = 0
         for message in messages:
-            if message.role == "tool" and len(message.content) > limit:
+            # A message already rewritten by an earlier stage/pass carries a
+            # ``compressed`` marker — skipping it keeps per-turn hygiene idempotent
+            # instead of re-truncating (and re-versioning) the same message every turn.
+            if message.metadata.get("compressed"):
+                snipped.append(message)
+            elif message.role == "tool" and len(message.content) > limit:
                 half = max(100, limit // 2)
                 content = f"{message.content[:half]}\n[snip]\n{message.content[-half:]}"
                 snipped.append(_evolve_message(message, content, "snip"))
@@ -684,28 +770,78 @@ class CompressionPipeline:
         detail = f"snipped {count}" if count else ""
         return snipped, CompressionEvent("snip", before, self._char_count(snipped), detail)
 
-    def _microcompact(self, messages: list[Message], aggressive: bool) -> tuple[list[Message], CompressionEvent]:
+    def _microcompact(
+        self,
+        messages: list[Message],
+        aggressive: bool,
+        keep_recent: int | None = None,
+    ) -> tuple[list[Message], CompressionEvent]:
+        """Clear STALE tool results, keeping the most recent ones verbatim.
+
+        Tool results are the right target for per-turn hygiene: they are the bulk of
+        context growth in coding runs and are re-obtainable (re-read the file, re-run
+        the command). Everything older than the last ``keep`` tool messages is replaced
+        by ``_MICROCOMPACT_CLEARED`` — the message itself stays, so tool_call/
+        tool_result pairing survives for provider serialization. Assistant/user
+        messages are never touched here: their content is irreplaceable reasoning and
+        decision context, which is the fold's job to summarize (parity with the
+        reference microcompact, which only ever clears compactable tool results).
+
+        ``keep_recent`` overrides the configured keep window for one pass (the loop
+        passes the shrunken idle-gap value after a long idle break). When
+        ``tool_results_total_max_chars`` is set, a second pass clears the oldest
+        remaining results until the aggregate is back under the cap — never touching
+        the single most recent tool result (floor 1, reference parity).
+        """
         before = self._char_count(messages)
-        budget_limit = max(40, self.config.max_context_chars // (6 if aggressive else 4))
-        limit = min(self.config.max_message_chars // (3 if aggressive else 2), budget_limit)
+        base_keep = (
+            keep_recent if keep_recent is not None else self.config.microcompact_keep_recent_tool_results
+        )
+        keep = max(1, base_keep // (2 if aggressive else 1))
+        tool_positions = [index for index, message in enumerate(messages) if message.role == "tool"]
+        stale = set(tool_positions[: max(0, len(tool_positions) - keep)])
         compacted: list[Message] = []
-        count = 0
-        for message in messages:
-            # Pinned blocks (e.g. injected CLAUDE.md, the userContext system-reminder)
-            # are kept verbatim — they are one-time context that must survive compaction.
-            # _context_collapse already preserves them, but microcompact truncates by
-            # length without regard to role, so it needs its own guard.
-            if message.metadata.get("pinned"):
-                compacted.append(message)
-                continue
-            if len(message.content) > limit:
-                content = f"{message.content[:limit]} [microcompact: omitted {len(message.content) - limit} chars]"
-                compacted.append(_evolve_message(message, content, "microcompact"))
-                count += 1
+        cleared = 0
+        for index, message in enumerate(messages):
+            if index in stale and self._is_clearable_tool_result(message):
+                compacted.append(_evolve_message(message, _MICROCOMPACT_CLEARED, "microcompact"))
+                cleared += 1
             else:
                 compacted.append(message)
-        detail = f"microcompacted {count}" if count else ""
-        return compacted, CompressionEvent("microcompact", before, self._char_count(compacted), detail)
+
+        budget_cleared = 0
+        budget = self.config.tool_results_total_max_chars
+        if budget > 0:
+            total = sum(len(m.content) for m in compacted if m.role == "tool")
+            last_tool = tool_positions[-1] if tool_positions else -1
+            for index, message in enumerate(compacted):
+                if total <= budget or index >= last_tool:
+                    break
+                if message.role == "tool" and self._is_clearable_tool_result(message):
+                    compacted[index] = _evolve_message(message, _MICROCOMPACT_CLEARED, "microcompact")
+                    total -= len(message.content) - len(_MICROCOMPACT_CLEARED)
+                    budget_cleared += 1
+
+        details: list[str] = []
+        if cleared:
+            details.append(f"cleared {cleared} stale tool results")
+        if budget_cleared:
+            details.append(f"cleared {budget_cleared} over the tool-result budget")
+        return compacted, CompressionEvent(
+            "microcompact", before, self._char_count(compacted), ", ".join(details)
+        )
+
+    @staticmethod
+    def _is_clearable_tool_result(message: Message) -> bool:
+        """A tool result microcompact may clear: never pinned (injected context),
+        never already rewritten (``compressed`` marker — keeps per-turn hygiene
+        idempotent), never already the placeholder."""
+        return (
+            message.role == "tool"
+            and not message.metadata.get("pinned")
+            and not message.metadata.get("compressed")
+            and message.content != _MICROCOMPACT_CLEARED
+        )
 
     async def _context_collapse(
         self,

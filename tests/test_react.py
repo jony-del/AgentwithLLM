@@ -542,6 +542,75 @@ async def test_reactive_recovery_shrinks_single_oversized_round(tmp_path: Path) 
     assert any(m.metadata.get("compressed") == "ptl_shrink" for m in provider.last_messages)
 
 
+class _ManyRoundsProvider:
+    """``rounds`` echo rounds, then a final answer — enough tool results for the
+    per-turn hygiene stages to start clearing the stale ones (default keep-recent 5)."""
+
+    def __init__(self, rounds: int = 7) -> None:
+        self.calls = 0
+        self.rounds = rounds
+
+    async def complete(self, messages, tools, config, stream=None, should_cancel=None) -> LLMResult:
+        self.calls += 1
+        if self.calls <= self.rounds:
+            return LLMResult(
+                f"round {self.calls}",
+                tool_calls=[ToolCall("echo", {"text": f"r{self.calls}"}, id=f"toolu_{self.calls}")],
+                stop_reason="tool_use",
+            )
+        return LLMResult("done", stop_reason="end")
+
+
+async def test_per_turn_hygiene_clears_stale_tool_results_without_a_fold(tmp_path: Path) -> None:
+    # The default-config token gate never trips on a small conversation, but the cheap
+    # hygiene stages run EVERY turn: after 7 tool rounds the first 2 results are
+    # cleared in place (keep-recent 5) — no fold (no summary message), pairing intact.
+    provider = _ManyRoundsProvider(7)
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(run_dir=str(tmp_path), permission="auto", memory=MemoryConfig(enabled=False))
+    agent = ReActAgent(provider, config, logger=logger)
+
+    result = await agent.run("work through the rounds")
+
+    assert result.answer == "done"
+    tool_messages = [m for m in result.messages if m.role == "tool"]
+    assert len(tool_messages) == 7
+    assert [m.content for m in tool_messages[:2]] == ["[Old tool result content cleared]"] * 2
+    assert [m.content for m in tool_messages[2:]] == [f"echo: r{i}" for i in range(3, 8)]
+    from agent_core.compression import is_summary_message
+
+    assert not any(is_summary_message(m) for m in result.messages)
+
+
+async def test_idle_gap_shrinks_hygiene_keep_window(tmp_path: Path) -> None:
+    # After an idle break longer than the configured gap (e.g. the user returns after
+    # lunch), the next turn's hygiene keeps only ``microcompact_idle_keep_recent`` tool
+    # results — the rest are likely stale, and the prompt cache is cold anyway
+    # (reference parity: timeBasedMicrocompact).
+    from agent_core.compression import CompressionConfig
+
+    provider = _ManyRoundsProvider(3)
+    logger = JSONLRunLogger(tmp_path)
+    config = ReActConfig(
+        run_dir=str(tmp_path),
+        permission="auto",
+        memory=MemoryConfig(enabled=False),
+        compression=CompressionConfig(microcompact_idle_gap_minutes=60, microcompact_idle_keep_recent=1),
+    )
+    agent = ReActAgent(provider, config, logger=logger)
+    first = await agent.run("round one")
+    # 3 results, all within the default keep window (5) — nothing cleared yet.
+    assert [m.content for m in first.messages if m.role == "tool"] == [f"echo: r{i}" for i in range(1, 4)]
+
+    # Simulate a two-hour break, then continue the same session.
+    agent._last_activity_at -= 7200
+    second = await agent.run("round two", history=first.messages)
+
+    tool_messages = [m for m in second.messages if m.role == "tool"]
+    assert [m.content for m in tool_messages[:2]] == ["[Old tool result content cleared]"] * 2
+    assert tool_messages[2].content == "echo: r3"
+
+
 class _RecordingUI(AgentUI):
     """Captures the token-usage and recap events the loop emits."""
 

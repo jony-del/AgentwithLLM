@@ -71,9 +71,9 @@ async def test_ui_emits_events_in_order(tmp_path: Path) -> None:
 
 
 async def test_compaction_emits_start_and_end(tmp_path: Path) -> None:
-    # A tiny token window + tiny per-message char budget forces auto_compact to fire on
-    # the first loop step (the long system prompt is microcompacted), so the UI must see
-    # a start/end pair (the bar's bracketing events).
+    # A tiny token window makes the auto-compact gate trip on the first loop step (the
+    # default per-message char budget leaves the system prompt intact through per-turn
+    # hygiene), so the UI must see a start/end pair (the bar's bracketing events).
     ui = RecordingUI()
     config = ReActConfig(
         run_dir=str(tmp_path),
@@ -82,8 +82,6 @@ async def test_compaction_emits_start_and_end(tmp_path: Path) -> None:
             context_window_tokens=200,
             autocompact_buffer_tokens=10,
             reserved_output_tokens_for_summary=10,
-            max_message_chars=20,
-            max_context_chars=40,
         ),
     )
     agent = ReActAgent(FakeProvider(), config, ui=ui)

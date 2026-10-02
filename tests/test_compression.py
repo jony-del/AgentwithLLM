@@ -94,8 +94,9 @@ def _gate_config(**overrides: Any) -> CompressionConfig:
 async def test_auto_compact_triggers_when_estimate_at_or_above_threshold() -> None:
     # window 600, reserve min(8192,100)=100 → effective 500, buffer 100 → threshold 400.
     pipeline = CompressionPipeline(_gate_config())
-    # 12 messages * ~120 chars = ~1440 chars → ~360... push well over: char/4 must be >= 400.
-    messages = [Message("user", f"m{i} " + "x" * 200) for i in range(12)]
+    # 12 messages * ~405 chars = ~4860 chars → char/4 ≈ 1215, well over the 400 line.
+    # Non-tool messages are never touched by the cheap hygiene stages, so the fold runs.
+    messages = [Message("user", f"m{i} " + "x" * 400) for i in range(12)]
     estimate = sum(len(m.content) for m in messages) // 4
     assert estimate >= 400
     compacted, events = await pipeline.auto_compact(messages, model="claude-haiku")
@@ -132,8 +133,9 @@ async def test_auto_compact_uses_injected_estimator() -> None:
 
 
 async def test_auto_compact_pct_override_lowers_threshold() -> None:
-    # Without override the gate stays closed; a small pct override trips it.
-    messages = [Message("user", "x" * 800) for _ in range(4)]  # ~3200 chars → ~800 tokens
+    # Without override the gate stays closed; a small pct override trips it. The
+    # messages are non-tool (untouched by cheap hygiene) and numerous enough to fold.
+    messages = [Message("user", f"m{i} " + "x" * 400) for i in range(12)]  # ~4860 chars → ~1215 tokens
     closed = CompressionPipeline(CompressionConfig(max_message_chars=60, collapsed_keep_recent=4))
     out, events = await closed.auto_compact(messages, model="claude-haiku")
     assert out is messages and events == []
@@ -142,7 +144,7 @@ async def test_auto_compact_pct_override_lowers_threshold() -> None:
         CompressionConfig(max_message_chars=60, collapsed_keep_recent=4, autocompact_pct_override=0.1)
     )
     out2, events2 = await override.auto_compact(messages, model="claude-haiku")
-    # pct 0.1% of effective (~180000) ≈ 180 tokens → well under ~800 estimate → trips.
+    # pct 0.1% of effective (~180000) ≈ 180 tokens → well under the ~1215 estimate → trips.
     assert events2
     assert sum(len(m.content) for m in out2) < sum(len(m.content) for m in messages)
 
@@ -153,6 +155,219 @@ async def test_reactive_compact_is_more_aggressive() -> None:
     compacted, events = await pipeline.reactive_compact(messages)
     assert events
     assert len(compacted) < len(messages)
+
+
+async def test_auto_compact_skips_fold_when_cheap_stages_suffice() -> None:
+    """The gate trips, but snip/microcompact alone pull the estimate back under the
+    threshold → the lossy fold (and any summarizer call) is skipped entirely."""
+    pipeline = CompressionPipeline(_gate_config())
+    # 6 tool results of ~404 chars → ~606 tokens ≥ 400 (the gate trips); snip cuts
+    # each to ~207 chars → ~310 tokens < 400 → the fold must not run.
+    messages = [
+        Message("tool", f"r{i} " + "x" * 400, name="echo", metadata={"tool_call_id": f"c{i}", "ok": True})
+        for i in range(6)
+    ]
+
+    async def summarizer(prefix: list[Message]) -> str:
+        raise AssertionError("summarizer called despite cheap stages sufficing")
+
+    compacted, events = await pipeline.auto_compact(
+        messages, model="claude-haiku", summarizer=summarizer
+    )
+
+    assert compacted is not messages
+    assert not any(is_summary_message(m) for m in compacted)
+    assert [event.stage for event in events] == ["snip"]
+    assert pipeline._consecutive_autocompact_failures == 0
+
+
+async def test_auto_compact_reports_all_stages_when_fold_is_skipped() -> None:
+    """The UI progress bracket still completes (3 stage reports) when the cheap
+    stages resolve the pressure and the fold is skipped."""
+    pipeline = CompressionPipeline(_gate_config())
+    messages = [
+        Message("tool", "x" * 400, name="echo", metadata={"tool_call_id": f"c{i}", "ok": True})
+        for i in range(6)
+    ]
+    calls: list[tuple[int, int, str]] = []
+
+    await pipeline.auto_compact(
+        messages,
+        model="claude-haiku",
+        on_stage=lambda done, total, event: calls.append((done, total, event.stage)),
+    )
+
+    assert calls == [(1, 3, "snip"), (2, 3, "microcompact"), (3, 3, "context_collapse")]
+
+
+async def test_auto_compact_still_folds_when_cheap_stages_cannot_help() -> None:
+    """The gate trips and the cheap stages shrink nothing (small non-tool messages)
+    → the prefix fold still runs."""
+    pipeline = CompressionPipeline(_gate_config(max_message_chars=10000))
+    messages = [Message("user", f"m{i} " + "x" * 200) for i in range(12)]
+
+    def estimator(msgs: list[Message]) -> int:
+        # Over before folding, under after (the fold cuts 12 messages to 5).
+        return 10_000 if len(msgs) > 6 else 10
+
+    compacted, events = await pipeline.auto_compact(
+        messages, model="claude-haiku", token_estimator=estimator
+    )
+
+    assert any(is_summary_message(m) for m in compacted)
+    assert any(event.stage == "context_collapse" for event in events)
+    assert pipeline._consecutive_autocompact_failures == 0
+
+
+def test_run_cheap_stages_runs_without_gate_and_is_idempotent() -> None:
+    """Hygiene stages run unconditionally (no token gate) and a second pass is a
+    no-op (the compressed-marker guard), so per-turn calls never churn versions."""
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=60))
+    tool = Message("tool", "x" * 400, name="echo", metadata={"tool_call_id": "c1", "ok": True})
+    messages = [tool, Message("user", "short")]
+
+    once, events1 = pipeline.run_cheap_stages(messages)
+    assert [event.stage for event in events1] == ["snip"]
+    assert once[0].metadata.get("compressed") == "snip"
+    assert len(once[0].content) < len(tool.content)
+
+    twice, events2 = pipeline.run_cheap_stages(once)
+    assert events2 == []
+    assert [(m.uuid, m.version) for m in twice] == [(m.uuid, m.version) for m in once]
+
+
+def test_microcompact_clears_only_stale_tool_results() -> None:
+    """Everything older than the last ``keep`` tool messages is replaced by the
+    placeholder; the message (and its tool_call pairing metadata) stays."""
+    pipeline = CompressionPipeline(CompressionConfig(microcompact_keep_recent_tool_results=3))
+    messages: list[Message] = [Message("user", "start")]
+    for i in range(6):
+        messages.append(_assistant_with_calls(f"call c{i}", [f"c{i}"]))
+        messages.append(_tool_result(f"payload c{i} " + "x" * 500, f"c{i}"))
+    messages.append(Message("assistant", "final reasoning " + "y" * 500))
+
+    compacted, event = pipeline._microcompact(messages, aggressive=False)
+
+    # The first 3 tool results are stale (6 results, keep 3) and cleared in place.
+    cleared = [m for m in compacted if m.metadata.get("compressed") == "microcompact"]
+    assert len(cleared) == 3
+    assert all(m.content == "[Old tool result content cleared]" for m in cleared)
+    assert [m.metadata["tool_call_id"] for m in cleared] == ["c0", "c1", "c2"]
+    # Recent results, the user turn, and the long assistant message survive verbatim.
+    survivors = [
+        m for m in compacted if m.role == "tool" and m.metadata.get("compressed") != "microcompact"
+    ]
+    assert [m.metadata["tool_call_id"] for m in survivors] == ["c3", "c4", "c5"]
+    assert compacted[-1].content.endswith("y" * 500)
+    assert compacted[0].content == "start"
+    assert event.detail == "cleared 3 stale tool results"
+
+
+def test_microcompact_never_touches_non_tool_messages() -> None:
+    """Assistant reasoning and user turns are irreplaceable context — they are left
+    for the fold, never truncated/cleared by per-turn hygiene."""
+    pipeline = CompressionPipeline(CompressionConfig(max_message_chars=60))
+    messages = [
+        Message("user", "u " + "x" * 5000),
+        Message("assistant", "reasoning " + "y" * 5000),
+    ]
+    compacted, event = pipeline._microcompact(messages, aggressive=False)
+    assert compacted == messages
+    assert event.before_chars == event.after_chars
+
+
+def test_microcompact_keeps_pinned_tool_result_and_stays_pairable() -> None:
+    pipeline = CompressionPipeline(CompressionConfig(microcompact_keep_recent_tool_results=1))
+    pinned_tool = Message(
+        "tool", "PINNED RESULT", name="echo",
+        metadata={"tool_call_id": "c0", "ok": True, "pinned": "context"},
+    )
+    messages = [
+        _assistant_with_calls("a0", ["c0"]), pinned_tool,
+        _assistant_with_calls("a1", ["c1"]), _tool_result("stale", "c1"),
+        _assistant_with_calls("a2", ["c2"]), _tool_result("fresh", "c2"),
+    ]
+    compacted, _ = pipeline._microcompact(messages, aggressive=False)
+    assert pinned_tool in compacted  # pinned wins over staleness
+    cleared = [m for m in compacted if m.metadata.get("compressed") == "microcompact"]
+    assert [m.metadata["tool_call_id"] for m in cleared] == ["c1"]
+    # Provider serialization stays valid: every tool result still immediately follows
+    # the assistant tool_call it answers.
+    for index, message in enumerate(compacted):
+        if message.role == "tool":
+            previous = compacted[index - 1]
+            call_ids = {call["id"] for call in previous.metadata.get("tool_calls", [])}
+            assert message.metadata["tool_call_id"] in call_ids
+
+
+def test_microcompact_aggressive_keeps_fewer_recent_results() -> None:
+    pipeline = CompressionPipeline(CompressionConfig(microcompact_keep_recent_tool_results=4))
+    messages = [
+        m
+        for i in range(6)
+        for m in (_assistant_with_calls(f"a{i}", [f"c{i}"]), _tool_result(f"r{i}", f"c{i}"))
+    ]
+    compacted, _ = pipeline._microcompact(messages, aggressive=True)
+    # aggressive: keep = 4 // 2 = 2 → the first 4 results are cleared.
+    cleared = [m for m in compacted if m.metadata.get("compressed") == "microcompact"]
+    assert len(cleared) == 4
+
+
+def test_microcompact_keep_override_shrinks_the_window() -> None:
+    """The idle-gap override narrows the keep window for one pass (the loop passes it
+    when the wall-clock gap since the previous turn exceeds the configured idle gap)."""
+    pipeline = CompressionPipeline(CompressionConfig(microcompact_keep_recent_tool_results=5))
+    messages = [
+        m
+        for i in range(4)
+        for m in (_assistant_with_calls(f"a{i}", [f"c{i}"]), _tool_result(f"r{i}", f"c{i}"))
+    ]
+    # 4 results fit the configured window (keep 5) — nothing is cleared normally…
+    same, event = pipeline._microcompact(messages, aggressive=False)
+    assert same == messages
+    assert event.detail == ""
+    # …but the idle-gap override keeps only the most recent one.
+    compacted, event = pipeline._microcompact(messages, aggressive=False, keep_recent=1)
+    cleared = [m for m in compacted if m.metadata.get("compressed") == "microcompact"]
+    assert [m.metadata["tool_call_id"] for m in cleared] == ["c0", "c1", "c2"]
+    assert compacted[-1].content == "r3"
+    assert event.detail == "cleared 3 stale tool results"
+
+
+def test_microcompact_aggregate_budget_clears_oldest_first() -> None:
+    """The aggregate cap is a second line of defence: with it exceeded, the oldest
+    remaining results are cleared past the keep window — but never the most recent."""
+    pipeline = CompressionPipeline(
+        CompressionConfig(microcompact_keep_recent_tool_results=3, tool_results_total_max_chars=200)
+    )
+    messages = [
+        m
+        for i in range(5)
+        for m in (
+            _assistant_with_calls(f"a{i}", [f"c{i}"]),
+            _tool_result(f"r{i} " + "x" * 90, f"c{i}"),
+        )
+    ]
+    compacted, event = pipeline._microcompact(messages, aggressive=False)
+    # Count pass cleared c0/c1 (keep 3); the survivors still bust the 200-char budget,
+    # so the budget pass clears c2/c3 as well — c4 (most recent) is untouchable.
+    cleared = [m for m in compacted if m.metadata.get("compressed") == "microcompact"]
+    assert [m.metadata["tool_call_id"] for m in cleared] == ["c0", "c1", "c2", "c3"]
+    assert compacted[-1].content.startswith("r4")
+    assert event.detail == "cleared 2 stale tool results, cleared 2 over the tool-result budget"
+
+
+def test_microcompact_budget_off_by_default() -> None:
+    pipeline = CompressionPipeline(CompressionConfig(microcompact_keep_recent_tool_results=10))
+    messages = [
+        m
+        for i in range(3)
+        for m in (_assistant_with_calls(f"a{i}", [f"c{i}"]), _tool_result("x" * 5000, f"c{i}"))
+    ]
+    compacted, event = pipeline._microcompact(messages, aggressive=False)
+    # Within the keep window and no budget configured → untouched despite the size.
+    assert compacted == messages
+    assert event.detail == ""
 
 
 async def test_context_collapse_preserves_system_prompt() -> None:

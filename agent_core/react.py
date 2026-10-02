@@ -791,6 +791,11 @@ class ReActAgent:
         # auto-compact gate thresholds against this (parity with the reference) instead
         # of a char ratio; 0 until the first response with usage arrives.
         self._last_usage_tokens: int = 0
+        # Monotonic timestamp of the last loop iteration, for idle-gap hygiene: when the
+        # gap between turns exceeds [compression] microcompact_idle_gap_minutes, the
+        # microcompact keep window shrinks for one pass. NOT reset per run — an idle
+        # break between chat prompts is exactly what it measures.
+        self._last_activity_at: float | None = None
         # Session-cumulative token totals live in ``runtime.counters`` (exposed via the
         # ``_session_*_tokens`` properties) and are surfaced by the chat
         # ``/cost``/``/status`` commands. Summed across every run() on this agent.
@@ -1724,6 +1729,27 @@ class ReActAgent:
             # pipeline forwards them to build_post_compact_messages inside the collapse
             # stage). Empty when nothing has been read yet.
             attachments = self._build_read_attachments()
+            # Cheap deterministic hygiene (snip, microcompact) runs EVERY turn, ahead of
+            # the auto-compact gate — so the gate, the PreCompact predicate, and any fold
+            # all evaluate the post-hygiene state, and a lossy LLM fold fires only when
+            # deletion alone can't keep context under the threshold (reference pipeline
+            # order). Hygiene-only changes never write a compaction boundary (no summary
+            # in the (uuid, version) diff) and don't drive the UI's fold progress bar.
+            # Idle-gap hygiene (off by default): after a long break between turns the
+            # keep window shrinks — old results are likely stale and the prompt cache is
+            # cold anyway (reference: timeBasedMicrocompact).
+            now = time.monotonic()
+            idle_minutes = None if self._last_activity_at is None else (now - self._last_activity_at) / 60
+            self._last_activity_at = now
+            idle_keep: int | None = None
+            idle_gap = self.config.compression.microcompact_idle_gap_minutes
+            if idle_gap is not None and idle_minutes is not None and idle_minutes >= idle_gap:
+                idle_keep = self.config.compression.microcompact_idle_keep_recent
+            messages, hygiene_events = self.compression.run_cheap_stages(messages, keep_recent=idle_keep)
+            if hygiene_events:
+                self._active_messages = messages
+                for event in hygiene_events:
+                    await self.logger.write("compression", asdict(event))
             # PreCompact fires only when a proactive fold is actually imminent (the gate
             # predicate mirrors auto_compact's own check). A hook may block the fold this
             # turn or inject grounding; PostCompact fires afterwards with the new summary.
