@@ -9,12 +9,10 @@ Everything here is stdlib only — no LSP/MCP or other external integrations.
 from __future__ import annotations
 
 import difflib
-import fnmatch
 import importlib.util
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +20,6 @@ from typing import Any
 
 from agent_core.models import ToolRisk, ToolResult
 from agent_core.permission_safety import (
-    is_secret_path,
     ordinary_read_permission,
     ordinary_write_permission,
 )
@@ -44,6 +41,7 @@ from agent_core.tools.base import (
     write_text_exact,
 )
 from agent_core.tools.catalog import builtin_tool
+from agent_core.codeintel.snapshots import edit_precondition, worktree_id
 
 
 def unified_diff(before: str, after: str, path: str) -> str:
@@ -188,6 +186,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
             "old_string": {"type": "string", "description": "Exact text to replace (must be unique unless replace_all)."},
             "new_string": {"type": "string", "description": "Replacement text."},
             "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring uniqueness."},
+            "expected_version": {"type": "object", "description": "File version returned by a verified read."},
         },
         "required": ["path", "old_string", "new_string"],
     }
@@ -209,6 +208,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
         old_string = str(arguments["old_string"])
         new_string = str(arguments["new_string"])
         replace_all = bool(arguments.get("replace_all", False))
+        edit_precondition(self.workspace, path, arguments.get("expected_version"))
 
         if not path.exists():
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
@@ -262,171 +262,12 @@ class SearchTextTool(WorkspacePathMixin, Tool):
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(
-            arguments.get("path", "."), "read", subtree=True, requires_success=True
+            arguments.get("path", "."), "read", subtree=True, requires_success=True, materialize=False
         ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
-        pattern = str(arguments["pattern"])
-        base = self.resolve_workspace_path(arguments.get("path", "."))
-        glob = arguments.get("glob")
-        max_results = coerce_int(arguments.get("max_results", 100))
-        flags = re.IGNORECASE if arguments.get("ignore_case") else 0
-        try:
-            matcher = re.compile(pattern if arguments.get("regex") else re.escape(pattern), flags)
-        except re.error as exc:
-            return ToolResult(self.name, f"Invalid regex: {exc}", ok=False, metadata={"error_type": "BadRegex"})
-
-        if not base.exists():
-            return ToolResult(self.name, f"No such path: {base}", ok=False, metadata={"error_type": "NotFound"})
-
-        # ripgrep fast path (R3): probe for `rg` and use it when present; ANY
-        # degradation (missing binary, timeout, rust-regex syntax gap, error exit)
-        # falls back to the pure-Python scan so behavior never depends on rg.
-        scanned = None
-        rg = shutil.which("rg")
-        if rg:
-            scanned = self._search_with_ripgrep(rg, pattern, base, arguments, max_results)
-        if scanned is None:
-            scanned = self._search_pure_python(matcher, base, glob, max_results)
-        results, truncated = scanned
-
-        if not results:
-            return ToolResult(self.name, "No matches.")
-        body = "\n".join(results)
-        if truncated:
-            body += f"\n[... stopped at {max_results} matches ...]"
-        return ToolResult(self.name, body, metadata={"matches": len(results), "truncated": truncated})
-
-    def _search_pure_python(
-        self, matcher: "re.Pattern[str]", base: Path, glob: object, max_results: int
-    ) -> tuple[list[str], bool]:
-        results: list[str] = []
-        truncated = False
-        for file in self._iter_files(base, glob):
-            if len(results) >= max_results:
-                truncated = True
-                break
-            for lineno, line in self._matches_in_file(file, matcher):
-                rel = file.relative_to(self.workspace)
-                results.append(f"{rel.as_posix()}:{lineno}: {line.strip()}")
-                if len(results) >= max_results:
-                    truncated = True
-                    break
-        return results, truncated
-
-    def _search_with_ripgrep(
-        self, rg: str, pattern: str, base: Path, arguments: dict[str, object], max_results: int
-    ) -> "tuple[list[str], bool] | None":
-        """Run one bounded ``rg`` subprocess; ``None`` means "fall back to Python".
-
-        Flags reproduce the pure-Python scan's semantics — ``--no-config --no-ignore
-        --hidden`` (we honor only ``_IGNORED_DIRS``, not .gitignore), the same
-        max-filesize guard, fixed-string vs regex, basename glob — and the output is
-        re-rendered into the identical ``relpath:line: text`` shape, so the two
-        backends are interchangeable.
-        """
-        try:
-            rel_base = base.relative_to(self.workspace)
-        except ValueError:
-            return None
-        cmd = [
-            rg,
-            "--no-config",
-            "--no-heading",
-            "--with-filename",
-            "--line-number",
-            "--no-ignore",
-            "--hidden",
-            f"--max-filesize={_MAX_SEARCH_FILE_BYTES}",
-            "--max-count",
-            str(max(1, max_results)),
-        ]
-        if not arguments.get("regex"):
-            cmd.append("--fixed-strings")
-        if arguments.get("ignore_case"):
-            cmd.append("--ignore-case")
-        if arguments.get("glob"):
-            cmd.extend(["--glob", str(arguments["glob"])])
-        for name in sorted(_IGNORED_DIRS):
-            cmd.extend(["--glob", f"!**/{name}/**"])
-        if base.is_dir():
-            for secret_pattern in (
-                ".env",
-                ".env.*",
-                "*.pem",
-                "*.key",
-                "*.p12",
-                "*.pfx",
-                "id_rsa*",
-                "id_ed25519*",
-                "credentials",
-                "credentials.json",
-            ):
-                cmd.extend(["--glob", f"!**/{secret_pattern}"])
-            for name in (".ssh", ".aws", ".gnupg", ".kube"):
-                cmd.extend(["--glob", f"!**/{name}/**"])
-        cmd.extend(["--regexp", pattern, "--", str(rel_base) or "."])
-        try:
-            proc = subprocess.run(
-                cmd, cwd=str(self.workspace), capture_output=True, timeout=_RG_TIMEOUT_SECONDS
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.debug("ripgrep failed (%s); falling back to pure-Python scan", exc)
-            return None
-        if proc.returncode not in (0, 1):  # 0 = matches, 1 = none, else = error
-            logger.debug(
-                "ripgrep exited %s (%s); falling back to pure-Python scan",
-                proc.returncode,
-                proc.stderr.decode("utf-8", errors="replace")[:200],
-            )
-            return None
-        results: list[str] = []
-        truncated = False
-        for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
-            if len(results) >= max_results:
-                truncated = True
-                break
-            # Paths are workspace-relative (rg ran with cwd=workspace), so the first
-            # two ':' split path and line number — no drive letters possible.
-            path_part, _, rest = line.partition(":")
-            lineno, _, text = rest.partition(":")
-            if not lineno.isdigit():
-                continue
-            normalized_path = path_part.replace(os.sep, "/")
-            if normalized_path.startswith("./"):
-                normalized_path = normalized_path[2:]
-            results.append(f"{normalized_path}:{lineno}: {text.strip()}")
-        if len(results) >= max_results:
-            truncated = True
-        return results, truncated
-
-    def _iter_files(self, base: Path, glob: object):
-        candidates = [base] if base.is_file() else base.rglob("*")
-        for path in candidates:
-            if not path.is_file():
-                continue
-            if any(part in _IGNORED_DIRS for part in path.relative_to(self.workspace).parts[:-1]):
-                continue
-            if not base.is_file() and is_secret_path(path):
-                continue
-            if glob and not fnmatch.fnmatch(path.name, str(glob)):
-                continue
-            yield path
-
-    @staticmethod
-    def _matches_in_file(file: Path, matcher):
-        try:
-            if file.stat().st_size > _MAX_SEARCH_FILE_BYTES:
-                return
-            raw = file.read_bytes()
-        except OSError:
-            return
-        if _is_probably_binary(raw[:1024]):
-            return
-        text = raw.decode("utf-8", errors="replace")
-        for index, line in enumerate(text.splitlines(), start=1):
-            if matcher.search(line):
-                yield index, line
+        from agent_core.codeintel.legacy import search
+        return search(self, arguments)
 
 
 @builtin_tool
@@ -713,16 +554,38 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
 
             content, metadata = format_notebook(path)
             return ToolResult(name=self.name, content=content, metadata=metadata)
-        text = path.read_text(encoding="utf-8")
+        session = getattr(self, "_code_session", None)
+        session_config = getattr(session, "codeintel_config", None)
+        if session_config is not None and not session_config.enabled:
+            # Layer disabled: plain read, no versioned evidence is issued.
+            text = path.read_text(encoding="utf-8")
+            version_metadata: dict[str, Any] | None = None
+        else:
+            from agent_core.codeintel.config import CodeIntelConfig
+            from agent_core.codeintel.budget import QueryBudget
+            from agent_core.codeintel.snapshots import read_snapshot
+            from agent_core.tools.base import current_execution_context, current_execution_scope
+            # Bounded reads hash the exact bytes used to generate the observation.
+            data, version = read_snapshot(self.workspace, str(path.relative_to(self.workspace)),
+                QueryBudget(CodeIntelConfig(max_file_bytes=16 * 1024 * 1024), current_execution_scope()), allow_secret=True)
+            context = current_execution_context()
+            root = context.logical_workspace if context and context.logical_workspace else self.workspace
+            version_metadata = {**version.to_dict(), "worktree_id": worktree_id(root)}
+            text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         offset = arguments.get("offset")
         limit = arguments.get("limit")
+        version_fields: dict[str, Any] = {}
+        if version_metadata is not None:
+            version_fields = {"file_version": version_metadata}
         # No paging requested: return up to DEFAULT_READ_LINES (like Claude Code's
         # Read), with a note to page on if the file is longer. This keeps an
         # unguided read predictable and bounded instead of dumping a huge file.
         if offset is None and limit is None:
             lines = text.splitlines()
             if len(lines) <= _DEFAULT_READ_LINES:
-                return ToolResult(name=self.name, content=text)
+                return ToolResult(name=self.name, content=text,
+                                  metadata={**version_fields, "start_line": 1, "end_line": len(lines)}
+                                  if version_fields else {})
             shown = "\n".join(lines[:_DEFAULT_READ_LINES])
             note = (
                 f"\n[file truncated: showing 1-{_DEFAULT_READ_LINES} of {len(lines)} lines; "
@@ -731,13 +594,17 @@ class ReadTextFileTool(WorkspacePathMixin, Tool):
             return ToolResult(
                 name=self.name,
                 content=shown + note,
-                metadata={"total_lines": len(lines), "shown_lines": _DEFAULT_READ_LINES},
+                metadata={"total_lines": len(lines), "shown_lines": _DEFAULT_READ_LINES,
+                          **version_fields, "start_line": 1, "end_line": _DEFAULT_READ_LINES},
             )
         # Explicit paging: honor offset/limit verbatim.
         lines = text.splitlines()
         start = max(coerce_int(offset) - 1, 0) if offset is not None else 0
         end = start + coerce_int(limit) if limit is not None else len(lines)
-        return ToolResult(name=self.name, content="\n".join(lines[start:end]))
+        if not version_fields:
+            return ToolResult(name=self.name, content="\n".join(lines[start:end]))
+        return ToolResult(name=self.name, content="\n".join(lines[start:end]), metadata={
+            **version_fields, "start_line": start + 1, "end_line": min(end, len(lines))})
 
 
 @builtin_tool
@@ -749,6 +616,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
         "properties": {
             "path": {"type": "string"},
             "content": {"type": "string"},
+            "expected_version": {"type": "object", "description": "File version returned by a verified read."},
         },
         "required": ["path", "content"],
     }
@@ -768,6 +636,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
         before = path.read_text(encoding="utf-8") if path.exists() else ""
+        edit_precondition(self.workspace, path, arguments.get("expected_version"))
         path.parent.mkdir(parents=True, exist_ok=True)
         content = str(arguments.get("content", ""))
         write_text_exact(path, content)

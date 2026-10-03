@@ -40,6 +40,9 @@ _PROTECTED_DIRS = frozenset({".git", ".polaris", ".claude"})
 _PROTECTED_FILES = frozenset({"agent.toml", "settings.json", "settings.local.json"})
 
 _READ_PATH_TOOLS = {
+    "code_search": ("path", "."),
+    "code_relations": ("path", "."),
+    "code_context": ("path", None),
     "list_dir": ("path", "."),
     "search_text": ("path", "."),
     "glob": ("path", "."),

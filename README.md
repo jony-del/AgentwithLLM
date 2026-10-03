@@ -1,5 +1,15 @@
 # Polaris / Agent with LLM
 
+## Code intelligence for large repositories
+
+Versioned code retrieval is independent of long-term memory. Build a resumable local
+index with `polaris code build --workspace . --seconds 120`; query it with
+`polaris code search target_function --kind symbol`. Agent tools use bounded retrieval,
+task working sets and content-version checks before edits.
+
+See [code intelligence](docs/code-intelligence.md) for configuration, supported languages,
+coverage semantics, compatibility and reproducible scale benchmarks.
+
 ## Reliability and retention defaults
 
 Session cleanup is enabled by default. Resumable transcripts are retained for 90 days

@@ -67,6 +67,7 @@ class ResourceLock:
     # deliberately carried by the concrete resource rather than inferred from
     # ToolRisk: a READ label alone does not prove what a tool needs to succeed.
     requires_success: bool = False
+    materialize: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +120,9 @@ class ToolExecutionContext:
     provisional: bool = False
     execution_scope: "ExecutionScope | None" = None
     idempotency_key: str | None = None
+    logical_workspace: Path | None = None
+    read_versions: Any = None
+    strict_versions: bool = False
 
 
 _EXECUTION_CONTEXT: ContextVar[ToolExecutionContext | None] = ContextVar(
@@ -160,6 +164,7 @@ class WorkspacePathMixin:
 
     def __init__(self, workspace: str | Path | None = None) -> None:
         self._workspace = Path(workspace or Path.cwd()).resolve()
+        self._code_session: Any = None
 
     @property
     def workspace(self) -> Path:
@@ -187,6 +192,7 @@ class WorkspacePathMixin:
         *,
         subtree: bool = False,
         requires_success: bool = False,
+        materialize: bool = True,
     ) -> ResourceLock:
         return ResourceLock(
             "fs",
@@ -194,6 +200,7 @@ class WorkspacePathMixin:
             mode,
             subtree=subtree,
             requires_success=requires_success,
+            materialize=materialize,
         )
 
 
@@ -264,6 +271,13 @@ class Tool(ABC, ToolDisplayProvider):
         transport) override ``run`` directly; the executor detects the override and
         awaits them on the loop so their work can overlap.
         """
+        session = getattr(self, "_code_session", None)
+        context = current_execution_context()
+        if self.name in {"search_text", "glob"} and session is not None and session.codeintel_config and session.codeintel_config.enabled and not (context and context.workspace_view):
+            from agent_core.codeintel.legacy import indexed_search
+            indexed = await indexed_search(self, arguments, session)
+            if indexed is not None:
+                return indexed
         return await asyncio.to_thread(self._invoke, arguments)
 
     async def run_with_context(

@@ -145,6 +145,8 @@ class SessionRuntime:
         if self.closed:
             return
         self.closed = True
+        from agent_core.codeintel.runtime import release_service
+        await release_service(self.context)
         if self.transcript is not None:
             close_transcript = getattr(self.transcript, "close", None)
             if callable(close_transcript):
@@ -346,6 +348,11 @@ class SessionContext:
     # newest-last so post-compaction re-injection can take the most-recent few. Capped
     # so a long run that reads many files can't grow this unbounded.
     read_file_state: dict[str, str] = field(default_factory=dict)
+    codeintel_config: Any | None = None
+    codeintel: Any | None = None
+    code_working_set: Any | None = None
+    code_read_versions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    code_permission_rules: Any | None = None
     notebook_reads: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def notify_todos(self) -> None:

@@ -663,3 +663,23 @@ vm_name = "polaris-sandbox"            # managed guest VM name (Hyper-V/Lima)
 snapshot_name = "polaris-base"         # snapshot restored on reset (Hyper-V checkpoint / Lima)
 guest_host = ""                        # SSH target for command exec (required for Hyper-V)
 reset_each_task = true                 # restore the base snapshot before every run/task
+
+# Rebuildable code facts, separate from long-term memory. No embeddings are enabled.
+[codeintel]
+enabled = true
+strict_versions = false                # require verified reads for all existing-file edits
+maintain = true                        # background build/reconcile in agent sessions; `polaris code build` works regardless
+watch = true                           # optional watchdog OS events; periodic reconciliation is the fallback
+reconcile_seconds = 60.0
+query_seconds = 5.0                    # shared across retrieval and fallbacks
+max_files = 2000
+max_bytes = 67108864
+max_file_bytes = 2097152
+max_results = 100
+max_candidates = 10000
+max_context_tokens = 8000              # conservative UTF-8 byte allowance for evidence
+max_depth = 2
+max_edges = 2000
+max_shards = 4                         # logical module fan-out
+cache_entries = 128
+max_index_bytes = 8589934592            # checked between bounded build slices, including WAL

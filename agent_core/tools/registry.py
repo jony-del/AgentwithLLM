@@ -90,6 +90,8 @@ class ToolRegistry:
             tool.bind_web_policy(self._runtime["web_policy"], unattended=bool(self._runtime["unattended"]))
         session = self._runtime.get("session")
         if session is not None:
+            if isinstance(tool, WorkspacePathMixin):
+                tool._code_session = session
             session.registered_tool_names = frozenset(set(session.registered_tool_names) | {tool.name})
 
     def register_deferred(

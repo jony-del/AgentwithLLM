@@ -203,6 +203,12 @@ class ToolExecutor:
     ) -> ToolResult:
         try:
             context = execution_context or ToolExecutionContext(uuid.uuid4().hex)
+            session = self.registry._runtime.get("session")
+            codeintel = getattr(session, "codeintel_config", None) if session is not None else None
+            if session is not None and (codeintel is None or codeintel.enabled):
+                context = replace(context, logical_workspace=session.workspace,
+                                  read_versions=session.code_read_versions,
+                                  strict_versions=bool(codeintel and codeintel.strict_versions))
             return await prepared.tool.run_with_context(prepared.tool_call.arguments, context)
         except Exception as exc:  # noqa: BLE001 - surface any tool failure as a failed result
             return ToolResult(

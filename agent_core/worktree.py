@@ -125,6 +125,11 @@ class WorktreeManager:
         return removed
 
     async def _switch(self, workspace: Path) -> None:
+        from agent_core.codeintel.runtime import release_service
+        await release_service(self.session)
+        self.session.code_working_set = None
+        getattr(self.session, "code_read_versions", {}).clear()
+        getattr(self.session, "read_file_state", {}).clear()
         manager = self.session.lsp_manager
         if manager is not None:
             await manager.close()

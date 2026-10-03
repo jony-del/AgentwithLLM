@@ -45,6 +45,9 @@ memory = [
     "onnxruntime==1.23.2",
     "usearch==2.26.0",
 ]
+codeintel = [
+    "watchdog>=4,<7",
+]
 # SWE-bench is deliberately optional: importing/running the normal Agent does not
 # need HuggingFace, Docker, or the official Harness.  Keep these broad enough to
 # accommodate the Harness CLI's minor release drift; the runner adapts flags at
@@ -55,7 +58,7 @@ swebench = [
     "swebench>=5.0,<6",
 ]
 all = [
-    "agent-with-llm[web,mcp,terminal,memory,swebench]",
+    "agent-with-llm[web,mcp,terminal,memory,codeintel,swebench]",
 ]
 dev = [
     "pytest>=8.0",

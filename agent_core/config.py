@@ -22,6 +22,15 @@ if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-
 _T = TypeVar("_T")
 
 
+def resolve_codeintel_config(config_file: str | Path = "agent.toml"):
+    from agent_core.codeintel.config import CodeIntelConfig
+    raw = load_agent_toml(config_file).get("codeintel", {})
+    table = dict(raw) if isinstance(raw, dict) else {}
+    if "AGENT_CODEINTEL" in os.environ:
+        table["enabled"] = os.environ["AGENT_CODEINTEL"].strip().lower() in {"1", "true", "yes", "on"}
+    return CodeIntelConfig.from_dict(table)
+
+
 def coerce_to_type(declared_type: Any, value: Any) -> Any:
     """Coerce a raw (often string) value to a dataclass field's declared type.
 

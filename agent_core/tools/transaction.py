@@ -1468,6 +1468,8 @@ class WorkspaceTransaction:
         self._subtree_members: dict[str, frozenset[str]] = {}
         self._write_scopes: list[tuple[str, bool]] = []
         self._declared_scopes: set[tuple[str, str, bool]] = set()
+        self._query_reads: dict[str, str] = {}
+        self._query_dirs: dict[str, tuple[int, int, int]] = {}
         self.overlay.mkdir(parents=True, exist_ok=True)
         self.journal.record(RecoveryState.TRANSACTION_OPENED, overlay=str(self._container), workspace=str(self.workspace))
 
@@ -1483,6 +1485,14 @@ class WorkspaceTransaction:
     def declare_resources(self, locks: object) -> None:
         for lock in locks if isinstance(locks, (list, tuple)) else ():
             if getattr(lock, "namespace", None) != "fs":
+                continue
+            if getattr(lock, "mode", "read") == "read" and not getattr(lock, "materialize", True):
+                # Query tools merge the live baseline with exact overlay changes.
+                # They record only files actually read and directory membership guards.
+                source = Path(str(getattr(lock, "key", ""))).resolve()
+                relative = source.relative_to(self.workspace)
+                if source.is_dir():
+                    (self.overlay / relative).mkdir(parents=True, exist_ok=True)
                 continue
             self._declare_path(
                 Path(str(getattr(lock, "key", ""))),
@@ -1551,6 +1561,41 @@ class WorkspaceTransaction:
         if not target.exists():
             shutil.copy2(source, target, follow_symlinks=False)
         self._baseline.setdefault(key, _digest(source))
+
+    def resolve_read_path(self, relative: str) -> Path:
+        path = self.overlay / relative
+        if path.exists() or relative in self._baseline:
+            return path
+        return self.workspace / relative
+
+    def observe_query_read(self, relative: str, digest: str) -> None:
+        if relative not in self._baseline:
+            self._query_reads.setdefault(relative, digest)
+
+    def query_files(self, relative: Path, budget: Any, ignored: frozenset[str]):
+        from agent_core.codeintel.scanning import walk_files
+        seen: set[str] = set()
+
+        def observe_directory(directory: Path) -> None:
+            stat = directory.stat()
+            rel = directory.relative_to(self.workspace).as_posix()
+            self._query_dirs.setdefault(rel, (stat.st_mtime_ns, stat.st_size, stat.st_ino))
+
+        base = self.workspace / relative
+        if base.exists():
+            for path in walk_files(self.workspace, base, budget, ignored=ignored, project=False,
+                                   observe_directory=observe_directory):
+                rel = path.relative_to(self.workspace).as_posix()
+                seen.add(rel)
+                if rel in self._baseline and not (self.overlay / rel).exists():
+                    continue
+                yield self.overlay / rel
+        overlay_base = self.overlay / relative
+        if overlay_base.exists():
+            for path in walk_files(self.overlay, overlay_base, budget, ignored=ignored, project=False):
+                rel = path.relative_to(self.overlay).as_posix()
+                if rel not in seen:
+                    yield path
 
     @staticmethod
     def _contains(candidate: str, parent: str) -> bool:
@@ -1642,6 +1687,13 @@ class WorkspaceTransaction:
             self._assert_unchanged(relative)
         for relative in self._subtree_members:
             self._assert_subtree_unchanged(relative)
+        for relative, digest in self._query_reads.items():
+            if _digest(self.workspace / relative) != digest:
+                raise RuntimeError(f"workspace query evidence changed during tool turn: {relative}")
+        for relative, fingerprint in self._query_dirs.items():
+            stat = (self.workspace / relative).stat()
+            if (stat.st_mtime_ns, stat.st_size, stat.st_ino) != fingerprint:
+                raise RuntimeError(f"workspace query membership changed during tool turn: {relative}")
 
         recovery = self._container / "recovery"
         recovery.mkdir(parents=True, exist_ok=True)
@@ -1687,6 +1739,14 @@ class WorkspaceTransaction:
                 ) from commit_error
             raise
         self._closed = True
+        try:
+            from agent_core.codeintel.changes import record_commit
+            record_commit(self.workspace, self.turn_id, changed)
+        except Exception as exc:
+            # File commit is already durable. Startup reconciliation and the
+            # committed journal recover an outbox failure without undoing edits.
+            import logging
+            logging.getLogger(__name__).warning("code change outbox unavailable: %s", exc)
         self.journal.discard_overlay(self._container)
         return changed
 

@@ -23,16 +23,15 @@ from agent_core.tools.base import (
     ExecutionSafety,
     Tool,
     WorkspacePathMixin,
-    coerce_int,
     write_text_exact,
 )
 from agent_core.tools.builtin import (
     ExactEditError,
     _apply_exact_edit,
-    _IGNORED_DIRS,
     unified_diff,
 )
 from agent_core.tools.catalog import builtin_tool
+from agent_core.codeintel.snapshots import edit_precondition
 from agent_core.unified_diff import PatchError, PatchHunk, PatchOperation, parse_unified_diff
 
 _MAX_GLOB_RESULTS = 200
@@ -65,37 +64,12 @@ class GlobTool(WorkspacePathMixin, Tool):
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec((self.workspace_lock(
-            arguments.get("path", "."), "read", subtree=True, requires_success=True
+            arguments.get("path", "."), "read", subtree=True, requires_success=True, materialize=False
         ),))
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
-        pattern = str(arguments["pattern"])
-        base = self.resolve_workspace_path(arguments.get("path", "."))
-        max_results = coerce_int(arguments.get("max_results", _MAX_GLOB_RESULTS))
-        if not base.exists():
-            return ToolResult(self.name, f"No such path: {base}", ok=False, metadata={"error_type": "NotFound"})
-
-        matches: list[Path] = []
-        try:
-            for path in base.glob(pattern):
-                if not path.is_file():
-                    continue
-                rel = path.relative_to(self.workspace)
-                if any(part in _IGNORED_DIRS for part in rel.parts[:-1]):
-                    continue
-                matches.append(path)
-        except (ValueError, OSError) as exc:
-            return ToolResult(self.name, f"Bad glob pattern: {exc}", ok=False, metadata={"error_type": "BadPattern"})
-
-        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        truncated = len(matches) > max_results
-        shown = matches[:max_results]
-        if not shown:
-            return ToolResult(self.name, "No files matched.")
-        body = "\n".join(p.relative_to(self.workspace).as_posix() for p in shown)
-        if truncated:
-            body += f"\n[... stopped at {max_results} of {len(matches)} matches ...]"
-        return ToolResult(self.name, body, metadata={"matches": len(shown), "truncated": truncated})
+        from agent_core.codeintel.legacy import glob
+        return glob(self, arguments)
 
 
 @builtin_tool
@@ -111,6 +85,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
         "type": "object",
         "properties": {
             "path": {"type": "string"},
+            "expected_version": {"type": "object", "description": "Version returned by read_text_file or code_context."},
             "edits": {
                 "type": "array",
                 "description": "Ordered list of edits to apply.",
@@ -149,6 +124,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
 
         original = path.read_text(encoding="utf-8")
+        edit_precondition(self.workspace, path, arguments.get("expected_version"))
         text = original
         total = 0
         for index, edit in enumerate(edits):
@@ -200,6 +176,7 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
         "type": "object",
         "properties": {
             "patch": {"type": "string", "description": "The unified diff text."},
+            "expected_versions": {"type": "object", "description": "Map of workspace paths to expected file versions."},
         },
         "required": ["patch"],
     }
@@ -234,6 +211,9 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
         for patch_file in patch_set.files:
             target = patch_file.target
             path = self.resolve_workspace_path(target)
+            versions = arguments.get("expected_versions", {})
+            expected = versions.get(target) if isinstance(versions, dict) else None
+            edit_precondition(self.workspace, path, expected)
             if patch_file.operation is PatchOperation.CREATE:
                 if path.exists():
                     return ToolResult(

@@ -97,6 +97,22 @@ def collect_dependency_checks(
         distributions = (*_RUNTIME_DISTRIBUTIONS, *_DEV_DISTRIBUTIONS)
     checks.extend(_distribution_check(name) for name in distributions)
     checks.extend(_command_check(name) for name in _HOST_COMMANDS)
+    try:
+        watcher_version = importlib.metadata.version("watchdog")
+    except importlib.metadata.PackageNotFoundError:
+        checks.append(HealthCheck("codeintel-watcher", False, "missing",
+                                  detail="optional; periodic reconciliation remains available"))
+    else:
+        checks.append(HealthCheck("codeintel-watcher", False, "ok", version=watcher_version))
+    import sqlite3
+    from contextlib import closing
+    try:
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE VIRTUAL TABLE probe USING fts5(text, tokenize='trigram case_sensitive 1')")
+    except sqlite3.OperationalError:
+        checks.append(HealthCheck("codeintel-fts", False, "missing", detail="bounded text scan fallback"))
+    else:
+        checks.append(HealthCheck("codeintel-fts", False, "ok", version=sqlite3.sqlite_version))
     from agent_core.process_supervisor import (
         ShellUnavailableError,
         resolve_bash_executable,

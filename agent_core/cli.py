@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from agent_core.config import (
     resolve_capabilities_config,
+    resolve_codeintel_config,
     resolve_compression_config,
     resolve_concurrency_config,
     resolve_config,
@@ -400,6 +401,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         model=values["model"],
         permission=values["permission"],
         memory=_memory_config(args),
+        codeintel=resolve_codeintel_config(config_file),
         output=resolve_output_config(config_file),
         compression=resolve_compression_config(config_file),
         tool_use_summary=resolve_tool_use_summary_config(config_file),
@@ -1976,6 +1978,42 @@ def _swebench_command(args: argparse.Namespace) -> int:
     return 0 if not any(item.get("state") == "failed" for item in summary.get("instances", [])) else 2
 
 
+def code_command(args: argparse.Namespace) -> int:
+    from agent_core.codeintel.runtime import get_service, release_service
+    from agent_core.codeintel.models import SearchRequest
+    from agent_core.execution import ExecutionScope
+    from agent_core.session import SessionContext
+    import time
+
+    async def execute() -> int:
+        config = replace(resolve_codeintel_config(_config_file(args)), maintain=False, watch=False)
+        session = SessionContext(workspace=Path(args.workspace).resolve(), codeintel_config=config,
+                                 code_permission_rules=lambda: resolve_permission_rules(_config_file(args)))
+        service = await get_service(session)
+        scope = ExecutionScope.for_workspace(session.workspace, deadline=time.monotonic() + args.seconds)
+        try:
+            if args.action in {"build", "reconcile"}:
+                status = await service.ensure_index(scope=scope, reconcile=True, audit=args.audit)
+                while not (status["catalog_complete"] and status["pending"] == 0):
+                    if (scope.remaining_budget() or 0) <= 0:
+                        break
+                    if status.get("stop_reason") == "index_disk_quota":
+                        break
+                    status = await service.ensure_index(scope=scope)
+                print(json.dumps(status, ensure_ascii=False, indent=2))
+                return 0 if status["catalog_complete"] and status["pending"] == 0 else 2
+            if args.action == "search":
+                page = await service.search(SearchRequest(args.query, kind=args.kind, path=args.path), scope=scope)
+                print(json.dumps(page.to_dict(), ensure_ascii=False, indent=2))
+                return 0 if page.coverage.complete else 2
+            print(json.dumps(await service.status(), ensure_ascii=False, indent=2))
+            return 0
+        finally:
+            await release_service(session)
+            await scope.close()
+    return asyncio.run(execute())
+
+
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_output()
     parser = argparse.ArgumentParser(prog="polaris")
@@ -2129,6 +2167,17 @@ def main(argv: list[str] | None = None) -> int:
             action="store_true",
             help="Do not write a resumable transcript for this run.",
         )
+
+    code_parser = subparsers.add_parser("code", help="Build, inspect and query the independent versioned code index.")
+    add_config_flag(code_parser)
+    code_parser.add_argument("action", choices=["status", "build", "reconcile", "search"])
+    code_parser.add_argument("query", nargs="?", default="")
+    code_parser.add_argument("--workspace", default=".")
+    code_parser.add_argument("--path", default=".")
+    code_parser.add_argument("--kind", default="auto", choices=["auto", "path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency"])
+    code_parser.add_argument("--seconds", type=float, default=60.0)
+    code_parser.add_argument("--audit", action="store_true", help="Also hash unchanged files, in resumable batches.")
+    code_parser.set_defaults(func=code_command)
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("task")

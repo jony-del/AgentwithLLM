@@ -373,6 +373,7 @@ class LSPManager:
         self.event_sink = event_sink
         self.sandbox = sandbox
         self._servers: dict[str, _Server] = {}
+        self._document_hashes: dict[str, str] = {}
 
     def rebind_workspace(self, workspace: str | Path) -> None:
         if self._servers:
@@ -427,17 +428,37 @@ class LSPManager:
         resolved = self._resolve(path)
         server = await self._server_for(resolved)
         uri = server.server_uri(resolved)
-        text = resolved.read_text(encoding="utf-8")
+        from agent_core.codeintel.budget import QueryBudget
+        from agent_core.codeintel.config import CodeIntelConfig
+        from agent_core.codeintel.snapshots import read_snapshot
+        from agent_core.tools.base import current_execution_scope
+        raw, fingerprint = await asyncio.to_thread(read_snapshot, self.workspace,
+            resolved.relative_to(self.workspace).as_posix(), QueryBudget(CodeIntelConfig(), current_execution_scope()))
+        text = raw.decode("utf-8")
         if uri not in server.documents:
             language = server.config.extensions.get(resolved.suffix.lower(), resolved.suffix.lstrip("."))
             server.documents[uri] = 1
             await server.notify("textDocument/didOpen", {
                 "textDocument": {"uri": uri, "languageId": language, "version": 1, "text": text}
             })
+        elif self._document_hashes.get(uri) != fingerprint.sha256:
+            server.documents[uri] += 1
+            await server.notify("textDocument/didChange", {
+                "textDocument": {"uri": uri, "version": server.documents[uri]}, "contentChanges": [{"text": text}]
+            })
+        self._document_hashes[uri] = fingerprint.sha256
         return server, resolved
 
     async def notify_saved(self, path: str | Path) -> None:
         resolved = self._resolve(path)
+        if not resolved.exists():
+            for existing in self._servers.values():
+                uri = existing.server_uri(resolved)
+                if uri in existing.documents:
+                    await existing.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+                    existing.documents.pop(uri, None)
+                    self._document_hashes.pop(uri, None)
+            return
         try:
             server = await self._server_for(resolved)
         except ValueError:
@@ -448,11 +469,18 @@ class LSPManager:
             return
         version = server.documents[uri] + 1
         server.documents[uri] = version
-        text = resolved.read_text(encoding="utf-8")
+        from agent_core.codeintel.budget import QueryBudget
+        from agent_core.codeintel.config import CodeIntelConfig
+        from agent_core.codeintel.snapshots import read_snapshot
+        from agent_core.tools.base import current_execution_scope
+        raw, fingerprint = await asyncio.to_thread(read_snapshot, self.workspace,
+            resolved.relative_to(self.workspace).as_posix(), QueryBudget(CodeIntelConfig(), current_execution_scope()))
+        text = raw.decode("utf-8")
         await server.notify("textDocument/didChange", {
             "textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": text}]
         })
         await server.notify("textDocument/didSave", {"textDocument": {"uri": uri}, "text": text})
+        self._document_hashes[uri] = fingerprint.sha256
 
     async def request(self, operation: str, *, path: str | None = None, line: int = 0, character: int = 0, query: str = "") -> Any:
         if operation == "workspace_symbols":
@@ -503,3 +531,4 @@ class LSPManager:
     async def close(self) -> None:
         await asyncio.gather(*(server.close() for server in self._servers.values()), return_exceptions=True)
         self._servers.clear()
+        self._document_hashes.clear()

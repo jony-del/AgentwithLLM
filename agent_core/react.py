@@ -58,6 +58,7 @@ from agent_core.memory.repository import MemoryRepository
 from agent_core.memory.retrieval import RepositoryMemoryRetriever
 from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.lifecycle import MemoryLifecycle
+from agent_core.codeintel.config import CodeIntelConfig
 from agent_core.file_lock import FileLock
 from agent_core.managed_policy import (
     FileManagedPolicyProvider,
@@ -339,6 +340,7 @@ class ReActConfig:
     git_context: bool = True
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    codeintel: CodeIntelConfig = field(default_factory=CodeIntelConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
     tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
     # Skill / slash-command subsystem (loaded eagerly at startup when enabled).
@@ -568,6 +570,7 @@ class ReActAgent:
             run_id=self.logger.run_id,
             permission_mode_setter=self.set_permission_mode,
             tool_suite=self.config.tools,
+            codeintel_config=self.config.codeintel,
             logger=self.logger,
             audit_event=self._audit_event,
             mcp_manager=mcp_manager,
@@ -683,6 +686,11 @@ class ReActAgent:
                 "cron_delivery_list", "cron_delivery_retry",
             ):
                 self.registry.unregister(name)
+        if not self.config.codeintel.enabled:
+            # Disabled means invisible: the tools must not be discoverable via
+            # tool_search only to fail at call time.
+            for name in ("code_search", "code_relations", "code_context"):
+                self.registry.unregister(name)
         blanket_denied = {
             rule.tool_name for rule in self.config.permission_rules.deny if rule.content is None
         }
@@ -729,6 +737,7 @@ class ReActAgent:
             managed_policy_listener=self._on_managed_policy_reload,
         )
         self.session.permission_grant_setter = self.permissions.add_session_rule
+        self.session.code_permission_rules = lambda: self.permissions.rules
         self.session.permission_workspace_setter = lambda path: setattr(
             self.permissions, "workspace", path
         )
@@ -971,6 +980,7 @@ class ReActAgent:
             run_id=self.logger.run_id,
             permission_mode_setter=self.set_permission_mode,
             tool_suite=self.config.tools,
+            codeintel_config=self.config.codeintel,
             logger=self.logger,
             audit_event=self._audit_event,
             mcp_manager=old_session.mcp_manager,
@@ -1008,6 +1018,7 @@ class ReActAgent:
             allow_unsandboxed_unattended=False,
         )
         new_session.permission_grant_setter = new_permissions.add_session_rule
+        new_session.code_permission_rules = lambda: new_permissions.rules
         new_session.permission_workspace_setter = lambda path: setattr(
             new_permissions, "workspace", path
         )
@@ -3302,7 +3313,16 @@ class ReActAgent:
         tool schema each turn via ``registry.schemas_for_llm()``, so tools are never lost
         after compaction.)
         """
-        if tool_call.name != "read_text_file" or not tool_result.ok:
+        if not tool_result.ok:
+            return
+        from agent_core.codeintel.runtime import codeintel_enabled, remember_version
+        if tool_call.name in {"search_text", "glob"}:
+            if codeintel_enabled(self.session):
+                for path, version in tool_result.metadata.get("file_versions", {}).items():
+                    if isinstance(version, dict):
+                        remember_version(self.session, path, version)
+            return
+        if tool_call.name != "read_text_file":
             return
         try:
             raw_path = tool_call.arguments.get("path")
@@ -3315,6 +3335,17 @@ class ReActAgent:
                 return
             key = str((self.session.workspace / raw_path).resolve())
             self.session.record_read(key, tool_result.content)
+            version = tool_result.metadata.get("file_version")
+            if isinstance(version, dict) and codeintel_enabled(self.session):
+                from agent_core.codeintel.models import CodeHit, FileVersion
+                from agent_core.codeintel.working_set import TaskWorkingSet
+                from agent_core.codeintel.backends import module
+                remember_version(self.session, raw_path, version)
+                if self.session.code_working_set is None:
+                    self.session.code_working_set = TaskWorkingSet()
+                self.session.code_working_set.add(CodeHit(
+                    version["path"], tool_result.metadata.get("start_line"), tool_result.metadata.get("end_line"),
+                    "", FileVersion(**version), module=module(version["path"])), reason="read_text_file")
             if tool_result.metadata.get("notebook"):
                 self.session.notebook_reads[key] = {
                     "sha256": tool_result.metadata.get("fingerprint"),
@@ -3325,7 +3356,7 @@ class ReActAgent:
             return
 
     async def _notify_lsp_edit(self, tool_call: ToolCall, tool_result: ToolResult) -> None:
-        if not tool_result.ok or self.session.lsp_manager is None:
+        if not tool_result.ok:
             return
         path_keys = {
             "edit_file": "path", "multi_edit": "path", "write_text_file": "path",
@@ -3335,12 +3366,20 @@ class ReActAgent:
         if key is None:
             return
         raw = tool_call.arguments.get(key)
-        if not isinstance(raw, str) or not raw:
-            return
-        try:
-            await self.session.lsp_manager.notify_saved(raw)
-        except Exception as exc:  # observational integration: edits already succeeded
-            await self.logger.write("lsp_server_state", {"state": "notify_failed", "error": str(exc)})
+        paths = [raw] if isinstance(raw, str) and raw else []
+        if tool_call.name == "apply_patch":
+            from agent_core.unified_diff import parse_unified_diff
+            paths = [file.target for file in parse_unified_diff(str(tool_call.arguments.get("patch", ""))).files]
+        from agent_core.codeintel.runtime import codeintel_enabled, notify_committed
+        if codeintel_enabled(self.session):
+            await notify_committed(self.session, tuple(paths), f"{self.logger.run_id}:{tool_call.id or uuid.uuid4().hex}")
+        for path in paths:
+            self.session.read_file_state.pop(str((self.session.workspace / path).resolve()), None)
+            if self.session.lsp_manager is not None:
+                try:
+                    await self.session.lsp_manager.notify_saved(path)
+                except Exception as exc:
+                    await self.logger.write("lsp_server_state", {"state": "notify_failed", "error": str(exc)})
 
     def _build_read_attachments(self) -> list[Message]:
         """Build the post-compact file re-injection message from session read-state.
@@ -3355,8 +3394,16 @@ class ReActAgent:
         invariant in ``_context_collapse``).
         """
         state = self.session.read_file_state
+        from agent_core.codeintel.runtime import codeintel_enabled
+        attachments: list[Message] = []
+        if codeintel_enabled(self.session) and self.session.code_working_set is not None:
+            references = self.session.code_working_set.render_references()
+            if references:
+                envelope = canonicalize_untrusted_context(references, PromptSource.COMPRESSION)
+                attachments.append(Message("user", envelope.canonical_text, metadata={
+                    "post_compact_attachment": True, "prompt_ingress": envelope.metadata()}))
         if not state:
-            return []
+            return attachments
         config = self.config.compression
         max_files = config.post_compact_max_files
         # Budgets are token-based (char/4, matching the auto-compact gate); convert to a
@@ -3364,7 +3411,7 @@ class ReActAgent:
         per_file = config.post_compact_max_tokens_per_file * 4
         total_budget = config.post_compact_total_budget_tokens * 4
         if max_files <= 0 or per_file <= 0 or total_budget <= 0:
-            return []
+            return attachments
 
         sections: list[str] = []
         spent = 0
@@ -3384,7 +3431,7 @@ class ReActAgent:
             sections.append(f"## {rel}\n{body}")
             spent += len(body)
         if not sections:
-            return []
+            return attachments
         joined = "\n\n".join(sections)
         envelope = canonicalize_untrusted_context(
             (
@@ -3397,7 +3444,7 @@ class ReActAgent:
             max_chars=max(1, total_budget + 512),
             max_bytes=max(4, (total_budget + 512) * 4),
         )
-        return [
+        attachments.append(
             Message(
                 "user",
                 envelope.canonical_text,
@@ -3406,7 +3453,8 @@ class ReActAgent:
                     "prompt_ingress": envelope.metadata(),
                 },
             )
-        ]
+        )
+        return attachments
 
     def _relativize(self, key: str) -> str:
         """Workspace-relative path for the attachment heading; fall back to the raw key."""

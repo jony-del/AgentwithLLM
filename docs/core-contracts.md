@@ -8,6 +8,12 @@
 
 ## 版本总览
 
+代码检索的 `FileVersion` / `SearchPage` 与持久化索引使用独立 schema v1，
+详见 [代码智能层契约](code-intelligence.md#contracts)。它是可重建的代码事实投影，
+不更改下列四个核心 contract 的版本，也不替代恢复 journal 或长期记忆。
+`ResourceLock.materialize` 是兼容性扩展，默认 `true`；仅审计过的查询工具使用
+`false`，通过事务投影视图读取并在提交时校验实际观察的文件与目录。
+
 | Contract | 定义位置 | Schema 版本 |
 |---|---|---|
 | ExecutionScope | `agent_core/execution.py` | v1 |

@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "python": "3.12.13 (main, May  8 2026, 18:37:00) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "win32",
+  "corpus": {
+    "lines": 10000000,
+    "files": 10000,
+    "modules": 32,
+    "language": "python",
+    "shape": "function + integer assignments; synthetic, not a real monorepo"
+  },
+  "generation_seconds": 9.592429099982837,
+  "build_seconds": 647.1166351000138,
+  "index_bytes": 1488101377,
+  "query_seconds": {
+    "symbol": {
+      "median": 0.009538050013361499,
+      "p95": 0.01231059999554418
+    },
+    "text": {
+      "median": 0.05908659999840893,
+      "p95": 0.06869229997391813
+    },
+    "no_match": {
+      "median": 0.008607649986515753,
+      "p95": 0.012281200004508719
+    }
+  },
+  "queries": {
+    "symbol": {
+      "hits": 1,
+      "usage": {
+        "files": 1,
+        "bytes": 16787,
+        "candidates": 1,
+        "edges": 0,
+        "output_bytes": 429,
+        "elapsed_ms": 0.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [],
+        "reasons": [],
+        "advisories": [
+          "python_syntax_only; dynamic and other-language relations unresolved"
+        ],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": true,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    },
+    "text": {
+      "hits": 19,
+      "usage": {
+        "files": 20,
+        "bytes": 335792,
+        "candidates": 20,
+        "edges": 0,
+        "output_bytes": 7687,
+        "elapsed_ms": 63.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [
+          "module:module_07 under . (remaining, pending, or unindexed candidates)"
+        ],
+        "reasons": [
+          "context_tokens"
+        ],
+        "advisories": [],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": false,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    },
+    "no_match": {
+      "hits": 0,
+      "usage": {
+        "files": 0,
+        "bytes": 0,
+        "candidates": 0,
+        "edges": 0,
+        "output_bytes": 0,
+        "elapsed_ms": 15.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [],
+        "reasons": [],
+        "advisories": [],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": true,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    }
+  },
+  "incremental_seconds": 0.18060949997743592,
+  "incremental_usage": {
+    "files": 1,
+    "bytes": 40,
+    "candidates": 0,
+    "edges": 0,
+    "output_bytes": 0,
+    "elapsed_ms": 172.0
+  },
+  "config": {
+    "query_seconds": 2,
+    "max_files": 500,
+    "max_bytes": 67108864
+  }
+}

@@ -24,6 +24,10 @@ You distil durable, reusable memories from a conversation. Capture only things w
 remembering for *future, separate* conversations: stable user preferences, facts about
 the user or their projects, and decisions — not transient task chatter, not greetings,
 not anything already obvious.
+Keep architecture decisions, module responsibilities and reusable experience. Do not
+store current file listings, line numbers, symbol definitions or reference graphs as
+durable facts. Any code path or symbol retained as a historical clue must be rechecked
+through code retrieval against the current worktree before analysis or editing.
 
 Respond with ONLY a JSON array (no prose). Each item is a change:
   {{"operation": "create"|"update"|"archive"|"forget", "target_id": str|null,

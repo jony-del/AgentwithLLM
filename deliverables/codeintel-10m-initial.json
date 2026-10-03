@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "python": "3.12.13 (main, May  8 2026, 18:37:00) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "win32",
+  "corpus": {
+    "lines": 10000000,
+    "files": 10000,
+    "modules": 32,
+    "language": "python",
+    "shape": "function + integer assignments; synthetic, not a real monorepo"
+  },
+  "generation_seconds": 8.913021000000299,
+  "build_seconds": 897.494237699997,
+  "index_bytes": 1657409537,
+  "query_seconds": {
+    "symbol": {
+      "median": 0.24124619999929564,
+      "p95": 0.3172372999979416
+    },
+    "text": {
+      "median": 0.27673639999557054,
+      "p95": 0.34321420000924263
+    },
+    "no_match": {
+      "median": 0.18079519999446347,
+      "p95": 0.23479349999979604
+    }
+  },
+  "queries": {
+    "symbol": {
+      "hits": 1,
+      "usage": {
+        "files": 1,
+        "bytes": 16787,
+        "candidates": 1,
+        "edges": 0,
+        "output_bytes": 64,
+        "elapsed_ms": 312.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [
+          "module:module_07 under . (remaining, pending, or unindexed candidates)"
+        ],
+        "reasons": [
+          "python_syntax_only; dynamic and other-language relations unresolved"
+        ],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": false,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    },
+    "text": {
+      "hits": 36,
+      "usage": {
+        "files": 36,
+        "bytes": 604432,
+        "candidates": 36,
+        "edges": 0,
+        "output_bytes": 1900,
+        "elapsed_ms": 328.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [],
+        "reasons": [],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": true,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    },
+    "no_match": {
+      "hits": 0,
+      "usage": {
+        "files": 0,
+        "bytes": 0,
+        "candidates": 0,
+        "edges": 0,
+        "output_bytes": 0,
+        "elapsed_ms": 204.0
+      },
+      "coverage": {
+        "requested": [
+          "module:module_07 under ."
+        ],
+        "checked": [
+          "module:module_07 under . (indexed candidates; returned files hash-verified)"
+        ],
+        "unchecked": [],
+        "reasons": [],
+        "excluded": [
+          "vcs/build/runtime directories",
+          "secrets",
+          "symlinks"
+        ],
+        "complete": true,
+        "freshness": "observed; external changes may await reconciliation"
+      }
+    }
+  },
+  "incremental_seconds": 0.42047149999416433,
+  "incremental_usage": {
+    "files": 1,
+    "bytes": 40,
+    "candidates": 0,
+    "edges": 0,
+    "output_bytes": 0,
+    "elapsed_ms": 406.0
+  },
+  "config": {
+    "query_seconds": 2,
+    "max_files": 500,
+    "max_bytes": 67108864
+  }
+}

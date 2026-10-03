@@ -159,7 +159,7 @@ async def test_search_text_parses_rg_output_shape(tmp_path: Path, monkeypatch) -
     assert "notes.md:1: compute the answer" in out
 
 
-async def test_search_text_falls_back_when_rg_errors(tmp_path: Path, monkeypatch, caplog) -> None:
+async def test_search_text_unaffected_when_rg_errors(tmp_path: Path, monkeypatch) -> None:
     _search_fixture(tmp_path)
     from agent_core.tools import builtin
 
@@ -170,12 +170,10 @@ async def test_search_text_falls_back_when_rg_errors(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(shutil, "which", lambda name: "C:/fake/rg.exe")
     monkeypatch.setattr(builtin.subprocess, "run", lambda *a, **k: _Broken())
-    with caplog.at_level("DEBUG", logger="agent_core.tools.builtin"):
-        out = (await SearchTextTool(tmp_path).run({"pattern": "compute"})).content
-    # The pure-Python fallback still finds everything (and skips ignored dirs).
+    out = (await SearchTextTool(tmp_path).run({"pattern": "compute"})).content
+    # The bounded scan reads files directly; a broken/absent rg cannot change results.
     assert "pkg/mod.py:2:" in out and "notes.md:1:" in out
     assert "node_modules" not in out
-    assert any("falling back" in record.getMessage() for record in caplog.records)
 
 
 # --- command execution -------------------------------------------------------
