@@ -129,6 +129,7 @@ persist_compaction_boundary = true
 # AGENT_DISABLE_CLAUDE_MD / AGENT_DISABLE_GIT_CONTEXT env vars.
 [context]
 project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAUDE.md injection
+git_aware_revisions = false    # optional Git source inventory; final verification always rehashes
 git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
 
@@ -491,7 +492,7 @@ enabled = true
 max_bytes = 16777216
 max_output_chars = 8000
 [tools.worktree]
-root = ".polaris/worktrees"
+root = ".polaris-worktrees"
 stale_days = 30
 [tools.scheduler]
 enabled = true

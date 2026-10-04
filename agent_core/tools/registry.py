@@ -321,10 +321,18 @@ class ToolRegistry:
         return results
 
     def rebind_workspace(self, workspace: str) -> None:
-        self._workspace = workspace
-        for tool in self._tools.values():
-            if isinstance(tool, WorkspacePathMixin):
+        previous = self._workspace
+        tools = [tool for tool in self._tools.values() if isinstance(tool, WorkspacePathMixin)]
+        old_roots = [tool._workspace for tool in tools]
+        try:
+            for tool in tools:
                 tool.bind_workspace(workspace)
+            self._workspace = workspace
+        except BaseException:
+            for tool, root in zip(tools, old_roots, strict=True):
+                tool._workspace = root
+            self._workspace = previous
+            raise
 
     @property
     def workspace(self) -> str | None:

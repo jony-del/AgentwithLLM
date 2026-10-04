@@ -167,6 +167,15 @@ class ContainerBackend(SandboxBackend):
         suffix = ":ro" if workspace_read_only else ""
         prefix += ["-v", f"{ws_host}:{ws_guest}{suffix}", "-w", ws_guest]
 
+        denied_writes = [Path(raw).resolve() for raw in expand_paths(config.filesystem.deny_write, workspace)]
+        writable_roots = [workspace.resolve(), *[
+            Path(raw).resolve() for raw in expand_paths(config.filesystem.allow_write, workspace)
+        ]]
+        for denied in denied_writes:
+            for writable_root in writable_roots:
+                if writable_root != workspace.resolve() and writable_root != denied and writable_root.is_relative_to(denied):
+                    raise GuestCapabilityUnavailable("guest_capability_unavailable: writable mount conflicts with deny_write")
+
         for raw in expand_paths(config.filesystem.allow_write, workspace):
             path = Path(raw).resolve()
             if path == workspace.resolve():
@@ -190,6 +199,17 @@ class ContainerBackend(SandboxBackend):
                 f"{_map_workspace_path(path, cfg.windows_isolation)}:ro",
             ]
 
+        # A deny must be enforced at the process boundary, not only in file tools.
+        for denied in sorted(set(denied_writes), key=lambda path: len(path.parts)):
+            if denied == workspace.resolve():
+                continue
+            if not any(denied.is_relative_to(root) for root in writable_roots):
+                continue  # Host paths that were never mounted are already unavailable.
+            if not denied.exists():
+                raise GuestCapabilityUnavailable("guest_capability_unavailable: deny_write mount target does not exist")
+            prefix += ["-v", f"{_host_mount_path(denied, cfg.windows_isolation)}:"
+                       f"{_map_workspace_path(denied, cfg.windows_isolation)}:ro"]
+
         prefix += [cfg.image]
         return prefix + argv, False
 
@@ -197,6 +217,11 @@ class ContainerBackend(SandboxBackend):
 def _validate_container_policy(config: SandboxConfig) -> None:
     cfg = config.container
     validate_container_image(cfg)
+    if config.filesystem.deny_read:
+        raise GuestCapabilityUnavailable(
+            "guest_capability_unavailable: container backend cannot enforce deny_read; "
+            "use a backend supporting read masks"
+        )
     if cfg.windows_isolation.casefold() != "wsl2":
         raise GuestCapabilityUnavailable(
             "guest_capability_unavailable: container backend only supports WSL2/Linux; "

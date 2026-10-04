@@ -61,9 +61,10 @@ def _run_gate(thresholds: Path, report: Path, *extra: str, env_extra: dict | Non
         *extra,
     ]
     env = dict(os.environ)
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(command, capture_output=True, text=True, timeout=300, env=env)
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=300, env=env)
 
 
 def test_artificially_tight_threshold_fails_the_gate(tmp_path: Path) -> None:

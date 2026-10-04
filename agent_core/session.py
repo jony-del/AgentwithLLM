@@ -320,6 +320,7 @@ class SessionContext:
     permission_mode_setter: Callable[..., object] | None = None
     permission_grant_setter: Callable[[str], object] | None = None
     permission_workspace_setter: Callable[[Path], None] | None = None
+    workspace_binding_setter: Callable[[Path], Awaitable[None]] | None = None
     registered_tool_names: frozenset[str] = frozenset()
     process_supervisor: Any | None = None
     lsp_manager: Any | None = None
@@ -354,6 +355,35 @@ class SessionContext:
     code_read_versions: dict[str, dict[str, Any]] = field(default_factory=dict)
     code_permission_rules: Any | None = None
     notebook_reads: dict[str, dict[str, object]] = field(default_factory=dict)
+    task_run: Any | None = None
+    task_store: Any | None = None
+    bundle_store: Any | None = None
+    checkpoint_store: Any | None = None
+    revision_tracker: Any | None = None
+    review_task: Any | None = None
+    plan_code_task: Any | None = None
+    record_aux_usage: Any | None = None
+
+    async def capture_revision(self, *, strict: bool = True):
+        if self.revision_tracker is not None:
+            return await self.revision_tracker.capture(strict=strict)
+        import asyncio
+        from agent_core.task_runtime import capture_revision
+        return await asyncio.to_thread(capture_revision, self.workspace)
+
+    def persist_task(self) -> None:
+        if self.task_run is not None and self.task_store is not None:
+            self.task_store.save(self.task_run)
+
+    async def persist_task_async(self) -> None:
+        """Drain atomic private writes before cancellation can publish a new status."""
+        import asyncio
+        pending = asyncio.create_task(asyncio.to_thread(self.persist_task))
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
 
     def notify_todos(self) -> None:
         if self.ui_notify is not None:

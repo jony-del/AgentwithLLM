@@ -8,6 +8,11 @@
 
 ## 版本总览
 
+任务契约/任务状态与 worktree 修改包使用独立 schema v2（兼容读取 v1）；源码 checkpoint
+manifest 使用独立 schema v1，评估报告使用 v1。`AgentRunResult` 兼容性增加
+`status`、`verification`、`task_id`，不修改下列四个核心 contract 的版本。
+任务续跑与会话消息恢复是两个明确入口，详见 [Coding Agent 任务闭环](coding-agent-runtime.md)。
+
 代码检索的 `FileVersion` / `SearchPage` 与持久化索引使用独立 schema v1，
 详见 [代码智能层契约](code-intelligence.md#contracts)。它是可重建的代码事实投影，
 不更改下列四个核心 contract 的版本，也不替代恢复 journal 或长期记忆。

@@ -11,4 +11,5 @@ venv/
 .env
 agent.local.toml
 /.claude/worktrees/
+/.polaris-worktrees/
 

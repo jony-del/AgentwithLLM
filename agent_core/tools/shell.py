@@ -17,6 +17,7 @@ from agent_core.process_supervisor import (
     powershell_utf8_command,
     resolve_bash_executable,
     resolve_powershell_executable,
+    safe_process_environment,
 )
 from agent_core.sandbox import SandboxInvocation
 from agent_core.sandbox import SandboxAwareMixin
@@ -151,7 +152,7 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
                 raise RuntimeError("sandbox returned invalid argv")
             child_env = None
             if self.session.plugin_bin_paths and not self.sandbox.uses_guest:
-                child_env = dict(os.environ)
+                child_env = safe_process_environment()
                 child_env["PATH"] = os.pathsep.join(
                     [*self.session.plugin_bin_paths, child_env.get("PATH", "")]
                 )

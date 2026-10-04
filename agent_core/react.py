@@ -127,6 +127,12 @@ from agent_core.process_supervisor import (
 )
 from agent_core.tool_config import ToolSuiteConfig
 from agent_core.worktree import WorktreeManager
+from agent_core.task_runtime import TaskContract, TaskRun, TaskStatus, TaskStore, VerificationReport, capture_revision, verify_completion
+from agent_core.change_bundles import BundleStore
+from agent_core.checkpoints import CheckpointStore
+from agent_core.revisions import RevisionTracker, git_capture
+from agent_core.review import contract_hash, review_task
+from agent_core.planner import plan_code_task
 from agent_core import tokens
 from agent_core.tool_use_summary import (
     ToolUseSummaryConfig,
@@ -210,6 +216,9 @@ _READ_ONLY_CHILD_TOOLS = frozenset(
         "read_text_file",
         "echo",
         "update_todos",
+        "update_task_plan",
+        "task_state",
+        "plan_code_task",
         "sleep",
         "cron_create",
         "cron_list",
@@ -223,6 +232,10 @@ _FULL_CHILD_TOOLS = _READ_ONLY_CHILD_TOOLS | {
     "multi_edit",
     "apply_patch",
     "write_text_file",
+    "run_verification",
+    "create_checkpoint",
+    "rollback_checkpoint",
+    "run_review",
 }
 
 
@@ -308,7 +321,11 @@ class ReActConfig:
     system_prompt: str = (
         "You are a ReAct agent. Reason briefly, call tools when useful, "
         "and return a final answer when the task is complete. "
-        "For non-trivial, multi-step tasks, call update_todos first to lay out a plan, "
+        "For non-trivial, multi-step tasks, call update_task_plan to define dependent steps "
+        "and appropriate verification checks with explicit argv; update_todos can display progress. "
+        "After changing files, call run_verification for each required check on the final revision. "
+        "Revise the plan after repeated failures instead of repeating an unchanged attempt. "
+        "Use update_todos to lay out a plan, "
         "then keep it current — mark one item in_progress at a time and complete it before "
         "moving on. For self-contained sub-investigations, consider dispatch_agent to run "
         "them in a fresh context. For work that needs a team of cooperating agents, use "
@@ -360,6 +377,8 @@ class ReActConfig:
     # domain not in allowed_domains is refused too (fail-closed exfiltration guard).
     web: WebPolicyConfig = field(default_factory=WebPolicyConfig)
     tools: ToolSuiteConfig = field(default_factory=ToolSuiteConfig)
+    # Measurements on Windows favour walking; Git inventory is explicitly selectable.
+    git_aware_revisions: bool = False
 
 
 @dataclass(slots=True)
@@ -368,6 +387,9 @@ class AgentRunResult:
     messages: list[Message]
     steps: int
     run_id: str
+    status: TaskStatus = "unverified"
+    verification: VerificationReport | None = None
+    task_id: str | None = None
 
 
 class _TurnStreamHandler(StreamHandler):
@@ -773,6 +795,10 @@ class ReActAgent:
             ),
         )
         self.recover_turn_journals()
+        self.session.workspace_binding_setter = self._bind_execution_workspace
+        self.session.task_store = TaskStore(self.executor.journal_storage)
+        self.session.bundle_store = BundleStore(self.executor.journal_storage)
+        self._init_task_services()
         # Strong refs to in-flight fire-and-forget PostSampling hook tasks, so they
         # aren't garbage-collected mid-run; reaped best-effort at terminal returns.
         self._background_hook_tasks: set[asyncio.Task[None]] = set()
@@ -1036,6 +1062,7 @@ class ReActAgent:
                 workspace, loaded.session_id, self.logger.run_id
             ),
         )
+        new_session.workspace_binding_setter = self._bind_execution_workspace
         candidate = SessionRuntime(
             descriptor=SessionDescriptor(
                 loaded.session_id,
@@ -1055,6 +1082,9 @@ class ReActAgent:
         await old_runtime.close()
         self.runtime = candidate
         self.executor = new_executor
+        self.session.task_store = TaskStore(self.executor.journal_storage)
+        self.session.bundle_store = BundleStore(self.executor.journal_storage)
+        self._init_task_services()
         for tool in self.registry.list():
             if isinstance(tool, SessionAwareMixin):
                 tool.bind_session(new_session)
@@ -1408,10 +1438,17 @@ class ReActAgent:
         *,
         _user_messages: list[Message] | None = None,
         execution_scope: ExecutionScope | None = None,
+        task_contract: TaskContract | None = None,
+        resume_task: bool = False,
+        require_review: bool = False,
     ) -> AgentRunResult:
         """Run within one root/inherited execution budget, including preflight work."""
 
         started = time.monotonic()
+        self._requested_task_contract = task_contract
+        self._resume_task_requested = resume_task
+        self._require_review = require_review
+        self.session.task_run = None
         owned_scope = execution_scope is None
         if execution_scope is None:
             if deadline is None and self.config.max_wall_seconds is not None:
@@ -1487,6 +1524,27 @@ class ReActAgent:
             self._active_deadline = None
             if owned_scope:
                 await execution_scope.close()
+            await self._emit_task_metrics(started)
+
+    async def _emit_task_metrics(self, started: float) -> None:
+        task_run = self.session.task_run
+        if task_run is None:
+            return
+        tracker = self.session.revision_tracker
+        try:
+            await self.logger.write("task_metrics", {
+                "task_id": task_run.id, "status": task_run.status,
+                "duration_seconds": time.monotonic() - started,
+                "input_tokens": self._run_input_tokens, "output_tokens": self._run_output_tokens,
+                "verification_attempts": len(task_run.evidence),
+                "verification_failures": sum(e.state != "completed" or e.exit_code != 0 for e in task_run.evidence),
+                "tool_failures": len(task_run.failures), "review_attempts": len(task_run.reviews),
+                "review_passed": bool(task_run.reviews and task_run.reviews[-1].get("status") == "passed"),
+                "checkpoint_count": sum("id" in c for c in task_run.checkpoints),
+                "snapshot": tracker.totals if tracker is not None else {},
+            })
+        except Exception as exc:
+            logging.getLogger(__name__).warning("task outcome metrics unavailable: %s", type(exc).__name__)
 
     async def _run_scoped(
         self,
@@ -1513,6 +1571,17 @@ class ReActAgent:
                 scope=scope,
                 started=started,
             )
+        except asyncio.CancelledError:
+            if self.session.task_run is not None:
+                self.session.task_run.status = "cancelled"
+                await self.session.persist_task_async()
+            raise
+        except Exception:
+            active_task = self.session.task_run
+            if active_task is not None and active_task.status == "running":
+                active_task.status = "failed"
+                await self.session.persist_task_async()
+            raise
         finally:
             await self._cancel_pending_tool_use_summary()
             # The natural-end and ``_stopped`` paths already reaped inline (their
@@ -1660,14 +1729,43 @@ class ReActAgent:
         if not first_should_query:
             answer = str(first_block_reason or "First queued prompt was blocked by a hook.")
             self._emit_recap(messages, 0, "blocked")
-            await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
-            return AgentRunResult(answer, messages, 0, self.logger.run_id)
+            await self.logger.write("final", {"answer": answer, "stopped": "blocked", "status": "blocked"})
+            return AgentRunResult(answer, messages, 0, self.logger.run_id, "blocked")
         accepted_ids = {message.uuid for message in messages}
         canonical_task = "\n".join(
             submitted.content
             for submitted in user_messages
             if submitted.uuid in accepted_ids
         )
+        restored = await asyncio.to_thread(cast(TaskStore, self.session.task_store).load) if self._resume_task_requested else None
+        if self._resume_task_requested and (restored is None or restored.status == "completed"):
+            raise ValueError("resume_task requires an unfinished task in the selected session")
+        if restored is not None and restored.status != "completed":
+            self.session.task_run = restored
+            if self._require_review and not restored.contract.review_required:
+                if not restored.baseline_checkpoint:
+                    raise ValueError("cannot add required review on resume without an original source baseline")
+                restored.contract = replace(restored.contract, review_required=True)
+            if restored.execution_workspace and restored.execution_workspace != str(self.session.workspace.resolve()):
+                manager = self.session.worktree_manager
+                if restored.workspace_binding is None or manager is None:
+                    raise ValueError("resume_task requires the recorded execution workspace: " + restored.execution_workspace)
+                await scope.run_awaitable(manager.restore_owned(restored.workspace_binding))
+            restored.status = "running"
+        else:
+            baseline = await scope.run_awaitable(self.session.capture_revision())
+            contract = self._requested_task_contract or TaskContract(canonical_task, review_required=self._require_review)
+            if self._require_review and not contract.review_required:
+                contract = replace(contract, review_required=True)
+            self.session.task_run = TaskRun(contract, baseline, checks_locked=self._requested_task_contract is not None)
+            self.session.task_run.execution_workspace = str(self.session.workspace.resolve())
+            if contract.review_required:
+                from agent_core.tools.codeintel import path_allowed
+                checkpoint = await asyncio.to_thread(cast(CheckpointStore, self.session.checkpoint_store).capture,
+                    self.session.task_run, baseline, "task baseline", allowed=lambda path: path_allowed(self.session, path, "create_checkpoint"))
+                self.session.task_run.baseline_checkpoint = checkpoint.id
+        self.session.code_working_set = None
+        await self.session.persist_task_async()
         await scope.run_awaitable(self._recall(canonical_task, messages))
         discovery = await scope.run_awaitable(asyncio.to_thread(
             self.capability_manager.auto_discover,
@@ -1713,8 +1811,17 @@ class ReActAgent:
         # How many times a Stop hook has blocked termination so far this run; bounds
         # the "可阻断/可续跑" continuation so a stop hook can't pin the loop forever.
         stop_blocks = 0
+        verification_blocks = 0
+        no_progress_rounds = 0
         step = 0
         while True:
+            self._refresh_task_context(messages)
+            if self.session.task_run.stalled():
+                no_progress_rounds += 1
+                if no_progress_rounds > 2:
+                    return await self._stopped(messages, step, "no_progress", "repeated failures without a code or plan change")
+            else:
+                no_progress_rounds = 0
             # The natural exit below — the model returning no tool calls — is the primary
             # stop, so a task can take as many tool turns as it needs. These guards are only
             # a safety net so a runaway or stuck loop can't spin forever: a cooperative
@@ -2065,6 +2172,39 @@ class ReActAgent:
                     termination_proven=result.termination_proven,
                     termination_event=result.termination_event,
                 )
+                current = await scope.run_awaitable(self.session.capture_revision())
+                report = verify_completion(
+                    self.session.task_run, current,
+                    running_processes=bool(self.process_supervisor.running()),
+                    truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
+                    termination_proven=result.termination_proven,
+                )
+                if any(todo.status != "completed" for todo in self.session.todos.items()):
+                    report = replace(report, status="blocked" if report.status == "blocked" else "unverified",
+                                     issues=(*report.issues, "unfinished todo items"))
+                review_issue = "independent review has not passed on the final revision"
+                if report.issues == (review_issue,):
+                    matching = [r for r in self.session.task_run.reviews if r.get("revision") == current.digest and
+                                r.get("workspace") == current.workspace and r.get("contract_hash") == contract_hash(self.session.task_run)]
+                    if not matching:
+                        await scope.run_awaitable(cast(Any, self.session.review_task)(current))
+                        current = await scope.run_awaitable(self.session.capture_revision())
+                        report = verify_completion(self.session.task_run, current,
+                            running_processes=bool(self.process_supervisor.running()),
+                            truncated=result.stop_reason in {"max_tokens", "length", "incomplete"}, termination_proven=result.termination_proven)
+                if report.issues and verification_blocks < 2 and report.status != "blocked":
+                    verification_blocks += 1
+                    envelope = canonicalize_untrusted_context(
+                        "Completion verification failed: " + json.dumps(report.issues) +
+                        ". Update the task plan, run the required verification checks, and resolve these issues. "
+                        "If verification cannot run, explain the blocker instead of claiming completion.",
+                        PromptSource.HOOK_CONTEXT,
+                    )
+                    await self._emit(messages, Message("user", envelope.canonical_text,
+                        metadata={"completion_verifier": True, "prompt_ingress": envelope.metadata()}))
+                    await self.logger.write("verification", asdict(report))
+                    self.ui.on_reasoning(result.content)
+                    continue
                 # Stop hook: a hook may BLOCK this stop and force the loop to keep running
                 # ("可阻断/可续跑"), bounded by config.max_stop_blocks so it can't loop
                 # forever. A block injects the continuation directive and re-enters the loop.
@@ -2098,11 +2238,38 @@ class ReActAgent:
                     self.ui.on_reasoning(result.content)
                     continue
                 await self._reap_background_hooks()
-                self.ui.on_final(result.content)
-                self._emit_recap(messages, step, "completed")
-                await self.logger.write("final", {"answer": result.content})
+                # Stop/observational hooks can execute project code. Recheck the
+                # revision after they drain before certifying the final result.
+                final_revision = await scope.run_awaitable(self.session.capture_revision())
+                if final_revision.digest != report.revision or self.process_supervisor.running():
+                    report = verify_completion(self.session.task_run, final_revision,
+                        running_processes=bool(self.process_supervisor.running()),
+                        truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
+                        termination_proven=result.termination_proven)
+                    if any(todo.status != "completed" for todo in self.session.todos.items()):
+                        report = replace(report, status="unverified", issues=(*report.issues, "unfinished todo items"))
+                    if report.issues and verification_blocks < 2:
+                        verification_blocks += 1
+                        envelope = canonicalize_untrusted_context(
+                            "Final hooks invalidated completion evidence: " + json.dumps(report.issues) +
+                            ". Recheck the workspace and run verification again.", PromptSource.HOOK_CONTEXT)
+                        await self._emit(messages, Message("user", envelope.canonical_text,
+                            metadata={"completion_verifier": True, "prompt_ingress": envelope.metadata()}))
+                        self.ui.on_reasoning(result.content)
+                        continue
+                answer = result.content
+                if report.status != "completed":
+                    answer += "\n\nVerification status: " + report.status + ". " + "; ".join(report.issues)
+                self.session.task_run.status = report.status
+                await self.session.persist_task_async()
+                self.ui.on_final(answer)
+                if report.status != "completed" and self.config.stream:
+                    self.ui.on_stopped(report.status, "completion verification: " + "; ".join(report.issues))
+                self._emit_recap(messages, step, report.status)
+                await self.logger.write("final", {"answer": answer, "status": report.status, "verification": asdict(report)})
                 await self._extract_memories(messages)
-                return AgentRunResult(result.content, messages, step, self.logger.run_id)
+                return AgentRunResult(answer, messages, step, self.logger.run_id,
+                                      report.status, report, self.session.task_run.id)
 
             # Intermediate turn: show the reasoning that precedes the tool calls.
             self.ui.on_reasoning(result.content)
@@ -2128,6 +2295,16 @@ class ReActAgent:
                 termination_proven=result.termination_proven,
                 termination_event=result.termination_event,
             )
+            task_revision = await scope.run_awaitable(self.session.capture_revision(strict=False))
+            self.session.task_run.current_revision = task_revision.digest
+            for call, task_outcome in zip(result.tool_calls, tool_results, strict=True):
+                if not task_outcome.ok:
+                    self.session.task_run.record_failure(call.name, call.arguments,
+                        str(task_outcome.metadata.get("error_type", "ToolFailed")), task_revision.digest)
+                elif (call.name in {"edit_file", "multi_edit", "apply_patch", "write_text_file", "notebook_edit", "merge_change_bundle"} or
+                      (call.name == "rollback_checkpoint" and not call.arguments.get("preview", True))):
+                    self.session.task_run.mutation_seen = True
+            await self.session.persist_task_async()
             if any(item.metadata.get("activation_pending") for item in tool_results):
                 activation_outcomes = await asyncio.to_thread(
                     self.capability_manager.commit_pending
@@ -2143,6 +2320,7 @@ class ReActAgent:
                     item.metadata["activation_status"] = outcome.get("status")
                     await self.logger.write("capability_activation", outcome)
             tool_messages: list[Message] = []
+            pending_rules: list[Message] = []
             for ordinal, (tool_call, tool_result) in enumerate(
                 zip(result.tool_calls, tool_results, strict=True)
             ):
@@ -2167,7 +2345,26 @@ class ReActAgent:
                 # conflicts with SessionAwareMixin) so it can be re-injected after a
                 # post-compaction fold. Defensive: odd/missing args just skip.
                 self._record_read_result(tool_call, tool_result)
+                if tool_result.ok and tool_call.name == "read_text_file" and self.config.project_instructions:
+                    from agent_core.context import build_scoped_instructions
+                    target = self.session.workspace / str(tool_call.arguments.get("path", ""))
+                    rules = await build_scoped_instructions(self.session.workspace, target)
+                    if rules:
+                        rule_envelope = canonicalize_untrusted_context(rules, PromptSource.HOOK_CONTEXT)
+                        # Replace rules for this directory and cap unrelated scopes.
+                        scope_key = str(target.resolve().parent)
+                        pending_rules.append(Message("user", rule_envelope.canonical_text,
+                            metadata={"instruction_scope": scope_key, "pinned": True,
+                                      "prompt_ingress": rule_envelope.metadata()}))
                 await self._notify_lsp_edit(tool_call, tool_result)
+
+            for rule_message in pending_rules:
+                scope_key = rule_message.metadata["instruction_scope"]
+                messages[:] = [m for m in messages if m.metadata.get("instruction_scope") != scope_key]
+                scoped_messages = [m for m in messages if m.metadata.get("instruction_scope")]
+                for expired in scoped_messages[:-7]:
+                    messages.remove(expired)
+                messages.append(rule_message)
 
             manifest = tool_batch.execution_manifest()
             history_payload: dict[str, object] = {
@@ -2388,8 +2585,24 @@ class ReActAgent:
         await self._reap_background_hooks()
         answer = f"Stopped after {human} without a final answer."
         self.ui.on_stopped(reason, human)
-        await self.logger.write("final", {"answer": answer, "stopped": reason})
-        return AgentRunResult(answer, messages, step, self.logger.run_id)
+        status: TaskStatus = "cancelled" if reason == "interrupted" else "blocked"
+        await self.logger.write("final", {"answer": answer, "stopped": reason, "status": status})
+        if self.session.task_run is not None:
+            self.session.task_run.status = status
+            await self.session.persist_task_async()
+        return AgentRunResult(answer, messages, step, self.logger.run_id, status,
+                              task_id=self.session.task_run.id if self.session.task_run else None)
+
+    def _refresh_task_context(self, messages: list[Message]) -> None:
+        task = self.session.task_run
+        if task is None:
+            return
+        messages[:] = [message for message in messages if not message.metadata.get("task_state")]
+        envelope = canonicalize_untrusted_context(task.context(), PromptSource.HOOK_CONTEXT)
+        latest_user = next((n for n in reversed(range(len(messages))) if messages[n].role == "user"), len(messages))
+        index = next((n for n, message in enumerate(messages) if message.role in {"assistant", "tool"}), latest_user)
+        messages.insert(index, Message("user", envelope.canonical_text,
+            metadata={"task_state": True, "pinned": True, "prompt_ingress": envelope.metadata()}))
 
     def _fire_tool_use_summary(
         self, batch: list[tuple[ToolCall, ToolResult]], last_assistant_text: str
@@ -2581,7 +2794,7 @@ class ReActAgent:
             answer = outcome.reason or "Request blocked by a UserPromptSubmit hook."
             self._emit_recap(messages, 0, "blocked")
             self.ui.on_stopped("blocked", answer)
-            await self.logger.write("final", {"answer": answer, "stopped": "blocked"})
+            await self.logger.write("final", {"answer": answer, "stopped": "blocked", "status": "blocked"})
             return AgentRunResult(answer, messages, 0, self.logger.run_id), True
         if outcome.additional_context:
             context_envelope = canonicalize_untrusted_context(
@@ -3626,16 +3839,95 @@ class ReActAgent:
         await self.logger.write(kind, {**payload, **self._trace_fields()})
 
     async def _git_capture(self, cwd: Path, *args: str) -> str:
-        process = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        output, error = await asyncio.wait_for(process.communicate(), 30)
-        text = output.decode("utf-8", errors="replace").strip()
-        if process.returncode:
-            detail = error.decode("utf-8", errors="replace").strip() or text
-            raise RuntimeError(f"git {' '.join(args)} failed: {detail[:2000]}")
-        return text
+        return os.fsdecode(await git_capture(cwd, *args, timeout=30)).strip()
+
+    def _init_task_services(self, *, isolated: bool = False) -> None:
+        self.session.checkpoint_store = CheckpointStore(self.executor.journal_storage, isolated=isolated)
+        self.session.review_task = lambda current: review_task(self.session, self.provider, self._provider_config(), current)
+        self.session.plan_code_task = lambda queries: plan_code_task(self.session, self.provider, self._provider_config(), queries)
+        self.session.record_aux_usage = self._record_aux_usage
+        self.session.revision_tracker = self._revision_tracker(self.session.workspace)
+
+    def _record_aux_usage(self, usage: Any) -> None:
+        if usage is not None:
+            self._session_input_tokens += usage.input_tokens
+            self._session_output_tokens += usage.output_tokens
+            self._run_input_tokens += usage.input_tokens
+            self._run_output_tokens += usage.output_tokens
+
+    def _revision_tracker(self, workspace: Path) -> RevisionTracker:
+        # Runtime-owned output is never source evidence, including custom in-tree logs.
+        excluded = [self.logger.path.resolve()]
+        for raw in (self.config.run_dir, self.config.session_dir):
+            if raw:
+                root = Path(raw).expanduser().resolve()
+                if root != workspace.resolve():
+                    excluded.append(root)
+                elif raw == self.config.run_dir:
+                    excluded.extend(root / name for name in ("tasks", "teams", "outputs"))
+        if self.config.memory.enabled:
+            memory_root = Path(self.config.memory.dir).expanduser().resolve()
+            if memory_root != workspace.resolve():
+                excluded.append(memory_root)
+        return RevisionTracker(workspace, excluded=tuple(excluded), git_aware=self.config.git_aware_revisions)
+
+    async def _bind_execution_workspace(self, workspace: Path) -> None:
+        """Prepare recovery ownership before publishing a new execution workspace.
+
+        SessionDescriptor/transcript keep the stable project identity; file tools,
+        permissions and the journal share the current execution workspace.
+        """
+        from agent_core.codeintel.runtime import release_service
+
+        workspace = workspace.resolve()
+        current = self.executor.journal_storage
+        if current.partitioned:
+            storage = JournalStorage.user_state(workspace, self.session_id, self.logger.run_id)
+        else:
+            # Embedders' trusted local storage gets a separate workspace partition.
+            import hashlib
+            key = hashlib.sha256(str(workspace).encode()).hexdigest()[:16]
+            storage = JournalStorage.local(
+                current.anchor / f"workspace-{key}", workspace=workspace,
+                session_id=current.session_id, run_id=current.run_id,
+            )
+        await asyncio.to_thread(TurnExecutionJournal.require_recovered, storage)
+        await release_service(self.session)
+        if self.session.lsp_manager is not None:
+            await self.session.lsp_manager.close()
+        self.session.lsp_manager = None
+        self.session.code_working_set = None
+        self.session.code_read_versions.clear()
+        self.session.read_file_state.clear()
+        previous_workspace = self.session.workspace
+        task = self.session.task_run
+        previous_task_workspace = task.execution_workspace if task is not None else ""
+        previous_tracker = self.session.revision_tracker
+        try:
+            self.registry.rebind_workspace(str(workspace))
+            self.executor.rebind_journal_storage(storage)
+            self.sandbox.workspace = workspace
+            self.permissions.workspace = workspace
+            self.session.workspace = workspace
+            self.session.revision_tracker = self._revision_tracker(workspace)
+            if task is not None:
+                task.execution_workspace = str(workspace)
+                await self.session.persist_task_async()
+            await self.logger.write("workspace_binding", {
+                "workspace": str(workspace), "project_workspace": str(self.runtime.descriptor.workspace),
+                "journal_root": str(storage.run_root),
+            })
+        except BaseException:
+            self.registry.rebind_workspace(str(previous_workspace))
+            self.executor.rebind_journal_storage(current)
+            self.sandbox.workspace = previous_workspace
+            self.permissions.workspace = previous_workspace
+            self.session.workspace = previous_workspace
+            self.session.revision_tracker = previous_tracker
+            if task is not None:
+                task.execution_workspace = previous_task_workspace
+                await self.session.persist_task_async()
+            raise
 
     async def _create_agent_worktree(self, prefix: str) -> dict[str, Any]:
         workspace = self.session.workspace.resolve()
@@ -3649,7 +3941,15 @@ class ReActAgent:
         branch = f"polaris/ephemeral/{slug}"
         root.mkdir(parents=True, exist_ok=True)
         await self._git_capture(repo, "worktree", "add", "-b", branch, str(path), base_sha)
-        return {"path": path, "branch": branch, "base_sha": base_sha, "repo": repo}
+        try:
+            baseline = await asyncio.to_thread(capture_revision, path)
+            await asyncio.to_thread(cast(BundleStore, self.session.bundle_store).capture_baseline, path, baseline)
+        except BaseException:
+            await self._git_capture(repo, "worktree", "remove", str(path))
+            await self._git_capture(repo, "branch", "-D", branch)
+            raise
+        return {"path": path, "branch": branch, "base_sha": base_sha, "repo": repo,
+                "baseline": baseline, "parent_workspace": workspace}
 
     async def _finalize_agent_worktree(self, state: dict[str, Any]) -> dict[str, object]:
         path = Path(state["path"])
@@ -3659,6 +3959,18 @@ class ReActAgent:
         commits = int(await self._git_capture(path, "rev-list", "--count", f"{base_sha}..HEAD") or "0")
         diff = await self._git_capture(path, "diff", "--stat", base_sha)
         retained = bool(status) or commits > 0
+        bundle = None
+        bundle_error = None
+        if retained and "baseline" in state:
+            try:
+                store = self.session.bundle_store
+                if store is None:
+                    raise ValueError("change bundle store unavailable")
+                bundle = await asyncio.to_thread(store.export, path,
+                                                 state["baseline"], state["parent_workspace"])
+            except (ValueError, OSError) as exc:
+                bundle_error = str(exc)
+                await self.logger.write("change_bundle", {"status": "export_failed", "error": bundle_error})
         if not retained:
             await self._git_capture(repo, "worktree", "remove", str(path))
             await self._git_capture(repo, "branch", "-D", str(state["branch"]))
@@ -3666,6 +3978,7 @@ class ReActAgent:
             "path": str(path), "branch": state["branch"], "base_sha": base_sha,
             "dirty": bool(status), "new_commits": commits, "diff_summary": diff[:8000],
             "retained": retained,
+            "bundle_id": bundle.id if bundle is not None else None, "bundle_error": bundle_error,
         }
 
     def _make_subagent_child(
@@ -3763,6 +4076,10 @@ class ReActAgent:
             supervisor_dir=Path(child_config.run_dir) / "tasks" / self.session_id / agent_id,
         )
         child.session.depth = self.session.depth + 1
+        child.session.task_store = TaskStore(child.executor.journal_storage, isolated=True)
+        child._init_task_services(isolated=True)
+        if self.session.revision_tracker is not None:
+            self.session.revision_tracker.excluded.add(child.logger.path.resolve())
         child.session.max_depth = self.session.max_depth
         child.session.parent_run_id = self.logger.run_id
         child.session.agent_id = agent_id
@@ -3996,6 +4313,10 @@ class ReActAgent:
             supervisor_dir=Path(child_config.run_dir) / "tasks" / self.session_id / agent_id,
         )
         child.session.depth = self.session.depth + 1
+        child.session.task_store = TaskStore(child.executor.journal_storage, isolated=True)
+        child._init_task_services(isolated=True)
+        if self.session.revision_tracker is not None:
+            self.session.revision_tracker.excluded.add(child.logger.path.resolve())
         child.session.max_depth = self.session.max_depth
         child.session.agent_name = name
         child.session.team_id = team_id

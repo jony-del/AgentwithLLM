@@ -247,7 +247,7 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
-        fs_mode: LockMode = "write" if preset == "full" else "read"
+        fs_mode: LockMode = "write" if preset == "full" and arguments.get("isolation") != "worktree" else "read"
         locks = [
             ResourceLock("team", f"{team_id or '_'}/members/{name}", "write"),
             ResourceLock("fs", str(self.session.workspace.resolve()), fs_mode, subtree=True),

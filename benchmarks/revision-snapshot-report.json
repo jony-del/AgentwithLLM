@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "python": "3.12.13",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "corpus": {
+    "files": 512,
+    "bytes_per_file": 65536,
+    "shape": "synthetic indexed UTF-8 text"
+  },
+  "samples": 5,
+  "median_seconds": {
+    "walk_full": 0.34830050001619384,
+    "git_strict": 0.684348000009777,
+    "git_warm_hint": 0.33476910000899807,
+    "walk_strict": 0.4695890999864787,
+    "walk_warm_hint": 0.2103310000093188
+  },
+  "last_metrics": {
+    "git_strict": {
+      "files": 512,
+      "bytes_hashed": 33554432,
+      "files_reused": 0,
+      "inventory": "git",
+      "strict": true,
+      "seconds": 0.7030000000086147
+    },
+    "git_warm_hint": {
+      "files": 512,
+      "bytes_hashed": 0,
+      "files_reused": 512,
+      "inventory": "git",
+      "strict": false,
+      "seconds": 0.3279999999795109
+    },
+    "walk_strict": {
+      "files": 512,
+      "bytes_hashed": 33554432,
+      "files_reused": 0,
+      "inventory": "walk",
+      "strict": true,
+      "seconds": 0.4840000000258442
+    },
+    "walk_warm_hint": {
+      "files": 512,
+      "bytes_hashed": 0,
+      "files_reused": 512,
+      "inventory": "walk",
+      "strict": false,
+      "seconds": 0.2029999999795109
+    }
+  },
+  "single_file_hint": {
+    "files": 512,
+    "bytes_hashed": 8,
+    "files_reused": 511,
+    "inventory": "git",
+    "strict": false,
+    "seconds": 0.32800000000861473
+  },
+  "final_strict": {
+    "files": 512,
+    "bytes_hashed": 33488904,
+    "files_reused": 0,
+    "inventory": "git",
+    "strict": true,
+    "seconds": 0.7339999999967404
+  },
+  "coverage": "same eligible content and matching hashes across all modes",
+  "limitations": [
+    "Planning hints may reuse metadata; completion never does",
+    "Git queries have fixed process overhead",
+    "Synthetic local corpus; not a real-world task-success claim"
+  ]
+}

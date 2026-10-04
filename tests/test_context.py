@@ -136,6 +136,28 @@ async def test_truncates_oversized(tmp_path: Path) -> None:
     assert result.endswith("...(truncated)")
 
 
+async def test_agents_rules_and_closest_scope_survive_large_parent(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "CLAUDE.md").write_text("parent " * 5000)
+    child = tmp_path / "pkg"
+    child.mkdir()
+    (child / "AGENTS.md").write_text("CHILD RULES")
+    result = await build_project_instructions(child, include_user_home=False, max_chars=1500)
+    assert "CHILD RULES" in result
+    assert len(result) <= 1500
+
+
+async def test_nested_rules_are_scoped_to_retrieved_file(tmp_path: Path) -> None:
+    from agent_core.context import build_scoped_instructions
+    (tmp_path / "CLAUDE.md").write_text("ROOT RULES")
+    child = tmp_path / "pkg"
+    child.mkdir()
+    (child / "AGENTS.md").write_text("NESTED RULES")
+    result = await build_scoped_instructions(tmp_path, child / "f.py")
+    assert "NESTED RULES" in result and "ROOT RULES" not in result
+    assert await build_scoped_instructions(tmp_path, tmp_path.parent / "outside.py") is None
+
+
 async def test_unreadable_file_skipped(tmp_path: Path) -> None:
     # A directory named CLAUDE.md is not a regular file: discovery skips it, no raise.
     (tmp_path / "CLAUDE.md").mkdir()
@@ -185,6 +207,13 @@ def test_enabled_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert values["project_instructions"] is True
     assert values["git_context"] is True
     assert values["claudemd_max_chars"] == 32000
+    assert values["git_aware_revisions"] is False
+
+
+def test_git_revision_inventory_is_explicitly_configurable(tmp_path):
+    config = tmp_path / "agent.toml"
+    config.write_text("[context]\ngit_aware_revisions = true\n")
+    assert resolve_context_config(config)["git_aware_revisions"] is True
 
 
 def test_git_context_disabled_via_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,7 +470,7 @@ async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatc
 
     result = await agent.run("hello")
 
-    # Order: system(+gitStatus) → pinned untrusted memory data → userContext → user task.
+    # Order: system(+gitStatus) → memory → userContext → task state → user task.
     assert result.messages[0].role == "system"
     assert "gitStatus: GIT BLOCK" in result.messages[0].content
     assert "RECALLED MEMORY BLOCK" in result.messages[1].content
@@ -450,7 +479,8 @@ async def test_injection_order_with_memory_recall(monkeypatch: pytest.MonkeyPatc
     assert result.messages[1].metadata["memory"] == "recall"
     assert result.messages[2].metadata.get("pinned") == "user_context"
     assert "# claudeMd\nCLAUDEMD BLOCK" in result.messages[2].content
-    assert result.messages[3].content == "hello"
+    assert result.messages[3].metadata.get("task_state") is True
+    assert result.messages[4].content == "hello"
 
 
 async def test_git_block_survives_compaction(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ from agent_core.tools.base import (
     ExecutionSafety,
     Tool,
     WorkspacePathMixin,
+    read_text_exact,
     write_text_exact,
 )
 from agent_core.tools.builtin import (
@@ -123,7 +124,7 @@ class MultiEditTool(WorkspacePathMixin, Tool):
         if not path.exists():
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
 
-        original = path.read_text(encoding="utf-8")
+        original = read_text_exact(path)
         edit_precondition(self.workspace, path, arguments.get("expected_version"))
         text = original
         total = 0
@@ -167,9 +168,9 @@ class MultiEditTool(WorkspacePathMixin, Tool):
 class ApplyPatchTool(WorkspacePathMixin, Tool):
     name = "apply_patch"
     description = (
-        "Apply a unified-diff patch across one or more workspace files. Hunks are matched by "
-        "their context lines (line numbers are advisory), so the patch need not be byte-exact on "
-        "offsets. Use '--- /dev/null' as the old path to create a new file. If any hunk's context "
+        "Apply a unified-diff patch across one or more workspace files. Hunks use the declared "
+        "position or a unique context match; ambiguous anchors are rejected. "
+        "Use '--- /dev/null' as the old path to create a new file. If any hunk's context "
         "can't be located the whole patch is rejected and nothing is written."
     )
     input_schema = {
@@ -222,14 +223,15 @@ class ApplyPatchTool(WorkspacePathMixin, Tool):
                         ok=False,
                         metadata={"error_type": "AlreadyExists"},
                     )
-                new_text = _apply_hunks("", patch_file.hunks)
-                if new_text and patch_text.endswith("\n"):
-                    new_text += "\n"
+                try:
+                    new_text = _apply_hunks("", patch_file.hunks)
+                except PatchError as exc:
+                    return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": "HunkFailed"})
                 planned.append((path, new_text, patch_file.operation))
                 continue
             if not path.exists():
                 return ToolResult(self.name, f"No such file to patch: {target}", ok=False, metadata={"error_type": "NotFound"})
-            original = path.read_text(encoding="utf-8")
+            original = read_text_exact(path)
             try:
                 updated = _apply_hunks(original, patch_file.hunks)
             except PatchError as exc:
@@ -298,29 +300,53 @@ def _parse_unified_diff(patch_text: str):
 
 
 def _apply_hunks(original: str, hunks: tuple[PatchHunk, ...]) -> str:
-    """Apply each hunk by locating its old-block as a contiguous run of lines."""
-    had_trailing_newline = original.endswith("\n")
-    file_lines = original.splitlines()
+    """Use the declared position or a unique context match; never guess an anchor."""
+    file_lines = original.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in original else "\n"
     cursor = 0
+    offset = 0
+    previous_end = 0
     for hunk in hunks:
         old_block = list(hunk.old_lines)
-        new_block = list(hunk.new_lines)
+        base = hunk.old_start - 1 if old_block else hunk.old_start
+        if base < previous_end:
+            raise PatchError("overlapping or out-of-order hunks")
+        expected = base + offset
+        contents = [line.rstrip("\r\n") for line in file_lines]
         if not old_block:
-            # Pure insertion with no context anchor: append at the cursor.
-            file_lines[cursor:cursor] = new_block
-            cursor += len(new_block)
-            continue
-        index = _find_block(file_lines, old_block, cursor)
-        if index < 0:
-            index = _find_block(file_lines, old_block, 0)  # fall back to a full scan
-        if index < 0:
-            raise PatchError("context lines not found")
-        file_lines[index:index + len(old_block)] = new_block
-        cursor = index + len(new_block)
-    result = "\n".join(file_lines)
-    if had_trailing_newline and result:
-        result += "\n"
-    return result
+            index = expected
+            if not cursor <= index <= len(file_lines):
+                raise PatchError("insertion position is outside the file")
+        elif expected >= cursor and contents[expected:expected + len(old_block)] == old_block:
+            index = expected
+        else:
+            matches = [i for i in range(cursor, len(contents) - len(old_block) + 1)
+                       if contents[i:i + len(old_block)] == old_block]
+            if len(matches) != 1:
+                raise PatchError("context lines not found" if not matches else "ambiguous context; add context or correct the hunk position")
+            index = matches[0]
+        old_raw = file_lines[index:index + len(old_block)]
+        if hunk.old_no_newline and (index + len(old_block) != len(file_lines) or not old_raw or old_raw[-1].endswith(("\n", "\r"))):
+            raise PatchError("old newline marker does not match the file")
+        replacement: list[str] = []
+        for n, line in enumerate(hunk.new_lines):
+            source = hunk.new_sources[n] if hunk.new_sources else None
+            raw = old_raw[source] if source is not None else line + newline
+            if n == len(hunk.new_lines) - 1:
+                if hunk.new_no_newline:
+                    if index + len(old_block) != len(file_lines):
+                        raise PatchError("newline marker is not at end of file")
+                    raw = raw.rstrip("\r\n")
+                elif not raw.endswith(("\n", "\r")):
+                    raw += newline
+            replacement.append(raw)
+        if replacement and index and not file_lines[index - 1].endswith(("\n", "\r")):
+            raise PatchError("cannot insert after an unterminated line; include it in the hunk")
+        file_lines[index:index + len(old_block)] = replacement
+        cursor = index + len(replacement)
+        offset += index - expected + len(replacement) - len(old_block)
+        previous_end = base + len(old_block)
+    return "".join(file_lines)
 
 
 def _find_block(haystack: list[str], needle: list[str], start: int) -> int:

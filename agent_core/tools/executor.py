@@ -1582,6 +1582,11 @@ class StreamingToolBatch:
         self.model_finished_at = time.monotonic()
         self.metrics["termination_proven"] = termination_proven
         self.metrics["termination_event"] = termination_event
+        if len(final_calls) > 1 and any(call.name in {"enter_worktree", "exit_worktree"} for call in final_calls):
+            await self._invalidate_turn("workspace switches require a separate model turn")
+            return await self._protocol_results(
+                final_calls, [(call, None) for call in final_calls], error_type="WorkspaceSwitchRequiresSeparateTurn",
+            )
         if not termination_proven:
             unproven_bindings = [
                 (call, self._by_id.get(call.id) if call.id else None)

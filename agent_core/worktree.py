@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
 from typing import Any
+
+from agent_core.revisions import git_capture
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -33,21 +34,12 @@ class WorktreeManager:
         self.owned: dict[str, WorktreeState] = {}
 
     async def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> str:
-        process = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=str(cwd or self.session.workspace),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            output, error = await asyncio.wait_for(process.communicate(), 30)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            raise RuntimeError(f"git {' '.join(args)} timed out") from None
-        text = output.decode("utf-8", errors="replace")
-        if check and process.returncode:
-            detail = error.decode("utf-8", errors="replace").strip() or text.strip()
-            raise RuntimeError(f"git {' '.join(args)} failed: {detail[:4000]}")
-        return text.strip()
+            return os_decode(await git_capture(cwd or self.session.workspace, *args, timeout=30))
+        except RuntimeError:
+            if check:
+                raise
+            return ""
 
     async def create_and_enter(self, name: str | None = None) -> WorktreeState:
         if self.active is not None:
@@ -63,6 +55,7 @@ class WorktreeManager:
                 raise RuntimeError("session-owned worktree path disappeared; refusing to recreate it")
             await self._switch(state.path)
             self.active = state
+            await self._persist_binding()
             await self._event("workspace_switched", state, action="resume")
             return state
         repo_root = Path(await self._git("rev-parse", "--show-toplevel", cwd=self.original_workspace)).resolve()
@@ -86,7 +79,55 @@ class WorktreeManager:
             self.owned.pop(slug, None)
             raise
         self.active = state
+        await self._persist_binding()
         await self._event("workspace_switched", state, action="enter")
+        return state
+
+    async def _persist_binding(self) -> None:
+        task = getattr(self.session, "task_run", None)
+        if task is None:
+            return
+        state = self.active
+        task.workspace_binding = ({"slug": state.slug, "path": str(state.path), "branch": state.branch,
+                                   "base_sha": state.base_sha, "created_at": state.created_at,
+                                   "original_workspace": str(self.original_workspace)} if state is not None else None)
+        await self.session.persist_task_async()
+
+    async def restore_owned(self, record: dict[str, Any]) -> WorktreeState:
+        """Restore only a private session record still corroborated by Git ownership."""
+        slug = record.get("slug", "")
+        if not isinstance(slug, str) or not _SLUG.fullmatch(slug):
+            raise ValueError("invalid restored worktree name")
+        if record.get("original_workspace") != str(self.original_workspace):
+            raise ValueError("worktree resume belongs to another project")
+        branch = f"polaris/{self.session.session_id[:12]}/{slug}"
+        if record.get("branch") != branch or re.fullmatch(r"[0-9a-f]{40,64}", str(record.get("base_sha", ""))) is None:
+            raise ValueError("worktree resume ownership mismatch")
+        repo = Path(os_decode(await git_capture(self.original_workspace, "rev-parse", "--show-toplevel"))).resolve()
+        root = (repo / self.config.root).resolve()
+        if not root.is_relative_to(repo) or root == repo:
+            raise ValueError("unsafe restored worktree root")
+        path = Path(str(record.get("path", ""))).resolve()
+        if path.parent != root or path.name != slug or not path.is_dir() or path.is_symlink():
+            raise ValueError("unsafe or missing restored worktree path")
+        listing = os_decode(await git_capture(repo, "worktree", "list", "--porcelain", "-z"))
+        matches = []
+        for block in listing.split("\0\0"):
+            fields = dict(item.split(" ", 1) for item in block.split("\0") if " " in item)
+            if fields.get("worktree") and Path(fields["worktree"]).resolve() == path:
+                matches.append(fields)
+        if len(matches) != 1 or matches[0].get("branch") != "refs/heads/" + branch:
+            raise ValueError("restored worktree is not registered on its owned branch")
+        actual = os_decode(await git_capture(path, "symbolic-ref", "--short", "HEAD"))
+        if actual != branch:
+            raise ValueError("restored worktree branch changed")
+        await git_capture(path, "merge-base", "--is-ancestor", record["base_sha"], "HEAD")
+        state = WorktreeState(slug, path, branch, record["base_sha"], float(record["created_at"]))
+        await self._switch(path)
+        self.owned[slug] = state
+        self.active = state
+        await self._persist_binding()
+        await self._event("workspace_switched", state, action="restore")
         return state
 
     async def cleanup_stale(self, repo_root: Path | None = None) -> list[str]:
@@ -125,6 +166,10 @@ class WorktreeManager:
         return removed
 
     async def _switch(self, workspace: Path) -> None:
+        binder = getattr(self.session, "workspace_binding_setter", None)
+        if binder is not None:
+            await binder(workspace.resolve())
+            return
         from agent_core.codeintel.runtime import release_service
         await release_service(self.session)
         self.session.code_working_set = None
@@ -166,6 +211,7 @@ class WorktreeManager:
                 raise RuntimeError("worktree has uncommitted files or new commits; set discard_changes=true after review")
         await self._switch(self.original_workspace)
         self.active = None
+        await self._persist_binding()
         if action == "remove":
             try:
                 args = ["worktree", "remove"]
@@ -176,6 +222,7 @@ class WorktreeManager:
             except Exception:
                 await self._switch(state.path)
                 self.active = state
+                await self._persist_binding()
                 raise
             await self._git(
                 "branch", "-D", state.branch, cwd=self.original_workspace, check=False
@@ -197,3 +244,8 @@ class WorktreeManager:
             await self.session.logger.write(kind, {
                 "path": str(state.path), "branch": state.branch, "base_sha": state.base_sha, **extra
             })
+
+
+def os_decode(value: bytes) -> str:
+    import os
+    return os.fsdecode(value).strip()

@@ -1,5 +1,14 @@
 # Polaris / Agent with LLM
 
+## Task planning and verified completion
+
+Agent runs now keep a durable task contract and dependency-checked plan. Registered
+verification commands bind their results to the final workspace revision; file changes
+without passing checks return `unverified`. Isolated child worktrees export conflict-checked
+change bundles for explicit parent integration. See [Coding Agent runtime](docs/coding-agent-runtime.md)
+for the APIs, `--resume-task`, `--require-review`, source checkpoints, conservative three-way
+merging, measured snapshot modes, exit codes, safety boundaries and remaining limitations.
+
 ## Code intelligence for large repositories
 
 Versioned code retrieval is independent of long-term memory. Build a resumable local

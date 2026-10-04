@@ -38,8 +38,9 @@ async def get_service(session: Any) -> CodeIntelligenceService:
     pool = _SERVICES.setdefault(loop, {})
     key = (str(session.workspace.resolve()), config, policy_key)
     def allowed(path: str) -> bool:
-        return rules is None or not any(rules.deny_match(name, {"path": path}) or rules.ask_match(name, {"path": path})
-                                       for name in ("read_text_file", "search_text", "code_search"))
+        arguments = ({"path": path}, {"path": str((session.workspace / path).resolve())})
+        return rules is None or not any(rules.deny_match(name, argument) or rules.ask_match(name, argument)
+                                       for argument in arguments for name in ("read_text_file", "search_text", "code_search"))
     database = default_store(session.workspace)
     if policy_key:
         database = database.with_name(f"code-{policy_key}.sqlite3")

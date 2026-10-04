@@ -18,9 +18,9 @@ def path_allowed(session: Any, path: str, tool: str = "code_search") -> bool:
     rules = session.code_permission_rules() if callable(session.code_permission_rules) else None
     if rules is None:
         return True
-    arguments = {"path": path}
-    return not any(rules.deny_match(name, arguments) or rules.ask_match(name, arguments)
-                   for name in {tool, "read_text_file", "search_text"})
+    arguments = ({"path": path}, {"path": str((session.workspace / path).resolve())})
+    return not any(rules.deny_match(name, argument) or rules.ask_match(name, argument)
+                   for argument in arguments for name in {tool, "read_text_file", "search_text"})
 
 
 class _CodeTool(SessionAwareMixin, WorkspacePathMixin, Tool):

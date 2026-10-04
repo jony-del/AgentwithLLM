@@ -444,12 +444,15 @@ def resolve_context_config(config_file: str | Path = "agent.toml") -> dict[str, 
     table = load_agent_toml(config_file).get("context")
     values: dict[str, Any] = {
         "project_instructions": True,
+        "git_aware_revisions": False,
         "git_context": True,
         "claudemd_max_chars": 32000,
     }
     if isinstance(table, dict):
         if "project_instructions" in table:
             values["project_instructions"] = coerce_to_type(bool, table["project_instructions"])
+        if "git_aware_revisions" in table:
+            values["git_aware_revisions"] = coerce_to_type(bool, table["git_aware_revisions"])
         if "git_context" in table:
             values["git_context"] = coerce_to_type(bool, table["git_context"])
         if "claudemd_max_chars" in table:

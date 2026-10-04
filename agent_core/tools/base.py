@@ -32,6 +32,12 @@ class ToolDisplayProvider:
 LockMode = Literal["read", "write"]
 
 
+def read_text_exact(path: Path) -> str:
+    """Read UTF-8 without universal-newline conversion before an edit."""
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
 def coerce_int(value: object) -> int:
     """Convert a JSON-compatible scalar without accepting arbitrary objects."""
     if isinstance(value, (int, float, str, bytes, bytearray)):

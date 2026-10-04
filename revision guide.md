@@ -400,6 +400,21 @@ notebook）。
   `tests/test_tool_platform.py` 覆盖关键生命周期。（2026-07-20）
 
 **原明确延后项（已于 2026-07-20 落地）：**
+
+**Coding Agent 架构审查实施（2026-10-03）：**
+- [x] **W16 / P0** 任务契约、最终版本验证门、无进展检测；Patch 位置/counts/CRLF；
+  run_tests 共享进程监管；worktree journal 重绑定；container 文件系统策略显式执行/拒绝。
+- [x] **W17 / P1 基础** 依赖计划、固定目标投影、分页任务状态与显式任务续跑；
+  AGENTS.md/嵌套指令；子 worktree 修改包、冲突拒绝与项目提交互斥。
+- [x] **W18 / P1 后续（2026-10-04）** 独立上下文/无工具 Reviewer，版本与契约绑定的审查门；
+  私有内容寻址源码 checkpoint，显式预览/批准的事务 rollback；Git 所有权核对后恢复 worktree。
+- [x] **W19 / P2 基础（2026-10-04）** 可选 Git-aware inventory、规划/进展 hint 缓存与最终完整 hash；
+  有界多语言证据驱动的依赖规划；保守三方文本合并及 Python AST 所有权检查。
+  已记录合成快照测量与五类脚本化任务结果，并核对 JSONL/transcript；Git 模式的 Windows
+  开销未证明默认收益，保持显式启用。契约及边界见 `docs/coding-agent-runtime.md`。
+  **明确未覆盖**：全语言类型解析/AST merge、独立不同模型 Reviewer、生产 Coding 任务成功率
+  基线和真实 Container/VM 验证。本机 Docker 不可用、Podman 服务未运行，不将 mock 当系统验证。
+
 - ~~AskUserQuestion 工具（C2，依赖 terminal 栈）。~~
 - ~~后台/长进程任务族（C3）。~~
 - ~~LSP/诊断、worktree 隔离、notebook 编辑（C4）。~~

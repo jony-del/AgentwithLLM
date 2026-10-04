@@ -30,6 +30,7 @@ from agent_core.permission_types import (
     PermissionResult,
 )
 from agent_core.sandbox import SandboxAwareMixin
+from agent_core.session import SessionAwareMixin, SessionContext
 from agent_core.tools.base import (
     ConcurrencySpec,
     ExecutionScope,
@@ -38,6 +39,7 @@ from agent_core.tools.base import (
     Tool,
     WorkspacePathMixin,
     coerce_int,
+    read_text_exact,
     write_text_exact,
 )
 from agent_core.tools.catalog import builtin_tool
@@ -122,6 +124,9 @@ def _apply_exact_edit(text: str, old_string: str, new_string: str, replace_all: 
     memory). Raises ``ExactEditError`` if the edit is empty, a no-op, missing, or
     ambiguous (more than one match without ``replace_all``).
     """
+    if "\r\n" in text:
+        old_string = re.sub(r"(?<!\r)\n", "\r\n", old_string)
+        new_string = re.sub(r"(?<!\r)\n", "\r\n", new_string)
     if not old_string:
         raise ExactEditError("old_string must not be empty", "EmptyMatch")
     if old_string == new_string:
@@ -213,7 +218,7 @@ class EditFileTool(WorkspacePathMixin, Tool):
         if not path.exists():
             return ToolResult(self.name, f"No such file: {path}", ok=False, metadata={"error_type": "NotFound"})
 
-        text = path.read_text(encoding="utf-8")
+        text = read_text_exact(path)
         try:
             updated, replaced = _apply_exact_edit(text, old_string, new_string, replace_all)
         except ExactEditError as exc:
@@ -334,7 +339,7 @@ def _unsafe_test_arguments(arguments: dict[str, Any]) -> str | None:
 
 
 @builtin_tool
-class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
+class RunTestsTool(WorkspacePathMixin, SessionAwareMixin, SandboxAwareMixin, Tool):
     name = "run_tests"
     description = (
         "Run the test suite with pytest in the workspace. Optionally scope to `target` "
@@ -350,6 +355,12 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
         "required": [],
     }
     risk = ToolRisk.DANGEROUS
+    safely_cancellable = True
+    execution_timeout = 600.0
+
+    def __init__(self, workspace: str | Path | None = None) -> None:
+        WorkspacePathMixin.__init__(self, workspace)
+        SessionAwareMixin.__init__(self, SessionContext(workspace=self._workspace))
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
         return ConcurrencySpec(
@@ -357,11 +368,11 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
                 ResourceLock(
                     "fs",
                     str(self.workspace.resolve()),
-                    "read",
+                    "write",
                     subtree=True,
                     requires_success=True,
                 ),
-                ResourceLock("env", "process", "read", requires_success=True),
+                ResourceLock("env", "process", "write", requires_success=True),
             )
         )
 
@@ -390,7 +401,7 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
             metadata={"target": str(arguments.get("target", ""))[:200]},
         )
 
-    def _invoke(self, arguments: dict[str, object]) -> ToolResult:
+    async def run(self, arguments: dict[str, object]) -> ToolResult:
         # Host pytest is irrelevant for a Linux guest; the prepared image manifest is
         # the authority in that mode.
         if not self.sandbox.uses_guest and importlib.util.find_spec("pytest") is None:
@@ -421,7 +432,7 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
         if isinstance(extra, list):
             cmd += [str(a) for a in extra]
             guest_cmd += [str(a) for a in extra]
-        timeout = min(coerce_int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT)
+        timeout = max(1, min(coerce_int(arguments.get("timeout", 300)), _MAX_COMMAND_TIMEOUT))
         # Sandbox the (argv) test invocation when active; no command string to exclude on.
         from agent_core.sandbox import SandboxInvocation
 
@@ -438,7 +449,30 @@ class RunTestsTool(WorkspacePathMixin, SandboxAwareMixin, Tool):
                 self.name, str(exc), ok=False,
                 metadata={"error_type": getattr(exc, "error_type", "SandboxUnavailable")},
             )
-        return _run_subprocess(self.name, spec, cwd=self.workspace, timeout=timeout, shell=shell)
+        if shell or not isinstance(spec, (list, tuple)):
+            return ToolResult(self.name, "test runner requires explicit argv", ok=False)
+        from agent_core.process_supervisor import ProcessSupervisor
+        from tempfile import TemporaryDirectory
+
+        async def execute(supervisor: ProcessSupervisor) -> ToolResult:
+            output = await supervisor.run_argv([str(item) for item in spec], self.workspace, timeout=timeout)
+            content = str(output.pop("output"))
+            return ToolResult(
+                self.name, f"[exit {output['exit_code']}; state {output['state']}]\n{content}",
+                ok=output["state"] == "completed", metadata={**output, "returncode": output["exit_code"]},
+            )
+
+        supervisor = self.session.process_supervisor
+        if isinstance(supervisor, ProcessSupervisor):
+            return await execute(supervisor)
+        # Standalone tool embedding remains supported, with owned cleanup.
+        with TemporaryDirectory(prefix="polaris-test-runner-") as root:
+            from agent_core.tool_config import ShellToolConfig
+            owned = ProcessSupervisor(ShellToolConfig(), root)
+            try:
+                return await execute(owned)
+            finally:
+                await owned.shutdown()
 
 
 def _shell_invocation(command: str):
@@ -463,7 +497,8 @@ def _shell_invocation(command: str):
 
 def _utf8_child_env() -> dict[str, str]:
     """Environment that makes child processes emit UTF-8 (kills GBK encode errors)."""
-    env = dict(os.environ)
+    from agent_core.process_supervisor import safe_process_environment
+    env = safe_process_environment()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
@@ -635,7 +670,7 @@ class WriteTextFileTool(WorkspacePathMixin, Tool):
 
     def _invoke(self, arguments: dict[str, object]) -> ToolResult:
         path = self.resolve_workspace_path(arguments["path"])
-        before = path.read_text(encoding="utf-8") if path.exists() else ""
+        before = read_text_exact(path) if path.exists() else ""
         edit_precondition(self.workspace, path, arguments.get("expected_version"))
         path.parent.mkdir(parents=True, exist_ok=True)
         content = str(arguments.get("content", ""))

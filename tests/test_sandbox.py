@@ -377,6 +377,29 @@ def test_container_wrap_hardening_flags(monkeypatch, tmp_path) -> None:
     assert user != "0:0"
 
 
+def test_container_enforces_nested_deny_write(monkeypatch, tmp_path):
+    manager = _container_manager(monkeypatch, tmp_path, "podman")
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    manager.config.filesystem.deny_write = [str(protected)]
+    spec, _ = manager.wrap_invocation(_invocation("@bash", "-lc", "true"))
+    assert f"{protected}:{protected}:ro" in spec
+
+
+def test_container_rejects_unsupported_read_masks(monkeypatch, tmp_path):
+    manager = _container_manager(monkeypatch, tmp_path, "podman")
+    manager.config.filesystem.deny_read = [str(tmp_path / ".env")]
+    with pytest.raises(GuestCapabilityUnavailable, match="deny_read"):
+        manager.wrap_invocation(_invocation("@bash", "-lc", "true"))
+
+
+def test_container_rejects_missing_write_mask_target(monkeypatch, tmp_path):
+    manager = _container_manager(monkeypatch, tmp_path, "podman")
+    manager.config.filesystem.deny_write = [str(tmp_path / "not-created")]
+    with pytest.raises(GuestCapabilityUnavailable, match="does not exist"):
+        manager.wrap_invocation(_invocation("@bash", "-lc", "true"))
+
+
 def test_read_only_workspace_is_mounted_once(monkeypatch, tmp_path) -> None:
     manager = _container_manager(monkeypatch, tmp_path, "podman")
     invocation = SandboxInvocation.create(

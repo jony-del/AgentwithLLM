@@ -146,6 +146,7 @@ scan_interval_seconds = 86400
 # AGENT_DISABLE_CLAUDE_MD / AGENT_DISABLE_GIT_CONTEXT env vars.
 [context]
 project_instructions = true    # false (or AGENT_DISABLE_CLAUDE_MD=1) skips CLAUDE.md injection
+git_aware_revisions = false    # optional Git source inventory; Windows process overhead can outweigh hash savings
 git_context = true             # false (or AGENT_DISABLE_GIT_CONTEXT=1) skips the git snapshot
 claudemd_max_chars = 32000     # truncate the joined block to this many characters
 
@@ -561,7 +562,9 @@ enabled = true
 max_bytes = 16777216
 max_output_chars = 8000
 [tools.worktree]
-root = ".polaris/worktrees"
+# Separate from protected .polaris state. Existing .polaris/worktrees configs
+# still require the ordinary protected-path permission review.
+root = ".polaris-worktrees"
 stale_days = 30
 [tools.scheduler]
 enabled = true
@@ -626,6 +629,8 @@ allow_unsandboxed_commands = false     # per-command host fallback is forbidden
 allow_write = []                       # extra writable paths, e.g. ["~/.cache"]
 deny_write  = []                       # carve read-only holes inside a writable region
 deny_read   = []                       # hide sensitive regions, e.g. ["~/.ssh", "~/.aws"]
+# Container does not support deny_read: such policies fail explicitly. Use a
+# backend supporting read masks. Nested deny_write requires an existing mount target.
 allow_read  = []                       # re-allow specific paths inside a deny_read region
 
 [sandbox.network]

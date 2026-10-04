@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "cohort": "synthetic deterministic safety scenarios; no real LLM",
+  "scenarios": [
+    {
+      "scenario": "verified_review",
+      "expected": "completed",
+      "actual": "completed",
+      "serialized_final_matches": true,
+      "transcript_tool_pairs_valid": true
+    },
+    {
+      "scenario": "unchecked_edit",
+      "expected": "unverified",
+      "actual": "unverified",
+      "serialized_final_matches": true,
+      "transcript_tool_pairs_valid": true
+    },
+    {
+      "scenario": "failed_check",
+      "expected": "unverified",
+      "actual": "unverified",
+      "serialized_final_matches": true,
+      "transcript_tool_pairs_valid": true
+    },
+    {
+      "scenario": "blocked_review",
+      "expected": "unverified",
+      "actual": "unverified",
+      "serialized_final_matches": true,
+      "transcript_tool_pairs_valid": true
+    },
+    {
+      "scenario": "repeated_tool_failure",
+      "expected": "blocked",
+      "actual": "blocked",
+      "serialized_final_matches": true,
+      "transcript_tool_pairs_valid": true
+    }
+  ],
+  "expected_outcome_match_rate": 1.0,
+  "runtime_metrics": {
+    "schema_version": 1,
+    "runs_read": 5,
+    "runs_without_metrics": 0,
+    "tasks": 5,
+    "completed": 1,
+    "completion_rate": 0.2,
+    "statuses": {
+      "completed": 1,
+      "unverified": 3,
+      "blocked": 1,
+      "failed": 0,
+      "cancelled": 0
+    },
+    "reviewed_completions": 1,
+    "completed_with_checks": 1,
+    "median_duration_seconds": 0.6089999999967404,
+    "totals": {
+      "input_tokens": 16104,
+      "output_tokens": 192,
+      "verification_attempts": 3,
+      "verification_failures": 1,
+      "tool_failures": 6,
+      "review_attempts": 2
+    },
+    "limitations": [
+      "Uses runtime outcomes; does not prove semantic task success",
+      "Resumed tasks counted once using latest terminal metrics",
+      "No pre-change quality baseline implied"
+    ]
+  },
+  "limitations": [
+    "Does not measure model coding ability or real task-success improvement",
+    "Host execution explicitly enabled only for disposable fake-provider checks"
+  ]
+}

@@ -70,7 +70,12 @@ def default_tools(
     tools: list[Tool] = []
     for cls in builtin_tool_classes():
         constructor = cast(Any, cls)
-        if issubclass(cls, SessionAwareMixin):
+        if issubclass(cls, WorkspacePathMixin):
+            tool = constructor(workspace)
+            if issubclass(cls, SessionAwareMixin) and session is not None:
+                tool.bind_session(session)
+            tools.append(tool)
+        elif issubclass(cls, SessionAwareMixin):
             tools.append(constructor(session) if session is not None else constructor())
         elif workspace is not None and issubclass(cls, WorkspacePathMixin):
             tools.append(constructor(workspace))
@@ -93,6 +98,11 @@ def populate_registry(
         constructor = cast(Any, cls)
 
         def factory(cls=cls, constructor=constructor):
+            if issubclass(cls, WorkspacePathMixin):
+                tool = constructor(workspace)
+                if issubclass(cls, SessionAwareMixin) and session is not None:
+                    tool.bind_session(session)
+                return tool
             if issubclass(cls, SessionAwareMixin):
                 return constructor(session) if session is not None else constructor()
             if workspace is not None and issubclass(cls, WorkspacePathMixin):

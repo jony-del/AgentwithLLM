@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
@@ -52,6 +52,8 @@ _WINDOWS_RESERVED_NAME = re.compile(
     r"(?i)^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$"
 )
 _AUDIT_LOCK = threading.Lock()
+_COMMIT_LOCKS_GUARD = threading.Lock()
+_COMMIT_LOCKS: dict[Path, Any] = {}
 _LIVE_JOURNALS: weakref.WeakValueDictionary[Path, TurnExecutionJournal] = weakref.WeakValueDictionary()
 
 
@@ -1667,6 +1669,42 @@ class WorkspaceTransaction:
             raise RuntimeError(f"workspace subtree changed during tool turn: {relative}")
 
     def commit(self) -> list[str]:
+        # Baseline validation and replacement must be one critical section across
+        # agents/sessions. Resource schedulers alone only serialize one executor.
+        from agent_core.execution import current_execution_scope
+        scope = current_execution_scope()
+        deadline = time.monotonic() + 30
+        timeout = scope.remaining_budget(30) if scope is not None else 30
+        with _COMMIT_LOCKS_GUARD:
+            lock = _COMMIT_LOCKS.setdefault(self.workspace, threading.RLock())
+        if not lock.acquire(timeout=timeout):
+            raise TimeoutError("timed out waiting for workspace commit lock")
+        try:
+            if scope is not None:
+                scope.raise_if_cancelled()
+            storage = self.journal.storage
+            if not storage.partitioned:
+                # Explicit embedding scopes may reside in the workspace; do not
+                # create a lock there and invalidate its own snapshot.
+                return self._commit_locked()
+            project_root = storage.recovery_root.parent
+            project_storage = replace(storage, recovery_root=project_root, run_root=project_root)
+            project_storage.validate()
+            _secure_mkdir(project_root)
+            lock_path = project_root / "workspace-commit.lock"
+            with _open_state(project_storage, lock_path, "ab"):
+                pass
+            remaining = max(0.0, deadline - time.monotonic())
+            timeout = scope.remaining_budget(remaining) if scope is not None else remaining
+            with FileLock(lock_path, timeout=timeout):
+                project_storage.validate(lock_path)
+                if scope is not None:
+                    scope.raise_if_cancelled()
+                return self._commit_locked()
+        finally:
+            lock.release()
+
+    def _commit_locked(self) -> list[str]:
         if self._closed:
             raise RuntimeError("workspace transaction is already closed")
         changed = self.changed_paths()

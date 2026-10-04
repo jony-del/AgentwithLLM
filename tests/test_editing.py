@@ -254,3 +254,43 @@ async def test_apply_patch_keeps_lf_endings(tmp_path: Path) -> None:
     result = await ApplyPatchTool(tmp_path).run({"patch": patch})
     assert result.ok, result.content
     assert target.read_bytes() == b"line\nline two\n"
+
+
+@pytest.mark.parametrize("original,patch,expected", [
+    ("one\ntwo\nthree\n", "@@ -2,0 +3,1 @@\n+INSERT\n", "one\ntwo\nINSERT\nthree\n"),
+    ("left\nvalue=1\nmiddle\nvalue=1\nright\n", "@@ -4 +4 @@\n-value=1\n+value=2\n", "left\nvalue=1\nmiddle\nvalue=2\nright\n"),
+    ("a\r\nb\r\n", "@@ -2 +2 @@\n-b\n+B\n", "a\r\nB\r\n"),
+    ("a", "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n", "b"),
+    ("a\n", "@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n", "b"),
+    ("a", "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n", "b\n"),
+])
+async def test_patch_position_and_byte_fidelity(tmp_path, original, patch, expected):
+    target = tmp_path / "f.txt"
+    target.write_bytes(original.encode())
+    result = await ApplyPatchTool(tmp_path).run({"patch": "--- a/f.txt\n+++ b/f.txt\n" + patch})
+    assert result.ok, result.content
+    assert target.read_bytes() == expected.encode()
+
+
+async def test_patch_rejects_ambiguous_drift_without_writing(tmp_path):
+    target = tmp_path / "f.txt"
+    target.write_bytes(b"x\na\nx\na\n")
+    result = await ApplyPatchTool(tmp_path).run({"patch": "--- a/f.txt\n+++ b/f.txt\n@@ -2 +2 @@\n-x\n+y\n"})
+    assert not result.ok
+    assert "ambiguous" in result.content
+    assert target.read_bytes() == b"x\na\nx\na\n"
+
+
+@pytest.mark.parametrize("hunk", ["@@ nope @@\n+x\n", "@@ -0,0 +1,2 @@\n+x\n"])
+def test_patch_rejects_invalid_ranges(hunk):
+    with pytest.raises(PatchError):
+        parse_unified_diff("--- /dev/null\n+++ b/f.txt\n" + hunk)
+
+
+async def test_precise_edit_preserves_crlf_and_normalizes_replacement(tmp_path):
+    from agent_core.tools.builtin import EditFileTool
+    target = tmp_path / "f.txt"
+    target.write_bytes(b"a\r\nb\r\n")
+    result = await EditFileTool(tmp_path).run({"path": "f.txt", "old_string": "a\nb", "new_string": "A\nB\nC"})
+    assert result.ok
+    assert target.read_bytes() == b"A\r\nB\r\nC\r\n"

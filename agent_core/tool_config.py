@@ -171,7 +171,7 @@ class NotebookToolConfig:
 
 @dataclass(slots=True)
 class WorktreeToolConfig:
-    root: str = ".polaris/worktrees"
+    root: str = ".polaris-worktrees"
     stale_days: int = 30
 
 

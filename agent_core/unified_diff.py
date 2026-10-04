@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
+import re
 
 
 class PatchError(ValueError):
@@ -26,6 +27,11 @@ class PatchOperation(str, Enum):
 class PatchHunk:
     old_lines: tuple[str, ...]
     new_lines: tuple[str, ...]
+    old_start: int = 1
+    new_start: int = 1
+    old_no_newline: bool = False
+    new_no_newline: bool = False
+    new_sources: tuple[int | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,25 +95,51 @@ def parse_unified_diff(patch_text: str) -> PatchSet:
         index += 2
         hunks: list[PatchHunk] = []
         while index < len(lines) and lines[index].startswith("@@"):
+            header = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*", lines[index])
+            if header is None:
+                raise PatchError("invalid hunk header")
+            old_start, new_start = int(header[1]), int(header[3])
+            old_count = int(header[2]) if header[2] is not None else 1
+            new_count = int(header[4]) if header[4] is not None else 1
+            if (old_count and not old_start) or (new_count and not new_start):
+                raise PatchError("non-empty hunk ranges must start at line 1 or later")
             index += 1
             old_lines: list[str] = []
             new_lines: list[str] = []
+            new_sources: list[int | None] = []
+            old_no_newline = new_no_newline = False
+            previous_marker = ""
             while index < len(lines):
                 body = lines[index]
                 if body.startswith(("@@", "--- ", "diff --git ")):
                     break
                 if body.startswith("\\ No newline at end of file"):
+                    if not previous_marker:
+                        raise PatchError("newline marker must follow a hunk line")
+                    old_no_newline |= previous_marker in {" ", "-"}
+                    new_no_newline |= previous_marker in {" ", "+"}
+                    previous_marker = ""
                     index += 1
                     continue
                 if not body or body[0] not in {" ", "+", "-"}:
                     raise PatchError(f"invalid hunk line at line {index + 1}")
                 marker, content = body[0], body[1:]
+                if (old_no_newline and marker in {" ", "-"}) or (new_no_newline and marker in {" ", "+"}):
+                    raise PatchError("content follows an end-of-file newline marker")
+                source = len(old_lines) if marker == " " else None
                 if marker in {" ", "-"}:
                     old_lines.append(content)
                 if marker in {" ", "+"}:
                     new_lines.append(content)
+                    new_sources.append(source)
+                previous_marker = marker
                 index += 1
-            hunks.append(PatchHunk(tuple(old_lines), tuple(new_lines)))
+            if len(old_lines) != old_count or len(new_lines) != new_count:
+                raise PatchError("hunk line counts do not match its header")
+            hunks.append(PatchHunk(
+                tuple(old_lines), tuple(new_lines), old_start, new_start,
+                old_no_newline, new_no_newline, tuple(new_sources),
+            ))
 
         if not hunks:
             raise PatchError("file entry contains no hunks")

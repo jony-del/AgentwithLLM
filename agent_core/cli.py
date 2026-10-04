@@ -406,6 +406,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         compression=resolve_compression_config(config_file),
         tool_use_summary=resolve_tool_use_summary_config(config_file),
         project_instructions=bool(context["project_instructions"]),
+        git_aware_revisions=bool(context["git_aware_revisions"]),
         git_context=bool(context["git_context"]),
         claudemd_max_chars=int(context["claudemd_max_chars"]),
         thinking_budget=getattr(args, "thinking_budget", None),
@@ -707,7 +708,9 @@ def run_task(args: argparse.Namespace) -> int:
                 agent.session.should_background = interrupt.consume_background
                 try:
                     result = await agent.run(
-                        args.task, should_cancel=interrupt.is_set, history=built.history or None
+                        args.task, should_cancel=interrupt.is_set, history=built.history or None,
+                        resume_task=bool(getattr(args, "resume_task", False)),
+                        require_review=bool(getattr(args, "require_review", False)),
                     )
                 finally:
                     agent.session.should_background = None
@@ -725,7 +728,7 @@ def run_task(args: argparse.Namespace) -> int:
         # SessionEnd; the finally below still tears down sandbox/MCP/logger.
         print("[interrupted] run cancelled by user", file=sys.stderr)
         return 130
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
         # Covers LLMTransientError (network exhausted retries) and API errors.
         print(f"[error] {exc}", file=sys.stderr)
         return 1
@@ -748,7 +751,9 @@ def run_task(args: argparse.Namespace) -> int:
     print(f"\nRun log: runs/{result.run_id}.jsonl")
     if agent.transcript is not None:
         print(f"Session: {agent.session_id}  (resume with --resume {agent.session_id})")
-    return 0
+    if getattr(result, "status", "completed") == "cancelled":
+        return 130
+    return 0 if getattr(result, "status", "completed") == "completed" else 2
 
 
 def chat_command(args: argparse.Namespace) -> int:
@@ -2182,6 +2187,8 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("task")
     add_common(run_parser)
+    run_parser.add_argument("--resume-task", action="store_true", help="Restore this session's unfinished durable task in its recorded workspace.")
+    run_parser.add_argument("--require-review", action="store_true", help="Require a tool-free independent review of the final revision in addition to checks.")
     add_session_flags(run_parser)
     run_parser.set_defaults(func=run_task)
 
@@ -2388,4 +2395,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

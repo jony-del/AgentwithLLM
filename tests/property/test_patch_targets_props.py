@@ -67,7 +67,8 @@ def _entry(draw: st.DrawFn, path: str, operation: str) -> str:
         context = draw(st.lists(_content, max_size=2))
         olds = draw(st.lists(_content, min_size=1, max_size=2))
         adds = draw(st.lists(_content, min_size=1, max_size=2))
-        lines = [f"--- a/{path}", f"+++ b/{path}", "@@ -1 +1 @@"]
+        shared = len(context) + len(context[:1])
+        lines = [f"--- a/{path}", f"+++ b/{path}", f"@@ -1,{shared + len(olds)} +1,{shared + len(adds)} @@"]
         lines += [" " + content for content in context]
         lines += ["-" + content for content in olds]
         lines += ["+" + content for content in adds]

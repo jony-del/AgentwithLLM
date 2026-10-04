@@ -106,7 +106,7 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         preset = str(arguments.get("tool_preset", "read_only"))
         if preset not in _PRESETS:
             preset = "read_only"
-        mode: LockMode = "write" if preset == "full" else "read"
+        mode: LockMode = "write" if preset == "full" and arguments.get("isolation") != "worktree" else "read"
         return ConcurrencySpec((ResourceLock("fs", str(self.session.workspace.resolve()), mode, subtree=True),))
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:

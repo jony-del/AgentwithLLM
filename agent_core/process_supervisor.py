@@ -24,6 +24,19 @@ from agent_core.tool_config import ShellToolConfig
 EventSink = Callable[[str, dict[str, object]], Awaitable[None]]
 
 
+def safe_process_environment() -> dict[str, str]:
+    """Forward platform essentials, never ambient provider/credential variables."""
+    allowed = {
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+        "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA",
+        "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "LANG", "LC_ALL", "LC_CTYPE",
+        "TERM", "VIRTUAL_ENV", "SSL_CERT_FILE", "SSL_CERT_DIR", "CI", "NO_COLOR",
+    }
+    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    return env
+
+
 class ShellUnavailableError(RuntimeError):
     pass
 
@@ -234,6 +247,19 @@ class ProcessSupervisor:
             detail = output.decode("utf-8", errors="replace").strip()[:4000]
             raise ValueError(f"{dialect} syntax error: {detail or 'parser rejected command'}")
 
+    async def run_argv(self, argv: list[str], cwd: Path, *, timeout: float) -> dict[str, object]:
+        """Run one foreground command with the same cleanup/log limits as shell tasks."""
+        task = await self.start(
+            "argv", json.dumps(argv), cwd, argv=argv, timeout=timeout,
+            env=safe_process_environment(), skip_syntax_check=True,
+        )
+        try:
+            await task.done.wait()
+            return await self.output(task.id, block=False, timeout=0, tail_lines=None)
+        except BaseException:
+            await self.stop(task.id)
+            raise
+
     async def start(
         self,
         dialect: str,
@@ -292,13 +318,14 @@ class ProcessSupervisor:
             process = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(resolved_cwd), stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=env,
+                env=env if env is not None else safe_process_environment(),
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
             process = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(resolved_cwd), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, start_new_session=True, env=env,
+                stderr=asyncio.subprocess.STDOUT, start_new_session=True,
+                env=env if env is not None else safe_process_environment(),
             )
         digest = hashlib.sha256(command.encode("utf-8", errors="replace")).hexdigest()
         task = ProcessTask(

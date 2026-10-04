@@ -80,6 +80,9 @@ class FakeProvider(LLMProvider):
         return TokenUsage(input_tokens=input_tokens, output_tokens=8)
 
     def _compute(self, messages: list[Message]) -> LLMResult:
+        # Runtime projections are context, not fresh demo commands to parse.
+        messages = [message for message in messages if not message.metadata.get("task_state")
+                    and not message.metadata.get("instruction_scope")]
         memory_response = self._maybe_memory_response(messages)
         if memory_response is not None:
             return LLMResult(content=memory_response, stop_reason="end")
