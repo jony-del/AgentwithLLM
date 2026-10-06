@@ -363,6 +363,8 @@ class SessionContext:
     review_task: Any | None = None
     plan_code_task: Any | None = None
     record_aux_usage: Any | None = None
+    run_verifier: Any | None = None
+    review_answer: Any | None = None
 
     async def capture_revision(self, *, strict: bool = True):
         if self.revision_tracker is not None:

@@ -63,7 +63,11 @@ class UpdateTaskPlanTool(SessionAwareMixin, Tool):
             self.session.persist_task()
         except (KeyError, TypeError, ValueError) as exc:
             return ToolResult(self.name, str(exc), ok=False, metadata={"error_type": "InvalidTaskPlan"})
-        return ToolResult(self.name, task.context())
+        ready = len(task.plan) >= 3 and all(step.status == "completed" for step in task.plan)
+        content = task.context()
+        if ready and not task.verifier_runs:
+            content += "\nThe completed plan has no independent behavioral evidence. Call run_verifier before claiming completion."
+        return ToolResult(self.name, content, metadata={"verifier_stage_ready": ready})
 
 
 @builtin_tool
@@ -128,7 +132,7 @@ class RunVerificationTool(SessionAwareMixin, SandboxAwareMixin, Tool):
         code = output["exit_code"]
         evidence = VerificationEvidence(check.id, after.digest, after.workspace,
             hashlib.sha256(json.dumps(argv).encode()).hexdigest(), code if isinstance(code, int) else None,
-            state, str(output["output_path"]))
+            state, str(output["output_path"]), output_preview=str(output["output"])[-4000:])
         task.evidence.append(evidence)
         task.evidence = task.evidence[-100:]
         if state == "completed" and code == 0:
@@ -145,7 +149,8 @@ class TaskStateTool(SessionAwareMixin, Tool):
     name = "task_state"
     description = "Read the durable task contract, checks, plan, attempts, evidence, review findings or checkpoints in bounded pages."
     input_schema = {"type": "object", "properties": {
-        "section": {"enum": ["goal", "checks", "plan", "failures", "evidence", "reviews", "checkpoints"]},
+        "section": {"enum": ["goal", "checks", "plan", "failures", "evidence", "reviews", "checkpoints",
+                              "verifier_runs", "answer_reviews", "observations"]},
         "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 4096},
     }, "required": ["section"]}
     risk = ToolRisk.READ

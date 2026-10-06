@@ -229,12 +229,13 @@ async def test_parallel_subagents_overlap_shared_provider_access(tmp_path) -> No
     agent = ReActAgent(
         provider=provider,
         config=ReActConfig(
-            run_dir=str(tmp_path),
+            run_dir=str(tmp_path / "runs"), session_dir="",
             permission="auto",
             memory=MemoryConfig(enabled=False),
             max_tool_workers=2,
         ),
         permission_classifier=_AllowClassifier(),
+        workspace=tmp_path,
     )
 
     result = await agent.run("parent task")
@@ -299,8 +300,9 @@ def test_child_inherits_only_scoped_session_grants(tmp_path) -> None:
     )
 
 
-def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
-    agent = ReActAgent(provider=FakeProvider())
+def test_subagent_registry_excludes_dispatch_and_dangerous_read_only(tmp_path) -> None:
+    agent = ReActAgent(provider=FakeProvider(),
+                       config=ReActConfig(run_dir=str(tmp_path / "runs"), session_dir=""), workspace=tmp_path)
     # Re-derive what the read_only child would receive by replicating the filter the
     # factory uses, then assert the guarantees hold.
     from agent_core.tools.catalog import default_tools
@@ -315,8 +317,9 @@ def test_subagent_registry_excludes_dispatch_and_dangerous_read_only() -> None:
     assert "glob" in names_read_only and "search_text" in names_read_only
 
 
-async def test_dispatch_depth_ceiling_refuses() -> None:
-    agent = ReActAgent(provider=FakeProvider())
+async def test_dispatch_depth_ceiling_refuses(tmp_path) -> None:
+    agent = ReActAgent(provider=FakeProvider(),
+                       config=ReActConfig(run_dir=str(tmp_path / "runs"), session_dir=""), workspace=tmp_path)
     agent.session.depth = agent.session.max_depth  # already at the limit
     answer = await agent._spawn_subagent("go deeper", "read_only")
     assert "max sub-agent depth" in answer

@@ -599,6 +599,15 @@ def resolve_hooks_config(config_file: str | Path = "agent.toml") -> "HooksConfig
     return config
 
 
+def resolve_verifier_config(config_file: str | Path = "agent.toml"):
+    from agent_core.verifier import VerifierConfig
+    raw = load_agent_toml(config_file).get("verifier", {})
+    table = dict(raw) if isinstance(raw, dict) else {}
+    if "AGENT_VERIFIER_MODE" in os.environ:
+        table["mode"] = os.environ["AGENT_VERIFIER_MODE"]
+    return VerifierConfig.from_dict(table)
+
+
 def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHookSpec | None":
     """Validate one ``[[hooks.external]]`` entry into an ``ExternalHookSpec`` or ``None``.
 
@@ -610,12 +619,18 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
 
     if not isinstance(entry, dict):
         return None
+    if str(entry.get("decision_mode", "advisory")) not in {"advisory", "gate"}:
+        raise ValueError("hook decision_mode must be advisory or gate")
     event = str(entry.get("event", "")).strip()
     hook_type = str(entry.get("type", "")).strip().lower()
     if event not in valid_events or hook_type not in _HOOK_TYPES:
+        if entry.get("decision_mode") == "gate":
+            raise ValueError("gate hook requires a valid event and type")
         return None
     required = {"command": "command", "http": "url", "prompt": "prompt", "agent": "prompt"}[hook_type]
     if not entry.get(required):
+        if entry.get("decision_mode") == "gate":
+            raise ValueError("gate hook requires " + required)
         return None
     headers = entry.get("headers")
     timeout_raw = entry.get("timeout", 30.0)
@@ -630,7 +645,7 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
     # approval gate must refuse, not wave things through — new gates default closed).
     fail_mode_raw = entry.get("fail_mode")
     if fail_mode_raw is None:
-        fail_mode = "closed" if event == "PermissionRequest" else "open"
+        fail_mode = "closed" if event == "PermissionRequest" or entry.get("decision_mode") == "gate" else "open"
     else:
         fail_mode = "open" if str(fail_mode_raw).strip().lower() == "open" else "closed"
     return ExternalHookSpec(
@@ -644,6 +659,7 @@ def _parse_external_hook(entry: object, valid_events: set[str]) -> "ExternalHook
         headers=(dict(headers) if isinstance(headers, dict) else None),
         timeout=max(0.1, timeout),
         fail_mode=fail_mode,
+        decision_mode=str(entry.get("decision_mode", "advisory")),
     )
 
 

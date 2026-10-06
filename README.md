@@ -6,8 +6,16 @@ Agent runs now keep a durable task contract and dependency-checked plan. Registe
 verification commands bind their results to the final workspace revision; file changes
 without passing checks return `unverified`. Isolated child worktrees export conflict-checked
 change bundles for explicit parent integration. See [Coding Agent runtime](docs/coding-agent-runtime.md)
-for the APIs, `--resume-task`, `--require-review`, source checkpoints, conservative three-way
+for the APIs, `--resume-task`, `--require-review`, `--require-verification`, source checkpoints, conservative three-way
 merging, measured snapshot modes, exit codes, safety boundaries and remaining limitations.
+
+Repository configuration enables an independent behavioral verifier and final-answer
+evidence review (`[verifier] mode = "auto"`). Behavioral probes require a real sandbox and
+must include functional and adversarial cases. Missing capabilities return `PARTIAL`;
+failed verification cannot produce a completed task. Use `run_verifier` to rerun and
+`/init-verifiers` to generate project guides; the local CLI guide includes offline smoke probes.
+Library callers retain the default `mode = "off"`. Model-backed hooks can opt into a
+strict `decision_mode = "gate"` with structured results and blocking failure behavior.
 
 ## Code intelligence for large repositories
 

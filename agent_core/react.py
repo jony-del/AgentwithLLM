@@ -132,6 +132,11 @@ from agent_core.change_bundles import BundleStore
 from agent_core.checkpoints import CheckpointStore
 from agent_core.revisions import RevisionTracker, git_capture
 from agent_core.review import contract_hash, review_task
+from agent_core.verifier import (VerifierConfig, completion_issues as verifier_issues,
+                                 matching as matching_verifier, observe as observe_verifier,
+                                 repair_details as verifier_repair_details,
+                                 repair_worthwhile as verifier_repair_worthwhile,
+                                 requirements as verifier_requirements, review_answer, verify_behavior)
 from agent_core.planner import plan_code_task
 from agent_core import tokens
 from agent_core.tool_use_summary import (
@@ -236,6 +241,7 @@ _FULL_CHILD_TOOLS = _READ_ONLY_CHILD_TOOLS | {
     "create_checkpoint",
     "rollback_checkpoint",
     "run_review",
+    "run_verifier",
 }
 
 
@@ -267,8 +273,8 @@ class ReActConfig:
     # Upper bound on how many times a Stop hook may block the agent's natural
     # termination and force it to keep running ("可阻断/可续跑"). Once this many
     # consecutive blocks have happened, the loop stops regardless, so a misbehaving
-    # stop hook can't pin the agent in an infinite continue loop. 0 disables stop-hook
-    # blocking entirely (a stop hook can still observe/inject context but never continue).
+    # stop hook can't pin the agent in an infinite continue loop. 0 disables continuation;
+    # a rejected Stop still returns unverified rather than falsely claiming completion.
     max_stop_blocks: int = 3
     # Wall-clock safety net so a runaway/stuck loop can't hang forever. Configurable
     # via the [limits] toml table, AGENT_MAX_WALL_SECONDS, or --max-wall-seconds.
@@ -366,6 +372,7 @@ class ReActConfig:
     # Lifecycle-hook subsystem: built-in programmatic hook toggles + config-driven
     # external hooks. Assembled into the shared HookPipeline by _build_hook_pipeline.
     hooks: HooksConfig = field(default_factory=HooksConfig)
+    verifier: VerifierConfig = field(default_factory=VerifierConfig)
     # OS sandbox (enforcement layer): wraps dangerous command execution in bwrap/
     # sandbox-exec on Linux/macOS, no-op on Windows. Disabled by default.
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
@@ -1441,6 +1448,7 @@ class ReActAgent:
         task_contract: TaskContract | None = None,
         resume_task: bool = False,
         require_review: bool = False,
+        require_verification: bool = False,
     ) -> AgentRunResult:
         """Run within one root/inherited execution budget, including preflight work."""
 
@@ -1448,6 +1456,7 @@ class ReActAgent:
         self._requested_task_contract = task_contract
         self._resume_task_requested = resume_task
         self._require_review = require_review
+        self._require_verification = require_verification or self.config.verifier.mode == "required"
         self.session.task_run = None
         owned_scope = execution_scope is None
         if execution_scope is None:
@@ -1539,6 +1548,8 @@ class ReActAgent:
                 "verification_attempts": len(task_run.evidence),
                 "verification_failures": sum(e.state != "completed" or e.exit_code != 0 for e in task_run.evidence),
                 "tool_failures": len(task_run.failures), "review_attempts": len(task_run.reviews),
+                "behavioral_verifier_attempts": len(task_run.verifier_runs),
+                "answer_review_attempts": len(task_run.answer_reviews),
                 "review_passed": bool(task_run.reviews and task_run.reviews[-1].get("status") == "passed"),
                 "checkpoint_count": sum("id" in c for c in task_run.checkpoints),
                 "snapshot": tracker.totals if tracker is not None else {},
@@ -1764,6 +1775,8 @@ class ReActAgent:
                 checkpoint = await asyncio.to_thread(cast(CheckpointStore, self.session.checkpoint_store).capture,
                     self.session.task_run, baseline, "task baseline", allowed=lambda path: path_allowed(self.session, path, "create_checkpoint"))
                 self.session.task_run.baseline_checkpoint = checkpoint.id
+        if self._require_verification:
+            self.session.task_run.contract = replace(self.session.task_run.contract, verification_required=True)
         self.session.code_working_set = None
         await self.session.persist_task_async()
         await scope.run_awaitable(self._recall(canonical_task, messages))
@@ -2183,32 +2196,53 @@ class ReActAgent:
                     report = replace(report, status="blocked" if report.status == "blocked" else "unverified",
                                      issues=(*report.issues, "unfinished todo items"))
                 review_issue = "independent review has not passed on the final revision"
-                if report.issues == (review_issue,):
+                behavior_issue = "behavioral verifier has not passed on the final revision"
+                # Substring match: completion issues may carry a [failure_class] prefix.
+                if not any(review_issue not in issue and behavior_issue not in issue for issue in report.issues):
+                    behavior, _ = verifier_requirements(self.session.task_run, current, self.config.verifier)
+                    if behavior and not matching_verifier(self.session.task_run.verifier_runs, self.session.task_run, current):
+                        await self._run_verifier(current)
                     matching = [r for r in self.session.task_run.reviews if r.get("revision") == current.digest and
                                 r.get("workspace") == current.workspace and r.get("contract_hash") == contract_hash(self.session.task_run)]
-                    if not matching:
+                    if self.session.task_run.contract.review_required and not matching:
                         await scope.run_awaitable(cast(Any, self.session.review_task)(current))
-                        current = await scope.run_awaitable(self.session.capture_revision())
-                        report = verify_completion(self.session.task_run, current,
-                            running_processes=bool(self.process_supervisor.running()),
-                            truncated=result.stop_reason in {"max_tokens", "length", "incomplete"}, termination_proven=result.termination_proven)
-                if report.issues and verification_blocks < 2 and report.status != "blocked":
-                    verification_blocks += 1
-                    envelope = canonicalize_untrusted_context(
-                        "Completion verification failed: " + json.dumps(report.issues) +
-                        ". Update the task plan, run the required verification checks, and resolve these issues. "
-                        "If verification cannot run, explain the blocker instead of claiming completion.",
-                        PromptSource.HOOK_CONTEXT,
-                    )
-                    await self._emit(messages, Message("user", envelope.canonical_text,
-                        metadata={"completion_verifier": True, "prompt_ingress": envelope.metadata()}))
-                    await self.logger.write("verification", asdict(report))
-                    self.ui.on_reasoning(result.content)
-                    continue
+                    current = await scope.run_awaitable(self.session.capture_revision())
+                    report = verify_completion(self.session.task_run, current,
+                        running_processes=bool(self.process_supervisor.running()),
+                        truncated=result.stop_reason in {"max_tokens", "length", "incomplete"}, termination_proven=result.termination_proven)
+                if not report.issues:
+                    extra = await self._verify_output(current, result.content)
+                    if extra:
+                        report = replace(report, status="unverified", issues=extra)
+                if report.issues and verification_blocks < self.config.verifier.max_repair_attempts and report.status != "blocked":
+                    if verifier_repair_worthwhile(report.issues):
+                        verification_blocks += 1
+                        details = verifier_repair_details(self.session.task_run, current, result.content)
+                        envelope = canonicalize_untrusted_context(
+                            "Completion verification failed: " + json.dumps(report.issues) +
+                            ("\n" + details if details else "") +
+                            ". Update the task plan, run the required verification checks, and resolve these issues. "
+                            "If verification cannot run, explain the blocker instead of claiming completion.",
+                            PromptSource.HOOK_CONTEXT,
+                        )
+                        await self._emit(messages, Message("user", envelope.canonical_text,
+                            metadata={"completion_verifier": True, "prompt_ingress": envelope.metadata()}))
+                        await self.logger.write("verification", asdict(report))
+                        self.ui.on_reasoning(result.content)
+                        continue
+                    # Every remaining issue is an environment/budget failure that another
+                    # repair round cannot fix; fall through and report honestly.
+                    await self.logger.write("verification",
+                        {**asdict(report), "repair_skipped": "non-repairable verification failure"})
                 # Stop hook: a hook may BLOCK this stop and force the loop to keep running
                 # ("可阻断/可续跑"), bounded by config.max_stop_blocks so it can't loop
                 # forever. A block injects the continuation directive and re-enters the loop.
                 stop = await self._run_stop_hooks(messages, result.content, stop_blocks)
+                if stop.additional_context and not stop.block:
+                    await self.logger.write("hook_advisory", {"hook_event": "Stop", "context": stop.additional_context})
+                    envelope = canonicalize_untrusted_context(stop.additional_context, PromptSource.HOOK_CONTEXT)
+                    await self._emit(messages, Message("user", envelope.canonical_text,
+                        metadata={"stop_hook": "advisory", "prompt_ingress": envelope.metadata()}))
                 if stop.block and stop_blocks < self.config.max_stop_blocks:
                     stop_blocks += 1
                     directive = (
@@ -2241,22 +2275,37 @@ class ReActAgent:
                 # Stop/observational hooks can execute project code. Recheck the
                 # revision after they drain before certifying the final result.
                 final_revision = await scope.run_awaitable(self.session.capture_revision())
-                if final_revision.digest != report.revision or self.process_supervisor.running():
-                    report = verify_completion(self.session.task_run, final_revision,
-                        running_processes=bool(self.process_supervisor.running()),
-                        truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
-                        termination_proven=result.termination_proven)
-                    if any(todo.status != "completed" for todo in self.session.todos.items()):
-                        report = replace(report, status="unverified", issues=(*report.issues, "unfinished todo items"))
-                    if report.issues and verification_blocks < 2:
+                report = verify_completion(self.session.task_run, final_revision,
+                    running_processes=bool(self.process_supervisor.running()),
+                    truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
+                    termination_proven=result.termination_proven)
+                if any(todo.status != "completed" for todo in self.session.todos.items()):
+                    report = replace(report, status="blocked" if report.status == "blocked" else "unverified",
+                                     issues=(*report.issues, "unfinished todo items"))
+                extra = await self._verify_output(final_revision, result.content) if not report.issues else verifier_issues(
+                    self.session.task_run, final_revision, self.config.verifier, result.content)
+                if extra:
+                    # Completion issues may carry a [failure_class] prefix; match on the plain text.
+                    issues = tuple(i for i in report.issues if not any(i in e for e in extra))
+                    report = replace(report, status="blocked" if report.status == "blocked" else "unverified",
+                                     issues=tuple(dict.fromkeys((*issues, *extra))))
+                if report.issues and verification_blocks < self.config.verifier.max_repair_attempts and report.status != "blocked":
+                    if verifier_repair_worthwhile(report.issues):
                         verification_blocks += 1
+                        details = verifier_repair_details(self.session.task_run, final_revision, result.content)
                         envelope = canonicalize_untrusted_context(
                             "Final hooks invalidated completion evidence: " + json.dumps(report.issues) +
+                            ("\n" + details if details else "") +
                             ". Recheck the workspace and run verification again.", PromptSource.HOOK_CONTEXT)
                         await self._emit(messages, Message("user", envelope.canonical_text,
                             metadata={"completion_verifier": True, "prompt_ingress": envelope.metadata()}))
                         self.ui.on_reasoning(result.content)
                         continue
+                    await self.logger.write("verification",
+                        {**asdict(report), "repair_skipped": "non-repairable verification failure"})
+                if stop.block:
+                    report = replace(report, status="blocked" if report.status == "blocked" else "unverified", issues=(*report.issues,
+                        "stop gate did not pass: " + str(stop.reason or "continuation budget exhausted")))
                 answer = result.content
                 if report.status != "completed":
                     answer += "\n\nVerification status: " + report.status + ". " + "; ".join(report.issues)
@@ -2298,6 +2347,7 @@ class ReActAgent:
             task_revision = await scope.run_awaitable(self.session.capture_revision(strict=False))
             self.session.task_run.current_revision = task_revision.digest
             for call, task_outcome in zip(result.tool_calls, tool_results, strict=True):
+                observe_verifier(self.session.task_run, call, task_outcome, task_revision)
                 if not task_outcome.ok:
                     self.session.task_run.record_failure(call.name, call.arguments,
                         str(task_outcome.metadata.get("error_type", "ToolFailed")), task_revision.digest)
@@ -2305,6 +2355,12 @@ class ReActAgent:
                       (call.name == "rollback_checkpoint" and not call.arguments.get("preview", True))):
                     self.session.task_run.mutation_seen = True
             await self.session.persist_task_async()
+            if (self.config.verifier.stage_checks and self.config.verifier.mode != "off" and
+                any(item.metadata.get("verifier_stage_ready") for item in tool_results)):
+                stage_revision = await self.session.capture_revision()
+                if (verifier_requirements(self.session.task_run, stage_revision, self.config.verifier)[0] and
+                    not matching_verifier(self.session.task_run.verifier_runs, self.session.task_run, stage_revision)):
+                    await self._run_verifier(stage_revision)
             if any(item.metadata.get("activation_pending") for item in tool_results):
                 activation_outcomes = await asyncio.to_thread(
                     self.capability_manager.commit_pending
@@ -3741,8 +3797,8 @@ class ReActAgent:
         the hook subsystem is enabled, layers in the toggled built-in programmatic
         lifecycle hooks (closing over this run's session/logger) and any config-driven
         external adapters (each appended to the pipeline list for its event). A bad spec or
-        a transport whose dependency is unavailable drops that one hook; assembly never
-        raises into construction, so a misconfigured ``[hooks]`` table degrades gracefully.
+        advisory transports with unavailable dependencies are dropped. Explicit gates
+        and sandbox execution boundaries raise rather than silently losing enforcement.
         """
         pipeline = HookPipeline(
             post_hooks=[
@@ -3810,6 +3866,8 @@ class ReActAgent:
                     limits=self.config.hooks.limits,
                 )
             except Exception as exc:
+                if spec.decision_mode == "gate":
+                    raise
                 if self.config.sandbox.enabled and spec.type in {"command", "http"}:
                     # An enabled sandbox is an execution boundary, not a best-effort
                     # wrapper. Unsupported external transports must block construction.
@@ -3844,9 +3902,34 @@ class ReActAgent:
     def _init_task_services(self, *, isolated: bool = False) -> None:
         self.session.checkpoint_store = CheckpointStore(self.executor.journal_storage, isolated=isolated)
         self.session.review_task = lambda current: review_task(self.session, self.provider, self._provider_config(), current)
+        self.session.run_verifier = self._run_verifier
+        self.session.review_answer = lambda current, answer: review_answer(
+            self.session, self.provider, self._provider_config(), self.config.verifier, current, answer)
         self.session.plan_code_task = lambda queries: plan_code_task(self.session, self.provider, self._provider_config(), queries)
         self.session.record_aux_usage = self._record_aux_usage
         self.session.revision_tracker = self._revision_tracker(self.session.workspace)
+
+    async def _run_verifier(self, current: Any) -> dict[str, Any]:
+        from agent_core.tools.verifier import probe_executor
+        model = self.config.verifier.model
+        if model and not is_model_allowed(self.config.provider, model):
+            raise ValueError(unsupported_model_message("verifier", self.config.provider, model))
+        return await verify_behavior(self.session, self.provider, self._provider_config(),
+            self.config.verifier, current, lambda copy, revision, probes: probe_executor(self, copy, revision, probes))
+
+    async def _verify_output(self, current: Any, answer: str) -> tuple[str, ...]:
+        task = self.session.task_run
+        if task is None:
+            return ("active task unavailable for verification",)
+        model = self.config.verifier.model
+        if model and not is_model_allowed(self.config.provider, model):
+            raise ValueError(unsupported_model_message("verifier", self.config.provider, model))
+        behavior, check_answer = verifier_requirements(task, current, self.config.verifier)
+        if behavior and not matching_verifier(task.verifier_runs, task, current):
+            await self._run_verifier(current)
+        if check_answer and not matching_verifier(task.answer_reviews, task, current, answer):
+            await cast(Any, self.session.review_answer)(current, answer)
+        return verifier_issues(task, current, self.config.verifier, answer)
 
     def _record_aux_usage(self, usage: Any) -> None:
         if usage is not None:
@@ -4056,6 +4139,8 @@ class ReActAgent:
             permission=_child_permission_mode(self.config.permission, preset),
             memory=memory_config,
             skills=replace(self.config.skills, enabled=False),
+            verifier=replace(self.config.verifier, mode="off", check_answer=False, stage_checks=False),
+            hooks=replace(self.config.hooks, external=[]) if preset == "hook" else self.config.hooks,
         )
         if model:
             child_config = replace(child_config, model=model)
@@ -4292,6 +4377,7 @@ class ReActAgent:
             permission_rules=self.config.permission_rules.merge(_TEAMMATE_COORDINATION_RULES),
             memory=memory_config,
             skills=replace(self.config.skills, enabled=False),
+            verifier=replace(self.config.verifier, mode="off", check_answer=False, stage_checks=False),
         )
         if model:
             child_config = replace(child_config, model=model)

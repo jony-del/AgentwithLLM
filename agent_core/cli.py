@@ -20,6 +20,7 @@ from agent_core.config import (
     resolve_config,
     resolve_context_config,
     resolve_hooks_config,
+    resolve_verifier_config,
     resolve_limits_config,
     resolve_mcp_config,
     resolve_memory_config,
@@ -427,6 +428,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         skills=resolve_skills_config(config_file),
         capabilities=resolve_capabilities_config(config_file),
         hooks=resolve_hooks_config(config_file),
+        verifier=resolve_verifier_config(config_file),
         sandbox=_sandbox_config(args),
         permission_rules=_permission_rules(args),
         web=resolve_web_config(config_file),
@@ -712,6 +714,7 @@ def run_task(args: argparse.Namespace) -> int:
                         args.task, should_cancel=interrupt.is_set, history=built.history or None,
                         resume_task=bool(getattr(args, "resume_task", False)),
                         require_review=bool(getattr(args, "require_review", False)),
+                        require_verification=bool(getattr(args, "require_verification", False)),
                     )
                 finally:
                     agent.session.should_background = None
@@ -2195,6 +2198,7 @@ def main(argv: list[str] | None = None) -> int:
     add_common(run_parser)
     run_parser.add_argument("--resume-task", action="store_true", help="Restore this session's unfinished durable task in its recorded workspace.")
     run_parser.add_argument("--require-review", action="store_true", help="Require a tool-free independent review of the final revision in addition to checks.")
+    run_parser.add_argument("--require-verification", action="store_true", help="Require independent sandboxed functional/adversarial probes.")
     add_session_flags(run_parser)
     run_parser.set_defaults(func=run_task)
 

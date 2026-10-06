@@ -16,8 +16,10 @@ flowchart TD
     E --> P[Patch / 精确编辑 / 事务 overlay]
     P --> J[提交锁 / baseline 检查 / durable journal]
     J --> V[run_verification / ProcessSupervisor / sandbox]
-    V --> RV[可选必需 Reviewer / 独立上下文 / 无工具]
-    RV --> R{最终完整内容 hash 与证据门}
+    V --> BV[run_verifier / 独立上下文 / 沙箱源码副本 / 功能与反例探测]
+    BV --> RV[可选必需 Reviewer / 独立上下文 / 无工具]
+    RV --> AR[最终回答审查 / 无工具 / 回答与证据 hash]
+    AR --> R{最终完整内容 hash 与证据门}
     R -->|失败或证据过期| C
     R -->|通过| F[completed / 最终输出]
     R -->|无法验证| B[unverified / blocked / 明确原因]
@@ -40,7 +42,7 @@ flowchart TD
 
 ## 任务契约、计划与完成条件
 
-`TaskContract` 包含 goal、constraints、acceptance、checks、allowed_paths、review_required。
+`TaskContract` 包含 goal、constraints、acceptance、checks、allowed_paths、review_required、verification_required。
 `update_task_plan` 提交带依赖的步骤，拒绝未知依赖、环路，以及在依赖尚未完成时开始或完成步骤。
 它支持替换计划；仅修改步骤状态不会重置重复失败检测。Todo/PlanMode 继续提供原有交互，
 不能替代机器验证。
@@ -95,7 +97,7 @@ status 为 `running/completed/unverified/blocked/failed/cancelled` 中相应终�
 保留至多八个有界 scope。稀缺预算优先保留较近目录的规则，规则仍属不可信仓库输入，
 不会提升权限。嵌套规则在整个 tool-result 批次之后插入，保持 provider 调用配对。
 
-`TaskStore` 使用 schema v1 私有原子记录，不存储权限授权。普通 `--resume` 仍恢复会话消息，
+`TaskStore` 使用 schema v3 私有原子记录，兼容读取 v1/v2，不存储权限授权。普通 `--resume` 仍恢复会话消息，
 父任务使用稳定 session 记录，子任务使用各自 run partition，避免共享 session ID 时互相覆盖。
 明确续跑任务需同时选择原会话，例如：
 
@@ -143,6 +145,122 @@ Reviewer/Planner 输出不超过调用方配置的 max_tokens，并额外封顶 
 当前 Python 提供 AST 符号/关系，其他语言主要提供字面上下文与 manifest 依赖。本工具尚未
 接入 LSP 类型关系，执行 Agent 可单独调用现有 LSP 工具。报告保留覆盖与精度限制，
 不能称为全语言类型解析或全依赖解析。
+
+## 独立行为验证与最终回答审查
+
+本项目移植了参考项目的功能验证、反例探测、阶段提醒、结构化 hook 裁决与项目验证指南机制，
+并将它们接入现有确定性完成门。参考项目中的验证 Agent 默认受关闭的功能开关控制，
+Todo 提醒本身不会执行验证；本项目显式启用后会实际执行探测并保存证据。
+
+仓库 `agent.toml` 使用 `[verifier] mode = "auto"`：源码发生变更时要求独立行为验证；
+有工具观察/执行证据的最终回答要求独立回答审查。纯聊天不额外调用模型。
+库 API 的 `ReActConfig()` 默认 `mode = "off"`，保持已有调用兼容。
+`mode = "required"`、`polaris run TASK --require-verification` 或
+`TaskContract(verification_required=True)` 要求行为验证，即使任务没有修改源码。
+`check_answer` 控制额外的回答审查，默认 true；命令行强制选项不会覆盖显式 false。
+
+```toml
+[verifier]
+mode = "auto"              # off | auto | required
+model = ""                 # 继承主模型，或同一 provider 的受支持模型
+check_answer = true
+timeout = 300              # 行为验证总预算，包含模型与工具执行
+max_tokens = 4096
+max_repair_attempts = 2     # 完成验证失败后的主循环修复机会
+max_probes = 12
+max_context_bytes = 163840
+stage_checks = false       # 至少三步计划全部完成时，可额外自动验证
+min_changed_files = 0      # auto 模式下变更文件数低于该阈值时跳过行为验证 LLM
+                           #（0 = 任何变更都验证）；确定性完成门与回答审查不受影响
+```
+
+也可设置 `AGENT_VERIFIER_MODE`。建议为 verifier 配置不同（理想情况下更强）的模型，
+可降低同模型自审的共同盲点，但仍不是完全独立的正确性证明。
+验证会增加模型调用与执行时间；辅助模型 usage 纳入任务计数及 `verifier_usage` 日志。
+不可信仓库不能通过 verifier.mode=off、check_answer=false、调大 min_changed_files
+或切换模型削弱验证设置；显式 `--config` 仍按现有用户配置规则处理。
+
+`run_verifier` 可手动重跑或用于完成一个阶段后的验证。显式调用后的裁决也作为本任务完成条件，
+失败不会因没有源码变更或 mode=off 而被忽略。它创建经过内容 hash 检查的临时源码副本，
+向独立模型提供契约、文件清单、变更路径、已有检查结果与项目指南，不提供执行 Agent 的历史。
+只暴露读取、`verifier_probe` 和已连接的浏览器 MCP 探测入口；没有源码编辑、依赖安装、
+子 Agent 或契约改写工具。探测命令经父任务原有权限规则、hooks、沙箱及 ProcessSupervisor 执行，
+父工作区只读，副本可生成运行产物但已复制的源码必须保持不变。共享取消、截止时间及进程树清理。
+
+每个探测声明 functional/adversarial、验收条件、argv、预期退出码及输出；框架保存真实退出码、
+状态、输出摘要/日志、输出 hash 与证据 ID。模型必须判断探测是否充分覆盖本次任务。
+PASS 至少需要一个实际通过的功能探测和一个反例/边界/回归探测，且不能有失败探测。
+退出码和输出匹配是可执行门槛，不保证探测语义充分；仅打印 PASS 或只跑类型检查不能替代功能验收。
+测试预期的非零退出码可作为有效反例证据，必须同时核对具体错误输出。
+
+结果严格为 `{"verdict":"PASS|FAIL|PARTIAL","findings":[{"claim":"...","reason":"...","evidence_ids":["..."]}]}`。
+引用不存在的证据、非法/截断/未证明终止的输出、被拒绝的能力、超限或超时均不会通过。
+PASS/FAIL/PARTIAL 对应 passed/blocked/incomplete；最终完成门不通过时主任务返回 unverified
+（或现有无进展条件下 blocked），修复机会耗尽也不会自动改为 completed。
+原有注册检查、未完成计划/Todo、后台进程、范围限制及可选代码审查继续生效；
+行为验证不会替代调用方声明的 `run_verification` 检查。
+
+每条验证记录带 `failure_class`：`verdict`（模型裁决未通过）、`environment`（沙箱/权限/工作区
+并发变更等环境限制）、`budget`（超时、截止时间、上下文或探测预算）、`transient`（验证器输出
+非法，重跑可能恢复）。完成门 issue 以 `[类别]` 前缀标注。当全部剩余 issue 都是 environment/budget
+类时，主循环不再注入"修复"消息、也不消耗修复机会——这类失败无法通过主 Agent 修代码解决，
+任务直接以 unverified 结束并由回答如实说明限制。其余类别沿用修复循环，且注入消息会附带最近
+失败记录的结构化 findings（claim/原因/失败探测的 argv 与期望），减少一轮 task_state 往返。
+重跑行为验证时，payload 的 `previous_attempts_untrusted` 携带本任务最近失败裁决的
+verdict/findings/reason（标注为不可信上下文），避免验证器重复已被排除的假设；
+它不保留验证器对话历史，裁决标准不得因此降低。
+
+独立回答审查只接收当前版本的检查、工具观察、行为探测和候选最终回答，tools 为空。
+它检查“测试通过”“修改完成”等断言是否有证据支撑、是否与失败结果矛盾、是否隐瞒限制。
+除当前版本观察外，`stale_observations` 附带最近 16 条历史观察（标注 stale 及原 revision），
+防止"测试跑完后又改了无关文件"的合理声明被误判为无证据；涉及文件此后发生变更的过期观察
+不得作为通过依据。契约检查的注册证据仍严格绑定最终版本。
+审查记录绑定 workspace、源码版本、契约、回答 hash 和证据 hash。回答改写或证据增加后重新审查。
+工具观察保留读取路径；有文件版本信息时，排除与当前源码 hash 不一致的读取结果，避免将旧内容绑定到新版本。
+Stop/后台观察 hook 完成后再次检查版本、任务条件及回答证据，防止旧裁决被复用。
+同一版本的失败行为裁决不会无限自动重试；修复后或手动 `run_verifier` 可产生新证据。
+
+`task_state(section="verifier_runs")`、`answer_reviews`、`observations` 可分页查询，
+完整记录保存于 task-state schema v3，事件日志包含 `verifier`、`verifier_probe`、
+`verifier_browser_probe` 和 `answer_review`。Verifier 记录使用 schema_version=1，运行日志仍使用 v2。
+阶段计划至少三步全部完成时提示验证；
+开启 stage_checks 后实际自动触发。提醒本身不等于通过证据。
+
+项目指南在 `.polaris/skills/*verifier*/SKILL.md`，作为有界、不可信上下文单独传入。
+使用 `/init-verifiers` 可根据实际 CLI/API/browser 入口生成或更新指南。
+本仓库已提供 `.polaris/skills/verifier-cli/SKILL.md` 与
+`benchmarks/verifier_cli_smoke.py`：功能场景验证公开 CLI 的回答、退出码和日志，
+反例场景验证错误参数及无沙箱时强制验证的失败返回。脚本使用隔离配置和临时状态目录，
+不使用真实模型；特定业务变更仍须补充针对它的探测。指南变化后应显式重跑 run_verifier。
+
+行为验证必须具备已准备好的真实沙箱；不会回退为宿主机执行。
+源码副本不含 .git、.venv、node_modules、根目录 .polaris/runs/tmp/memory 和 Secret 文件，
+依赖必须已存在于执行环境。缺少沙箱、依赖或能力时明确 PARTIAL。
+命令探测保留 network=deny；需要监听/网络的 API 应在支持该能力的既有受控测试方式中检查，
+无法运行就报告缺失。浏览器仅转发已连接的 playwright、claude-in-chrome、chrome_devtools
+等命名的 MCP 服务工具，并逐次执行父任务权限检查；不会自动启动/安装浏览器服务或授权。
+当前没有进行真实模型或真实 Container/VM 的端到端验证；替身沙箱测试仅证明调用边界。
+
+## 结构化 prompt/agent hook gate
+
+旧 prompt/agent hook 默认 `decision_mode = "advisory"`，回复作为建议上下文，Stop 建议会保存并记录。
+显式 `decision_mode = "gate"` 将其变为裁决门：接受严格 `{"ok":true}` 或
+`{"ok":false,"reason":"具体未满足条件"}`。false 会阻止相应控制动作；错误、超时、缺失依赖、
+不完整配置及非法输出失败关闭，不会静默放行。Stop 失败在有界预算内回到主循环，
+预算耗尽返回未验证状态。gate 支持 Stop、UserPromptSubmit、PreCompact、PreToolUse、PostToolUse；
+不用于 PermissionRequest 自动授权，也不将仅观察事件变为阻断事件。
+
+```toml
+[[hooks.external]]
+event = "Stop"
+type = "prompt"             # agent 可只读检查项目，禁用嵌套外部 hooks，避免递归
+decision_mode = "gate"
+prompt = "根据实际证据核对领域验收条件，返回 ok 与未满足条件的 reason。"
+timeout = 30
+```
+
+prompt gate 无工具；agent gate 只读检查项目。需要真正执行功能探测时使用 run_verifier。
+上述 gate 是可选领域补充；默认 verifier 已覆盖一般完成/回答审查，无需重复配置。
 
 ## 编辑、工作区与多 Agent
 
@@ -219,7 +337,7 @@ checkpoint 与快照计数，不写原始失败参数。`benchmarks/task_evaluat
   被排除的数据不属于当前完成证据的覆盖面。持续变化的构建产物可能需要第二次稳定验证。
   当前 logger、配置的 run/session/memory 目录被显式排除。其他长写入产物仍可能使证据失效。
 - checkpoint 只恢复源码；不自动撤销外部副作用、Git commits、模型调用、授权或后台进程。
-- 全语言类型关系和 AST 合并、不同模型的 Reviewer 以及生产任务成功率基线仍未实现。
+- 全语言类型关系和 AST 合并、生产任务成功率基线仍未实现；行为/回答 verifier 可配置同 provider 的模型，原有代码 Reviewer 仍继承主模型。
 - Docker 未安装，已检查的 Podman 服务未运行；本机未完成真实 Container/VM 系统级验证。
 - 语义任务拆解和检查充分性仍由模型/调用方决定，当前模块不提供任意需求的形式化完成证明。
 

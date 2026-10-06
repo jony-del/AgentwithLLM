@@ -86,6 +86,7 @@ class TaskContract:
     checks: tuple[VerificationCheck, ...] = ()
     allowed_paths: tuple[str, ...] = ()
     review_required: bool = False
+    verification_required: bool = False
 
     def __post_init__(self) -> None:
         if not self.goal.strip() or len(self.checks) > 32 or len({c.id for c in self.checks}) != len(self.checks):
@@ -114,6 +115,8 @@ class VerificationEvidence:
     exit_code: int | None
     state: str
     output_path: str = ""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    output_preview: str = ""
 
 
 @dataclass
@@ -135,6 +138,9 @@ class TaskRun:
     reviews: list[dict[str, Any]] = field(default_factory=list)
     workspace_binding: dict[str, Any] | None = None
     updated_at: float = field(default_factory=time.time)
+    verifier_runs: list[dict[str, Any]] = field(default_factory=list)
+    answer_reviews: list[dict[str, Any]] = field(default_factory=list)
+    observations: list[dict[str, Any]] = field(default_factory=list)
 
     def replace_plan(self, steps: list[PlanStep]) -> None:
         if len(steps) > 128 or len({step.id for step in steps}) != len(steps):
@@ -202,6 +208,9 @@ class TaskRun:
                            "acceptance": [x[:256] for x in self.contract.acceptance[:8]],
                            "check_ids": [c.id[:128] for c in self.contract.checks],
                            "review_required": self.contract.review_required, "recent_review": review_summary,
+                           "verification_required": self.contract.verification_required,
+                           "recent_verifier": self._verifier_summary(self.verifier_runs),
+                           "recent_answer_review": self._verifier_summary(self.answer_reviews),
                            "plan_revision": self.plan_revision,
                            "steps": [{"id": x.id[:128], "description": x.description[:256], "status": x.status,
                                       "depends_on": [d[:128] for d in x.depends_on[:8]],
@@ -209,6 +218,15 @@ class TaskRun:
                                       "path_count": len(x.paths)} for x in selected],
                            "step_count": len(self.plan), "completed_count": sum(x.status == "completed" for x in self.plan),
                            "recent_failures": self.failures[-3:], "detail_tool": "task_state"}, ensure_ascii=False)
+
+    @staticmethod
+    def _verifier_summary(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not records:
+            return None
+        record = records[-1]
+        return {"status": record.get("status"), "verdict": record.get("verdict"),
+                "reason": str(record.get("reason", ""))[:512],
+                "findings": record.get("findings", [])[:2], "detail": "task_state"}
 
 
 @dataclass(frozen=True)
@@ -254,6 +272,16 @@ def verify_completion(task: TaskRun, current: WorkspaceRevision, *, running_proc
                    r.get("workspace") == current.workspace and r.get("contract_hash") == contract_hash]
         if not reviews or reviews[-1].get("status") != "passed":
             issues.append("independent review has not passed on the final revision")
+    if task.contract.verification_required:
+        contract_hash = hashlib.sha256(json.dumps(asdict(task.contract), sort_keys=True).encode()).hexdigest()
+        runs = [r for r in task.verifier_runs if r.get("revision") == current.digest and
+                r.get("workspace") == current.workspace and r.get("contract_hash") == contract_hash]
+        if not runs or runs[-1].get("status") != "passed":
+            issue = "behavioral verifier has not passed on the final revision"
+            failure_class = runs[-1].get("failure_class") if runs else None
+            if isinstance(failure_class, str) and failure_class:
+                issue = "[" + failure_class + "] " + issue
+            issues.append(issue)
     status: TaskStatus = "blocked" if task.stalled() else ("unverified" if issues else "completed")
     return VerificationReport(status, current.digest, changed, tuple(issues), valid)
 
@@ -271,7 +299,7 @@ class TaskStore:
         task.updated_at = time.time()
         try:
             with _open_state(self.storage, temporary, "w") as handle:
-                json.dump({"v": 2, "task": asdict(task)}, handle, ensure_ascii=False)
+                json.dump({"v": 3, "task": asdict(task)}, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             self.storage.validate(self.path)
@@ -287,7 +315,7 @@ class TaskStore:
             raise ValueError("task-state record exceeds its budget")
         with _open_state(self.storage, self.path, "r") as handle:
             value = json.load(handle)
-        if value.get("v") not in {1, 2}:
+        if value.get("v") not in {1, 2, 3}:
             raise ValueError("unsupported task-state schema")
         data = value["task"]
         contract = data.pop("contract")

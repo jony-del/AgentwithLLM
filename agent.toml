@@ -214,7 +214,18 @@ ref = "main"
 #   * Built-in programmatic hooks (in-process, hold live objects) — toggled below.
 #   * Config-driven external hooks ([[hooks.external]]) — subprocess / HTTP / re-prompt
 #     / verifier agent, declared here without touching code.
-# Any hook failure degrades to "allow + log" and never sinks a run.
+# Advisory failures are logged; explicit gates fail closed.
+[verifier]
+mode = "auto"                 # code changes: independent behavioral probes; tool answers: evidence review
+model = ""                    # inherit the configured provider/model; no protocol switching
+check_answer = true
+timeout = 300                  # shared deadline for one behavioral verification
+max_tokens = 4096
+max_repair_attempts = 2
+max_probes = 12
+max_context_bytes = 163840
+stage_checks = false           # optional check when a 3+ step plan finishes
+
 [hooks]
 enabled = true                 # false (or AGENT_HOOKS=0) turns the whole subsystem off
 
@@ -238,10 +249,11 @@ max_chars = 100000             # reject prompts larger than this; 0 disables the
 reject_control_chars = true    # reject NUL / C0 control chars (tab/newline/CR are allowed)
 neutralize_framing = true      # wrap+escape spoofed control framing instead of rejecting it
 
-# External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
+# External hooks: a flat array, each entry names its `event` + `type`. `command`/`http`
 # carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
 # {"hookSpecificOutput": {"additionalContext": "..."}} is injected). `prompt`/`agent` are
-# advisory (inject the model/sub-agent reply as context, never block). `matcher` only
+# advisory by default; decision_mode="gate" enables strict JSON decisions and fails closed.
+# `matcher` only
 # applies to Pre/PostCompact (matched against the trigger: "auto" | "reactive"). Every call
 # is bounded by a single `timeout` (seconds) with kill-await; the hook receives a bounded
 # JSON projection of the context on stdin / as the request body.
@@ -266,12 +278,14 @@ type = "command"
 matcher = "auto"             # only on the proactive fold, not the 413-reactive path
 command = "./.polaris/hooks/precompact.sh"
 #
-[[hooks.external]]
-event = "Stop"
-type = "prompt"              # advisory: re-prompt the LLM for a completion check
-prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
-model = "claude-haiku-4-5-20251001"
-timeout = 30
+# Optional additional domain-specific stop gate; [verifier] already checks final answers.
+# [[hooks.external]]
+# event = "Stop"
+# type = "prompt"
+# decision_mode = "gate"
+# prompt = "Check whether the user's acceptance criteria have evidence. Return JSON with ok and reason."
+# model = ""                   # inherit, or select a model supported by the same provider
+# timeout = 30
 
 # --- Context compaction -----------------------------------------------------
 # How the history is shrunk as it grows. The cheap deterministic stages (snip,

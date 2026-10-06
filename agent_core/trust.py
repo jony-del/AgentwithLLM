@@ -102,6 +102,14 @@ def _present(value: Any) -> bool:
     return value is not _MISSING and value not in (None, "", [], {}, ())
 
 
+def _verifier_off(value: Any) -> bool:
+    return str(value) == "off"
+
+
+def _positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
 def _truthy(value: Any) -> bool:
     if value is _MISSING:
         return False
@@ -130,6 +138,10 @@ TRUST_MATRIX: tuple[TrustRule, ...] = (
     TrustRule(("permission",), "permission", _privileged_permission),
     TrustRule(("permissions", "allow"), "permissions.allow", _present),
     TrustRule(("hooks", "external"), "hooks.external", _present),
+    TrustRule(("verifier", "model"), "verifier.model", _present),
+    TrustRule(("verifier", "mode"), "verifier.mode", _verifier_off),
+    TrustRule(("verifier", "check_answer"), "verifier.check_answer", _is_false),
+    TrustRule(("verifier", "min_changed_files"), "verifier.min_changed_files", _positive_number),
     TrustRule(("hooks", "enabled"), "hooks.enabled", _is_false),
     TrustRule(("hooks", "prompt_validation", "enabled"), "hooks.prompt_validation.enabled", _is_false),
     TrustRule(
@@ -230,6 +242,9 @@ TRUST_MATRIX: tuple[TrustRule, ...] = (
 
 
 _PROTECTED_KEYS: dict[tuple[str, ...], frozenset[str]] = {
+    ("verifier",): frozenset({"mode", "model", "check_answer", "timeout", "max_tokens",
+                              "max_repair_attempts", "max_probes", "max_context_bytes", "stage_checks",
+                              "min_changed_files"}),
     ("permissions",): frozenset({"allow", "ask", "deny"}),
     ("hooks",): frozenset({"enabled", "external", "builtin", "prompt_validation"}),
     ("hooks", "prompt_validation"): frozenset(

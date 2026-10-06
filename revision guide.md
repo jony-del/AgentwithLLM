@@ -8,6 +8,17 @@
 
 ## 1. 当前项目已有能力（附证据）
 
+2026-10-06 verifier 移植：`agent_core/verifier.py` 实现独立功能/反例探测与最终回答证据审查，
+`tools/verifier.py` 提供 run_verifier 和权限受控的内部命令/浏览器探测；结果绑定源码、契约、
+回答及证据 hash，严格 PASS/FAIL/PARTIAL，缺失能力与非法裁决失败关闭。prompt/agent hook 支持
+decision_mode=gate，有界续跑耗尽后仍返回未验证状态；库默认 off，仓库配置 auto。
+任务记录升级 schema v3，兼容 v1/v2；已提供 /init-verifiers、项目 CLI 指南及实际功能/错误探测脚本。
+回归首轮 1,801 passed / 12 skipped；7 项测试失败（新增信任策略生成器、schema 旧断言、测试工作区隔离）
+已修正并定向复跑 59 passed。CLI 功能/反例探测通过，Ruff 与 Mypy（207 个生产文件）通过。
+相关运行时、hook、信任、技能、CLI、导入边界及 verifier 模块回归 277 passed。
+补充手动验证失败阻断用例后，新增 verifier 专项 45 passed。
+真实模型及真实 Container/VM 的端到端验证仍未完成；确定性 provider/边界替身不代表这些能力已验收。
+
 ### 1.1 核心循环与上下文管理
 - 异步 ReAct 主循环：`agent_core/react.py:434` `ReActAgent.run()`。自然终止为主，
   辅以协作取消（Esc，`interrupt.py`）、可选 `max_steps`、共享 wall-clock deadline
@@ -106,7 +117,7 @@
   `allowed_domains` 纳入 TOFU 放权键（`trust.py`）。
 - ✅ **S5 已闭环** — 子代理/teammate 不再提权（`react.py` `_child_permission_mode`；teammate 去 `auto`）。
 - ✅ **S6 已闭环** — `auto_allow_command_if_sandboxed` 默认翻转为 false（D4）。
-- ✅ **S7 已闭环** — 外部 hook `fail_mode = open|closed`（command/http），`prompt`/`agent` 仍恒 advisory（设计如此）。
+- ✅ **S7 已闭环** — 外部 hook `fail_mode = open|closed`（command/http）；prompt/agent 默认 advisory，现支持显式 decision_mode=gate 结构化阻断并失败关闭。
 - ✅ **S8 已闭环** — `always allow` 改按规范化命令前缀记忆（`permissions.py` `_session_allowed`）。
 - ✅ **S9 已闭环** — bypass/无头/auto 无沙箱即拒绝启动（`SandboxRequiredError`，D3）。
 
@@ -322,7 +333,7 @@ notebook）。
 - **后续进展见 §6.6 清单（2026-07-03 起）**：原"仍未做"各项已逐一落地——
   PermissionRequest hook（W10）、依赖二次分层（W6，按 D9 形状）、replay（W8）、
   sandbox prepare 幂等共享（W5）、`ProviderConfig`（W4）等；per-hook fail_mode
-  覆盖 command/http，prompt/agent 恒为 advisory（设计如此，不变）。
+  覆盖 command/http；prompt/agent 默认 advisory，后续 verifier 移植增加显式 gate 模式。
 
 ## 6.6 剩余工作清单（2026-07-03 建账，逐项落地即勾选）
 
@@ -418,7 +429,7 @@ notebook）。
 - ~~AskUserQuestion 工具（C2，依赖 terminal 栈）。~~
 - ~~后台/长进程任务族（C3）。~~
 - ~~LSP/诊断、worktree 隔离、notebook 编辑（C4）。~~
-- `prompt`/`agent` 外部 hook 恒为 advisory —— 设计如此，非未完成项。
+- `prompt`/`agent` 外部 hook 默认 advisory；现可通过 decision_mode=gate 启用严格 JSON 裁决与失败阻断。
 
 ## 7. 分阶段实现路线
 

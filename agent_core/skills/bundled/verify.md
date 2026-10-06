@@ -11,7 +11,10 @@ code, actually exercise it.
 1. Work out what behaviour the change is meant to produce and the cheapest way to
    observe it: run the test suite, run the app/CLI, or run the specific command the
    change affects.
-2. Run it. Capture the real output. If a quick targeted test or one-off command proves
+2. Use `run_verifier` for independent functional and adversarial probes in a sandboxed
+   source copy. Project guides created with `/init-verifiers` supply setup and expectations.
+   Register required checks with `update_task_plan` and execute them with `run_verification`.
+   Run it. Capture the real output. If a quick targeted test or one-off command proves
    the behaviour, prefer that over a full run.
 3. Compare what you observed against what was expected. State plainly whether it works.
 4. If it fails or is inconclusive, report the exact output and what it implies — do not

@@ -255,7 +255,26 @@ ref = "main"
 #   * Built-in programmatic hooks (in-process, hold live objects) — toggled below.
 #   * Config-driven external hooks ([[hooks.external]]) — subprocess / HTTP / re-prompt
 #     / verifier agent, declared here without touching code.
-# Any hook failure degrades to "allow + log" and never sinks a run.
+# Advisory failures are logged; explicit gates fail closed.
+[verifier]
+mode = "auto"                 # off | auto | required; library-only default is off
+model = ""                    # inherit the provider/model; an explicit model must use that provider.
+                              # A different (ideally stronger) model reduces shared blind spots of self-review.
+check_answer = true
+timeout = 300                  # behavior verifier's total deadline, includes commands
+max_tokens = 4096              # also capped by caller's provider max_tokens
+max_repair_attempts = 2
+max_probes = 12
+max_context_bytes = 163840      # fail rather than truncate a certification payload
+stage_checks = false           # optional verification after a completed 3+ step plan
+min_changed_files = 0          # auto mode: skip the behavioral LLM verifier for changes touching
+                               # fewer files than this (0 = verify every change). The deterministic
+                               # completion gate and answer review still apply. Untrusted repo
+                               # configurations cannot raise this (widening; stripped by trust policy).
+# Behavioral probes require an enabled real sandbox. Missing capability => PARTIAL/unverified.
+# Environment/budget failures (no sandbox, timeout, context budget) are reported directly and do
+# not spend repair attempts on rounds the main agent cannot fix.
+
 [hooks]
 enabled = true                 # false (or AGENT_HOOKS=0) turns the whole subsystem off
 
@@ -288,10 +307,11 @@ max_items = 100
 max_messages = 20
 message_chars = 2000
 
-# External hooks: a flat array, each entry names its `event` + `type`. Only `command`/`http`
+# External hooks: a flat array, each entry names its `event` + `type`. `command`/`http`
 # carry the block contract (exit code 2 / JSON {"continue": false} = block; stdout
 # {"hookSpecificOutput": {"additionalContext": "..."}} is injected). `prompt`/`agent` are
-# advisory (inject the model/sub-agent reply as context, never block). `matcher` only
+# advisory by default; decision_mode="gate" requires strict JSON {"ok":bool,"reason":str?}
+# and blocks on false, malformed output, errors or timeouts. `matcher` only
 # applies to Pre/PostCompact (matched against the trigger: "auto" | "reactive"). Every call
 # is bounded by a single `timeout` (seconds) with kill-await; the hook receives a bounded
 # JSON projection of the context on stdin / as the request body.
@@ -318,9 +338,10 @@ command = "./.polaris/hooks/precompact.sh"
 #
 [[hooks.external]]
 event = "Stop"
-type = "prompt"              # advisory: re-prompt the LLM for a completion check
-prompt = "Given the transcript, is the user's task actually complete? Answer briefly."
-model = "claude-haiku-4-5-20251001"
+type = "prompt"              # extra domain-specific check; [verifier] covers final answers
+decision_mode = "gate"        # advisory (legacy) | gate (strict JSON, failures block)
+prompt = "Check the acceptance criteria against evidence. Return JSON with ok and reason."
+model = ""                    # inherit, or select a supported model from the same provider
 timeout = 30
 
 # --- Context compaction -----------------------------------------------------

@@ -11,11 +11,11 @@ from agent_core.skills import Skill, SkillContext, SkillRegistry
 from agent_core.ui import NullUI
 
 
-def _agent(skills=None, **config_kwargs) -> ReActAgent:
+def _agent(skills=None, workspace=None, **config_kwargs) -> ReActAgent:
     # Memory defaults to on in ReActConfig; disable it so tests don't touch the real
     # on-disk store (callers that test /memory pass their own memory config).
     config_kwargs.setdefault("memory", MemoryConfig(enabled=False))
-    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(**config_kwargs))
+    agent = ReActAgent(provider=FakeProvider(), config=ReActConfig(**config_kwargs), workspace=workspace)
     if skills is not None:
         agent.skills = SkillRegistry(skills)
         agent.session.skills = agent.skills
@@ -70,7 +70,7 @@ async def test_fork_skill_runs_via_subagent_and_handles(capsys, tmp_path) -> Non
     skill = Skill(name="explore", description="d", body="Explore the repo", context=SkillContext.FORK)
     turn = await dispatch(
         "/explore now",
-        _agent(skills=[skill], run_dir=str(tmp_path / "runs")),
+        _agent(skills=[skill], run_dir=str(tmp_path / "runs"), session_dir="", workspace=tmp_path),
         NullUI(),
         [],
     )

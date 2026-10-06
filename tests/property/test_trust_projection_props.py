@@ -34,6 +34,7 @@ _PRESENT_VALUES = st.one_of(
 _TRUTHY_VALUES = st.sampled_from([True, 1, "true", "yes", "on", "TRUE"])
 _FALSEY_VALUES = st.sampled_from([False, 0, "false", "off", ""])
 _NOT_WSL2_VALUES = st.sampled_from(["hyperv", "process", "HyperV"])
+_POSITIVE_NUMBER_VALUES = st.integers(1, 1000)
 _PRIVILEGED_PERMISSIONS = st.sampled_from(
     ["acceptedits", "auto", "bypass", "bypassPermissions"]
 )
@@ -51,6 +52,10 @@ def _widening_values(rule: trust.TrustRule) -> st.SearchStrategy[Any]:
         return _NOT_WSL2_VALUES
     if when is trust._privileged_permission:
         return _PRIVILEGED_PERMISSIONS
+    if when is trust._verifier_off:
+        return st.just("off")
+    if when is trust._positive_number:
+        return _POSITIVE_NUMBER_VALUES
     raise AssertionError(f"no value strategy for predicate of {rule.label}")
 
 
@@ -66,6 +71,10 @@ def _canonical_widening_value(rule: trust.TrustRule) -> Any:
         return "hyperv"
     if when is trust._privileged_permission:
         return "bypass"
+    if when is trust._verifier_off:
+        return "off"
+    if when is trust._positive_number:
+        return 3
     raise AssertionError(f"no canonical value for predicate of {rule.label}")
 
 

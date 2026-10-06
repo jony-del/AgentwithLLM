@@ -590,14 +590,14 @@ async def test_idle_gap_shrinks_hygiene_keep_window(tmp_path: Path) -> None:
     from agent_core.compression import CompressionConfig
 
     provider = _ManyRoundsProvider(3)
-    logger = JSONLRunLogger(tmp_path)
+    logger = JSONLRunLogger(tmp_path / "runs")
     config = ReActConfig(
-        run_dir=str(tmp_path),
+        run_dir=str(tmp_path / "runs"), session_dir="",
         permission="auto",
         memory=MemoryConfig(enabled=False),
         compression=CompressionConfig(microcompact_idle_gap_minutes=60, microcompact_idle_keep_recent=1),
     )
-    agent = ReActAgent(provider, config, logger=logger)
+    agent = ReActAgent(provider, config, logger=logger, workspace=tmp_path)
     first = await agent.run("round one")
     # 3 results, all within the default keep window (5) — nothing cleared yet.
     assert [m.content for m in first.messages if m.role == "tool"] == [f"echo: r{i}" for i in range(1, 4)]
@@ -626,9 +626,10 @@ class _RecordingUI(AgentUI):
 
 
 async def test_run_emits_token_usage_and_recap_tokens(tmp_path: Path) -> None:
-    logger = JSONLRunLogger(tmp_path)
+    logger = JSONLRunLogger(tmp_path / "runs")
     ui = _RecordingUI()
-    agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path)), logger=logger, ui=ui)
+    agent = ReActAgent(FakeProvider(), ReActConfig(run_dir=str(tmp_path / "runs"), session_dir=""),
+                       logger=logger, ui=ui, workspace=tmp_path)
 
     await agent.run("hello")
 

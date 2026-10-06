@@ -133,14 +133,15 @@ class ExternalHookSpec:
     ``command`` / ``http`` / ``prompt`` / ``agent``. ``matcher`` only applies to the
     compaction events (matched against the ``trigger``: ``auto`` / ``reactive``). The
     remaining fields are type-specific; an adapter reads what it needs and ignores the
-    rest. Unparseable/incomplete specs are dropped at load time, never raised.
+    rest. Unparseable/incomplete advisory specs are dropped at load time; explicit
+    gates raise a configuration error so a required check cannot silently disappear.
 
     ``fail_mode`` decides what happens when the hook ITSELF fails (timeout, crash,
     network error): ``"open"`` (default) degrades to allow — right for observational
     hooks; ``"closed"`` treats the failure as a block decision — required when the hook
-    is a security gate, so a crashed gate does not silently swing open. Honored only by
-    the transports that carry the block contract (``command`` / ``http``); ``prompt`` /
-    ``agent`` stay advisory regardless.
+    is a security gate, so a crashed gate does not silently swing open. Legacy prompt/
+    agent hooks stay advisory. ``decision_mode="gate"`` requires structured decisions
+    and always fails closed on invalid/missing results, regardless of fail_mode.
     """
 
     event: str
@@ -160,6 +161,17 @@ class ExternalHookSpec:
     env: dict[str, str] | None = None
     timeout: float = 30.0
     fail_mode: str = "open"
+    decision_mode: str = "advisory"
+
+    def __post_init__(self) -> None:
+        if self.decision_mode not in {"advisory", "gate"}:
+            raise ValueError("hook decision_mode must be advisory or gate")
+        if self.decision_mode == "gate" and self.event not in {
+            "Stop", "UserPromptSubmit", "PreCompact", "PreToolUse", "PostToolUse"
+        }:
+            raise ValueError("gate hooks require a supported control event")
+        if self.decision_mode == "gate" and self.type in {"prompt", "agent"} and not self.prompt:
+            raise ValueError("gate hook requires prompt")
 
 
 @dataclass(slots=True)

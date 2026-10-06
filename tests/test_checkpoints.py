@@ -96,7 +96,7 @@ async def test_checkpoint_ownership_integrity_retention_and_read_policy(tmp_path
     saved = other.capture(session.task_run, capture_revision(root), allowed=lambda path: path != "a.py")
     assert saved.files["a.py"] == hashlib.sha256(b"value=1\r\n").hexdigest()
     assert not (other.root / "blobs" / saved.files["a.py"]).exists()
-    assert json.loads(session.task_store.path.read_text())["v"] == 2
+    assert json.loads(session.task_store.path.read_text())["v"] == 3
 
 
 async def test_private_state_write_is_drained_before_cancellation_returns(tmp_path):
