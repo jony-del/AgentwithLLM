@@ -103,6 +103,10 @@ Python：项目安装器会准备隔离的 Python 环境，并补齐 Git、ripgr
 
 ## 一键安装
 
+普通安装下载已构建的 wheel 和小型安装器，不需要 clone、下载或保留本项目仓库，也不需要预装
+Python。安装脚本固定到其所属 Release，依赖版本来自 `uv.lock` 导出的约束文件。
+下面的命令需要仓库已有成功发布的 GitHub Release；仅提交代码不会自动产生下载地址。
+
 Windows 10/11（PowerShell）：
 
 ```powershell
@@ -117,6 +121,9 @@ curl -fsSL https://github.com/jony-del/AgentwithLLM/releases/latest/download/ins
 
 普通安装由 uv tool 提供用户级 `polaris` 命令，不需要激活虚拟环境；安装完成后重新打开终端或直接
 运行 `polaris` 即可。只有源码开发流程需要激活仓库中的 `.venv`。
+
+先运行 `polaris --version` 确认安装版本。模型服务/API Key 的首次配置、升级、固定版本、
+跳过沙箱/模型的安装方式，以及维护者发布流程见[安装与发布指南](docs/installation.md)。
 
 安装器会复用已通过完整挂载探针的 Podman、Docker 或 nerdctl；三者都不可用时安装 Podman，并
 拉取带 OCI index 摘要的 GHCR 工具链镜像。Windows 首次启用 WSL2 后可能返回退出码 `20` 并要求重启；重启后重新运行同一条命令

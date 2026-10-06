@@ -245,6 +245,8 @@ class Installer:
         if self.options.check:
             return before
 
+        # Validate distribution integrity before installing any host dependencies.
+        self._project_install_spec()
         self._install_host_commands()
         self._require_trusted_bash()
         self._install_node()
@@ -938,11 +940,52 @@ class Installer:
         guest = f"/mnt/{raw[0].casefold()}/{raw[2:].lstrip('/')}"
         return guest, guest
 
-    def _install_project(self) -> None:
+    def _project_install_spec(self) -> tuple[str, Path | None, dict[str, Any]]:
         source = self.options.source.resolve()
+        release_path = source / "release.json"
+        if release_path.is_file() and not self.options.dev:
+            try:
+                release = json.loads(release_path.read_text(encoding="utf-8"))
+                if (
+                    release["schema"] != 1
+                    or release["package"] != PACKAGE_NAME
+                    or release["tag"] != f"v{release['version']}"
+                    or release["tag"] != _MANIFEST.get("release_tag", release["tag"])
+                ):
+                    raise ValueError("release identity mismatch")
+                assets = []
+                for name in ("wheel", "constraints"):
+                    asset = release[name]
+                    filename = asset["filename"]
+                    if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
+                        raise ValueError("invalid asset filename")
+                    path = source / filename
+                    if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]):
+                        raise ValueError("missing asset or invalid checksum")
+                    verify_sha256(path, asset["sha256"])
+                    assets.append(path)
+                wheel, constraints = assets
+                if not wheel.name.endswith(".whl") or not wheel.name.startswith("agent_with_llm-"):
+                    raise ValueError("invalid Polaris wheel")
+                with zipfile.ZipFile(wheel) as bundle:
+                    metadata_names = [name for name in bundle.namelist() if name.endswith(".dist-info/METADATA")]
+                    if len(metadata_names) != 1:
+                        raise ValueError("invalid wheel metadata")
+                    from email.parser import Parser
+                    metadata = Parser().parsestr(bundle.read(metadata_names[0]).decode("utf-8"))
+                    if metadata["Name"] != PACKAGE_NAME or metadata["Version"] != release["version"]:
+                        raise ValueError("wheel metadata does not match release")
+                return f"{wheel}[all]", constraints, release
+            except (OSError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
+                raise InstallError(f"invalid release bundle: {exc}") from exc
         if not (source / "pyproject.toml").is_file():
             raise InstallError(f"project source is missing pyproject.toml: {source}")
         spec = f"{source}[all,dev]" if self.options.dev else f"{source}[all]"
+        return spec, None, {}
+
+    def _install_project(self) -> None:
+        source = self.options.source.resolve()
+        spec, constraints, release = self._project_install_spec()
         uv = self.runner.which("uv") or "uv"
         if self.options.dev:
             venv = source / ".venv"
@@ -1057,10 +1100,16 @@ class Installer:
                 )
             return
         args = [uv, "tool", "install", "--python", PYTHON_SERIES]
+        if constraints is not None:
+            args.extend(["--constraints", str(constraints)])
         if self.options.upgrade and owned:
             args.append("--force")
         args.append(spec)
-        self.runner.run(args, check=True, mutates=True)
+        dependency_env = os.environ.copy()
+        dependency_env.setdefault("UV_HTTP_CONNECT_TIMEOUT", "30")
+        dependency_env.setdefault("UV_HTTP_TIMEOUT", "120")
+        dependency_env.setdefault("UV_HTTP_RETRIES", "5")
+        self.runner.run(args, check=True, mutates=True, env=dependency_env)
         if not self.options.dry_run:
             tool_root = self._uv_tool_directory(uv, ["tool", "dir"])
             bin_dir = self._uv_tool_directory(uv, ["tool", "dir", "--bin"])
@@ -1085,8 +1134,12 @@ class Installer:
                     "tool_root": str(tool_root),
                     "bin_dir": str(bin_dir),
                     "bootstrap_python": str(Path(sys.executable).resolve()),
+                    "release_version": release.get("version", ""),
+                    "release_tag": release.get("tag", ""),
                 },
             )
+            self.runner.run([uv, "tool", "update-shell"], check=True, mutates=True)
+            print(f"Polaris command: {executable}; open a new terminal if it is not on PATH yet.")
 
     def _install_memory_models(self) -> None:
         command = self._project_command()

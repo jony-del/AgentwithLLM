@@ -1,0 +1,39 @@
+{
+  "version": "0.1.0",
+  "distribution": "wheel",
+  "checks": [
+    {
+      "command": [
+        "polaris",
+        "--version"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "polaris",
+        "run",
+        "Say hello without tools",
+        "--provider",
+        "fake",
+        "--no-memory",
+        "--session-dir",
+        ""
+      ],
+      "exit_code": 0
+    },
+    {
+      "check": "imports_from_isolated_wheel_environment",
+      "passed": true
+    },
+    {
+      "check": "health_configuration_and_fake_provider",
+      "passed": true,
+      "overall_status": "error"
+    }
+  ],
+  "notes": [
+    "Full Python dependencies installed into a workspace-only uv tool environment.",
+    "Host/container/model provisioning was not changed during this smoke test."
+  ]
+}

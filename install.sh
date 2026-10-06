@@ -3,6 +3,8 @@ set -euo pipefail
 
 UV_VERSION="0.11.28"
 REPOSITORY="https://github.com/jony-del/AgentwithLLM"
+# Filled by tools/build_release_assets.py; published scripts pin one release.
+RELEASE_TAG=""
 VERSION="latest"
 TEMP_ROOT=""
 FORWARD_ARGS=()
@@ -124,7 +126,7 @@ download() {
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/installer/install.py" ]]; then
+if [[ -n "${BASH_SOURCE[0]:-}" && -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/installer/install.py" ]]; then
   SOURCE_ROOT="$SCRIPT_DIR"
   if ((UNINSTALL)) && [[ ! -f "$SOURCE_ROOT/agent_core/uninstall.py" ]]; then
     echo "source checkout is missing agent_core/uninstall.py" >&2
@@ -135,25 +137,28 @@ else
     echo "--dev requires a persistent source checkout" >&2
     exit 2
   fi
-  TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/polaris-install.XXXXXX")"
   if [[ "$VERSION" == "latest" ]]; then
-    BASE="$REPOSITORY/releases/latest/download"
-  else
-    BASE="$REPOSITORY/releases/download/$VERSION"
+    VERSION="$RELEASE_TAG"
   fi
-  ARCHIVE="$TEMP_ROOT/polaris-source.tar.gz"
+  [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+    echo "Use an installer from a published GitHub Release, or specify --version vX.Y.Z" >&2
+    exit 2
+  }
+  TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/polaris-install.XXXXXX")"
+  BASE="$REPOSITORY/releases/download/$VERSION"
+  ARCHIVE="$TEMP_ROOT/polaris-installer.tar.gz"
   SUMS="$TEMP_ROOT/SHA256SUMS"
   echo "Downloading Polaris $VERSION release..."
-  download "$BASE/polaris-source.tar.gz" "$ARCHIVE"
+  download "$BASE/polaris-installer.tar.gz" "$ARCHIVE"
   download "$BASE/SHA256SUMS" "$SUMS"
-  EXPECTED="$(awk '{name=$2; sub(/^\*/, "", name); if (name=="polaris-source.tar.gz") {print $1; exit}}' "$SUMS")"
-  [[ -n "$EXPECTED" ]] || { echo "SHA256SUMS does not contain polaris-source.tar.gz" >&2; exit 10; }
+  EXPECTED="$(awk '{name=$2; sub(/^\*/, "", name); if (name=="polaris-installer.tar.gz") {print $1}}' "$SUMS")"
+  [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] || { echo "SHA256SUMS must contain exactly one polaris-installer.tar.gz entry" >&2; exit 10; }
   if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
   else
     ACTUAL="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
   fi
-  [[ "$ACTUAL" == "$EXPECTED" ]] || { echo "SHA-256 mismatch for polaris-source.tar.gz" >&2; exit 10; }
+  [[ "$ACTUAL" == "$EXPECTED" ]] || { echo "SHA-256 mismatch for polaris-installer.tar.gz" >&2; exit 10; }
   SOURCE_ROOT="$TEMP_ROOT/source"
   mkdir -p "$SOURCE_ROOT"
   tar -xzf "$ARCHIVE" -C "$SOURCE_ROOT"
@@ -179,6 +184,7 @@ else
   [[ -n "$UV" ]] || { echo "uv installation completed but uv was not found" >&2; exit 10; }
 fi
 
+export PATH="$(dirname -- "$UV"):$PATH"
 if ((!UNINSTALL && !CHECK && !DRY_RUN)); then
   "$UV" python install 3.12 || exit 10
 else
@@ -188,6 +194,9 @@ fi
 # remove.  The worker must run from uv's external managed Python.
 PYTHON="$("$UV" python find --system --no-project 3.12 | tail -n 1)"
 [[ -x "$PYTHON" ]] || { echo "uv did not return a Python 3.12 executable" >&2; exit 10; }
+if [[ -n "$TEMP_ROOT" ]]; then
+  "$PYTHON" -c 'import json,sys; r=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if r.get("tag")==sys.argv[2] else "Release bundle version does not match requested tag")' "$SOURCE_ROOT/release.json" "$VERSION" || exit 10
+fi
 if ((UNINSTALL)); then
   UNINSTALL_ARGS=()
   if ((PURGE_DATA)); then

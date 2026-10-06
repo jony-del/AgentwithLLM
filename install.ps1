@@ -17,6 +17,8 @@ param(
 $ErrorActionPreference = "Stop"
 $UvVersion = "0.11.28"
 $Repository = "https://github.com/jony-del/AgentwithLLM"
+# Filled by tools/build_release_assets.py; published scripts always pin one release.
+$ReleaseTag = ""
 $TemporaryRoot = $null
 
 if ($Uninstall -and ($Dev -or $Upgrade -or $Check -or $SkipSandbox -or $SkipMemoryModels -or $ModelBundle)) {
@@ -37,32 +39,34 @@ if ($Uninstall -and $NonInteractive -and (-not $Yes) -and (-not $DryRun)) {
 }
 
 function Get-VerifiedSource {
-    $localInstaller = Join-Path $PSScriptRoot "installer\install.py"
-    if ($PSScriptRoot -and (Test-Path -LiteralPath $localInstaller)) {
+    if ($PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot "installer\install.py"))) {
         if ($Uninstall -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot "agent_core\uninstall.py"))) {
             throw "Source checkout is missing agent_core/uninstall.py"
         }
         return (Resolve-Path -LiteralPath $PSScriptRoot).Path
     }
 
+    if ($Dev) { throw "-Dev requires a persistent source checkout" }
+    $tag = if ($Version -eq "latest") { $ReleaseTag } else { $Version }
+    if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
+        throw "Use an installer from a published GitHub Release, or specify -Version vX.Y.Z"
+    }
+
     $script:TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("polaris-install-" + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $script:TemporaryRoot | Out-Null
-    $base = if ($Version -eq "latest") {
-        "$Repository/releases/latest/download"
-    } else {
-        "$Repository/releases/download/$Version"
-    }
-    $archive = Join-Path $script:TemporaryRoot "polaris-source.zip"
+    $base = "$Repository/releases/download/$tag"
+    $archive = Join-Path $script:TemporaryRoot "polaris-installer.zip"
     $sums = Join-Path $script:TemporaryRoot "SHA256SUMS"
-    Write-Host "Downloading Polaris $Version release..."
-    Invoke-WebRequest -UseBasicParsing "$base/polaris-source.zip" -OutFile $archive
+    Write-Host "Downloading Polaris $tag release..."
+    Invoke-WebRequest -UseBasicParsing "$base/polaris-installer.zip" -OutFile $archive
     Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS" -OutFile $sums
 
-    $entry = Get-Content -LiteralPath $sums | Where-Object { $_ -match "\s\*?polaris-source\.zip$" } | Select-Object -First 1
-    if (-not $entry) { throw "SHA256SUMS does not contain polaris-source.zip" }
+    $entries = @(Get-Content -LiteralPath $sums | Where-Object { $_ -match '^[0-9a-fA-F]{64}\s+\*?polaris-installer\.zip$' })
+    if ($entries.Count -ne 1) { throw "SHA256SUMS must contain exactly one polaris-installer.zip entry" }
+    $entry = $entries[0]
     $expected = ($entry -split "\s+")[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-    if ($actual -ne $expected) { throw "SHA-256 mismatch for polaris-source.zip" }
+    if ($actual -ne $expected) { throw "SHA-256 mismatch for polaris-installer.zip" }
 
     $source = Join-Path $script:TemporaryRoot "source"
     Expand-Archive -LiteralPath $archive -DestinationPath $source
@@ -72,6 +76,8 @@ function Get-VerifiedSource {
     if (-not (Test-Path -LiteralPath (Join-Path $source "agent_core\uninstall.py"))) {
         throw "Release archive is missing agent_core/uninstall.py"
     }
+    $release = Get-Content -LiteralPath (Join-Path $source "release.json") -Raw | ConvertFrom-Json
+    if ($release.tag -ne $tag) { throw "Release bundle version does not match requested $tag" }
     return $source
 }
 
@@ -102,6 +108,8 @@ try {
         throw "-Dev requires a persistent source checkout; run this script from the repository"
     }
     $uv = Get-UvCommand
+    # uv's installer may only update future shells. The Python worker needs it now.
+    $env:PATH = (Split-Path -Parent $uv) + [IO.Path]::PathSeparator + $env:PATH
     if (-not ($Uninstall -or $Check -or $DryRun)) {
         & $uv python install 3.12
         if ($LASTEXITCODE -ne 0) { throw "uv could not install Python 3.12" }
@@ -146,7 +154,12 @@ catch {
 }
 finally {
     if ($TemporaryRoot -and (Test-Path -LiteralPath $TemporaryRoot)) {
-        Remove-Item -LiteralPath $TemporaryRoot -Recurse -Force
+        $resolvedTemp = (Resolve-Path -LiteralPath $TemporaryRoot).Path
+        $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        if ($resolvedTemp.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($resolvedTemp) -match '^polaris-install-[0-9a-f-]{36}$') {
+            Remove-Item -LiteralPath $resolvedTemp -Recurse -Force
+        }
     }
 }
 exit $exitCode

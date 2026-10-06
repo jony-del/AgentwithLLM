@@ -1,4 +1,4 @@
-name: Release installer assets
+name: Release wheel installers
 
 on:
   push:
@@ -7,8 +7,6 @@ on:
 permissions:
   contents: write
   packages: write
-  id-token: write
-  attestations: write
 
 env:
   SANDBOX_IMAGE: ghcr.io/jony-del/agentwithllm-sandbox
@@ -37,121 +35,124 @@ jobs:
           tags: ${{ env.SANDBOX_IMAGE }}:${{ github.ref_name }}
           sbom: true
           provenance: mode=max
-      - name: Verify OCI index digest
-        shell: bash
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: '[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]'
 
   linux-oci-e2e:
     needs: sandbox-image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
-      - run: pip install -e .[all,dev]
+          version: "0.11.28"
+      - run: uv sync --locked --extra all --extra dev --python 3.12
       - name: Linux real OCI sandbox E2E
         env:
           POLARIS_SANDBOX_E2E_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ needs.sandbox-image.outputs.digest }}
           POLARIS_SANDBOX_E2E_RUNTIME: docker
-        run: python -m pytest -q tests/test_sandbox_oci_e2e.py
+        run: uv run --no-sync python -m pytest -q tests/test_sandbox_oci_e2e.py
 
-  windows-wsl2-e2e:
+  build-release:
     needs: sandbox-image
-    runs-on: [self-hosted, Windows, X64, polaris-wsl2]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e .[all,dev]
-      - name: Start installer-owned Podman Machine for release verification
-        shell: pwsh
-        run: podman machine start
-      - name: Windows WSL2 Podman E2E
-        shell: pwsh
-        env:
-          POLARIS_SANDBOX_E2E_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ needs.sandbox-image.outputs.digest }}
-          POLARIS_SANDBOX_E2E_RUNTIME: podman
-        run: python -m pytest -q tests/test_sandbox_oci_e2e.py
-      - name: Stopped Podman Machine must fail closed
-        shell: pwsh
-        env:
-          POLARIS_SANDBOX_E2E_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ needs.sandbox-image.outputs.digest }}
-          POLARIS_SANDBOX_E2E_RUNTIME: podman
-          POLARIS_SANDBOX_E2E_EXPECT_STOPPED: "1"
-        run: |
-          podman machine stop
-          python -m pytest -q tests/test_sandbox_oci_e2e.py::test_stopped_runtime_fails_closed_without_host_execution
-      - name: Opt-in startup restores the stopped machine and passes OCI probes
-        shell: pwsh
-        env:
-          POLARIS_SANDBOX_E2E_IMAGE: ${{ env.SANDBOX_IMAGE }}@${{ needs.sandbox-image.outputs.digest }}
-          POLARIS_SANDBOX_E2E_RUNTIME: podman
-          POLARIS_SANDBOX_E2E_AUTO_START: "1"
-        run: python -m pytest -q tests/test_sandbox_oci_e2e.py::test_real_oci_shell_unicode_pytest_node_and_security
-      - name: Restore Podman Machine for the runner
-        if: always()
-        shell: pwsh
-        run: podman machine start
-
-  release:
-    needs: [sandbox-image, linux-oci-e2e, windows-wsl2-e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
         with:
-          fetch-depth: 0
+          version: "0.11.28"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Validate tag and inject immutable sandbox digest
-        shell: bash
         env:
           DIGEST: ${{ needs.sandbox-image.outputs.digest }}
         run: |
           python - <<'PY'
-          import json, os, pathlib, tomllib
+          import json, os, pathlib, re, tomllib
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
-          if tag != f"v{version}":
-              raise SystemExit(f"tag {tag!r} does not match project version v{version}")
-          image = f"ghcr.io/jony-del/agentwithllm-sandbox@{os.environ['DIGEST']}"
-          lock_path = pathlib.Path("agent_core/sandbox/sandbox-image.lock.json")
-          lock = json.loads(lock_path.read_text())
-          lock["image"] = image
-          lock_path.write_text(json.dumps(lock, indent=2) + "\n")
-          manifest_path = pathlib.Path("installer/manifest.json")
-          manifest = json.loads(manifest_path.read_text())
-          manifest["sandbox_image"] = image
-          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit("release tag must match project version")
+          digest = os.environ["DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("invalid OCI index digest")
+          image = f"ghcr.io/jony-del/agentwithllm-sandbox@{digest}"
+          for name, key in [("agent_core/sandbox/sandbox-image.lock.json", "image"), ("installer/manifest.json", "sandbox_image")]:
+              path = pathlib.Path(name)
+              content = json.loads(path.read_text())
+              content[key] = image
+              path.write_text(json.dumps(content, indent=2) + "\n")
           PY
+      - name: Distribution and installer regression tests
+        run: |
+          uv sync --locked --extra all --extra dev --python 3.12
+          uv run --no-sync python -m pytest -q tests/test_release_distribution.py tests/test_installer.py tests/test_uninstall.py tests/test_cli.py
           bash -n install.sh
-          python installer/install.py --help
-          python agent_core/uninstall.py --help
-      - name: Build reproducible source assets
-        shell: bash
+      - name: Build wheel, locked constraints and minimal installer bundles
+        run: python tools/build_release_assets.py --tag "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  cli-install:
+    needs: build-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # No checkout: installed commands must work without the repository.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.28"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install and exercise the distributed wheel outside any checkout
+        shell: python
         run: |
-          python tools/build_release_archives.py
-          sha256sum polaris-source.zip polaris-source.tar.gz install.ps1 install.sh > SHA256SUMS
-      - name: Smoke-test release archives
-        shell: bash
-        run: |
-          mkdir smoke-zip smoke-tar
-          unzip -q polaris-source.zip -d smoke-zip
-          tar -xzf polaris-source.tar.gz -C smoke-tar
-          python smoke-zip/installer/install.py --help
-          python smoke-tar/installer/install.py --help
-          python smoke-zip/agent_core/uninstall.py --help
-          python smoke-tar/agent_core/uninstall.py --help
-      - name: Publish GitHub Release assets
+          import json, os, pathlib, subprocess, tempfile
+          root = pathlib.Path("release").resolve()
+          release = json.loads((root / "release.json").read_text())
+          wheel = root / release["wheel"]["filename"]
+          subprocess.run(["uv", "tool", "install", "--python", "3.12", "--constraints", str(root / "polaris-constraints.txt"), f"{wheel}[all]"], check=True)
+          bin_dir = pathlib.Path(subprocess.check_output(["uv", "tool", "dir", "--bin"], text=True).strip())
+          cli = bin_dir / ("polaris.exe" if os.name == "nt" else "polaris")
+          with tempfile.TemporaryDirectory() as directory:
+              env = dict(os.environ, POLARIS_HOME=str(pathlib.Path(directory) / "home"))
+              output = subprocess.check_output([str(cli), "--version"], cwd=directory, env=env, text=True).strip()
+              assert output == f"polaris {release['version']}", output
+              subprocess.run([str(cli), "run", "Say hello without tools", "--provider", "fake", "--no-memory", "--session-dir", ""], cwd=directory, env=env, check=True)
+              result = subprocess.run([str(cli), "health", "--provider", "fake", "--no-memory", "--json"], cwd=directory, env=env, capture_output=True, text=True)
+              checks = {item["name"]: item for item in json.loads(result.stdout)["checks"]}
+              for name in ("configuration", "provider"):
+                  assert checks[name]["status"] == "ok", checks[name]
+      - name: Validate distributed PowerShell entrypoint
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-Command ./release/install.ps1 | Out-Null
+      - name: Validate distributed Bash entrypoint
+        if: runner.os != 'Windows'
+        run: bash -n release/install.sh
+
+  release:
+    needs: [build-release, cli-install, linux-oci-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+      - name: Publish verified GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
-          gh release upload "$GITHUB_REF_NAME" \
-            polaris-source.zip polaris-source.tar.gz SHA256SUMS install.ps1 install.sh --clobber
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag --draft
+          gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

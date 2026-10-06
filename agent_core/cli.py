@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from importlib.metadata import PackageNotFoundError, version
 import os
 import sys
 import threading
@@ -2022,6 +2023,11 @@ def code_command(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_output()
     parser = argparse.ArgumentParser(prog="polaris")
+    try:
+        package_version = version("agent-with-llm")
+    except PackageNotFoundError:
+        package_version = "uninstalled source"
+    parser.add_argument("--version", action="version", version=f"polaris {package_version}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_config_flag(subparser: argparse.ArgumentParser) -> None:
@@ -2386,7 +2392,7 @@ def main(argv: list[str] | None = None) -> int:
     # usual "invalid choice" error.
     if argv is None:
         argv = sys.argv[1:]
-    if not argv or (argv[0].startswith("-") and argv[0] not in {"-h", "--help"}):
+    if not argv or (argv[0].startswith("-") and argv[0] not in {"-h", "--help", "--version"}):
         argv = ["chat", *argv]
 
     args = parser.parse_args(argv)

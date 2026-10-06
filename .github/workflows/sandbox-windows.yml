@@ -1,0 +1,59 @@
+name: Windows WSL2 sandbox qualification
+
+# This needs a prepared self-hosted machine. Qualify new Windows/image
+# combinations separately before claiming verified full sandbox support.
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Immutable ghcr.io/jony-del/agentwithllm-sandbox@sha256:... image"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-wsl2-e2e:
+    runs-on: [self-hosted, Windows, X64, polaris-wsl2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.28"
+      - name: Validate image identity
+        shell: pwsh
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          if ($env:IMAGE -notmatch '^ghcr.io/jony-del/agentwithllm-sandbox@sha256:[0-9a-f]{64}$') {
+            throw "Provide an immutable sandbox image digest"
+          }
+      - run: uv sync --locked --extra all --extra dev --python 3.12
+      - name: Start existing Podman Machine
+        shell: pwsh
+        run: podman machine start
+      - name: Windows WSL2 Podman E2E
+        env:
+          POLARIS_SANDBOX_E2E_IMAGE: ${{ inputs.image }}
+          POLARIS_SANDBOX_E2E_RUNTIME: podman
+        run: uv run --no-sync python -m pytest -q tests/test_sandbox_oci_e2e.py
+      - name: Stopped machine must fail closed
+        shell: pwsh
+        env:
+          POLARIS_SANDBOX_E2E_IMAGE: ${{ inputs.image }}
+          POLARIS_SANDBOX_E2E_RUNTIME: podman
+          POLARIS_SANDBOX_E2E_EXPECT_STOPPED: "1"
+        run: |
+          podman machine stop
+          uv run --no-sync python -m pytest -q tests/test_sandbox_oci_e2e.py::test_stopped_runtime_fails_closed_without_host_execution
+      - name: Opt-in startup restores the machine and passes OCI probes
+        env:
+          POLARIS_SANDBOX_E2E_IMAGE: ${{ inputs.image }}
+          POLARIS_SANDBOX_E2E_RUNTIME: podman
+          POLARIS_SANDBOX_E2E_AUTO_START: "1"
+        run: uv run --no-sync python -m pytest -q tests/test_sandbox_oci_e2e.py::test_real_oci_shell_unicode_pytest_node_and_security
+      - name: Restore Podman Machine
+        if: always()
+        shell: pwsh
+        run: podman machine start
