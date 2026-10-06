@@ -553,17 +553,14 @@ def test_winget_failed_repair_is_actionable_and_does_not_mark_state(
 
 def test_path_merge_preserves_session_entries_and_deduplicates() -> None:
     separator = os.pathsep
+    prefix = "C:\\" if os.name == "nt" else "/"
+    session, shared, system, user = [prefix + name for name in ("session", "shared", "system", "user")]
     merged = merge_path_values(
-        separator.join([r"C:\session", r"C:\shared"]),
-        separator.join([r"C:\system", r"C:\shared"]),
-        r"C:\user",
+        separator.join([session, shared]),
+        separator.join([system, shared]),
+        user,
     )
-    assert merged.split(separator) == [
-        r"C:\session",
-        r"C:\shared",
-        r"C:\system",
-        r"C:\user",
-    ]
+    assert merged.split(separator) == [session, shared, system, user]
 
 
 def test_windows_exit_code_format_accepts_signed_and_unsigned_values() -> None:

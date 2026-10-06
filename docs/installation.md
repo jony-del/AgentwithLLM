@@ -79,7 +79,7 @@ curl -fsSL https://github.com/jony-del/AgentwithLLM/releases/latest/download/ins
 更新 CLI 后，后续模型/服务步骤失败可能留下部分完成状态，不保证整体事务回滚。
 
 指定版本时将入口中的 `latest/download` 改为 `download/vX.Y.Z`，例如已发布的
-`v0.1.0` 使用 `releases/download/v0.1.0/install.ps1`。已发布脚本内嵌其版本标签，后续
+`v0.1.1` 使用 `releases/download/v0.1.1/install.ps1`。已发布脚本内嵌其版本标签，后续
 下载不再访问 `latest`，避免更新期间混用不同 Release。
 
 可显式跳过容器准备和记忆模型下载，Python 依赖仍使用完整的 `[all]`：
@@ -144,9 +144,9 @@ bash install.sh --dev
    从 `uv.lock` 导出 `[all]` 的跨平台依赖约束；标签必须与项目版本一致。
 3. 检查 `dist/` 中的 wheel、两个安装包、两个安装脚本、`release.json`、约束文件和
    `SHA256SUMS`。构建器校验入口和必要资源，使用明确的辅助文件白名单。
-4. 推送版本标签触发 `.github/workflows/release.yml`。流水线构建双架构沙箱镜像，将不可变
-   digest 注入软件包，执行安装器回归、Linux OCI E2E 和 Windows/macOS/Linux 的 wheel
-   安装测试；三平台安装测试没有源码 checkout。
+4. 推送版本标签触发 `.github/workflows/release.yml`。流水线检查两个沙箱锁文件一致，验证
+   已锁定的双架构镜像可匿名下载，执行安装器回归、Linux OCI E2E 和
+   Windows/macOS/Linux 的 wheel 安装测试；三平台安装测试没有源码 checkout。
 5. 检查全部门禁通过。流水线先上传完整资产到草稿 Release，再公开，随后一行入口可用。
 
 可复用本地已经构建的 wheel 和约束文件检查打包，无需联网：
@@ -158,6 +158,11 @@ python tools/build_release_assets.py --wheel PATH.whl --constraints PATH.txt --t
 发布仍需要 GitHub 仓库和 GHCR 的相应权限。GHCR 镜像必须允许目标用户拉取；Release
 下载也必须允许目标用户访问。校验和用于检测文件损坏，分发信任来自受信任的 HTTPS 仓库
 和发布权限；当前流程没有额外的离线签名验证。
+
+沙箱镜像通过 `.github/workflows/sandbox-image.yml` 单独构建和执行 Linux OCI 验证。
+修改沙箱协议、镜像内运行代码、工具链或依赖时，先运行该工作流，提供新的镜像标签；验证
+通过后，将输出的不可变 digest 同时写入 `agent_core/sandbox/sandbox-image.lock.json`
+和 `installer/manifest.json`，提交后再发布 CLI。普通 CLI 发布复用已锁定的镜像。
 
 Windows WSL2/Podman 的完整资格验证保留在
 `.github/workflows/sandbox-windows.yml`，通过手动运行、提供不可变镜像 digest 来执行，需要

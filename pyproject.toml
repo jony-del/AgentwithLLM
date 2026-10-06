@@ -1,6 +1,6 @@
 [project]
 name = "agent-with-llm"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Python ReAct agent framework with Claude, tools, hooks, permissions, and compression."
 requires-python = ">=3.11"
 # Layered dependencies (revision guide D1/D9): core is the minimal library import
