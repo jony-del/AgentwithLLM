@@ -848,6 +848,13 @@ def chat_command(args: argparse.Namespace) -> int:
         def _show_tasks() -> None:
             print("\nTasks:")
             print(agent.session.todos.render())
+            manager = getattr(agent.session, "background_tasks", None)
+            print("Background work:")
+            records = manager.snapshots() if manager is not None else []
+            for record in records:
+                print(f"  {record['task_id']} [{record['task_type']}/{record['state']}] {record['description']}")
+            if not records:
+                print("  (none)")
             queued = prompt_queue.snapshot()
             print(f"Queued input ({len(queued)}):")
             for item in queued:
@@ -856,11 +863,17 @@ def chat_command(args: argparse.Namespace) -> int:
             if not queued:
                 print("  (none)")
 
+        def _background_all() -> None:
+            background_requested.set()
+            manager = getattr(agent.session, "background_tasks", None)
+            if manager is not None:
+                manager.background_all()
+
         def _input_kwargs() -> dict[str, Any]:
             return {
                 "is_running": lambda: run_task is not None,
                 "on_interrupt": cancel_requested.set,
-                "on_background": background_requested.set,
+                "on_background": _background_all,
                 "on_transcript": _show_transcript,
                 "on_tasks": _show_tasks,
                 "on_redraw": lambda: None,

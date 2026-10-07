@@ -46,6 +46,9 @@ class WorktreeManager:
             raise RuntimeError("this session is already inside a managed worktree")
         if self.session.process_supervisor is not None and self.session.process_supervisor.running():
             raise RuntimeError("stop all background tasks before switching workspace")
+        background = getattr(self.session, "background_tasks", None)
+        if background is not None and background.running(current_run=False):
+            raise RuntimeError("stop all background tasks before switching workspace")
         slug = (name or f"session-{self.session.session_id[:8]}").strip().lower()
         if not _SLUG.fullmatch(slug):
             raise ValueError("worktree name must match [a-z0-9][a-z0-9_-]{0,47}")
@@ -202,6 +205,9 @@ class WorktreeManager:
         if state is None or self.owned.get(state.slug) is not state:
             raise RuntimeError("no session-owned active worktree")
         if self.session.process_supervisor is not None and self.session.process_supervisor.running():
+            raise RuntimeError("stop all background tasks before switching workspace")
+        background = getattr(self.session, "background_tasks", None)
+        if background is not None and background.running(current_run=False):
             raise RuntimeError("stop all background tasks before switching workspace")
         details = await self.summary(state)
         if action not in {"keep", "remove"}:

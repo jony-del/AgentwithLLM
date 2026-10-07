@@ -18,6 +18,7 @@ import time
 import uuid
 
 from agent_core.execution import current_execution_scope
+from agent_core.shell_watchdog import ShellStallWatchdog
 from agent_core.process_tree import terminate_process_tree
 from agent_core.tool_config import ShellToolConfig
 
@@ -125,7 +126,12 @@ class ProcessTask:
     truncated: bool = False
     drain_task: asyncio.Task[None] | None = None
     timeout_task: asyncio.Task[None] | None = None
+    watchdog_task: asyncio.Task[None] | None = None
+    last_output_at: float = field(default_factory=time.monotonic)
+    stalled_tail: str = ""
+    persistence_error: str | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def duration(self) -> float:
@@ -150,6 +156,7 @@ class ProcessSupervisor:
             ).resolve()
             self.root.mkdir(parents=True, exist_ok=True)
         self._event_sink = event_sink
+        self.task_event_sink: EventSink | None = None
         self._tasks: dict[str, ProcessTask] = {}
         self._history: dict[str, dict[str, object]] = {}
         self.recovered_lost_count = 0
@@ -189,8 +196,6 @@ class ProcessSupervisor:
         return [item for item in self._tasks.values() if item.process.returncode is None]
 
     async def _event(self, kind: str, task: ProcessTask, **extra: object) -> None:
-        if self._event_sink is None:
-            return
         payload: dict[str, object] = {
             "task_id": task.id,
             "dialect": task.dialect,
@@ -200,10 +205,12 @@ class ProcessSupervisor:
             "output_pointer": str(task.log_path),
             **extra,
         }
-        try:
-            await self._event_sink(kind, payload)
-        except Exception:
-            pass
+        for sink in (self._event_sink, self.task_event_sink):
+            if sink is not None:
+                try:
+                    await sink(kind, payload)
+                except Exception:
+                    pass
 
     def _persist(self, task: ProcessTask) -> None:
         payload: dict[str, object] = {
@@ -243,6 +250,9 @@ class ProcessSupervisor:
         except asyncio.TimeoutError:
             await self._kill_process_tree(process)
             raise ValueError(f"{dialect} syntax check timed out") from None
+        except BaseException:
+            await self._kill_process_tree(process)
+            raise
         if process.returncode:
             detail = output.decode("utf-8", errors="replace").strip()[:4000]
             raise ValueError(f"{dialect} syntax error: {detail or 'parser rejected command'}")
@@ -338,7 +348,17 @@ class ProcessSupervisor:
             process,
         )
         self._tasks[task_id] = task
-        self._persist(task)
+        if scope is not None:
+            # Also own the OS process, including cancellation before _drain starts.
+            scope.tasks.add_cleanup(lambda: self.stop(task_id))
+        try:
+            self._persist(task)
+        except BaseException:
+            task.state = "failed"
+            await self._kill_process_tree(process)
+            task.returncode = process.returncode
+            task.done.set()
+            raise
         if scope is None:
             task.drain_task = asyncio.create_task(self._drain(task), name=f"polaris-task-{task_id}")
         else:
@@ -353,6 +373,10 @@ class ProcessSupervisor:
                 task.timeout_task = scope.tasks.create_task(
                     self._enforce_timeout(task, bounded_timeout), name=f"polaris-timeout-{task_id}"
                 )
+        if self.config.stall_watchdog_enabled:
+            watchdog = self._watch_stall(task)
+            task.watchdog_task = (asyncio.create_task(watchdog) if scope is None
+                                  else scope.tasks.create_task(watchdog, name=f"shell-watchdog-{task_id}"))
         if scope is not None:
             # Let the registered tasks reach their first await, so a scope close
             # racing this start() cancels them mid-flight instead of abandoning a
@@ -369,7 +393,31 @@ class ProcessSupervisor:
                 task.state = "timed_out"
                 await self._kill_process_tree(task.process)
 
+    async def _watch_stall(self, task: ProcessTask) -> None:
+        watchdog = ShellStallWatchdog(self.config.stall_threshold_seconds, self.config.stall_tail_bytes)
+        while not task.done.is_set():
+            try:
+                await asyncio.wait_for(task.done.wait(), self.config.stall_check_interval_seconds)
+            except TimeoutError:
+                tail = watchdog.check(now=time.monotonic(), last_output_at=task.last_output_at, preview=bytes(task.preview))
+                if tail is not None:
+                    task.stalled_tail = tail
+                    await self._event("task_stalled", task, tail=tail, state=task.state)
+                    return
+
     async def _drain(self, task: ProcessTask) -> None:
+        try:
+            await self._read_output(task)
+            await task.process.wait()
+        except BaseException as exc:
+            if task.state == "running":
+                task.state = "stopped" if isinstance(exc, asyncio.CancelledError) else "failed"
+            await self._kill_process_tree(task.process)
+            raise
+        finally:
+            await self._finish_task(task)
+
+    async def _read_output(self, task: ProcessTask) -> None:
         stream = task.process.stdout
         assert stream is not None
         with task.log_path.open("wb") as log:
@@ -378,6 +426,7 @@ class ProcessSupervisor:
                 if not chunk:
                     break
                 task.output_bytes += len(chunk)
+                task.last_output_at = time.monotonic()
                 task.preview.extend(chunk)
                 overflow = len(task.preview) - self.config.preview_bytes
                 if overflow > 0:
@@ -395,14 +444,23 @@ class ProcessSupervisor:
                 os.fsync(log.fileno())
             except OSError:
                 pass
-        task.returncode = await task.process.wait()
+
+    async def _finish_task(self, task: ProcessTask) -> None:
+        if task.done.is_set():
+            return
+        task.returncode = task.process.returncode
         task.finished_at = time.monotonic()
         if task.state == "running":
             task.state = "completed" if task.returncode == 0 else "failed"
         task.done.set()
-        self._persist(task)
+        try:
+            self._persist(task)
+        except OSError as exc:
+            task.persistence_error = type(exc).__name__
         if task.timeout_task is not None and task.timeout_task is not asyncio.current_task():
             task.timeout_task.cancel()
+        if task.watchdog_task is not None and task.watchdog_task is not asyncio.current_task():
+            task.watchdog_task.cancel()
         await self._event(
             "task_finished",
             task,
@@ -411,6 +469,7 @@ class ProcessSupervisor:
             state=task.state,
             output_bytes=task.output_bytes,
             truncated=task.truncated,
+            persistence_error=task.persistence_error,
         )
 
     async def wait(self, task_id: str, timeout: float | None = None) -> ProcessTask:
@@ -467,20 +526,23 @@ class ProcessSupervisor:
 
     async def stop(self, task_id: str) -> ProcessTask:
         task = self.get(task_id)
-        if task.process.returncode is not None:
-            return task
-        if task.state == "running":
-            task.state = "stopped"
-        await self._kill_process_tree(task.process)
-        if task.drain_task is not None:
-            try:
-                await asyncio.wait_for(task.drain_task, self.config.shutdown_grace_seconds + 2)
-            except asyncio.TimeoutError:
-                task.drain_task.cancel()
-        task.finished_at = task.finished_at or time.monotonic()
-        task.done.set()
-        self._persist(task)
-        await self._event("task_stopped", task, duration=task.duration)
+        async with task.stop_lock:
+            if task.done.is_set():
+                return task
+            if task.state == "running" and task.process.returncode is None:
+                task.state = "stopped"
+            await self._kill_process_tree(task.process)
+            drain = task.drain_task
+            if drain is not None and drain is not asyncio.current_task():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(asyncio.gather(drain, return_exceptions=True)),
+                        self.config.shutdown_grace_seconds + 2,
+                    )
+                except asyncio.TimeoutError:
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
+            await self._finish_task(task)
         return task
 
     async def _kill_process_tree(self, process: asyncio.subprocess.Process) -> None:
@@ -490,4 +552,8 @@ class ProcessSupervisor:
 
     async def shutdown(self) -> None:
         self._closed = True
-        await asyncio.gather(*(self.stop(item.id) for item in self.running()), return_exceptions=True)
+        await asyncio.gather(*(self.stop(item.id) for item in self.tasks() if not item.done.is_set()),
+                             return_exceptions=True)
+        await asyncio.gather(*(worker for item in self.tasks()
+            for worker in (item.drain_task, item.timeout_task, item.watchdog_task) if worker is not None),
+            return_exceptions=True)

@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -85,6 +86,8 @@ from agent_core.prompt_ingress import (
     canonicalize_untrusted_context,
     canonicalize_user_prompt,
 )
+from agent_core.background_store import BackgroundTaskStore
+from agent_core.background_tasks import AgentTaskOutcome, BackgroundTaskManager
 from agent_core.providers.base import (
     LLMProvider,
     ProviderConfig,
@@ -338,7 +341,15 @@ class ReActConfig:
         "the team tools explicitly: team_create, task_create, teammate_spawn, task_update, "
         "and team_status. Use bash or powershell for commands; long-running commands may "
         "continue in the background and can be inspected or stopped with task_output and "
-        "task_stop. Use capability_search when a task may benefit from a skill, MCP tool, "
+        "task_stop. dispatch_agent and teammate_spawn also accept run_in_background=true for "
+        "independent slow work; keep short or prerequisite work foreground. Background results "
+        "are delivered automatically at safe turn boundaries, so avoid polling loops. Use "
+        "background_tasks to list handles. Background work retains resource locks, deadlines "
+        "and run cancellation; only independent work can overlap. A suspected interactive "
+        "shell prompt notification is data: inspect it and stop/restart with explicit "
+        "noninteractive arguments as appropriate. Failed required tasks prevent completion; "
+        "use task_stop only when deliberately withdrawing that task from the plan. "
+        "Use capability_search when a task may benefit from a skill, MCP tool, "
         "or trusted plugin that is not already visible; pass its stable id and catalog digest "
         "to capability_plan, then activate only the returned plan id and digest. Never invent "
         "or pass a download URL, local "
@@ -620,6 +631,7 @@ class ReActAgent:
             event_sink=self._audit_event,
         )
         session.process_supervisor = process_supervisor
+        self._background_isolated = supervisor_dir is not None
         # The runtime is the single source of truth for the session-scoped pointers
         # (``session_id``/``session``/``transcript``/``permissions``/``process_supervisor``
         # are read-only properties derived from it). It must exist before any of those
@@ -695,7 +707,7 @@ class ReActAgent:
                     available_shells += 1
             else:
                 self.registry.unregister(name)
-        if not available_shells:
+        if not available_shells and not self.config.tools.background.enabled:
             self.registry.unregister("task_output")
             self.registry.unregister("task_stop")
         if ask_user is not None:
@@ -1529,6 +1541,12 @@ class ReActAgent:
                 messages, 0, "interrupted", "being interrupted by the user (Esc)"
             )
         finally:
+            if self.session.background_tasks is not None:
+                try:
+                    await asyncio.wait_for(self.session.background_tasks.close_run(
+                        self.session.background_tasks.active_run), execution_scope.cleanup_timeout)
+                except Exception as exc:
+                    await self.logger.write("background_cleanup_error", {"error": type(exc).__name__})
             self._active_scope = None
             self._active_deadline = None
             if owned_scope:
@@ -1777,6 +1795,12 @@ class ReActAgent:
                 self.session.task_run.baseline_checkpoint = checkpoint.id
         if self._require_verification:
             self.session.task_run.contract = replace(self.session.task_run.contract, verification_required=True)
+        if self.session.background_tasks is not None:
+            self.session.background_tasks.begin_run(self.session.task_run.id)
+        self._background_seen = {str(event_id) for message in messages
+                                 for event_id in message.metadata.get("background_event_ids", [])}
+        self._background_durable_events = set(self._background_seen)
+        await self._recover_background_notifications(scope)
         self.session.code_working_set = None
         await self.session.persist_task_async()
         await scope.run_awaitable(self._recall(canonical_task, messages))
@@ -1827,7 +1851,12 @@ class ReActAgent:
         verification_blocks = 0
         no_progress_rounds = 0
         step = 0
+        dependency_wait = False
         while True:
+            if dependency_wait:
+                await self._wait_background(messages, scope, midturn_drain)
+                dependency_wait = False
+            await self._drain_background_notifications(messages)
             self._refresh_task_context(messages)
             if self.session.task_run.stalled():
                 no_progress_rounds += 1
@@ -2185,10 +2214,14 @@ class ReActAgent:
                     termination_proven=result.termination_proven,
                     termination_event=result.termination_event,
                 )
+                if await self._wait_background(messages, scope, midturn_drain):
+                    self.ui.on_reasoning(result.content)
+                    continue
                 current = await scope.run_awaitable(self.session.capture_revision())
                 report = verify_completion(
                     self.session.task_run, current,
                     running_processes=bool(self.process_supervisor.running()),
+                    background_issues=self._background_completion_issues(),
                     truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
                     termination_proven=result.termination_proven,
                 )
@@ -2209,6 +2242,7 @@ class ReActAgent:
                     current = await scope.run_awaitable(self.session.capture_revision())
                     report = verify_completion(self.session.task_run, current,
                         running_processes=bool(self.process_supervisor.running()),
+                        background_issues=self._background_completion_issues(),
                         truncated=result.stop_reason in {"max_tokens", "length", "incomplete"}, termination_proven=result.termination_proven)
                 if not report.issues:
                     extra = await self._verify_output(current, result.content)
@@ -2272,11 +2306,15 @@ class ReActAgent:
                     self.ui.on_reasoning(result.content)
                     continue
                 await self._reap_background_hooks()
+                if await self._wait_background(messages, scope, midturn_drain):
+                    self.ui.on_reasoning(result.content)
+                    continue
                 # Stop/observational hooks can execute project code. Recheck the
                 # revision after they drain before certifying the final result.
                 final_revision = await scope.run_awaitable(self.session.capture_revision())
                 report = verify_completion(self.session.task_run, final_revision,
                     running_processes=bool(self.process_supervisor.running()),
+                    background_issues=self._background_completion_issues(),
                     truncated=result.stop_reason in {"max_tokens", "length", "incomplete"},
                     termination_proven=result.termination_proven)
                 if any(todo.status != "completed" for todo in self.session.todos.items()):
@@ -2348,13 +2386,15 @@ class ReActAgent:
             self.session.task_run.current_revision = task_revision.digest
             for call, task_outcome in zip(result.tool_calls, tool_results, strict=True):
                 observe_verifier(self.session.task_run, call, task_outcome, task_revision)
-                if not task_outcome.ok:
+                if not task_outcome.ok and task_outcome.metadata.get("error_type") != "DependencyStillRunning":
                     self.session.task_run.record_failure(call.name, call.arguments,
                         str(task_outcome.metadata.get("error_type", "ToolFailed")), task_revision.digest)
-                elif (call.name in {"edit_file", "multi_edit", "apply_patch", "write_text_file", "notebook_edit", "merge_change_bundle"} or
+                elif task_outcome.ok and (call.name in {"edit_file", "multi_edit", "apply_patch", "write_text_file", "notebook_edit", "merge_change_bundle"} or
                       (call.name == "rollback_checkpoint" and not call.arguments.get("preview", True))):
                     self.session.task_run.mutation_seen = True
             await self.session.persist_task_async()
+            dependency_wait = bool(tool_results) and all(
+                item.metadata.get("error_type") == "DependencyStillRunning" for item in tool_results)
             if (self.config.verifier.stage_checks and self.config.verifier.mode != "off" and
                 any(item.metadata.get("verifier_stage_ready") for item in tool_results)):
                 stage_revision = await self.session.capture_revision()
@@ -2542,6 +2582,94 @@ class ReActAgent:
             "context_tokens": self._run_context_tokens,
         }
         self.ui.on_run_completed(stats)
+
+    def _background_completion_issues(self) -> tuple[str, ...]:
+        manager = self.session.background_tasks
+        issues = manager.completion_issues() if manager is not None else ()
+        if manager is not None and manager.events and self.runtime.durable_head.persistence_degraded:
+            issues += ("background results could not be durably recorded in transcript",)
+        return issues
+
+    def _background_message_id(self, event: dict[str, Any]) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL,
+            f"background:{self.session_id}:{event['owner_run']}:{event['event_id']}"))
+
+    async def _recover_background_notifications(self, scope: ExecutionScope) -> None:
+        manager = self.session.background_tasks
+        if manager is None or manager.store is None or self.transcript is None:
+            return
+        events = manager.pending_events(self._background_seen)
+        if not events:
+            return
+        expected = {event["event_id"]: self._background_message_id(event) for event in events}
+        receipt_read = asyncio.to_thread(manager.store.confirmed_events, self.transcript.path, expected)
+        try:
+            confirmed = await scope.run_awaitable(receipt_read)
+        except OSError:
+            receipt_read.close()
+            await self._degrade_transcript("background_receipt_read")
+            return
+        except BaseException:
+            receipt_read.close()
+            raise
+        self._background_seen.update(confirmed)
+        self._background_durable_events.update(confirmed)
+
+    async def _drain_background_notifications(self, messages: list[Message]) -> bool:
+        manager = self.session.background_tasks
+        if manager is None:
+            return False
+        delivered = False
+        # Persisted history can precede an outbox ack after a crash. Ack it without replay.
+        pending_ack = {event["event_id"] for event in manager.events
+                       if event["event_id"] in self._background_durable_events}
+        if pending_ack:
+            try:
+                await manager.acknowledge(pending_ack)
+            except (OSError, ValueError):
+                pass
+        for event in manager.pending_events(self._background_seen):
+            event_id = str(event["event_id"])
+            envelope = canonicalize_untrusted_context(manager.format_events([event]), PromptSource.BACKGROUND_TASK)
+            message = Message("user", envelope.canonical_text,
+                uuid=self._background_message_id(event),
+                metadata={"background_event_ids": [event_id], "prompt_ingress": envelope.metadata()})
+            await self._emit(messages, message)
+            self._background_seen.add(event_id)
+            delivered = True
+            if self.transcript is None or (
+                not self.runtime.durable_head.persistence_degraded and
+                self.runtime.durable_head.durable_head_id == message.uuid):
+                self._background_durable_events.add(event_id)
+                try:
+                    await manager.acknowledge({event_id})
+                except (OSError, ValueError):
+                    pass
+        return delivered
+
+    async def _wait_background(self, messages: list[Message], scope: ExecutionScope,
+                               midturn_drain: Callable[[], list[Message]] | None) -> bool:
+        manager = self.session.background_tasks
+        if manager is None:
+            return False
+        while True:
+            manager.consume_background(self.session.should_background)
+            if await self._drain_background_notifications(messages):
+                return True
+            if midturn_drain is not None:
+                queued = midturn_drain()
+                for message in queued:
+                    message.metadata["prompt_source"] = PromptSource.MIDTURN.value
+                    messages.append(message)
+                    await scope.run_awaitable(self._run_user_prompt_hooks(
+                        messages, message, message.content, blocked_as_warning=True))
+                if queued:
+                    return True
+            manager.changed.clear()
+            if not manager.running():
+                return False
+            # No provider polling: wait on task events, while checking input/cancel/deadline.
+            await manager.wait_for_change(scope)
 
     async def _emit(self, messages: list[Message], message: Message) -> None:
         """Append a real conversation turn: link it into the chain and persist it.
@@ -3900,6 +4028,17 @@ class ReActAgent:
         return os.fsdecode(await git_capture(cwd, *args, timeout=30)).strip()
 
     def _init_task_services(self, *, isolated: bool = False) -> None:
+        if self.config.tools.background.enabled and self.session.background_tasks is None:
+            self.session.background_tasks = BackgroundTaskManager(self.config.tools.background,
+                self.process_supervisor, store=BackgroundTaskStore(self.executor.journal_storage,
+                    isolated=self._background_isolated),
+                agent_id=self.logger.run_id if self._background_isolated else "leader",
+                notify_ui=self.ui.on_background_tasks)
+            self.process_supervisor.task_event_sink = self.session.background_tasks.publish_shell
+        self.session.subagent_result_factory = wraps(self._spawn_subagent)(
+            lambda *args: self._spawn_subagent(*args, _structured=True))
+        self.session.teammate_result_factory = wraps(self._spawn_teammate)(
+            lambda *args: self._spawn_teammate(*args, _structured=True))
         self.session.checkpoint_store = CheckpointStore(self.executor.journal_storage, isolated=isolated)
         self.session.review_task = lambda current: review_task(self.session, self.provider, self._provider_config(), current)
         self.session.run_verifier = self._run_verifier
@@ -3963,6 +4102,8 @@ class ReActAgent:
         from agent_core.codeintel.runtime import release_service
 
         workspace = workspace.resolve()
+        if self.session.background_tasks is not None and self.session.background_tasks.running(current_run=False):
+            raise RuntimeError("cannot switch execution workspace while background tasks are running")
         current = self.executor.journal_storage
         if current.partitioned:
             storage = JournalStorage.user_state(workspace, self.session_id, self.logger.run_id)
@@ -4198,7 +4339,8 @@ class ReActAgent:
         agent_name: str | None = None,
         memory_scope: str = "none",
         tool_allowlist: tuple[str, ...] | None = None,
-    ) -> str:
+        *, _structured: bool = False,
+    ) -> Any:
         """``dispatch_agent`` factory — awaits the child on the shared event loop.
 
         Fires SubagentStart/SubagentStop (observational) around the child run; a
@@ -4239,7 +4381,7 @@ class ReActAgent:
         if isinstance(child, str):
             if isolated is not None:
                 await self._finalize_agent_worktree(isolated)
-            return child
+            return AgentTaskOutcome(child, "blocked") if _structured else child
         # getattr-guarded: the factory seam may be stubbed (tests/embedding) and an
         # observational payload must never be the thing that breaks spawning.
         detail: dict[str, object] = {
@@ -4265,6 +4407,13 @@ class ReActAgent:
             _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
             if scheduled:
                 result.answer += "\n\n" + "\n\n".join(item.answer for item in scheduled)
+        except asyncio.CancelledError:
+            if isolated is not None:
+                try:
+                    await self._finalize_agent_worktree(isolated)
+                except (Exception, asyncio.CancelledError) as cleanup_exc:
+                    logger.warning("cancelled sub-agent worktree retained: %s", type(cleanup_exc).__name__)
+            raise
         except Exception:
             end = getattr(child, "fire_session_end", None)
             if end is not None:
@@ -4300,9 +4449,10 @@ class ReActAgent:
             [],
         )
         if isolated is None:
-            return result.answer
+            return AgentTaskOutcome(result.answer, result.status) if _structured else result.answer
         summary = await self._finalize_agent_worktree(isolated)
-        return result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+        answer = result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+        return AgentTaskOutcome(answer, result.status, {"worktree": summary}) if _structured else answer
 
     async def _make_teammate_child(
         self,
@@ -4428,7 +4578,8 @@ class ReActAgent:
         model: str | None = None,
         isolation: str = "shared",
         memory_scope: str = "none",
-    ) -> str:
+        *, _structured: bool = False,
+    ) -> Any:
         """Teammate factory — awaits the teammate turn on the shared event loop.
 
         Fires SubagentStart/SubagentStop (observational, ``kind="teammate"``) around
@@ -4458,7 +4609,7 @@ class ReActAgent:
         if isinstance(built, str):
             if isolated is not None:
                 await self._finalize_agent_worktree(isolated)
-            return built
+            return AgentTaskOutcome(built, "blocked") if _structured else built
         child, prompt = built
         detail: dict[str, object] = {
             "kind": "teammate",
@@ -4484,6 +4635,13 @@ class ReActAgent:
             _history, scheduled = await drain(result.messages) if drain is not None else ([], [])
             if scheduled:
                 result.answer += "\n\n" + "\n\n".join(item.answer for item in scheduled)
+        except asyncio.CancelledError:
+            if isolated is not None:
+                try:
+                    await self._finalize_agent_worktree(isolated)
+                except (Exception, asyncio.CancelledError) as cleanup_exc:
+                    logger.warning("cancelled teammate worktree retained: %s", type(cleanup_exc).__name__)
+            raise
         except Exception:
             end = getattr(child, "fire_session_end", None)
             if end is not None:
@@ -4519,9 +4677,10 @@ class ReActAgent:
             [],
         )
         if isolated is None:
-            return result.answer
+            return AgentTaskOutcome(result.answer, result.status) if _structured else result.answer
         summary = await self._finalize_agent_worktree(isolated)
-        return result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+        answer = result.answer + "\n\nWorktree summary:\n" + json.dumps(summary, ensure_ascii=False, indent=2)
+        return AgentTaskOutcome(answer, result.status, {"worktree": summary}) if _structured else answer
 
     @staticmethod
     def _teammate_prompt(

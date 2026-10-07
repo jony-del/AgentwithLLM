@@ -171,6 +171,31 @@ async def _cmd_status(agent: "ReActAgent", ui: AgentUI, args: str, history: list
     return ChatTurn()
 
 
+async def _cmd_tasks(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
+    manager = getattr(agent.session, "background_tasks", None)
+    if manager is None:
+        print("Background task registry is unavailable.")
+        return ChatTurn()
+    parts = args.split()
+    if parts:
+        if len(parts) != 2 or parts[0] != "stop":
+            print("Usage: /tasks [stop <background_task_id>]")
+            return ChatTurn()
+        try:
+            task = await manager.stop(parts[1])
+            print(f"Task {task.id}: {task.state}")
+        except (KeyError, OSError, ValueError) as exc:
+            print(str(exc))
+        return ChatTurn()
+    print("Background tasks:")
+    for record in manager.snapshots():
+        mode = "background" if record["backgrounded"] else "foreground"
+        print(f"  {record['task_id']}  {record['task_type']}  {record['state']}  {mode}  {record['description']}")
+    if not manager.records:
+        print("  (none)")
+    return ChatTurn()
+
+
 async def _cmd_context(agent: "ReActAgent", ui: AgentUI, args: str, history: list[Message]) -> ChatTurn:
     model = agent.config.model
     est = _estimate_tokens(agent, history)
@@ -1166,6 +1191,7 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
     "reset": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),
     "new": CommandSpec(_cmd_clear, "Clear conversation history.", canonical="clear"),
     "status": CommandSpec(_cmd_status, "Show model, session, skill/tool counts.", immediate=True),
+    "tasks": CommandSpec(_cmd_tasks, "List background tasks, or /tasks stop <id>.", immediate=True),
     "context": CommandSpec(_cmd_context, "Show context-window usage."),
     "cost": CommandSpec(_cmd_cost, "Show session token usage and duration."),
     "compact": CommandSpec(_cmd_compact, "Compact the conversation now."),

@@ -197,6 +197,7 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
     input_schema = {
         "type": "object",
         "properties": {
+            "run_in_background": {"type": "boolean", "description": "Return a background handle; completion is notified automatically."},
             "team_id": {"type": "string", "description": "Team id returned by team_create."},
             "name": {"type": "string", "description": "Teammate name; letters, digits, _, ., or -."},
             "role": {"type": "string", "description": "Teammate role/instructions."},
@@ -283,6 +284,27 @@ class TeammateSpawnTool(SessionAwareMixin, Tool):
         try:
             parameters = inspect.signature(factory).parameters
             factory_call = cast(Callable[..., Awaitable[str]], factory)
+            manager = self.session.background_tasks
+            if manager is not None and manager.config.enabled:
+                from agent_core.background_tasks import AgentTaskOutcome
+                args = ((team_id, name, role, task_id, preset, model, isolation, memory) if len(parameters) >= 8
+                        else (team_id, name, role, task_id, preset, model, isolation) if len(parameters) >= 7
+                        else (team_id, name, role, task_id, preset, model))
+
+                async def operation() -> AgentTaskOutcome | str:
+                    structured = self.session.teammate_result_factory
+                    if structured is not None and getattr(structured, "__wrapped__", factory) != factory:
+                        structured = None
+                    return await (structured(*args) if structured is not None else factory_call(*args))
+
+                record = await manager.start_agent("teammate", f"{name}: {role}", operation,
+                    background=bool(arguments.get("run_in_background", False)),
+                    metadata={"team_id": team_id, "team_task_id": task_id, "teammate": name,
+                              "preset": preset, "model": model, "isolation": isolation})
+                released = await manager.await_agent(record, self.session.should_background)
+                return ToolResult(self.name, f"Background teammate {record.id} is running; completion will be notified."
+                    if released else record.result, ok=released or record.state == "completed",
+                    metadata={**record.metadata, "background_task_id": record.id, "state": record.state})
             answer = (
                 await factory_call(team_id, name, role, task_id, preset, model, isolation, memory)
                 if len(parameters) >= 8

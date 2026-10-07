@@ -248,9 +248,9 @@ Agent 运行时仍可继续输入：Enter 会把消息放入无限内存队列�
 取回所有可编辑队列项。
 
 - `Esc`：协作式中止当前 Agent run。
-- `Ctrl+B`：把当前前台 Bash/PowerShell 任务转入后台。
+- `Ctrl+B`：把当前运行中的 Shell、子代理、队友任务一起转入后台。
 - `Ctrl+O`：查看最近 transcript。
-- `Ctrl+T`：查看 todos 和输入队列。
+- `Ctrl+T`：查看 todos、后台任务和输入队列；`/tasks` 查看任务，`/tasks stop <id>` 停止指定任务。后台执行的配置、通知和生命周期见 [后台任务机制](docs/background-tasks.md)。
 - `Ctrl+R`：搜索输入历史；`Ctrl+L`：重绘终端。
 
 常用会话命令包括 `/rename`、`/effort`、`/fast`、`/sandbox`、`/model` 和 `/status`。`/sandbox`

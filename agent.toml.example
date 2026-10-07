@@ -573,12 +573,24 @@ max_tasks = 16
 preview_bytes = 262144
 log_bytes = 33554432
 shutdown_grace_seconds = 3
+stall_watchdog_enabled = true
+stall_check_interval_seconds = 5
+stall_threshold_seconds = 45
+stall_tail_bytes = 1024
 [tools.shell.bash]
 enabled = true
 # executable = "D:/Git/bin/bash.exe"
 [tools.shell.powershell]
 enabled = true
 # executable = "pwsh"
+[tools.background]
+enabled = true
+max_agents = 8
+agent_auto_background_seconds = 0  # 0: agents wait in foreground unless model/Ctrl+B requests background
+max_records = 128
+max_notifications = 256
+notification_max_bytes = 16384
+result_max_bytes = 65536
 [tools.notebook]
 max_bytes = 16777216
 max_output_chars = 8000

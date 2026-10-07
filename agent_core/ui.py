@@ -73,6 +73,9 @@ class AgentUI:
     def on_todos(self, todos: list[Any]) -> None:
         """The task-planning tool (``update_todos``) rewrote the to-do list."""
 
+    def on_background_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        """Background registry snapshot; UI-only and contains no permissions."""
+
     def on_tool_use_summary(self, label: str, tool_names: list[str]) -> None:
         """A one-line progress label for the tool batch that just ran (UI-only).
 
@@ -185,6 +188,7 @@ class ConsoleUI(AgentUI):
         self._loop: Any = None
         self._prompt_active = False
         self._deferred_live_events: list[Callable[[], None]] = []
+        self._background_states: dict[str, str] = {}
 
     def _render_or_defer(self, callback: Callable[[], None]) -> None:
         if self._prompt_active:
@@ -239,6 +243,20 @@ class ConsoleUI(AgentUI):
 
     def on_todos(self, todos: list[Any]) -> None:
         self._renderer.print_todos(todos)
+
+    def on_background_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        states: dict[str, str] = {}
+        for task in tasks:
+            if not task["backgrounded"]:
+                continue
+            task_id, state = task["task_id"], task["state"]
+            states[task_id] = state
+            if self._background_states.get(task_id) != state:
+                text = f"[background] {task_id} ({task['task_type']}): {state}"
+                def render_line(text: str = text) -> None:
+                    self._renderer.emit(text)
+                self._render_or_defer(render_line)
+        self._background_states = states
 
     def on_tool_use_summary(self, label: str, tool_names: list[str]) -> None:
         self._renderer.print_tool_use_summary(label)

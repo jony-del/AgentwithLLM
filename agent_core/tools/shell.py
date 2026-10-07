@@ -97,6 +97,12 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
         if isinstance(supervisor, ToolResult):
             return supervisor
         config = supervisor.config
+        manager = self.session.background_tasks
+        if manager is not None:
+            try:
+                manager.ensure_capacity()
+            except RuntimeError as exc:
+                return ToolResult(self.name, str(exc), ok=False)
         timeout = max(
             1, min(int(str(arguments.get("timeout", config.timeout))), config.max_timeout)
         )
@@ -161,13 +167,16 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
                 argv=[str(item) for item in argv], timeout=timeout, env=child_env,
                 skip_syntax_check=self.sandbox.uses_guest,
             )
+            record = await manager.register_shell(task, str(arguments.get("description") or task.command_preview)) if manager else None
         except (ValueError, RuntimeError, OSError) as exc:
             return ToolResult(self.name, f"{self.dialect} failed to start: {exc}", ok=False)
         if bool(arguments.get("run_in_background", False)):
+            if manager is not None and record is not None:
+                await manager.mark_background(record)
             return ToolResult(
                 self.name,
                 f"Task {task.id} started in background. Use task_output or task_stop.",
-                metadata={"task_id": task.id, "state": task.state, "output_path": str(task.log_path)},
+                metadata={"task_id": task.id, "background_task_id": task.id, "state": task.state, "output_path": str(task.log_path)},
             )
         foreground: float = float(timeout)
         if config.auto_background_seconds > 0:
@@ -176,11 +185,16 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             deadline = time.monotonic() + foreground
             while task.state == "running":
                 callback = self.session.should_background
-                if callback is not None and callback():
+                if manager is not None:
+                    manager.consume_background(callback)
+                if ((record is not None and record.backgrounded) or
+                        (manager is None and callback is not None and callback())):
+                    if manager is not None and record is not None:
+                        await manager.mark_background(record)
                     return ToolResult(
                         self.name,
                         f"Task {task.id} was moved to background by Ctrl+B.",
-                        metadata={"task_id": task.id, "state": "running", "interactive_backgrounded": True},
+                        metadata={"task_id": task.id, "background_task_id": task.id, "state": task.state, "interactive_backgrounded": True},
                     )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -196,10 +210,12 @@ class _ShellTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             if foreground >= timeout:
                 await supervisor.stop(task.id)
             else:
+                if manager is not None and record is not None:
+                    await manager.mark_background(record)
                 return ToolResult(
                     self.name,
                     f"Task {task.id} is still running and was moved to background after {foreground:g}s.",
-                    metadata={"task_id": task.id, "state": "running", "auto_backgrounded": True},
+                    metadata={"task_id": task.id, "background_task_id": task.id, "state": task.state, "auto_backgrounded": True},
                 )
         output = await supervisor.output(task.id, block=False, timeout=0, tail_lines=None)
         content = str(output.pop("output"))
@@ -229,7 +245,7 @@ class PowerShellTool(_ShellTool):
 @builtin_tool
 class TaskOutputTool(SessionAwareMixin, Tool):
     name = "task_output"
-    description = "Read bounded output and state for a supervised shell task."
+    description = "Read bounded output and state for a background shell, sub-agent, or teammate task."
     input_schema = {
         "type": "object",
         "properties": {
@@ -248,7 +264,9 @@ class TaskOutputTool(SessionAwareMixin, Tool):
         )
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
-        supervisor = _supervisor(self.name, self.session)
+        manager = self.session.background_tasks
+        task_id = str(arguments.get("task_id", ""))
+        supervisor = manager if manager is not None and task_id in manager.records else _supervisor(self.name, self.session)
         if isinstance(supervisor, ToolResult):
             return supervisor
         try:
@@ -261,13 +279,15 @@ class TaskOutputTool(SessionAwareMixin, Tool):
         except (KeyError, ValueError) as exc:
             return ToolResult(self.name, str(exc), ok=False)
         content = str(output.pop("output"))
+        # A snapshot of running work does not itself own a long-lived process read lock.
+        output["resource_lease_owner"] = False
         return ToolResult(self.name, content or "(no output)", metadata=output)
 
 
 @builtin_tool
 class TaskStopTool(SessionAwareMixin, Tool):
     name = "task_stop"
-    description = "Stop a supervised shell task and its entire process tree."
+    description = "Stop a background shell (including its process tree), sub-agent, or teammate task."
     input_schema = {
         "type": "object",
         "properties": {"task_id": {"type": "string"}},
@@ -281,7 +301,9 @@ class TaskStopTool(SessionAwareMixin, Tool):
         )
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
-        supervisor = _supervisor(self.name, self.session)
+        manager = self.session.background_tasks
+        task_id = str(arguments.get("task_id", ""))
+        supervisor = manager if manager is not None and task_id in manager.records else _supervisor(self.name, self.session)
         if isinstance(supervisor, ToolResult):
             return supervisor
         try:

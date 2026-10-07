@@ -16,6 +16,7 @@ class PromptSource(str, Enum):
     RESUME = "resume_continuation"
     HOOK_CONTEXT = "hook_context"
     PLUGIN_NOTIFICATION = "plugin_notification"
+    BACKGROUND_TASK = "background_task"
     MEMORY_RECALL = "memory_recall"
     CAPABILITY_DISCOVERY = "capability_discovery"
     COMPRESSION = "compression_input"

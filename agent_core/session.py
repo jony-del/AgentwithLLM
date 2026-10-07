@@ -147,6 +147,9 @@ class SessionRuntime:
         self.closed = True
         from agent_core.codeintel.runtime import release_service
         await release_service(self.context)
+        if self.context.background_tasks is not None:
+            with contextlib.suppress(Exception):
+                await self.context.background_tasks.close()
         if self.transcript is not None:
             close_transcript = getattr(self.transcript, "close", None)
             if callable(close_transcript):
@@ -300,6 +303,8 @@ class SessionContext:
     # Haiku/Sonnet/Opus children.
     subagent_factory: Callable[..., Awaitable[str]] | None = None
     teammate_factory: Callable[..., Awaitable[str]] | None = None
+    subagent_result_factory: Callable[..., Awaitable[Any]] | None = None
+    teammate_result_factory: Callable[..., Awaitable[Any]] | None = None
     team_store: Any | None = None
     agent_name: str = "leader"
     team_id: str | None = None
@@ -323,6 +328,7 @@ class SessionContext:
     workspace_binding_setter: Callable[[Path], Awaitable[None]] | None = None
     registered_tool_names: frozenset[str] = frozenset()
     process_supervisor: Any | None = None
+    background_tasks: Any | None = None
     lsp_manager: Any | None = None
     worktree_manager: Any | None = None
     mcp_manager: Any | None = None

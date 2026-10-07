@@ -557,6 +557,10 @@ async def test_process_supervisor_registers_tasks_with_ambient_scope(tmp_path: P
     # Scope close reaps the registered supervisor tasks.
     assert task.drain_task.done()
     assert task.timeout_task.done()
+    assert task.process.returncode is not None
+    assert task.done.is_set()
+    assert task.state == "stopped"
+    assert json.loads((supervisor.root / f"{task.id}.json").read_text(encoding="utf-8"))["state"] == "stopped"
     await supervisor.shutdown()
 
 

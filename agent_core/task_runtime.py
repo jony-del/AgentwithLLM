@@ -239,10 +239,11 @@ class VerificationReport:
 
 
 def verify_completion(task: TaskRun, current: WorkspaceRevision, *, running_processes: bool = False,
-                      truncated: bool = False, termination_proven: bool = True) -> VerificationReport:
+                      truncated: bool = False, termination_proven: bool = True,
+                      background_issues: tuple[str, ...] = ()) -> VerificationReport:
     changed = tuple(sorted(path for path in task.baseline.files.keys() | current.files.keys()
                            if task.baseline.files.get(path) != current.files.get(path)))
-    issues: list[str] = []
+    issues: list[str] = list(background_issues)
     if truncated:
         issues.append("model response was truncated")
     if not termination_proven:

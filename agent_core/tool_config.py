@@ -104,6 +104,10 @@ class ShellToolConfig:
     preview_bytes: int = 256 * 1024
     log_bytes: int = 32 * 1024 * 1024
     shutdown_grace_seconds: float = 3.0
+    stall_watchdog_enabled: bool = True
+    stall_check_interval_seconds: float = 5.0
+    stall_threshold_seconds: float = 45.0
+    stall_tail_bytes: int = 1024
     bash: BashConfig = field(default_factory=BashConfig)
     powershell: PowerShellConfig = field(default_factory=PowerShellConfig)
 
@@ -191,6 +195,17 @@ class SchedulerToolConfig:
 
 
 @dataclass(slots=True)
+class BackgroundTaskConfig:
+    enabled: bool = True
+    max_agents: int = 8
+    agent_auto_background_seconds: float = 0.0
+    max_records: int = 128
+    max_notifications: int = 256
+    notification_max_bytes: int = 16_384
+    result_max_bytes: int = 65_536
+
+
+@dataclass(slots=True)
 class ToolSuiteConfig:
     shell: ShellToolConfig = field(default_factory=ShellToolConfig)
     lsp: LSPToolConfig = field(default_factory=LSPToolConfig)
@@ -198,6 +213,7 @@ class ToolSuiteConfig:
     worktree: WorktreeToolConfig = field(default_factory=WorktreeToolConfig)
     scheduler: SchedulerToolConfig = field(default_factory=SchedulerToolConfig)
     execution_policies: dict[str, ToolPolicyConfig] = field(default_factory=dict)
+    background: BackgroundTaskConfig = field(default_factory=BackgroundTaskConfig)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "ToolSuiteConfig":
@@ -216,6 +232,9 @@ class ToolSuiteConfig:
         shell.preview_bytes = max(1024, int(shell.preview_bytes))
         shell.log_bytes = max(shell.preview_bytes, int(shell.log_bytes))
         shell.shutdown_grace_seconds = max(0.1, float(shell.shutdown_grace_seconds))
+        shell.stall_check_interval_seconds = max(0.05, float(shell.stall_check_interval_seconds))
+        shell.stall_threshold_seconds = max(0.0, float(shell.stall_threshold_seconds))
+        shell.stall_tail_bytes = max(64, min(16_384, int(shell.stall_tail_bytes)))
         shell.bash = BashConfig(
             executable=str(bash_raw["executable"]) if bash_raw.get("executable") else None,
             enabled=bool(bash_raw.get("enabled", True)),
@@ -277,6 +296,16 @@ class ToolSuiteConfig:
         policies = _parse_tool_policies(
             raw.get("execution_policies", raw.get("policies", {}))
         )
+        background = BackgroundTaskConfig()
+        for key, value in dict(raw.get("background", {}) or {}).items():
+            if hasattr(background, key):
+                setattr(background, key, value)
+        background.max_agents = max(1, min(64, int(background.max_agents)))
+        background.max_records = max(16, min(128, int(background.max_records)))
+        background.max_notifications = max(16, min(256, int(background.max_notifications)))
+        background.agent_auto_background_seconds = max(0.0, float(background.agent_auto_background_seconds))
+        background.notification_max_bytes = max(1024, min(16_384, int(background.notification_max_bytes)))
+        background.result_max_bytes = max(1024, min(65_536, int(background.result_max_bytes)))
         return cls(
             shell=shell,
             lsp=lsp,
@@ -284,4 +313,5 @@ class ToolSuiteConfig:
             worktree=worktree,
             scheduler=scheduler,
             execution_policies=policies,
+            background=background,
         )

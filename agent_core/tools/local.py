@@ -288,6 +288,12 @@ _CONFIG_SETTINGS = {
     "model", "provider", "effort", "permission",
     "tools.shell.timeout", "tools.shell.auto_background_seconds",
     "tools.shell.max_tasks", "tools.lsp.autodetect",
+    "tools.shell.stall_watchdog_enabled", "tools.shell.stall_threshold_seconds",
+    "tools.shell.stall_check_interval_seconds", "tools.shell.stall_tail_bytes",
+    "tools.background.enabled", "tools.background.max_agents",
+    "tools.background.agent_auto_background_seconds", "tools.background.max_records",
+    "tools.background.max_notifications", "tools.background.notification_max_bytes",
+    "tools.background.result_max_bytes",
 }
 
 

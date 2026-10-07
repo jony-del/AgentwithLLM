@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from agent_core.models import ToolRisk, ToolResult
+from agent_core.background_tasks import AgentTaskOutcome
 from agent_core.permission_types import (
     DecisionSource,
     PermissionContext,
@@ -44,6 +45,7 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         "type": "object",
         "properties": {
             "task": {"type": "string", "description": "A complete, standalone description of the sub-task."},
+            "run_in_background": {"type": "boolean", "description": "Return a handle immediately; completion is notified automatically."},
             "tool_preset": {
                 "type": "string",
                 "enum": ["read_only", "full"],
@@ -139,12 +141,24 @@ class DispatchAgentTool(SessionAwareMixin, Tool):
         try:
             parameters = inspect.signature(factory).parameters
             factory_call = cast(Callable[..., Awaitable[str]], factory)
-            if len(parameters) >= 6:
-                answer = await factory_call(task, preset, model, isolation, agent_name, memory)
-            elif len(parameters) >= 4:
-                answer = await factory_call(task, preset, model, isolation)
-            else:
-                answer = await factory_call(task, preset, model)
+            args = ((task, preset, model, isolation, agent_name, memory) if len(parameters) >= 6
+                    else (task, preset, model, isolation) if len(parameters) >= 4 else (task, preset, model))
+            manager = self.session.background_tasks
+            if manager is not None and manager.config.enabled:
+                async def operation() -> AgentTaskOutcome | str:
+                    structured = self.session.subagent_result_factory
+                    if structured is not None and getattr(structured, "__wrapped__", factory) != factory:
+                        structured = None  # Respect an embedder's replacement legacy factory.
+                    return await (structured(*args) if structured is not None else factory_call(*args))
+
+                record = await manager.start_agent("agent", task, operation,
+                    background=bool(arguments.get("run_in_background", False)),
+                    metadata={"preset": preset, "model": model, "isolation": isolation})
+                released = await manager.await_agent(record, self.session.should_background)
+                return ToolResult(self.name, f"Background agent {record.id} is running; completion will be notified."
+                    if released else record.result, ok=released or record.state == "completed",
+                    metadata={**record.metadata, "background_task_id": record.id, "state": record.state})
+            answer = await factory_call(*args)
         except Exception as exc:  # noqa: BLE001 - a child failure must not crash the parent run
             return ToolResult(self.name, f"Sub-agent error: {type(exc).__name__}: {exc}", ok=False)
         return ToolResult(

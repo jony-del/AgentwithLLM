@@ -1249,10 +1249,19 @@ class StreamingToolBatch:
             dependency = self._calls[index]
             if not dependency.done.is_set():
                 continue
-            if dependency.result is not None and dependency.result.metadata.get("resource_lease_running"):
+            if (dependency.result is not None and dependency.result.metadata.get("resource_lease_running")
+                    and self.executor._active_lease_conflict(tracked.prepared.spec if tracked.prepared else ConcurrencySpec(()))):
                 return "DependencyStillRunning", (
-                    f"dependency task {dependency.result.metadata.get('task_id')} is still running"
+                    f"dependency task {dependency.result.metadata.get('background_task_id') or dependency.result.metadata.get('task_id')} is still running"
                 )
+            if index in tracked.hard_dependencies and dependency.result is not None and dependency.prepared is not None:
+                task_id = str(dependency.result.metadata.get("background_task_id") or dependency.result.metadata.get("task_id") or "")
+                session = getattr(dependency.prepared.tool, "session", None)
+                manager = getattr(session, "background_tasks", None)
+                if manager is not None and task_id in manager.records:
+                    state = manager.get(task_id).state
+                    if state not in {"pending", "running", "completed"}:
+                        return "DependencyFailed", f"required background task {task_id}: {state}"
             if (
                 index in tracked.hard_dependencies
                 and (dependency.result is None or not dependency.result.ok)
@@ -1508,9 +1517,12 @@ class StreamingToolBatch:
             tracked.finished_at = time.monotonic()
             tracked.state = "completed"
             prepared = tracked.prepared
-            task_id = str(result.metadata.get("task_id") or "")
-            if prepared is not None and task_id and result.metadata.get("state") == "running":
-                supervisor = getattr(getattr(prepared.tool, "session", None), "process_supervisor", None)
+            task_id = str(result.metadata.get("background_task_id") or result.metadata.get("task_id") or "")
+            if (prepared is not None and task_id and result.metadata.get("state") == "running"
+                    and result.metadata.get("resource_lease_owner", True)):
+                session = getattr(prepared.tool, "session", None)
+                manager = getattr(session, "background_tasks", None)
+                supervisor = manager if manager is not None and task_id in manager.records else getattr(session, "process_supervisor", None)
                 try:
                     process_task = supervisor.get(task_id) if supervisor is not None else None
                 except KeyError:
