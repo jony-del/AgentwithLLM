@@ -77,8 +77,9 @@ class SWEbenchDataset:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError(
-                "SWE-bench loading needs the optional benchmark dependencies. "
-                "Install with `pip install -e '.[swebench]'`, or pass a local JSON/JSONL file."
+                "SWE-bench loading needs the optional benchmark dependencies, which are not "
+                "in the default install. Re-run the installer with --full (install.ps1 -Full "
+                "on Windows, install.sh --full on macOS/Linux), or pass a local JSON/JSONL file."
             ) from exc
 
         kwargs: dict[str, Any] = {"split": split, "trust_remote_code": trust_remote_code}

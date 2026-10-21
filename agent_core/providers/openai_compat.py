@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from agent_core import credentials
 from agent_core.models import (
     LLMContextTooLongError,
     LLMResult,
@@ -75,14 +76,14 @@ class OpenAICompatProvider(LLMProvider):
         backoff_multiplier: float = 2.0,
         on_retry: Callable[[str], None] | None = _default_retry_notice,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or credentials.get_api_key("OPENAI_COMPAT_API_KEY") or credentials.get_api_key("OPENAI_API_KEY")
         self.base_url = (
             base_url
             or os.getenv("OPENAI_COMPAT_BASE_URL")
             or os.getenv("OPENAI_BASE_URL")
             or "https://api.openai.com"
         ).rstrip("/")
-        if api_key is None and os.getenv("OPENAI_COMPAT_API_KEY") is None and os.getenv("OPENAI_API_KEY"):
+        if api_key is None and credentials.get_api_key("OPENAI_COMPAT_API_KEY") is None and os.getenv("OPENAI_API_KEY"):
             self._warn_deprecated_env("OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY")
         if base_url is None and os.getenv("OPENAI_COMPAT_BASE_URL") is None and os.getenv("OPENAI_BASE_URL"):
             self._warn_deprecated_env("OPENAI_BASE_URL", "OPENAI_COMPAT_BASE_URL")
@@ -124,7 +125,8 @@ class OpenAICompatProvider(LLMProvider):
             raise RuntimeError(
                 "OPENAI_COMPAT_API_KEY is required for the OpenAI-compatible provider "
                 "(set OPENAI_COMPAT_BASE_URL too for a non-OpenAI endpoint; legacy "
-                "OPENAI_API_KEY/OPENAI_BASE_URL are still accepted with a deprecation warning)"
+                "OPENAI_API_KEY/OPENAI_BASE_URL are still accepted with a deprecation warning; "
+                "run `polaris setup` to store the key in the OS credential store)"
             )
         if not config.model:
             raise RuntimeError("OpenAICompatProvider needs an explicit model (--model / config.model)")

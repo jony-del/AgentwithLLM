@@ -84,8 +84,10 @@ class SWEbenchRunner:
         started = time.monotonic()
         if self.config.evaluate and not OfficialHarnessAdapter().available():
             raise RuntimeError(
-                "the official SWE-bench Harness is unavailable; install the benchmark extras "
-                "with `pip install -e '.[swebench]'`, or pass --no-evaluate"
+                "the official SWE-bench Harness is unavailable; the benchmark extras are "
+                "not in the default install — re-run the installer with --full "
+                "(install.ps1 -Full on Windows, install.sh --full on macOS/Linux), "
+                "or pass --no-evaluate"
             )
         load_kwargs: dict[str, Any] = {"include_gold": False}
         cache_dir = self.config.metadata.get("cache_dir")
@@ -189,8 +191,11 @@ class SWEbenchRunner:
             else:
                 if not image:
                     raise RuntimeError(
-                        "could not resolve the official SWE-bench instance image. Install the "
-                        "swebench package or pass --image/ SWEBENCH_INSTANCE_IMAGE."
+                        "could not resolve the official SWE-bench instance image. The swebench "
+                        "package is part of the benchmark extras, which are not in the default "
+                        "install — re-run the installer with --full (install.ps1 -Full on "
+                        "Windows, install.sh --full on macOS/Linux), or pass "
+                        "--image / SWEBENCH_INSTANCE_IMAGE."
                     )
                 runtime = DockerRuntime(workspace, image, name=f"polaris-swebench-{_safe_instance_dir(instance.instance_id)}-{self.config.run_id[:8]}")
             await runtime.start()

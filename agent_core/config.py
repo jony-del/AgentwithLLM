@@ -128,6 +128,43 @@ def user_settings_path() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".polaris" / "settings.toml"
 
 
+# Settings keys containing any of these markers look like credentials; the user
+# settings file is plaintext and must never hold them (they belong to the
+# environment or the OS credential store — see agent_core.credentials).
+_SECRET_KEY_MARKERS = ("key", "token", "secret", "password")
+
+
+def write_user_settings(values: dict[str, Any]) -> Path:
+    """Merge non-secret scalar settings into the user ``settings.toml``.
+
+    Existing content — comments, tables, unrelated keys — is preserved (tomlkit
+    round-trips it); only the supplied top-level keys are added or replaced. The
+    file and its parent directories are created when absent, and
+    ``POLARIS_SETTINGS_PATH`` is honored through :func:`user_settings_path`.
+    Secret-looking keys and non-scalar values are rejected so this writer can
+    never become a plaintext credential store.
+    """
+    import tomlkit
+
+    path = user_settings_path()
+    for key, value in values.items():
+        if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
+            raise ValueError(f"refusing to write secret-looking setting {key!r} to {path}")
+        if not isinstance(value, (str, bool, int, float)):
+            raise ValueError(f"settings value {key!r} must be a scalar, got {type(value).__name__}")
+    try:
+        document = (
+            tomlkit.parse(path.read_text(encoding="utf-8")) if path.exists() else tomlkit.document()
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"cannot update malformed {path}: {exc}") from exc
+    for key, value in values.items():
+        document[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    return path
+
+
 def _read_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}

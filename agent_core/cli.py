@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from agent_core import credentials
 from agent_core.config import (
     resolve_capabilities_config,
     resolve_codeintel_config,
@@ -161,19 +162,41 @@ def _sandbox_config(args: argparse.Namespace):
     return config
 
 
+def _settings_base_url(values: dict, *env_vars: str) -> str | None:
+    """The config-file ``base_url`` applies only when no provider env var outranks it.
+
+    Provider constructors read their own ``*_BASE_URL`` env vars when the argument
+    is None, so passing the settings value only when no env var is set keeps the
+    env-over-file precedence (and openai-compat's legacy deprecation warning).
+    """
+    if any(os.getenv(name) for name in env_vars):
+        return None
+    return values.get("base_url") or None
+
+
 def _make_provider(values: dict):
     provider = values["provider"]
     if provider == "claude":
-        return ClaudeProvider()
+        return ClaudeProvider(base_url=_settings_base_url(values, "ANTHROPIC_BASE_URL"))
     if provider == "openai":
-        return OpenAIResponsesProvider()
+        return OpenAIResponsesProvider(base_url=_settings_base_url(values, "OPENAI_BASE_URL"))
     if provider == "openai-compat":
-        return OpenAICompatProvider()
+        return OpenAICompatProvider(
+            base_url=_settings_base_url(values, "OPENAI_COMPAT_BASE_URL", "OPENAI_BASE_URL")
+        )
     if provider == "fake":
         return FakeProvider()
     raise RuntimeError(
         f"unknown provider {provider!r}; choose one of: {', '.join(PROVIDERS)}"
     )
+
+
+def _interactive_terminal() -> bool:
+    """Both stdin and stdout are real terminals, so prompts can be seen and answered."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty() and bool(sys.stdout) and sys.stdout.isatty()
+    except (ValueError, OSError):
+        return False
 
 
 def _make_ui(args: argparse.Namespace) -> AgentUI:
@@ -185,11 +208,38 @@ def _make_ui(args: argparse.Namespace) -> AgentUI:
     """
     if getattr(args, "quiet", False):
         return NullUI()
+    return ConsoleUI(verbose=getattr(args, "verbose", False)) if _interactive_terminal() else NullUI()
+
+
+def _check_provider_credentials(values: dict) -> None:
+    """First-run gate: a real provider without a resolvable credential gets setup help.
+
+    Non-interactive runs fail fast with an actionable message; an interactive
+    terminal is offered the setup wizard inline and continues when the wizard
+    leaves a working credential behind. ``fake`` never needs a credential.
+    """
+    provider = values["provider"]
+    env_vars = credentials.PROVIDER_KEY_ENV_VARS.get(provider)
+    if not env_vars or credentials.provider_credential(provider):
+        return
+    message = (
+        f"no API credential found for provider {provider!r}: set {env_vars[0]} "
+        "(or persist it via `polaris setup`), then retry"
+    )
+    if not _interactive_terminal():
+        raise RuntimeError(message)
+    print(f"No API credential found for provider {provider!r} ({env_vars[0]} is not set).")
     try:
-        interactive = bool(sys.stdin) and sys.stdin.isatty() and bool(sys.stdout) and sys.stdout.isatty()
-    except (ValueError, OSError):
-        interactive = False
-    return ConsoleUI(verbose=getattr(args, "verbose", False)) if interactive else NullUI()
+        answer = input("Run `polaris setup` now to configure it? [Y/n] ").strip().lower()
+    except EOFError:
+        answer = "n"
+    if answer in {"", "y", "yes"}:
+        from agent_core import setup_wizard
+
+        code = setup_wizard.run_setup(setup_wizard.default_arguments(provider=provider))
+        if code == 0 and credentials.provider_credential(provider):
+            return
+    raise RuntimeError(message)
 
 
 def _describe_mcp_error(exc: BaseException) -> str:
@@ -368,6 +418,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         ),
     )
     values = _resolve(args)
+    _check_provider_credentials(values)
     config_file = _config_file(args)
     tool_suite = resolve_tool_suite_config(config_file)
     if tool_suite.shell.enabled and tool_suite.shell.bash.enabled:
@@ -1528,6 +1579,13 @@ def replay_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def setup_command(args: argparse.Namespace) -> int:
+    """First-run configuration wizard: provider, model, and API credentials."""
+    from agent_core import setup_wizard
+
+    return setup_wizard.run_setup(args)
+
+
 def health_command(args: argparse.Namespace) -> int:
     """Aggregate application and installation checks without failing early."""
     from agent_core.health import HealthCheck, HealthReport, collect_dependency_checks, render_human
@@ -1683,6 +1741,14 @@ def uninstall_command(args: argparse.Namespace) -> int:
     from agent_core.uninstall import uninstall_from_cli
 
     return uninstall_from_cli(args)
+
+
+def upgrade_command(args: argparse.Namespace) -> int:
+    """Schedule an installer-owned release upgrade/rollback via a detached worker."""
+
+    from agent_core.upgrade import upgrade_from_cli
+
+    return upgrade_from_cli(args)
 
 
 def scheduler_service_command(args: argparse.Namespace) -> int:
@@ -2265,6 +2331,31 @@ def main(argv: list[str] | None = None) -> int:
     add_session_flags(chat_parser)
     chat_parser.set_defaults(func=chat_command)
 
+    setup_parser = subparsers.add_parser(
+        "setup", help="Configure provider, model, and API credentials (first-run wizard)."
+    )
+    setup_parser.add_argument("--provider", choices=["claude", "openai", "openai-compat"], default=None)
+    setup_parser.add_argument("--model", default=None)
+    setup_parser.add_argument("--base-url", default=None, metavar="URL")
+    setup_parser.add_argument(
+        "--api-key-env",
+        default=None,
+        metavar="VAR",
+        help="Declare that VAR already holds the API key; only non-secret config is saved.",
+    )
+    setup_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Make one minimal API call to confirm the setup works.",
+    )
+    setup_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt; write config from flags or print guidance "
+        "(automatic when stdin is not a TTY).",
+    )
+    setup_parser.set_defaults(func=setup_command)
+
     recovery_parser = subparsers.add_parser("recovery", help="Preview or explicitly apply this project's session recovery.")
     recovery_parser.add_argument("--session-id", required=True, type=_recovery_session_id)
     recovery_parser.add_argument(
@@ -2400,6 +2491,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Confirm the displayed removal plan without prompting.",
     )
     uninstall_parser.set_defaults(func=uninstall_command)
+
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade (or roll back) an installer-owned Polaris release.",
+    )
+    upgrade_parser.add_argument(
+        "--to",
+        metavar="vX.Y.Z",
+        default=None,
+        help="Install a specific release tag; an older tag performs a rollback.",
+    )
+    upgrade_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only report the installed and latest versions, then exit.",
+    )
+    upgrade_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reinstall even when the target equals the installed version.",
+    )
+    upgrade_parser.set_defaults(func=upgrade_command)
 
     # Default to `chat` when invoked with no subcommand, so a bare `polaris`
     # (like `claude`/`codex`) drops straight into an interactive session. This also

@@ -25,6 +25,7 @@ permission = "default"        # canonical: default | acceptedits | plan | auto |
 # default -> acceptedits -> plan -> auto -> default during an active run too.
 # default=manual confirmation; acceptedits=native workspace edits; plan=strict read-only;
 # auto=AI-classify pending actions; dontask=deny prompts; bypass=allow unmatched actions.
+# First run: `polaris setup` writes provider/model to ~/.polaris/settings.toml and stores the API key in the OS credential store.
 provider = "claude"           # claude | openai | openai-compat | fake
 # output_config.effort depth/cost control. none | minimal | low | medium | high | xhigh | max.
 # "high" is the safe agentic default. Providers gate levels by model: Claude gates

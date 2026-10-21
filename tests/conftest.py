@@ -21,6 +21,10 @@ import pytest
 
 os.environ.setdefault("AGENT_SANDBOX_ALLOW_UNATTENDED", "1")
 os.environ.setdefault("POLARIS_HOME", tempfile.mkdtemp(prefix="polaris-test-home-"))
+# Keyring is bypassed so credential resolution stays hermetic even on a machine
+# where `polaris setup` previously stored a real key in the OS credential store.
+# Keyring-path tests delete this per-test and install a fake module instead.
+os.environ.setdefault("POLARIS_DISABLE_KEYRING", "1")
 os.environ.setdefault(
     "AGENT_TRUST_STORE", os.path.join(tempfile.mkdtemp(prefix="polaris-test-trust-"), "trusted.json")
 )

@@ -844,7 +844,29 @@ def _stage_worker(plan: UninstallPlan) -> Path:
     return log_path
 
 
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _parent_running_windows(pid: int) -> bool:
+    # On Windows os.kill(pid, 0) terminates the target process, so probe the
+    # exit code through a limited-information handle instead.
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _parent_running(pid: int) -> bool:
+    if os.name == "nt":
+        return _parent_running_windows(pid)
     try:
         os.kill(pid, 0)
     except OSError:

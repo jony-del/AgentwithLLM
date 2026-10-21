@@ -125,8 +125,11 @@ class DockerRuntime:
             import docker
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "Docker runtime is unavailable. Install `docker` and start Docker Desktop/Engine, "
-                "or use --runtime local only for controlled development tests."
+                "Docker runtime is unavailable. The `docker` package is part of the benchmark "
+                "extras, which are not in the default install — re-run the installer with "
+                "--full (install.ps1 -Full on Windows, install.sh --full on macOS/Linux) and "
+                "start Docker Desktop/Engine, or use --runtime local only for controlled "
+                "development tests."
             ) from exc
         self.client = docker.from_env()
         kwargs = {

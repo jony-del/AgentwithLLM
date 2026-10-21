@@ -2,6 +2,7 @@
 param(
     [string]$Version = "latest",
     [switch]$Dev,
+    [switch]$Full,
     [switch]$Upgrade,
     [switch]$Check,
     [switch]$DryRun,
@@ -21,7 +22,7 @@ $Repository = "https://github.com/jony-del/AgentwithLLM"
 $ReleaseTag = ""
 $TemporaryRoot = $null
 
-if ($Uninstall -and ($Dev -or $Upgrade -or $Check -or $SkipSandbox -or $SkipMemoryModels -or $ModelBundle)) {
+if ($Uninstall -and ($Dev -or $Full -or $Upgrade -or $Check -or $SkipSandbox -or $SkipMemoryModels -or $ModelBundle)) {
     [Console]::Error.WriteLine("[usage] -Uninstall cannot be combined with install/upgrade options")
     exit 2
 }
@@ -137,6 +138,7 @@ try {
     } else {
         $arguments = @("--source", $source)
         if ($Dev) { $arguments += "--dev" }
+        if ($Full) { $arguments += "--full" }
         if ($Upgrade) { $arguments += "--upgrade" }
         if ($Check) { $arguments += "--check" }
         if ($DryRun) { $arguments += "--dry-run" }

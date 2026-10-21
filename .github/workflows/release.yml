@@ -113,6 +113,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     # No checkout: installed commands must work without the repository.
+    # No actions/setup-python either: this lane must prove the install works on
+    # a machine with no system Python at all. Every interpreter below is
+    # provisioned and selected by uv (UV_PYTHON_PREFERENCE=only-managed makes uv
+    # refuse host interpreters), and the steps assert that fact instead of
+    # assuming it.
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -121,18 +126,48 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           version: "0.11.28"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install and exercise the distributed wheel outside any checkout
-        shell: python
+      - name: Provision a uv-managed Python 3.12 with no system Python involved
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
         run: |
+          set -euo pipefail
+          uv python install 3.12
+          MANAGED_ROOT="$(uv python dir)"
+          FOUND="$(uv python find --no-project 3.12)"
+          echo "uv-managed Python root: $MANAGED_ROOT"
+          echo "Selected interpreter: $FOUND"
+          POLARIS_UV_PYTHON_DIR="$MANAGED_ROOT" "$FOUND" - <<'PY'
+          import os, sys
+          managed = os.path.normcase(os.path.realpath(os.environ["POLARIS_UV_PYTHON_DIR"]))
+          executable = os.path.normcase(os.path.realpath(sys.executable))
+          assert sys.version_info[:2] == (3, 12), sys.version
+          assert executable.startswith(managed + os.sep), (executable, managed)
+          assert "hostedtoolcache" not in executable, executable
+          print(f"Confirmed uv-managed interpreter: {executable}")
+          PY
+          echo "POLARIS_MANAGED_PYTHON=$FOUND" >> "$GITHUB_ENV"
+          echo "POLARIS_UV_PYTHON_DIR=$MANAGED_ROOT" >> "$GITHUB_ENV"
+      - name: Install and exercise the distributed wheel outside any checkout
+        shell: bash
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          set -euo pipefail
+          "$POLARIS_MANAGED_PYTHON" - <<'PY'
           import json, os, pathlib, subprocess, tempfile
           root = pathlib.Path("release").resolve()
           release = json.loads((root / "release.json").read_text())
           wheel = root / release["wheel"]["filename"]
           subprocess.run(["uv", "tool", "install", "--python", "3.12", "--constraints", str(root / "polaris-constraints.txt"), f"{wheel}[all]"], check=True)
+          tool_root = pathlib.Path(subprocess.check_output(["uv", "tool", "dir"], text=True).strip())
           bin_dir = pathlib.Path(subprocess.check_output(["uv", "tool", "dir", "--bin"], text=True).strip())
+          # The installed tool environment must run on the uv-managed
+          # interpreter, never on a system or hosted-toolcache Python.
+          venv_python = tool_root / "agent-with-llm" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+          base = subprocess.check_output([str(venv_python), "-c", "import sys; print(sys.base_prefix)"], text=True).strip()
+          managed_root = os.path.normcase(os.path.realpath(os.environ["POLARIS_UV_PYTHON_DIR"]))
+          assert os.path.normcase(os.path.realpath(base)).startswith(managed_root + os.sep), (base, managed_root)
           cli = bin_dir / ("polaris.exe" if os.name == "nt" else "polaris")
           with tempfile.TemporaryDirectory() as directory:
               work = pathlib.Path(directory) / "work"
@@ -145,6 +180,7 @@ jobs:
               checks = {item["name"]: item for item in json.loads(result.stdout)["checks"]}
               for name in ("configuration", "provider"):
                   assert checks[name]["status"] == "ok", checks[name]
+          PY
       - name: Validate distributed PowerShell entrypoint
         if: runner.os == 'Windows'
         shell: pwsh

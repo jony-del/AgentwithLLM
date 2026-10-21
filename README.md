@@ -130,8 +130,17 @@ curl -fsSL https://github.com/jony-del/AgentwithLLM/releases/latest/download/ins
 普通安装由 uv tool 提供用户级 `polaris` 命令，不需要激活虚拟环境；安装完成后重新打开终端或直接
 运行 `polaris` 即可。只有源码开发流程需要激活仓库中的 `.venv`。
 
-先运行 `polaris --version` 确认安装版本。模型服务/API Key 的首次配置、升级、固定版本、
-跳过沙箱/模型的安装方式，以及维护者发布流程见[安装与发布指南](docs/installation.md)。
+首次使用依次运行：
+
+```console
+polaris --version    # 确认安装版本
+polaris setup        # 首次配置 provider/模型；API Key 只存入操作系统凭据管理器
+polaris              # 进入交互会话；也可 polaris run "<任务>" 单次执行
+```
+
+之后用 `polaris upgrade` 升级（`--check` 只对比版本，`--to vX.Y.Z` 固定版本或回滚），用
+`polaris uninstall` 卸载。手动环境变量配置、固定版本安装、跳过沙箱/模型的可选方式，
+以及维护者发布流程见[安装与发布指南](docs/installation.md)。
 
 安装器会复用已通过完整挂载探针的 Podman、Docker 或 nerdctl；三者都不可用时安装 Podman，并
 拉取带 OCI index 摘要的 GHCR 工具链镜像。Windows 首次启用 WSL2 后可能返回退出码 `20` 并要求重启；重启后重新运行同一条命令

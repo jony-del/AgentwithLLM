@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -580,6 +581,78 @@ def test_cli_parser_dispatches_uninstall_flags(monkeypatch) -> None:
 
     assert main(["uninstall", "--dry-run", "--purge-data", "--yes"]) == 0
     assert received == [(True, True, True)]
+
+
+class _FakeKernel32:
+    """ctypes.windll.kernel32 stand-in for the Windows parent-liveness probe."""
+
+    def __init__(self, exit_code: int, *, open_handle: int = 64) -> None:
+        self.exit_code = exit_code
+        self.open_handle = open_handle
+        self.opened: list[tuple[int, int]] = []
+        self.closed: list[int] = []
+
+    def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+        self.opened.append((access, pid))
+        return self.open_handle
+
+    def GetExitCodeProcess(self, handle: int, ref) -> int:
+        ref._obj.value = self.exit_code
+        return 1
+
+    def CloseHandle(self, handle: int) -> int:
+        self.closed.append(handle)
+        return 1
+
+
+def test_parent_running_uses_ctypes_probe_and_never_kills_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(uninstall.os, "name", "nt")
+
+    def forbidden_kill(pid, sig):
+        raise AssertionError("os.kill must not be called on Windows")
+
+    monkeypatch.setattr(uninstall.os, "kill", forbidden_kill)
+    kernel32 = _FakeKernel32(exit_code=uninstall._STILL_ACTIVE)
+    monkeypatch.setattr(
+        uninstall.ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False
+    )
+
+    assert uninstall._parent_running(4321) is True
+    assert kernel32.opened == [(0x1000, 4321)]
+    assert kernel32.closed == [64]
+
+    exited = _FakeKernel32(exit_code=0)
+    monkeypatch.setattr(
+        uninstall.ctypes, "windll", SimpleNamespace(kernel32=exited), raising=False
+    )
+    assert uninstall._parent_running(4321) is False
+
+    gone = _FakeKernel32(exit_code=0, open_handle=0)
+    monkeypatch.setattr(
+        uninstall.ctypes, "windll", SimpleNamespace(kernel32=gone), raising=False
+    )
+    assert uninstall._parent_running(4321) is False
+
+
+def test_parent_running_keeps_posix_kill_probe(monkeypatch) -> None:
+    monkeypatch.setattr(uninstall.os, "name", "posix")
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(pid, sig):
+        calls.append((pid, sig))
+        if pid == 404:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(uninstall.os, "kill", fake_kill)
+    monkeypatch.setattr(
+        uninstall,
+        "_parent_running_windows",
+        lambda pid: pytest.fail("the Windows probe must not run on POSIX"),
+    )
+
+    assert uninstall._parent_running(123) is True
+    assert uninstall._parent_running(404) is False
+    assert calls == [(123, 0), (404, 0)]
 
 
 def test_public_bootstraps_expose_recovery_uninstall_without_installing_uv() -> None:

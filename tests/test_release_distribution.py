@@ -12,7 +12,7 @@ import zipfile
 
 import pytest
 
-from installer.install import InstallError, Installer, Options, Runner, StateStore
+from installer.install import DEFAULT_EXTRAS, InstallError, Installer, Options, Runner, StateStore
 from tools.build_release_assets import PAYLOAD_FILES, WHEEL_RESOURCES, assemble_assets, sha256
 
 
@@ -122,7 +122,7 @@ def test_wheel_install_and_upgrade_keep_ownership_and_constraints(release_assets
     installer = Installer(Options(source=bundle, skip_sandbox=True), runner=runner, state=state)
     installer._install_project()
     command = next(call for call in runner.calls if call[1:3] == ["tool", "install"])
-    assert command[-1] == f"{bundle.resolve() / 'agent_with_llm-0.1.0-py3-none-any.whl'}[all]"
+    assert command[-1] == f"{bundle.resolve() / 'agent_with_llm-0.1.0-py3-none-any.whl'}[{','.join(DEFAULT_EXTRAS)}]"
     assert command[command.index("--constraints") + 1] == str(bundle.resolve() / "polaris-constraints.txt")
     assert state.component("polaris")["release_tag"] == "v0.1.0"
     assert state.component_owned("polaris")

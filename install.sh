@@ -12,6 +12,7 @@ UNINSTALL=0
 PURGE_DATA=0
 ASSUME_YES=0
 DEV=0
+FULL=0
 UPGRADE=0
 CHECK=0
 DRY_RUN=0
@@ -29,6 +30,11 @@ while (($#)); do
       ;;
     --dev)
       DEV=1
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --full)
+      FULL=1
       FORWARD_ARGS+=("$1")
       shift
       ;;
@@ -93,7 +99,7 @@ if ((SKIP_MEMORY_MODELS)) && [[ -n "$MODEL_BUNDLE" ]]; then
 fi
 
 if ((UNINSTALL)); then
-  if ((DEV || UPGRADE || CHECK || SKIP_SANDBOX || SKIP_MEMORY_MODELS)) || [[ -n "$MODEL_BUNDLE" ]]; then
+  if ((DEV || FULL || UPGRADE || CHECK || SKIP_SANDBOX || SKIP_MEMORY_MODELS)) || [[ -n "$MODEL_BUNDLE" ]]; then
     echo "[usage] --uninstall cannot be combined with install/upgrade options" >&2
     exit 2
   fi

@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from agent_core import credentials
 from agent_core.models import (
     LLMContextTooLongError,
     LLMResult,
@@ -176,7 +177,7 @@ class ClaudeProvider(LLMProvider):
         backoff_multiplier: float = 2.0,
         on_retry: Callable[[str], None] | None = _default_retry_notice,
     ) -> None:
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.api_key = api_key or credentials.get_api_key("ANTHROPIC_API_KEY")
         self.base_url = (base_url or os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
         self.max_retries = max(0, max_retries)
         self.initial_backoff = initial_backoff
@@ -211,7 +212,10 @@ class ClaudeProvider(LLMProvider):
         (Esc) promptly rather than only at the next turn boundary.
         """
         if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is required for ClaudeProvider "
+                "(set the env var, or run `polaris setup` to store it in the OS credential store)"
+            )
 
         streaming = stream is not None and config.stream
         client = await self._get_client()
@@ -373,7 +377,10 @@ class ClaudeProvider(LLMProvider):
 
     def _headers(self, *, fast: bool = False) -> dict[str, str]:
         if not self.api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for ClaudeProvider")
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is required for ClaudeProvider "
+                "(set the env var, or run `polaris setup` to store it in the OS credential store)"
+            )
         headers = {
             "content-type": "application/json",
             "x-api-key": self.api_key,

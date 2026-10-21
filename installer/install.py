@@ -49,6 +49,11 @@ EXIT_RESTART_REQUIRED = 20
 EXIT_UNSUPPORTED = 30
 STATE_SCHEMA = 2
 PACKAGE_NAME = "agent-with-llm"
+# Default end-user extra set: every runtime capability except the SWE-bench
+# benchmark stack (datasets/docker/swebench), which is pulled in only by --full
+# or the [all] extra.  tests/test_installer_extras.py locks this list against
+# pyproject.toml so dependency edits fail loudly there.
+DEFAULT_EXTRAS = ("web", "mcp", "terminal", "memory", "codeintel", "credentials")
 
 WINDOWS_UAC_CANCELLED = 1223
 WINDOWS_UAC_CANCELLED_HRESULT = 0x800704C7
@@ -74,6 +79,7 @@ class UnsupportedHost(InstallError):
 class Options:
     source: Path
     dev: bool = False
+    full: bool = False
     upgrade: bool = False
     check: bool = False
     dry_run: bool = False
@@ -81,6 +87,7 @@ class Options:
     skip_memory_models: bool = False
     model_bundle: Path | None = None
     non_interactive: bool = False
+    only_project: bool = False
 
 
 @dataclass(slots=True)
@@ -247,6 +254,20 @@ class Installer:
 
         # Validate distribution integrity before installing any host dependencies.
         self._project_install_spec()
+        if self.options.only_project:
+            # 'polaris upgrade' detached-worker path: only the installer-owned
+            # uv-tool project component is replaced; host tools, Node, container
+            # runtime, memory models and the scheduler are left untouched.
+            self._install_project()
+            if self.options.dry_run:
+                return before
+            project_command = self._project_command()
+            after = [
+                Check("polaris", project_command is not None, project_command or "not installed"),
+                self._verify_installed_health(),
+            ]
+            self._print_checks("Verification", after)
+            return after
         self._install_host_commands()
         self._require_trusted_bash()
         self._install_node()
@@ -940,8 +961,29 @@ class Installer:
         guest = f"/mnt/{raw[0].casefold()}/{raw[2:].lstrip('/')}"
         return guest, guest
 
+    def _project_extras(self) -> str:
+        """Extra set for the project spec; upgrades preserve the installed width.
+
+        Fresh installs use the narrowed default set unless ``--full`` widens to
+        ``[all]``. An upgrade of an installer-owned install follows the receipt
+        instead: ``"default"`` keeps the narrowed set, while ``"full"`` or a
+        legacy receipt with no recorded width keeps the original ``[all]`` set,
+        so upgrading never silently drops already-installed dependencies.
+        """
+        if self.options.dev:
+            # Development installs always keep the complete extra set plus dev tools.
+            return "all,dev"
+        if self.options.full:
+            return "all"
+        if self.options.upgrade and self.state.component_owned("polaris"):
+            recorded = str(self.state.component("polaris").get("extras", ""))
+            if recorded != "default":
+                return "all"
+        return ",".join(DEFAULT_EXTRAS)
+
     def _project_install_spec(self) -> tuple[str, Path | None, dict[str, Any]]:
         source = self.options.source.resolve()
+        extras = self._project_extras()
         release_path = source / "release.json"
         if release_path.is_file() and not self.options.dev:
             try:
@@ -975,13 +1017,12 @@ class Installer:
                     metadata = Parser().parsestr(bundle.read(metadata_names[0]).decode("utf-8"))
                     if metadata["Name"] != PACKAGE_NAME or metadata["Version"] != release["version"]:
                         raise ValueError("wheel metadata does not match release")
-                return f"{wheel}[all]", constraints, release
+                return f"{wheel}[{extras}]", constraints, release
             except (OSError, KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
                 raise InstallError(f"invalid release bundle: {exc}") from exc
         if not (source / "pyproject.toml").is_file():
             raise InstallError(f"project source is missing pyproject.toml: {source}")
-        spec = f"{source}[all,dev]" if self.options.dev else f"{source}[all]"
-        return spec, None, {}
+        return f"{source}[{extras}]", None, {}
 
     def _install_project(self) -> None:
         source = self.options.source.resolve()
@@ -1071,6 +1112,7 @@ class Installer:
                     details={
                         "install_kind": "dev-venv",
                         "package": PACKAGE_NAME,
+                        "extras": "dev",
                         "executable": str(executable.resolve()),
                         "environment": str(venv.resolve()),
                         "uv": str(Path(uv).resolve()),
@@ -1128,6 +1170,7 @@ class Installer:
                 details={
                     "install_kind": "uv-tool",
                     "package": PACKAGE_NAME,
+                    "extras": "full" if self._project_extras() == "all" else "default",
                     "executable": str(executable.resolve()),
                     "environment": str(environment.resolve()),
                     "uv": str(Path(uv).resolve()),
@@ -1626,6 +1669,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path.cwd())
     parser.add_argument("--dev", action="store_true", help="install editable source + dev tools")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="install the full [all] extra set, including the SWE-bench "
+        "benchmark dependencies excluded from the default install",
+    )
     parser.add_argument("--upgrade", action="store_true", help="upgrade installer-owned components")
     parser.add_argument("--check", action="store_true", help="detect dependencies without installing")
     parser.add_argument("--dry-run", action="store_true", help="print changes without executing them")
@@ -1642,6 +1691,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="install memory models from a checksummed offline bundle",
     )
     parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument(
+        "--only-project",
+        action="store_true",
+        help="with --upgrade: only upgrade the installer-owned uv-tool component "
+        "(used by 'polaris upgrade')",
+    )
     return parser
 
 
@@ -1650,9 +1705,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.skip_memory_models and args.model_bundle is not None:
         parser.error("--skip-memory-models cannot be combined with --model-bundle")
+    if args.only_project and (not args.upgrade or args.dev or args.check):
+        parser.error("--only-project requires --upgrade and excludes --dev/--check")
     options = Options(
         source=args.source,
         dev=args.dev,
+        full=args.full,
         upgrade=args.upgrade,
         check=args.check,
         dry_run=args.dry_run,
@@ -1660,6 +1718,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_memory_models=args.skip_memory_models,
         model_bundle=args.model_bundle,
         non_interactive=args.non_interactive,
+        only_project=args.only_project,
     )
     try:
         checks = Installer(options).install()

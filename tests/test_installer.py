@@ -231,9 +231,14 @@ def test_uv_tool_install_records_exact_uninstall_receipt(tmp_path) -> None:
     assert receipt["installed_by_polaris"] is True
     assert receipt["install_kind"] == "uv-tool"
     assert receipt["package"] == "agent-with-llm"
+    assert receipt["extras"] == "default"
     assert Path(receipt["executable"]) == executable.resolve()
     assert Path(receipt["environment"]) == (tool_root / "agent-with-llm").resolve()
     assert Path(receipt["bootstrap_python"]) == Path(sys.executable).resolve()
+    installs = [call for call in installer.runner.calls if call[1:3] == ["tool", "install"]]
+    assert len(installs) == 1
+    assert installs[0][-1].endswith("[web,mcp,terminal,memory,codeintel,credentials]")
+    assert "swebench" not in installs[0][-1]
 
 
 def test_reused_polaris_is_recorded_as_external_not_owned(tmp_path) -> None:
@@ -294,12 +299,15 @@ def test_dev_install_reuses_valid_environment_and_sets_resilient_http_defaults(
 
     assert not any(call[1:2] == ["venv"] for call in runner.calls)
     assert any(call[1:3] == ["pip", "install"] for call in runner.calls)
+    pip_installs = [call for call in runner.calls if call[1:3] == ["pip", "install"]]
+    assert pip_installs[0][-1].endswith("[all,dev]")
     assert runner.pip_env["UV_HTTP_CONNECT_TIMEOUT"] == "30"
     assert runner.pip_env["UV_HTTP_TIMEOUT"] == "120"
     assert runner.pip_env["UV_HTTP_RETRIES"] == "5"
     assert installer.state.component("polaris")["environment"] == str(
         (tmp_path / ".venv").resolve()
     )
+    assert installer.state.component("polaris")["extras"] == "dev"
 
 
 def test_dev_install_preserves_user_uv_http_settings(tmp_path: Path, monkeypatch) -> None:

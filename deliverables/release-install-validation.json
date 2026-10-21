@@ -1,5 +1,6 @@
 {
   "version": "0.1.1",
+  "date": "2026-10-08",
   "distribution": "wheel",
   "checks": [
     {
@@ -7,7 +8,8 @@
         "polaris",
         "--version"
       ],
-      "exit_code": 0
+      "exit_code": 0,
+      "observed": "polaris 0.1.1"
     },
     {
       "command": [
@@ -30,10 +32,56 @@
       "check": "health_configuration_and_fake_provider",
       "passed": true,
       "overall_status": "error"
+    },
+    {
+      "command": [
+        "polaris",
+        "setup",
+        "--non-interactive"
+      ],
+      "exit_code": 2,
+      "observed": "prints flag-based configuration guidance; writes no settings.toml"
+    },
+    {
+      "command": [
+        "polaris",
+        "swebench",
+        "list",
+        "--dataset",
+        "SWE-bench/SWE-bench_Lite",
+        "--split",
+        "dev",
+        "--limit",
+        "1"
+      ],
+      "exit_code": 2,
+      "observed": "actionable --full reinstall guidance (benchmark deps excluded from the default install)"
+    },
+    {
+      "command": [
+        "polaris",
+        "upgrade",
+        "--to",
+        "v0.0.0"
+      ],
+      "exit_code": 10,
+      "observed": "HTTP 404 plus offline upgrade guidance; no mutation, no worker scheduled"
+    },
+    {
+      "command": [
+        "polaris",
+        "upgrade",
+        "--check"
+      ],
+      "exit_code": 0,
+      "observed": "Installed version: 0.1.1 / Latest release: 0.1.1 (v0.1.1) / Polaris is up to date."
     }
   ],
   "notes": [
-    "Full Python dependencies installed into a workspace-only uv tool environment.",
-    "Host/container/model provisioning was not changed during this smoke test."
+    "Default-extra Python dependencies (web,mcp,terminal,memory,codeintel,credentials) installed into a workspace-only uv tool environment.",
+    "Isolated POLARIS_HOME/LOCALAPPDATA/XDG dirs and UV_TOOL_DIR/UV_TOOL_BIN_DIR under a private temp root; POLARIS_DISABLE_KEYRING=1 kept the OS credential store untouched.",
+    "Health status stays 'error' only because no container runtime exists on this host; configuration and fake provider checks pass.",
+    "Upgrade checks used a fabricated installer-owned uv-tool receipt in the isolated LOCALAPPDATA; the invalid-tag run failed before any download/staging and no real upgrade was performed.",
+    "Host/container/model provisioning was not changed during this smoke test; the tool was removed with 'uv tool uninstall' afterwards."
   ]
 }

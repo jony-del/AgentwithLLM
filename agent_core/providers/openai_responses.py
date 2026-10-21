@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from agent_core import credentials
 from agent_core.models import (
     LLMContextTooLongError,
     LLMResult,
@@ -120,7 +121,7 @@ class OpenAIResponsesProvider(LLMProvider):
         backoff_multiplier: float = 2.0,
         on_retry: Callable[[str], None] | None = _default_retry_notice,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or credentials.get_api_key("OPENAI_API_KEY")
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com").rstrip("/")
         self.max_retries = max(0, max_retries)
         self.initial_backoff = initial_backoff
@@ -142,7 +143,10 @@ class OpenAIResponsesProvider(LLMProvider):
         scope: ExecutionScope | None = None,
     ) -> LLMResult:
         if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for the OpenAI Responses provider")
+            raise RuntimeError(
+                "OPENAI_API_KEY is required for the OpenAI Responses provider "
+                "(set the env var, or run `polaris setup` to store it in the OS credential store)"
+            )
         if not config.model:
             raise RuntimeError("OpenAIResponsesProvider needs an explicit model (--model / config.model)")
 
