@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import sys
 import tomllib
 from pathlib import PurePosixPath
 from typing import Any
@@ -15,6 +16,12 @@ LANGUAGES = {".py": "python", ".pyi": "python", ".js": "javascript", ".jsx": "ja
              ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".rs": "rust",
              ".java": "java", ".c": "c", ".h": "c", ".cpp": "cpp", ".cs": "csharp"}
 PARSER_FINGERPRINT = "python-ast-v1"
+
+
+def parser_fingerprint() -> str:
+    # AST grammar changes with the interpreter; static manifest extraction is
+    # versioned independently even though both currently publish in one batch.
+    return f"{PARSER_FINGERPRINT}:py{sys.version_info.major}.{sys.version_info.minor}:manifests-v1:module-boundaries-v1"
 
 
 def language(path: str) -> str:

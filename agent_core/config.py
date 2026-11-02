@@ -22,6 +22,19 @@ if TYPE_CHECKING:  # annotation-only imports; runtime imports stay deferred per-
 _T = TypeVar("_T")
 
 
+def resolve_snapshot_config(config_file: str | Path = "agent.toml"):
+    from agent_core.source_snapshots import SnapshotConfig
+    raw = load_agent_toml(config_file).get("snapshots", {})
+    table = dict(raw) if isinstance(raw, dict) else {}
+    for name in ("max_files", "max_source_bytes", "max_store_bytes", "max_manifest_bytes", "max_manifests", "max_git_output_bytes"):
+        env = os.environ.get("AGENT_SNAPSHOTS_" + name.upper())
+        if env is not None:
+            table[name] = int(env)
+    if "AGENT_SNAPSHOTS" in os.environ:
+        table["enabled"] = os.environ["AGENT_SNAPSHOTS"].strip().lower() in {"1", "true", "yes", "on"}
+    return SnapshotConfig.from_dict(table)
+
+
 def resolve_codeintel_config(config_file: str | Path = "agent.toml"):
     from agent_core.codeintel.config import CodeIntelConfig
     raw = load_agent_toml(config_file).get("codeintel", {})

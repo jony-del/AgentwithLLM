@@ -10,8 +10,8 @@ import time
 from typing import Any, Literal
 import uuid
 
-from agent_core.permission_safety import is_secret_path
 from agent_core.tools.transaction import JournalStorage, _open_state, _secure_mkdir
+from agent_core.recovery_paths import native_path
 
 TaskStatus = Literal["running", "completed", "unverified", "blocked", "failed", "cancelled"]
 _IGNORED = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
@@ -24,47 +24,13 @@ class WorkspaceRevision:
     workspace: str
     digest: str
     files: dict[str, str]
+    snapshot_id: str = field(default="", compare=False)
 
 
 def capture_revision(workspace: Path) -> WorkspaceRevision:
-    """Bounded content snapshot; moving files fail closed instead of certifying stale code."""
-    root = workspace.resolve()
-    from agent_core.execution import current_execution_scope
-    scope = current_execution_scope()
-    files: dict[str, str] = {}
-    total = 0
-    def walk_error(error: OSError) -> None:
-        raise error
-    for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
-        if scope is not None:
-            scope.raise_if_cancelled()
-        dirs[:] = sorted(name for name in dirs if name not in _IGNORED and
-                         not (Path(directory) == root and name in _ROOT_STATE) and
-                         not (Path(directory) / name).is_symlink() and not is_secret_path(name))
-        for name in sorted(names):
-            path = Path(directory) / name
-            if path.is_symlink():
-                raise ValueError("verification cannot certify symlinked files")
-            if is_secret_path(name):
-                continue
-            before = path.stat()
-            if len(files) >= 20_000 or total + before.st_size > 512 * 1024 * 1024:
-                raise ValueError("workspace verification snapshot exceeds its budget")
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for block in iter(lambda: handle.read(65536), b""):
-                    if scope is not None:
-                        scope.raise_if_cancelled()
-                    digest.update(block)
-                    total += len(block)
-                    if total > 512 * 1024 * 1024:
-                        raise ValueError("workspace verification snapshot exceeds its budget")
-            after = path.stat()
-            if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
-                raise ValueError("workspace changed during verification snapshot")
-            files[path.relative_to(root).as_posix()] = digest.hexdigest()
-    workspace_digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
-    return WorkspaceRevision(str(root), workspace_digest, files)
+    """Compatibility entry point using the shared bounded strict snapshot reader."""
+    from agent_core.revisions import RevisionTracker
+    return RevisionTracker(workspace, git_aware=False).capture_walk()
 
 
 @dataclass(frozen=True)
@@ -141,6 +107,7 @@ class TaskRun:
     verifier_runs: list[dict[str, Any]] = field(default_factory=list)
     answer_reviews: list[dict[str, Any]] = field(default_factory=list)
     observations: list[dict[str, Any]] = field(default_factory=list)
+    code_exploration: dict[str, Any] = field(default_factory=dict)
 
     def replace_plan(self, steps: list[PlanStep]) -> None:
         if len(steps) > 128 or len({step.id for step in steps}) != len(steps):
@@ -217,7 +184,11 @@ class TaskRun:
                                       "paths": [p[:160] for p in x.paths[:4]],
                                       "path_count": len(x.paths)} for x in selected],
                            "step_count": len(self.plan), "completed_count": sum(x.status == "completed" for x in self.plan),
-                           "recent_failures": self.failures[-3:], "detail_tool": "task_state"}, ensure_ascii=False)
+                           "recent_failures": self.failures[-3:], "detail_tool": "task_state",
+                           "code_exploration": {"queries": len(self.code_exploration.get("queries", [])),
+                                                "evidence": len(self.code_exploration.get("evidence", [])),
+                                                "sections": ["code_queries", "code_evidence"],
+                                                "freshness": "historical; revalidate before editing"}}, ensure_ascii=False)
 
     @staticmethod
     def _verifier_summary(records: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -292,6 +263,8 @@ class TaskStore:
     def __init__(self, storage: JournalStorage, *, isolated: bool = False) -> None:
         self.storage = storage
         self.path = (storage.run_root if isolated else storage.recovery_root) / "task-state.json"
+        from agent_core.source_snapshots import SnapshotStore
+        self.snapshots = SnapshotStore(storage, root=self.path.parent / "checkpoints")
 
     def save(self, task: TaskRun) -> None:
         self.storage.validate()
@@ -300,23 +273,36 @@ class TaskStore:
         task.updated_at = time.time()
         try:
             with _open_state(self.storage, temporary, "w") as handle:
-                json.dump({"v": 3, "task": asdict(task)}, handle, ensure_ascii=False)
+                if task.baseline.snapshot_id:
+                    # Do not deepcopy/serialize the entire file inventory on every
+                    # plan/status update. The immutable manifest owns that inventory.
+                    from dataclasses import replace
+                    record = asdict(replace(task, baseline=replace(task.baseline, files={})))
+                    record["baseline"].pop("files")
+                    version = 4
+                else:
+                    record, version = asdict(task), 3
+                if record.get("code_exploration"):
+                    version = 5
+                else:
+                    record.pop("code_exploration", None)
+                json.dump({"v": version, "task": record}, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             self.storage.validate(self.path)
-            os.replace(temporary, self.path)
+            os.replace(native_path(temporary), native_path(self.path))
         finally:
-            temporary.unlink(missing_ok=True)
+            Path(native_path(temporary)).unlink(missing_ok=True)
 
     def load(self) -> TaskRun | None:
         self.storage.validate(self.path)
-        if not self.path.exists():
+        if not Path(native_path(self.path)).exists():
             return None
-        if self.path.stat().st_size > 64 * 1024 * 1024:
+        if Path(native_path(self.path)).stat().st_size > 64 * 1024 * 1024:
             raise ValueError("task-state record exceeds its budget")
         with _open_state(self.storage, self.path, "r") as handle:
             value = json.load(handle)
-        if value.get("v") not in {1, 2, 3}:
+        if value.get("v") not in {1, 2, 3, 4, 5}:
             raise ValueError("unsupported task-state schema")
         data = value["task"]
         contract = data.pop("contract")
@@ -324,6 +310,10 @@ class TaskStore:
             contract[key] = tuple(contract[key])
         contract["checks"] = tuple(VerificationCheck(c["id"], tuple(c["argv"]), c["kind"]) for c in contract["checks"])
         data["contract"] = TaskContract(**contract)
+        if value["v"] == 4 or (value["v"] == 5 and data["baseline"].get("snapshot_id")):
+            baseline = data["baseline"]
+            manifest = self.snapshots.load(baseline["snapshot_id"], workspace=baseline["workspace"], revision=baseline["digest"])
+            baseline["files"] = manifest["files"]
         data["baseline"] = WorkspaceRevision(**data["baseline"])
         data["plan"] = [PlanStep(**{**step, "depends_on": tuple(step["depends_on"]), "paths": tuple(step.get("paths", ()))}) for step in data["plan"]]
         data["evidence"] = [VerificationEvidence(**e) for e in data["evidence"]]

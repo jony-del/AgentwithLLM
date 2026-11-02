@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import time
+import json
 from typing import Any
 
 from agent_core.codeintel.backends import language, module
 from agent_core.codeintel.budget import BudgetExceeded, QueryBudget
-from agent_core.codeintel.snapshots import IGNORED_DIRS, contained
+from agent_core.codeintel.snapshots import contained
+from agent_core.codeintel.paths import excluded_path
 from agent_core.codeintel.store import CodeStore
 from agent_core.permission_safety import is_secret_path
 
@@ -19,10 +21,30 @@ class FileCatalog:
     Enumeration is never part of a warm search.
     """
 
-    def __init__(self, store: CodeStore) -> None:
+    def __init__(self, store: CodeStore, exclude_paths: tuple[str, ...] = ()) -> None:
         self.store = store
+        self.exclude_paths = exclude_paths
         self._iterator: Any = None
         self._directory: str | None = None
+
+    def configure_policy(self) -> None:
+        """Invalidate the old inventory once when its exclusion rules change.
+
+        Caller holds the writer lock. Old databases must not claim completeness
+        until previously omitted source directories have been inventoried.
+        """
+        policy = json.dumps({"version": 2, "exclude_paths": self.exclude_paths}, sort_keys=True)
+        with self.store.connect() as db:
+            if self.store.get(db, "inventory_policy") == policy:
+                return
+            self.close()
+            db.execute("DELETE FROM scan_dirs")
+            db.execute("INSERT INTO scan_dirs VALUES('.')")
+            db.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='scan_epoch'")
+            db.execute("UPDATE meta SET value='0' WHERE key='catalog_complete'")
+            db.execute("INSERT OR REPLACE INTO meta VALUES('scan_error','0')")
+            db.execute("INSERT OR REPLACE INTO meta VALUES('inventory_policy',?)", (policy,))
+            self.store.bump(db)
 
     def close(self) -> None:
         if self._iterator is not None:
@@ -83,9 +105,11 @@ class FileCatalog:
                         continue
                     rel = path.relative_to(self.store.root).as_posix()
                     try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name not in IGNORED_DIRS:
-                                db.execute("INSERT OR IGNORE INTO scan_dirs VALUES(?)", (rel,))
+                        directory_entry = entry.is_dir(follow_symlinks=False)
+                        if excluded_path(rel, self.exclude_paths, directory=directory_entry):
+                            continue
+                        if directory_entry:
+                            db.execute("INSERT OR IGNORE INTO scan_dirs VALUES(?)", (rel,))
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             continue

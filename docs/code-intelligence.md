@@ -24,17 +24,22 @@ OS event watching, with periodic reconciliation as the fallback.
 Search also returns exit code 2 for incomplete coverage (including unresolved syntactic
 relations); consumers should inspect the JSON rather than treating it as a tool failure.
 
-`code_search`, `code_relations` and `code_context` are deferred tools discoverable with
+`code_search`, `code_relations`, `code_context` and `code_validate` are deferred tools discoverable with
 `tool_search`. `code_search` selects paths, symbols or text; an identifier first tries
 symbols and then text under the same budget. Explicit `kind` bypasses classification.
-Current task modules are searched first; zero hits permit a wider indexed query under
+Current task modules are searched first; an exhausted zero-hit candidate scan permits a wider indexed query under
 the same budget. Explicit path/modules remain scoped; `expand=true` starts wider.
 Coverage lists the actual checked ranges. `code_relations` supports incoming/outgoing syntactic edges and bounded
 depth expansion. These candidates are not type-resolved proofs of a complete call graph.
 
 Legacy `glob` keeps newest-first ordering. `search_text` retains substring/regex semantics,
 including basename glob filtering. Bounded scans do not interpret `.gitignore`; shared
-VCS/build/runtime exclusions apply at traversal entry. Secrets and redirected paths are
+VCS/cache/dependency exclusions apply at every depth. Build/runtime exclusions use
+`[codeintel].exclude_paths`: workspace-relative roots (default `runs`, `memory`, `build`,
+`dist`, `env`), so `agent_core/memory` and `src/build` remain searchable. Override the list
+for custom generated/runtime locations, or use `[]` when these root names contain source.
+The same rules apply to the catalog, cold scans, transaction overlays and change events.
+Secrets and redirected paths are
 not indexed. Unsupported files/encodings and oversized files are reported as exclusions.
 
 ## Implemented capabilities and boundaries
@@ -59,6 +64,71 @@ Modules currently use the first path component (root files belong to `.`). This 
 directory partition, not a claim to resolve every build-system package boundary.
 High-precision cross-language graphs, build target resolution, physical module shards,
 an independent daemon and selected semantic indexing are subsequent extensions.
+
+### Large-repository rollout status
+
+The first correctness milestone covers relative inventory exclusions, resumable empty
+pages, same-line fact pagination, explicit excerpt ranges, structured evidence
+compression and task working-set lifecycle. Regression gates are in
+`tests/test_codeintel_contracts.py` and `tests/test_code_evidence_compression.py`.
+
+The second milestone adds private immutable source manifests and streaming content
+objects shared by revision capture, checkpoints and verification copies. Checkpoints
+reference existing snapshots; task-state v4 references its baseline manifest instead
+of embedding the full file inventory on every update. Configurable source/store limits
+replace the former 20,000-file / 512-MiB whole-repository limits. Strict capture still
+hashes all eligible source and checks membership; stat hints never certify completion.
+See [snapshot configuration and validation](coding-agent-runtime.md#持久化源码快照与检查点).
+
+The follow-up exploration milestone adds `strategy.py::ExplorationState`: bounded
+query fingerprints (including input cursor, scope, kind and relation depth), index
+generation, coverage observations and repeated-no-gain advice. Search always executes;
+history never proves absence, freshness or permission. Incomplete empty results suggest
+continuation/refresh/narrowing, not a confident "not found". Module/checked-scope lists
+are bounded and disclose truncation. Raw query strings, cursors and source bodies are
+not stored in the history.
+
+`TaskWorkingSet` retains up to 128 evidence references and 64 query records in a
+128-KiB versioned task projection. Task-state v5 carries this projection; records bind
+to worktree and read policy. Resume filters paths under current permissions and marks
+everything `needs_revalidation`; it never repopulates `code_read_versions`. Commits
+mark relevant references and query observations stale. `task_state` sections
+`code_queries` and `code_evidence` expose bounded pages; compaction preserves a bounded
+historical projection. The planner records its search observations and passes strategy
+advice with the evidence to its model. This is rule-based guidance, not an automatic
+learning planner or a task-level retrieval-success guarantee.
+
+`tests/test_code_exploration.py` covers repeat/continuation distinctions, incomplete
+coverage, policy/worktree changes, stale invalidation, bounded UTF-8 state, both
+inline and manifest-based v5 baselines, compaction recovery, and an actual ReAct
+tool round with persisted run events and transcript records. These deterministic
+checks do not measure a real model's strategy selection or task-solving success.
+
+These milestones do not certify million-line end-to-end coding tasks. LSP location evidence,
+static package boundaries and literal/symbol candidate validation are now integrated (see below);
+full semantic graphs and measured indexing optimizations remain later work.
+Embeddings and physical sharding are optional, subject to measured need.
+
+2026-11-01 adds the first structural-location increment. Symbol hits optionally carry
+`symbol` metadata (subrecord schema v1): a definition ID scoped to worktree, file
+content hash, qualified name, kind, line range and parser fingerprint, plus container
+and explicit syntax precision. Reindexing identical content with the same parser
+keeps the ID; edits, movement or parser changes invalidate it. This is not a stable
+rename identity or type-resolved target. Relationship targets remain syntactic and
+do not receive invented resolved IDs. Task working-set persistence still stores
+file/range references; it does not yet persist these symbol IDs.
+
+The index meta record now binds Python AST version/interpreter grammar and manifest
+parser version. Missing or changed fingerprints atomically mark files pending and
+enqueue bounded rebuilding. Existing queue reasons survive; generation changes
+invalidate cursors. An already-open service with a mismatching parser refuses to
+publish facts or answer indexed searches. No source is parsed merely to initialize
+the database. The SQL table schema and search-page version remain v1 (additive
+metadata); mixed writers from old binaries that predate this protocol are unsupported.
+
+The offline [real-task evaluation baseline](repository-task-evaluation.md) separates
+retrieval, patch application, local tests and reported hidden-test resolution. Real
+repository/model execution is pending; the current increments do not close that gate.
 
 ```mermaid
 flowchart LR
@@ -90,6 +160,35 @@ no fabricated code range. A cursor binds the query and index generation; if the
 generation moves mid-pagination (any indexed change), the query returns an empty page
 with a `generation_changed` coverage reason instead of an error — restart without the
 cursor. Line numbers are one-based.
+
+Cursor format v2 tracks scan progress independently of returned hits. Empty partial
+pages may carry a cursor: continue until there is no cursor, checking coverage on every
+page. Stable fact positions preserve multiple relations on the same source line. A
+cursor also binds the store and resolved search strategy/scope; growth of the task
+working set does not narrow an in-flight query. Old-format cursors must be restarted.
+When no progress is possible (for example, the first hit cannot fit the output budget),
+the page has no cursor and an explicit `no_scan_progress` reason; narrow the query or
+increase the exhausted budget instead of repeating it unchanged. `scan_complete` means
+the selected indexed candidates were exhausted; it does not override coverage gaps.
+Budget-interrupted symbol scans do not silently fall back to text or expand their scope.
+Unindexable files elsewhere do not disable useful text fallback, but their coverage
+warnings survive fallback and scope expansion.
+
+`start_line`/`end_line` describe a source fact's extent. `excerpt_start_line` and
+`excerpt_end_line` identify the lines actually present in `text`; a symbol result may
+show only the first 11 lines of a longer definition. `truncated` and `next_start_line`
+make the omission explicit. Continue with `code_context(path, start=next_start_line,
+expected_version=version)` and a suitable limit. Region reads contain source lines only,
+never a truncation marker masquerading as a source line. Empty/out-of-range reads have
+null ranges; bounded region reads indicate whether further file lines remain.
+
+Conversation compression keeps complete JSON records or versioned references. It marks
+coverage incomplete, counts omitted hits, and exposes `recovery` with the original page
+request (or an instruction to repeat that tool call when the budget is very small).
+A compressed page clears its next-page cursor: advancing that cursor would skip hits
+removed by compression. Retained references can be reread with `code_context` and their
+expected versions. Spilled output is not reconstructed from hidden metadata. Normal
+output hooks and generic tool-result compression remain in effect.
 
 `coverage.complete` is relative to the requested **indexed observation**, not an atomic
 snapshot of a live filesystem. `freshness` explicitly describes this distinction.
@@ -150,6 +249,11 @@ monopolizing resources. IDE unsaved buffers are not part of the disk view.
 
 Agents on the same event loop, worktree, config and permission policy share maintenance
 and a ref-counted service. Cross-process writers use a file lock; readers use SQLite WAL.
+Starting a new task recreates its working set even when the index service is reused.
+Changing config, workspace or read policy rebinds the service and clears active evidence.
+Non-default exclusion lists use separate cache files. Old inventories missing the new
+policy fingerprint become incomplete and reconcile once before claiming full coverage;
+the persisted fact schema remains v1.
 Resume and worktree changes release the old service and clear active evidence. Long-term
 memory can be disabled without disabling any of this functionality.
 
@@ -209,12 +313,17 @@ migration.
 The current implementation is an in-process service with a separate store and API.
 Physical module sharding is not needed to validate this boundary; it remains a response
 to measured write contention or index size. Full call-graph correctness, workspace-wide
-LSP result federation and persistent task work-set restore are not claimed by this release.
+LSP result federation remain later work. Persistent task work-set restore is supported
+as historical references only. LSP location evidence and static package boundaries now have
+a first implementation. The next stage is measured index-maintenance/concurrency improvements;
+embedding and physical sharding remain optional. Real large-repository coding-task
+acceptance is still required separately from the synthetic capacity benchmarks.
 
 ## Validation commands
 
 ```powershell
 .venv/Scripts/python.exe -m pytest -q tests/test_codeintel.py
+.venv/Scripts/python.exe -m pytest -q tests/test_codeintel_contracts.py tests/test_code_evidence_compression.py tests/test_compression.py tests/test_editing.py
 .venv/Scripts/python.exe benchmarks/codeintel.py --lines 10000000 --samples 20 --output deliverables/codeintel-10m.json
 .venv/Scripts/python.exe -m ruff check agent_core tests installer
 .venv/Scripts/python.exe -m mypy
@@ -225,3 +334,82 @@ repeated module queries and a single-file update. Its generated functions/assign
 are a reproducible synthetic scale check, not a substitute for a heterogeneous real
 monorepo or a promise of universal latency. Limits should be calibrated on deployment
 hardware; the artifact records corpus shape, platform, configuration and query coverage.
+
+
+## LSP 位置证据、包边界与修改候选（2026-11-01）
+
+开启 code intelligence 时，`lsp` 的 `definition`、`references`、`implementation`
+返回统一 SearchPage：每条位置附带当前允许读取的源码、FileVersion、行范围与
+`precision=lsp_reported_location`。支持 Location/LocationLink；拒绝外部路径、非本地 file URI、
+越界及切开 UTF-16 代理对的位置。客户端仅协商 UTF-16。查询共享 deadline/读取/输出预算；
+结束前复读来源及已见目标检查版本。超过预算的部分结果只是线索。
+
+结果可进入工作集及结构化上下文压缩，但不会直接建立编辑版本凭证。覆盖始终声明
+`lsp_server_coverage_unknown`：源码哈希新鲜不等于语言服务器的全局依赖索引新鲜。
+hover、diagnostics、workspace/document symbols 和调用层级暂保留原接口；未实现全语言类型图，
+未配置服务器时仍使用文本/AST 检索。规划器会提示在歧义位置显式调用 LSP，尚不自动选择 LSP 查询坐标。
+
+索引维护识别有名字的 Python（project/Poetry）、npm、Cargo 包清单和 Go module 声明，
+将文件归入最近的包根目录（module 值仍为仓库相对路径，不是包名），缺少清单时退回首层目录。
+`module_roots` 保存清单路径、根目录、名称和内容哈希；不执行构建脚本，不展开 workspace glob，
+不把这层包边界当作完整构建目标图。嵌套清单增加、删除或失效时，受影响子树原子进入 pending，
+由现有有界维护队列重新提取；查询不会全仓重建。根目录边界改变可能使全仓待更新，成本需计入增量测试。
+新增规则已进入 parser fingerprint，旧索引首次打开会重新排队。
+
+修改前的推荐流程：检索候选 → 明确直接目标/依赖/测试 → code_context 读取 →
+`code_validate(path, expected_version, anchor, symbol?)` → 携带版本约束局部编辑 → diff/针对性检查。
+code_validate 要求 worktree/path/hash 全部匹配、非空文本锚点在文件中唯一（含重叠匹配），
+可选 symbol 必须是当前 Python 解析得到的身份且包含锚点。它返回版本、行范围、锚点哈希；
+不声称候选符合需求，也不替代编辑时的再次校验和行为测试。其他语言先使用精确文本锚点。
+工具默认延迟加载，code intelligence 关闭时一起禁用，现有工具参数保持兼容。
+
+离线测试：`tests/test_structural_evidence.py`，覆盖权限过滤、移动版本、UTF-16、
+嵌套包删除/失效、候选歧义和符号归属。真实语言服务器的大仓正确率/延迟尚待外部环境验收。
+
+
+## 索引维护与并发资源（2026-11-02）
+
+维护复用现有 SQLite/WAL、pending 队列和目录游标。`ensure_index` 默认使用
+`maintenance_seconds=0.25` 的软切片和 `maintenance_files=128` 文件上限；原有
+query_seconds/max_files/父任务 deadline 更小的限制仍生效。锁等待占用本次预算并支持取消。
+软切片在文件之间检查，已准入的单文件可在 query_seconds/父 deadline 内完成，避免解析较慢文件
+在每个短切片末尾反复被丢弃。AST 解析和部分 SQLite 调用是同步操作，预算不是抢占式硬实时保证。
+调用方应循环到 catalog_complete、pending=0 且 replay_pending=false；CLI 已更新，单次 ensure_index
+不再保证处理完整个小仓库。返回 maintenance.processed_files/unchanged_files 和 stop_reason 供诊断。
+
+低频 audit 仍完整读取并 hash 文件。仅当 pending 原因是 audit、原状态 ready/text_only、
+内容 hash 与当前 parser fingerprint 一致且 pending reason 未改变时，保留原 facts/revision，
+只更新 stat 并移除队列项；变化文件、策略过滤、模块改变、解析器升级和其他事件仍走提取流程。
+这减少 AST/FTS 重建，不取消源码新鲜度校验。
+
+transaction outbox 每次最多重放 64 条事件，失效标记和 commit_sequence 在同一事务提交，
+写事务开始后重读 sequence 防止并发回退；路径写入与提交前检查预算，失败整批回滚。
+查询有剩余事件时报告 commit_replay_pending，无法重放时报告 commit_replay_deferred，均不能声称完整覆盖。
+旧的单条巨型事件的 JSON 解析不可抢占，事件原子性也可能导致短预算反复重试；需提高维护/查询预算，
+若真实负载出现此问题再增加分路径游标。当前未引入新日志 schema。
+
+`max_concurrent_requests=4` 限制每个共享 service 提交给线程池的工作数；等待准入消耗原预算，
+取消会移除等待者。状态、查询、发布和维护均被跟踪。关闭时先拒绝新请求，再等待后台任务及在途
+文件/SQLite 工作结束，最后关闭目录游标和数据库。重复取消仍等待真实线程结束，不提前释放槽位。
+此上限按 service 生效，不是跨工作区的全进程并发优先级调度。
+
+后台维护和 CLI 构建循环使用 detailed=false，省去每个切片的 files/state/module 完整统计；
+只查询目录状态、pending 数与 generation。显式 status 及默认详细 ensure_index 保留完整统计。
+文件监听事件保留至发布成功，按版本令牌确认，每批最多 256 路径、队列最多 10,000 路径；
+失败/取消保留事件，更新中的路径不会被旧确认抹去，溢出或目录事件触发重新盘点。
+
+离线回归见 tests/test_codeintel_maintenance.py 和 tests/test_codeintel_watcher.py。
+`benchmarks/codeintel_maintenance.py --files 128 --lines-per-file 200 --samples 10 --output tmp/maintenance.json`
+生成临时合成仓库，测构建、未变化审计、单文件更新与维护期间查询，并断言检索答案。
+前后报告见 [`codeintel-maintenance-report.json`](../benchmarks/codeintel-maintenance-report.json)。
+计时为同机单轮小样本，真实百万/千万 LOC 与超过 20,000 文件的开发任务验收仍待真实仓库和模型环境。
+
+
+本机对照（128 个 Python 文件 × 200 行，每类查询/增量 10 个样本）：
+未变化 audit 从 0.945 s 到 0.295 s，AST 调用从 128 次到 0 次；首次构建
+2.840 s 到 1.941 s，解析仍为 128 次。单文件更新 P95 为 65.264/59.217 ms。
+维护中查询 P95 为 26.036/25.695 ms，P50 从 11.360 ms 上升到 18.236 ms，
+这组样本未证明并发查询变快。准入、让出机会和关闭清理的正确性由确定性回归检查。
+两批相关回归分别 98 项和 113 项通过（包含重叠用例），Ruff 与 Mypy（223 个生产模块）通过。
+普通受限 Windows 环境无法初始化 asyncio Proactor socketpair，离线基准及 async 回归在自动审核允许的
+正常 Windows 进程中运行；没有启用真实模型或外部服务。

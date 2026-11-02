@@ -97,7 +97,7 @@ class RollbackCheckpointTool(WorkspacePathMixin, SessionAwareMixin, Tool):
             if task.contract.allowed_paths and not any(relative == allowed or relative.startswith(allowed.rstrip("/") + "/")
                                                        for allowed in task.contract.allowed_paths):
                 raise ValueError("restore path is outside task scope")
-            data = await asyncio.to_thread(store.read, checkpoint, relative)
+            data = await asyncio.to_thread(store.read, checkpoint, relative, max_bytes=store.MAX_BYTES - total)
             total += len(data) if data is not None else 0
             if total > store.MAX_BYTES:
                 raise ValueError("restore byte budget exceeded")

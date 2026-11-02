@@ -24,13 +24,15 @@ class CodeStore:
     """Short-lived SQLite connections; a single atomic file revision owns all facts."""
 
     def __init__(self, root: Path, path: Path | None = None) -> None:
+        from agent_core.codeintel.backends import parser_fingerprint
+        self.parser_fingerprint = parser_fingerprint()
         self.root = root
         self.path = path or default_store(root)
         self._local = threading.local()
         self._anchor: sqlite3.Connection | None = None
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self, *, timeout: float = 0.5) -> Iterator[sqlite3.Connection]:
         current = getattr(self._local, "connection", None)
         if current is not None:
             yield current
@@ -38,7 +40,7 @@ class CodeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.is_symlink() or self.path.parent.resolve() != self.path.parent.absolute():
             raise ValueError("redirected code index path")
-        connection = sqlite3.connect(self.path, timeout=0.5)
+        connection = sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         try:
@@ -81,6 +83,8 @@ class CodeStore:
                 CREATE TABLE IF NOT EXISTS pending(path TEXT PRIMARY KEY, reason TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, source TEXT NOT NULL, paths TEXT NOT NULL, at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS scan_dirs(path TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS module_roots(manifest TEXT PRIMARY KEY, root TEXT NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS module_root ON module_roots(root);
             """)
             version = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             if version and version[0] != str(SCHEMA_VERSION):
@@ -90,6 +94,13 @@ class CodeStore:
             db.execute("INSERT OR IGNORE INTO meta VALUES('catalog_complete', '0')")
             db.execute("INSERT OR IGNORE INTO meta VALUES('scan_epoch', '1')")
             db.execute("INSERT OR IGNORE INTO meta VALUES('last_reconcile', '0')")
+            if self.get(db, "parser_fingerprint") != self.parser_fingerprint:
+                # Legacy indexes have no fingerprint. Invalidate facts atomically;
+                # normal bounded maintenance rebuilds them, never the query path.
+                db.execute("INSERT OR IGNORE INTO pending SELECT path,'parser_changed' FROM files")
+                db.execute("UPDATE files SET state='pending'")
+                db.execute("INSERT OR REPLACE INTO meta VALUES('parser_fingerprint',?)", (self.parser_fingerprint,))
+                self.bump(db)
             if not db.execute("SELECT 1 FROM meta WHERE key='initialized'").fetchone():
                 db.execute("INSERT OR IGNORE INTO scan_dirs VALUES('.')")
                 db.execute("INSERT INTO meta VALUES('initialized','1')")
@@ -137,9 +148,17 @@ class CodeStore:
                 self.bump(db)
             db.execute("DELETE FROM events WHERE at < ?", (time.time() - 7 * 86400,))
 
+    def maintenance_status(self) -> dict[str, Any]:
+        """Queue progress only; avoid module/state GROUP BY on every background tick."""
+        with self.connect() as db:
+            return {"catalog_complete": self.get(db, "catalog_complete") == "1",
+                    "pending": db.execute("SELECT count(*) FROM pending").fetchone()[0],
+                    "generation": int(self.get(db, "generation"))}
+
     def status(self) -> dict[str, Any]:
         with self.connect() as db:
             return {"schema_version": SCHEMA_VERSION, "workspace": str(self.root),
+                    "parser_fingerprint": self.get(db, "parser_fingerprint"),
                     "worktree_id": worktree_id(self.root), "generation": int(self.get(db, "generation")),
                     "catalog_complete": self.get(db, "catalog_complete") == "1",
                     "last_reconcile": float(self.get(db, "last_reconcile")),

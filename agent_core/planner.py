@@ -30,14 +30,21 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
         return path_allowed(session, path, "plan_code_task")
     pages = []
     hits = []
+    assert session.code_working_set is not None
     for query in queries:
         for kind in ("symbol", "text"):
-            page = await service.search(SearchRequest(query, kind=kind, limit=24), scope=scope, allowed=allowed)
-            pages.append(page.to_dict())
+            request = SearchRequest(query, kind=kind, limit=24)
+            page = await service.search(request, scope=scope, allowed=allowed)
+            count = sum(session.code_working_set.add(hit, reason="planning") for hit in page.hits)
+            body = page.to_dict()
+            body["exploration"] = session.code_working_set.exploration.record(request, page, tool="plan_code_task", new_evidence=count)
+            pages.append(body)
             hits.extend(page.hits)
     relations = await service.expand_relations(queries, depth=1, scope=scope, allowed=allowed)
     pages.append(relations.to_dict())
     hits.extend(relations.hits)
+    for hit in relations.hits:
+        session.code_working_set.add(hit, reason="planning_relation")
     contexts: list[dict[str, Any]] = []
     versions = {}
     for hit in hits:
@@ -48,12 +55,14 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
         region = await service.read_region(hit.path, max(1, (hit.start_line or 1) - 10), 120,
                                            expected_version=hit.version.to_dict(), scope=scope)
         remember_version(session, region.path, region.version.to_dict())
+        session.code_working_set.add(region, reason="planning_context")
         versions[hit.path] = region.version.sha256
         contexts.append(asdict(region))
     if not contexts:
         raise ValueError("no permitted code evidence matched; refine the symbol queries")
     payload = json.dumps({"contract": asdict(task.contract), "evidence": contexts,
-                          "coverage": [page["coverage"] for page in pages]}, ensure_ascii=False)
+                          "coverage": [page["coverage"] for page in pages],
+                          "exploration_hints": [page["exploration"] for page in pages if "exploration" in page]}, ensure_ascii=False)
     if len(payload.encode("utf-8")) > 96 * 1024:
         raise ValueError("planning context budget exceeded; narrow the queries")
     result = await provider.complete([
@@ -62,6 +71,8 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
                 "Return only JSON: {\"steps\":[{\"id\":\"unique id\",\"description\":\"concrete action\","
                 "\"depends_on\":[],\"paths\":[\"relative file\"]}]}. "
                 "Include verification of the acceptance criteria. All steps start pending. "
+                "Distinguish edit targets from dependencies and tests. Before edits, use code_validate on exact anchors; "
+                "when syntactic locations are ambiguous, use configured lsp definition/references and validate their hints. "
                 "Use dependency edges for prerequisites, and identify affected files. Do not change the task contract."),
         Message("user", payload),
     ], [], replace(config, stream=False, max_tokens=max(1, min(config.max_tokens, 4096))))
@@ -97,7 +108,7 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
     await session.persist_task_async()
     record = {"steps": [asdict(step) for step in steps], "revision": final.digest,
               "evidence_versions": versions, "coverage": [page["coverage"] for page in pages],
-              "precision": "Python AST/syntactic evidence; multilingual literal/manifest evidence; LSP type relations not integrated"}
+              "precision": "Python AST/syntactic evidence; multilingual literal/manifest evidence; LSP location evidence available through lsp tool, not automatically queried by this planner"}
     if session.logger is not None:
         await session.logger.write("semantic_plan", {**record, "usage": asdict(result.usage) if result.usage else None})
     return record

@@ -247,7 +247,10 @@ async def test_cancelled_inventory_restarts_uncommitted_directory(tmp_path, monk
         await service.ensure_index(scope=scope)
     monkeypatch.setattr(service.store, "bump", bump)
     assert service.catalog._iterator is None
-    status = await service.ensure_index()
+    for _ in range(100):
+        status = await service.ensure_index()
+        if status["catalog_complete"] and not status["pending"]:
+            break
     assert status["files"] == 25 and status["pending"] == 0
     await scope.close()
     await service.close()
@@ -609,7 +612,9 @@ async def test_read_region_truncates_at_output_budget(tmp_path):
     (root / "big.txt").write_text("x" * 100 + "\n" + ("y" * 100 + "\n") * 50, encoding="utf-8")
     service = await built(tmp_path, max_context_tokens=1000)
     hit = await service.read_region("big.txt", 1, 200)
-    assert "truncated: context output budget" in hit.text
+    assert hit.truncated and hit.next_start_line == hit.end_line + 1
+    assert hit.excerpt_end_line == hit.end_line == len(hit.text.splitlines())
+    assert "truncated" not in hit.text
     assert (hit.end_line or 0) < 51
     await service.close()
 

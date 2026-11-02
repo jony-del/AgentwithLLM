@@ -13,7 +13,9 @@ from agent_core.tools.catalog import builtin_tool
 @builtin_tool
 class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
     name = "lsp"
-    description = "Query definitions, references, symbols, hover, call hierarchy, implementations, or diagnostics."
+    description = ("Query definitions, references, symbols, hover, call hierarchy, implementations, or diagnostics. "
+                   "line/character are zero-based UTF-16 positions. With code intelligence enabled, definition, "
+                   "references and implementation return versioned location hints; validate edit anchors with code_validate.")
     deferred = True
     input_schema = {
         "type": "object",
@@ -32,9 +34,7 @@ class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
     risk = ToolRisk.READ
 
     def concurrency_spec(self, arguments: dict[str, object]) -> ConcurrencySpec:
-        raw = str(arguments.get("path", ""))
-        path = (self.session.workspace / raw).resolve() if raw else self.session.workspace.resolve()
-        return ConcurrencySpec((ResourceLock("fs", str(path), "read"),))
+        return ConcurrencySpec((ResourceLock("fs", str(self.session.workspace.resolve()), "read", subtree=True),))
 
     async def run(self, arguments: dict[str, object]) -> ToolResult:
         config = self.session.tool_suite.lsp if self.session.tool_suite is not None else None
@@ -55,6 +55,17 @@ class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             )
             self.session.lsp_manager = manager
         try:
+            from agent_core.codeintel.lsp_evidence import OPERATIONS, query_evidence
+            from agent_core.codeintel.runtime import codeintel_enabled
+            if arguments.get("operation") in OPERATIONS and codeintel_enabled(self.session):
+                if not arguments.get("path"):
+                    raise ValueError("path is required for LSP evidence")
+                page = await query_evidence(self.session, manager, str(arguments["operation"]),
+                    path=str(arguments["path"]), line=int(str(arguments.get("line", 0))),
+                    character=int(str(arguments.get("character", 0))))
+                body = page.to_dict()
+                return ToolResult(self.name, json.dumps(body, ensure_ascii=False), metadata={
+                    "codeintel": body, "code_recovery": {"tool": self.name, "arguments": dict(arguments)}})
             response = await manager.request(
                 str(arguments.get("operation", "")),
                 path=str(arguments["path"]) if arguments.get("path") else None,

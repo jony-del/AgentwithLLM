@@ -356,6 +356,18 @@ def _evolve_message(message: Message, content: str, marker: str) -> Message:
     )
 
 
+def _compact_code_message(message: Message, limit: int, *, keep_text: bool = True) -> str | None:
+    if message.role != "tool" or message.metadata.get("spilled") or message.metadata.get("post_hook"):
+        return None
+    from agent_core.codeintel.rendering import compact_code_result
+    return compact_code_result(message.content, message.name, limit,
+                               recovery=message.metadata.get("code_recovery"), keep_text=keep_text)
+
+
+def _cleared_tool_content(message: Message) -> str:
+    return _compact_code_message(message, min(400, len(message.content) - 1), keep_text=False) or _MICROCOMPACT_CLEARED
+
+
 def shrink_oversize_messages(
     messages: list[Message],
     *,
@@ -395,6 +407,7 @@ def shrink_oversize_messages(
         tail = message.content[-min_keep_chars:]
         omitted = len(message.content) - 2 * min_keep_chars
         content = f"{head}\n[truncated {omitted} chars]\n{tail}"
+        content = _compact_code_message(message, floor_len) or content
         saved_chars = len(message.content) - len(content)
         result[i] = _evolve_message(message, content, "ptl_shrink")
         changed = True
@@ -758,11 +771,12 @@ class CompressionPipeline:
             # A message already rewritten by an earlier stage/pass carries a
             # ``compressed`` marker — skipping it keeps per-turn hygiene idempotent
             # instead of re-truncating (and re-versioning) the same message every turn.
-            if message.metadata.get("compressed"):
+            if message.metadata.get("compressed") or is_preserved(message):
                 snipped.append(message)
             elif message.role == "tool" and len(message.content) > limit:
                 half = max(100, limit // 2)
                 content = f"{message.content[:half]}\n[snip]\n{message.content[-half:]}"
+                content = _compact_code_message(message, limit) or content
                 snipped.append(_evolve_message(message, content, "snip"))
                 count += 1
             else:
@@ -804,7 +818,7 @@ class CompressionPipeline:
         cleared = 0
         for index, message in enumerate(messages):
             if index in stale and self._is_clearable_tool_result(message):
-                compacted.append(_evolve_message(message, _MICROCOMPACT_CLEARED, "microcompact"))
+                compacted.append(_evolve_message(message, _cleared_tool_content(message), "microcompact"))
                 cleared += 1
             else:
                 compacted.append(message)
@@ -818,8 +832,9 @@ class CompressionPipeline:
                 if total <= budget or index >= last_tool:
                     break
                 if message.role == "tool" and self._is_clearable_tool_result(message):
-                    compacted[index] = _evolve_message(message, _MICROCOMPACT_CLEARED, "microcompact")
-                    total -= len(message.content) - len(_MICROCOMPACT_CLEARED)
+                    content = _cleared_tool_content(message)
+                    compacted[index] = _evolve_message(message, content, "microcompact")
+                    total -= len(message.content) - len(content)
                     budget_cleared += 1
 
         details: list[str] = []

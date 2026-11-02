@@ -258,6 +258,7 @@ ref = "main"
 #     / verifier agent, declared here without touching code.
 # Advisory failures are logged; explicit gates fail closed.
 [verifier]
+reuse_workspace = false        # opt in to session-local clean snapshot copy reuse; rehash before each lease
 mode = "auto"                 # off | auto | required; library-only default is off
 model = ""                    # inherit the provider/model; an explicit model must use that provider.
                               # A different (ideally stronger) model reduces shared blind spots of self-review.
@@ -703,14 +704,27 @@ snapshot_name = "polaris-base"         # snapshot restored on reset (Hyper-V che
 guest_host = ""                        # SSH target for command exec (required for Hyper-V)
 reset_each_task = true                 # restore the base snapshot before every run/task
 
-# Rebuildable code facts, separate from long-term memory. No embeddings are enabled.
+# Private immutable source snapshots and checkpoints.
+[snapshots]
+enabled = true                        # prebuild private immutable source objects during strict capture
+max_files = 500000
+max_source_bytes = 17179869184         # 16 GiB of eligible source per revision; streamed, not loaded at once
+max_store_bytes = 34359738368          # 32 GiB of private objects + manifests per session store
+max_manifest_bytes = 134217728        # 128 MiB of metadata; no source text in manifests
+max_manifests = 1024                  # unique revisions; unchanged snapshots reuse the same manifest
+max_git_output_bytes = 134217728      # bounded Git inventory output (when git_aware_revisions is enabled)
+
+# Rebuildable search indexes, separate from immutable source snapshots.
 [codeintel]
 enabled = true
 strict_versions = false                # require verified reads for all existing-file edits
 maintain = true                        # background build/reconcile in agent sessions; `polaris code build` works regardless
 watch = true                           # optional watchdog OS events; periodic reconciliation is the fallback
 reconcile_seconds = 60.0
-query_seconds = 5.0                    # shared across retrieval and fallbacks
+query_seconds = 5.0                    # shared across retrieval and fallbacks; hard per-call maintenance budget
+maintenance_seconds = 0.25             # soft slice; an admitted file may finish under query_seconds
+maintenance_files = 128                # maximum published files per maintenance slice
+max_concurrent_requests = 4            # admitted IO workers per shared code-index service
 max_files = 2000
 max_bytes = 67108864
 max_file_bytes = 2097152
@@ -722,3 +736,4 @@ max_edges = 2000
 max_shards = 4                         # logical module fan-out
 cache_entries = 128
 max_index_bytes = 8589934592            # checked between bounded build slices, including WAL
+exclude_paths = ["runs", "memory", "build", "dist", "env"] # workspace-relative roots, NOT names at every depth; [] includes root source directories

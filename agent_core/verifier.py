@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-import tempfile
 import time
 from typing import Any
 import uuid
@@ -36,6 +35,7 @@ class VerifierConfig:
     max_probes: int = 12
     max_context_bytes: int = 160 * 1024
     stage_checks: bool = False
+    reuse_workspace: bool = False
     # auto mode skips the behavioral LLM verifier for changes smaller than this many
     # files (0 = verify every change). The completion gate and answer review still apply.
     min_changed_files: int = 0
@@ -43,9 +43,13 @@ class VerifierConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> VerifierConfig:
         from agent_core.config import overlay_dataclass
+        if data and "reuse_workspace" in data and type(data["reuse_workspace"]) is not bool:
+            raise ValueError("verifier.reuse_workspace must be boolean")
         config = overlay_dataclass(cls(), data)
         if not isinstance(config.mode, str) or config.mode not in {"off", "auto", "required"}:
             raise ValueError("verifier.mode must be off, auto or required")
+        if type(config.reuse_workspace) is not bool:
+            raise ValueError("verifier.reuse_workspace must be boolean")
         config.timeout = max(1.0, min(600.0, float(config.timeout)))
         config.max_tokens = max(128, min(8192, int(config.max_tokens)))
         config.max_repair_attempts = max(0, min(4, int(config.max_repair_attempts)))
@@ -163,6 +167,7 @@ def observe(task: Any, call: ToolCall, result: ToolResult, current: WorkspaceRev
 
 def _record(task: Any, current: WorkspaceRevision, *, answer: str | None = None) -> dict[str, Any]:
     result = {"schema_version": 1, "id": uuid.uuid4().hex, "revision": current.digest, "workspace": current.workspace,
+              "source_snapshot": current.snapshot_id,
               "contract_hash": contract_hash(task), "status": "incomplete", "verdict": "PARTIAL",
               "failure_class": None, "created_at": time.time(), "findings": [], "probes": []}
     if answer is not None:
@@ -191,6 +196,14 @@ def _bounded(value: Any, config: VerifierConfig) -> str:
 
 
 def _copy_source(session: Any, current: WorkspaceRevision, destination: Path) -> None:
+    from agent_core.source_snapshots import SnapshotConfig, stream_hash
+    checkpoint_store = getattr(session, "checkpoint_store", None)
+    if current.snapshot_id and checkpoint_store is not None:
+        checkpoint_store.snapshots.materialize(current.snapshot_id, current.workspace, current.digest, destination,
+            allowed=lambda relative: path_allowed(session, relative, "run_verifier"))
+        return
+    config = checkpoint_store.snapshots.config if checkpoint_store is not None else SnapshotConfig()
+    total = 0
     for relative, expected in current.files.items():
         scope = current_execution_scope()
         if scope is not None:
@@ -198,14 +211,13 @@ def _copy_source(session: Any, current: WorkspaceRevision, destination: Path) ->
         if not path_allowed(session, relative, "run_verifier"):
             raise PermissionError("verifier source is restricted by read policy: " + relative)
         source = contained(Path(current.workspace), relative)
-        if source.is_symlink() or source.stat().st_size > 512 * 1024 * 1024:
-            raise ValueError("invalid verifier source")
-        data = source.read_bytes()
-        if hashlib.sha256(data).hexdigest() != expected:
-            raise ValueError("source changed while creating verification copy")
         target = contained(destination, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        with target.open("xb") as handle:
+            actual, size = stream_hash(source, sink=handle, maximum=config.max_source_bytes - total)
+        total += size
+        if actual != expected:
+            raise ValueError("source changed while creating verification copy")
         target.chmod(source.stat().st_mode & 0o777)
 
 
@@ -220,14 +232,19 @@ async def bounded_thread(function: Any, *args: Any) -> Any:
 
 
 def source_unchanged(current: WorkspaceRevision, copy: Path) -> bool:
-    for relative, digest in current.files.items():
-        scope = current_execution_scope()
-        if scope is not None:
-            scope.raise_if_cancelled()
-        path = contained(copy, relative)
-        if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            return False
-    return True
+    from agent_core.source_snapshots import SourceTreePaths, disk_path, stream_hash, check_cancelled
+    try:
+        tree = SourceTreePaths(copy)
+        for relative, digest in current.files.items():
+            check_cancelled()
+            path = tree.path(relative)
+            actual, _ = stream_hash(path, maximum=disk_path(path).stat().st_size)
+            if actual != digest:
+                return False
+        tree.validate()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _verdict(value: dict[str, Any], evidence: set[str]) -> None:
@@ -287,10 +304,9 @@ async def _behavior(session: Any, provider: LLMProvider, base: ProviderConfig, c
     deadline = time.monotonic() + config.timeout
     cfg = replace(base, model=config.model or base.model, stream=False,
                   max_tokens=min(base.max_tokens, config.max_tokens))
-    with tempfile.TemporaryDirectory(prefix="polaris-verifier-") as directory:
-        copy = Path(directory) / "workspace"
-        copy.mkdir()
-        await bounded_thread(_copy_source, session, current, copy)
+    from agent_core.verifier_workspace import verification_copy
+    async with verification_copy(session, current, _copy_source, reuse=config.reuse_workspace) as (copy, metrics):
+        record["workspace_copy"] = metrics
         executor = make_executor(copy, current, record["probes"])
         previous = [r for r in task.verifier_runs
                     if r.get("contract_hash") == contract_hash(task) and r.get("status") != "passed"][-2:]

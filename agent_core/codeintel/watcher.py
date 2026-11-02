@@ -11,34 +11,75 @@ from typing import Any
 import uuid
 
 from agent_core.codeintel.models import ChangeSet
-from agent_core.codeintel.snapshots import IGNORED_DIRS
+from agent_core.codeintel.paths import excluded_path
 from agent_core.permission_safety import is_secret_path
 
 logger = logging.getLogger(__name__)
 
 
-async def maintain(service: Any) -> None:
-    changed: OrderedDict[str, None] = OrderedDict()
-    guard = threading.Lock()
-    rescan = threading.Event()
-    watched: set[str] = set()
-    handler: Any = None
+class WatchChanges:
+    """Bounded coalescing queue; publication acknowledges only observed versions.
 
-    def event(raw: str, directory: bool) -> None:
+    Entries stay queued during IO, including failed/cancelled publication. A newer
+    event for an in-flight path cannot be removed by an older acknowledgement.
+    Overflow requests inventory reconciliation instead of growing the queue.
+    """
+
+    def __init__(self, workspace: Path, exclude_paths: tuple[str, ...], *,
+                 capacity: int = 10000, batch_size: int = 256) -> None:
+        self.workspace = workspace
+        self.exclude_paths = exclude_paths
+        self.capacity = capacity
+        self.batch_size = batch_size
+        self.changed: OrderedDict[str, int] = OrderedDict()
+        self.guard = threading.Lock()
+        self.rescan = threading.Event()
+        self.sequence = 0
+
+    def event(self, raw: str, directory: bool) -> None:
         try:
-            relative = Path(raw).relative_to(service.workspace)
+            relative = Path(raw).relative_to(self.workspace)
         except ValueError:
             return
-        if any(p in IGNORED_DIRS for p in relative.parts) or is_secret_path(relative):
+        if ".." in relative.parts:
+            return
+        if excluded_path(relative.as_posix(), self.exclude_paths, directory=directory) or is_secret_path(relative):
             return
         if directory:
-            rescan.set()
+            self.rescan.set()
             return
-        with guard:
-            if len(changed) >= 10000:
-                rescan.set()
+        path = relative.as_posix()
+        with self.guard:
+            if path not in self.changed and len(self.changed) >= self.capacity:
+                self.rescan.set()
                 return
-            changed[relative.as_posix()] = None
+            self.sequence += 1
+            self.changed[path] = self.sequence
+
+    def batch(self) -> tuple[tuple[str, int], ...]:
+        from itertools import islice
+        with self.guard:
+            return tuple(islice(self.changed.items(), self.batch_size))
+
+    def acknowledge(self, batch: tuple[tuple[str, int], ...]) -> None:
+        with self.guard:
+            for path, sequence in batch:
+                if self.changed.get(path) == sequence:
+                    del self.changed[path]
+
+
+async def publish_batch(service: Any, changed: WatchChanges) -> None:
+    batch = changed.batch()
+    if batch:
+        await service.publish_changes(ChangeSet(uuid.uuid4().hex, tuple(path for path, _ in batch), "watcher"))
+        changed.acknowledge(batch)
+
+
+async def maintain(service: Any) -> None:
+    changed = WatchChanges(service.workspace, service.config.exclude_paths)
+    rescan = changed.rescan
+    watched: set[str] = set()
+    handler: Any = None
 
     if not service.config.watch:
         service.watch_state = "periodic_reconciliation_only"
@@ -50,9 +91,9 @@ async def maintain(service: Any) -> None:
             class Handler(FileSystemEventHandler):
                 def on_any_event(self, value: Any) -> None:
                     if value.event_type in {"created", "modified", "deleted", "moved"}:
-                        event(value.src_path, value.is_directory)
+                        changed.event(value.src_path, value.is_directory)
                         if getattr(value, "dest_path", ""):
-                            event(value.dest_path, value.is_directory)
+                            changed.event(value.dest_path, value.is_directory)
 
             handler = Handler()
             service._observer = Observer()
@@ -67,11 +108,7 @@ async def maintain(service: Any) -> None:
     quota_blocked_until = 0.0
     while not service._closed:
         try:
-            with guard:
-                paths = tuple(changed)
-                changed.clear()
-            if paths:
-                await service.publish_changes(ChangeSet(uuid.uuid4().hex, paths, "watcher"))
+            await publish_batch(service, changed)
             now = time.monotonic()
             reconcile = rescan.is_set() or now - last_reconcile >= service.config.reconcile_seconds
             if reconcile:
@@ -85,7 +122,7 @@ async def maintain(service: Any) -> None:
                 if now < quota_blocked_until and not reconcile:
                     pass  # quota backoff: idle slices retry only on reconcile ticks
                 else:
-                    status = await service.ensure_index(reconcile=reconcile, audit=audit)
+                    status = await service.ensure_index(reconcile=reconcile, audit=audit, detailed=False)
                     if status.get("stop_reason") == "index_disk_quota":
                         quota_blocked_until = now + max(300.0, service.config.reconcile_seconds * 10)
                         service.watch_state = "degraded:index_disk_quota; index writes paused, queries unaffected"
@@ -103,6 +140,7 @@ async def maintain(service: Any) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            rescan.set()
             service.watch_state = f"degraded:{type(exc).__name__}; reconciliation pending"
             logger.warning("code index maintenance failed: %s", exc)
         await asyncio.sleep(1)

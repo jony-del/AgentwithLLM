@@ -11,6 +11,7 @@ from agent_core.codeintel.config import CodeIntelConfig
 from agent_core.codeintel.service import CodeIntelligenceService
 from agent_core.codeintel.working_set import TaskWorkingSet
 from agent_core.codeintel.store import default_store
+from agent_core.codeintel.snapshots import worktree_id
 
 logger = logging.getLogger(__name__)
 _SERVICES: WeakKeyDictionary[Any, dict[Any, tuple[CodeIntelligenceService, int]]] = WeakKeyDictionary()
@@ -22,6 +23,35 @@ def codeintel_enabled(session: Any) -> bool:
     return config is None or bool(config.enabled)
 
 
+def ensure_working_set(session: Any) -> TaskWorkingSet:
+    rules = session.code_permission_rules() if callable(session.code_permission_rules) else None
+    policy_key = hashlib.sha256(repr(rules).encode()).hexdigest()[:16] if rules and (rules.deny or rules.ask) else ""
+    binding = (worktree_id(session.workspace), policy_key)
+    working = session.code_working_set
+    if working is not None and working.binding in (None, binding):
+        working.binding = binding
+        return working
+    working = TaskWorkingSet()
+    working.binding = binding
+    session.code_working_set = working
+    session.code_read_versions.clear()
+    task = session.task_run
+    saved = getattr(task, "code_exploration", {}) if task is not None else {}
+    def allowed(path):
+        arguments = ({"path": path}, {"path": str((session.workspace / path).resolve())})
+        return rules is None or not any(rules.deny_match(name, arg) or rules.ask_match(name, arg)
+            for arg in arguments for name in ("code_search", "code_context", "code_relations", "read_text_file", "search_text", "plan_code_task"))
+    if saved:
+        try:
+            working.restore(saved, allowed=allowed)
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("discarding invalid historical code exploration: %s", exc)
+            working = TaskWorkingSet()
+            working.binding = binding
+            session.code_working_set = working
+    return working
+
+
 async def get_service(session: Any) -> CodeIntelligenceService:
     config = session.codeintel_config or CodeIntelConfig()
     if not config.enabled:
@@ -30,10 +60,17 @@ async def get_service(session: Any) -> CodeIntelligenceService:
     rules = session.code_permission_rules() if callable(session.code_permission_rules) else None
     restricted = bool(rules and (rules.deny or rules.ask))
     policy_key = hashlib.sha256(repr(rules).encode()).hexdigest()[:16] if restricted else ""
-    if existing is not None and existing.workspace == session.workspace.resolve() and existing.policy_key == policy_key:
+    # A task resets its evidence while the shared index service stays alive.
+    # Initialize task state on the reuse path as well as on first acquisition.
+    ensure_working_set(session)
+    if (existing is not None and not existing._closed and existing.workspace == session.workspace.resolve()
+            and existing.policy_key == policy_key and existing.config == config):
         return existing
     if existing is not None:
         await release_service(session)
+        session.code_working_set = None
+        ensure_working_set(session)
+        session.code_read_versions.clear()
     loop = asyncio.get_running_loop()
     pool = _SERVICES.setdefault(loop, {})
     key = (str(session.workspace.resolve()), config, policy_key)
@@ -44,12 +81,12 @@ async def get_service(session: Any) -> CodeIntelligenceService:
     database = default_store(session.workspace)
     if policy_key:
         database = database.with_name(f"code-{policy_key}.sqlite3")
-    service, count = pool.get(key, (CodeIntelligenceService(session.workspace, config, database=database, allowed=allowed), 0))
+    entry = pool.get(key)
+    service, count = entry if entry is not None else (
+        CodeIntelligenceService(session.workspace, config, database=database, allowed=allowed), 0)
     service.policy_key = policy_key
     pool[key] = (service, count + 1)
     session.codeintel = service
-    if session.code_working_set is None:
-        session.code_working_set = TaskWorkingSet()
     if service._background is None and config.maintain:
         from agent_core.codeintel.watcher import maintain
         service._background = asyncio.create_task(maintain(service), name="codeintel-maintenance")

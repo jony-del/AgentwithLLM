@@ -8,6 +8,18 @@ from pathlib import Path
 from typing import Any
 
 
+def native_path(path: str | Path) -> str:
+    """OS spelling only; callers retain canonical paths for containment checks.
+
+    Windows private state paths can exceed MAX_PATH in nested task directories.
+    The extended prefix must never participate in lexical trust-root comparisons.
+    """
+    raw = os.path.abspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\"):
+        return raw
+    return "\\\\?\\UNC\\" + raw[2:] if raw.startswith("\\\\") else "\\\\?\\" + raw
+
+
 def checked_path(path: Path, root: Path) -> Path:
     """Check the lexical path and every existing component before following links."""
     path = Path(os.path.abspath(path))
@@ -21,7 +33,7 @@ def checked_path(path: Path, root: Path) -> Path:
         if component is not None:
             current = current / component
         try:
-            info = current.lstat()
+            info = os.lstat(native_path(current))
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
@@ -39,7 +51,7 @@ def checked_path(path: Path, root: Path) -> Path:
 
 def identity(path: Path) -> tuple[int, int] | None:
     try:
-        info = path.lstat()
+        info = os.lstat(native_path(path))
     except FileNotFoundError:
         return None
     return info.st_dev, info.st_ino
@@ -48,7 +60,7 @@ def identity(path: Path) -> tuple[int, int] | None:
 def private_path(path: Path) -> None:
     """Reject foreign ownership and write grants; never repair an existing ACL."""
     try:
-        info = path.lstat()
+        info = os.lstat(native_path(path))
     except FileNotFoundError:
         return
     if os.name == "nt":
@@ -105,7 +117,7 @@ def _windows_private(path: Path) -> None:
     finally:
         kernel.CloseHandle(token)
     owner, acl, descriptor = pointer(), pointer(), pointer()
-    error = advapi.GetNamedSecurityInfoW(str(path), 1, 5, ctypes.byref(owner), None, ctypes.byref(acl), None, ctypes.byref(descriptor))
+    error = advapi.GetNamedSecurityInfoW(native_path(path), 1, 5, ctypes.byref(owner), None, ctypes.byref(acl), None, ctypes.byref(descriptor))
     if error:
         raise ctypes.WinError(error)
     try:

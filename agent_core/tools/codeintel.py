@@ -41,7 +41,8 @@ class CodeSearchTool(_CodeTool):
     name = "code_search"
     description = ("Search versioned code facts: paths, text, Python symbols and syntactic references. "
                    "Starts in task modules unless path/modules or expand=true is provided. "
-                   "Reports incomplete coverage; use polaris code build to construct the index.")
+                   "Reports incomplete coverage and repeated queries; follow exploration.next_action to continue or adjust scope. "
+                   "Use polaris code build to construct the index.")
     input_schema = {"type": "object", "properties": {
         "query": {"type": "string", "minLength": 1},
         "kind": {"enum": ["auto", "path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency"]},
@@ -58,21 +59,29 @@ class CodeSearchTool(_CodeTool):
         implicit_scope = "modules" not in arguments and not arguments.get("expand") and not arguments.get("path")
         if implicit_scope:
             modules = self.session.code_working_set.modules()
-        page = await service.search(SearchRequest(
+        request = SearchRequest(
             query=str(arguments["query"]), kind=str(arguments.get("kind", "auto")),
             path=str(arguments.get("path", ".")), modules=modules,
             language=arguments.get("language"), regex=bool(arguments.get("regex")),
             ignore_case=bool(arguments.get("ignore_case")), limit=int(arguments.get("limit", 100)),
             cursor=arguments.get("cursor"), direction=str(arguments.get("direction", "incoming")),
-            expand_scope=implicit_scope), scope=current_execution_scope(),
+            expand_scope=implicit_scope)
+        page = await service.search(request, scope=current_execution_scope(),
             allowed=lambda path: path_allowed(self.session, path, self.name))
+        new_evidence = 0
         for hit in page.hits:
-            self.session.code_working_set.add(hit)
+            new_evidence += self.session.code_working_set.add(hit)
             remember_version(self.session, hit.path, hit.version.to_dict())
         body = page.to_dict()
+        body["exploration"] = self.session.code_working_set.exploration.record(
+            request, page, tool=self.name, new_evidence=new_evidence)
         if modules:
             body["scope_hint"] = "local first; coverage.checked identifies any expanded ranges" if implicit_scope else "explicit module scope"
-        return ToolResult(self.name, json.dumps(body, ensure_ascii=False), metadata={"codeintel": body})
+        recovery = dict(arguments)
+        if implicit_scope and not arguments.get("cursor"):
+            recovery["modules"] = [] if page.usage.get("scope_expansions") else list(modules)
+        return ToolResult(self.name, json.dumps(body, ensure_ascii=False), metadata={
+            "codeintel": body, "code_recovery": {"tool": self.name, "arguments": recovery}})
 
 
 @builtin_tool
@@ -92,10 +101,18 @@ class CodeRelationsTool(CodeSearchTool):
                 path=str(arguments.get("path", ".")), modules=tuple(arguments.get("modules", [])),
                 scope=current_execution_scope(), allowed=lambda path: path_allowed(self.session, path, self.name))
             assert self.session.code_working_set is not None
+            new_evidence = 0
             for hit in page.hits:
-                self.session.code_working_set.add(hit, reason="relation_expansion")
+                new_evidence += self.session.code_working_set.add(hit, reason="relation_expansion")
                 remember_version(self.session, hit.path, hit.version.to_dict())
-            return ToolResult(self.name, json.dumps(page.to_dict(), ensure_ascii=False), metadata={"codeintel": page.to_dict()})
+            body = page.to_dict()
+            request = SearchRequest(str(arguments["query"]), kind=str(arguments.get("kind", "references")),
+                path=str(arguments.get("path", ".")), modules=tuple(arguments.get("modules", [])),
+                direction=str(arguments.get("direction", "incoming")))
+            body["exploration"] = self.session.code_working_set.exploration.record(
+                request, page, tool=self.name, depth=int(arguments["depth"]), new_evidence=new_evidence)
+            return ToolResult(self.name, json.dumps(body, ensure_ascii=False), metadata={
+                "codeintel": body, "code_recovery": {"tool": self.name, "arguments": dict(arguments)}})
         return await super().run({"kind": "references", **arguments})
 
 
@@ -118,4 +135,28 @@ class CodeContextTool(_CodeTool):
         self.session.code_working_set.add(hit, reason="explicit_read")
         remember_version(self.session, hit.path, hit.version.to_dict())
         return ToolResult(self.name, json.dumps(asdict(hit), ensure_ascii=False),
-                          metadata={"file_version": hit.version.to_dict()})
+                          metadata={"file_version": hit.version.to_dict(), "code_recovery": {
+                              "tool": self.name, "arguments": {**arguments, "expected_version": hit.version.to_dict()}}})
+
+
+@builtin_tool
+class CodeValidateTool(_CodeTool):
+    name = "code_validate"
+    description = ("Before editing a candidate, reread its current bytes and validate expected_version and a unique "
+                   "literal anchor; optionally require its Python symbol identity. Does not prove behavioral relevance. "
+                   "Use returned expected_version as the edit precondition; validate each file separately.")
+    input_schema = {"type": "object", "properties": {
+        "path": {"type": "string"}, "expected_version": {"type": "object"},
+        "anchor": {"type": "string", "minLength": 1}, "symbol": {"type": "object"}},
+        "required": ["path", "expected_version", "anchor"]}
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        path = str(arguments["path"])
+        if not path_allowed(self.session, path, self.name):
+            return ToolResult(self.name, "Candidate is restricted by read policy.", ok=False)
+        service = await get_service(self.session)
+        result = await service.validate_candidate(path, arguments["expected_version"], arguments["anchor"],
+            arguments.get("symbol"), scope=current_execution_scope())
+        remember_version(self.session, result["path"], result["expected_version"])
+        return ToolResult(self.name, json.dumps(result, ensure_ascii=False), metadata={
+            "file_version": result["expected_version"], "code_recovery": {"tool": self.name, "arguments": dict(arguments)}})

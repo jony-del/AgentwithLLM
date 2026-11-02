@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-01T14:27:01.648851+00:00",
+  "environment": {
+    "python": "3.12.13",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "storage_kind": "JournalStorage.local (no per-object private-root ACL checks)"
+  },
+  "corpus": {
+    "files": 512,
+    "bytes_per_file": 4096,
+    "source_bytes": 2097152,
+    "unique_initial_contents": 512
+  },
+  "phases": {
+    "cold_capture": {
+      "seconds": 4.906999999999243,
+      "files": 512,
+      "source_bytes": 2097152,
+      "bytes_hashed": 2097152,
+      "files_reused": 0,
+      "new_blobs": 512,
+      "reused_blobs": 0,
+      "bytes_stored": 2097152,
+      "bytes_read": 2097152,
+      "bytes_staged": 2097152,
+      "inventory": "walk",
+      "strict": true,
+      "inventory_seconds": 0.046999999998661224,
+      "hash_seconds": 4.688000000001921,
+      "stability_seconds": 0.09399999999732245,
+      "publish_seconds": 0.07800000000133878
+    },
+    "checkpoint": {
+      "seconds": 0.10967810000147438
+    },
+    "unchanged_strict": {
+      "seconds": 0.625,
+      "files": 512,
+      "source_bytes": 2097152,
+      "bytes_hashed": 2097152,
+      "files_reused": 0,
+      "new_blobs": 0,
+      "reused_blobs": 512,
+      "bytes_stored": 0,
+      "bytes_read": 2097152,
+      "bytes_staged": 0,
+      "inventory": "walk",
+      "strict": true,
+      "inventory_seconds": 0.046999999998661224,
+      "hash_seconds": 0.4370000000053551,
+      "stability_seconds": 0.07899999999790452,
+      "publish_seconds": 0.06199999999807915
+    },
+    "single_file_change": {
+      "seconds": 0.625,
+      "files": 512,
+      "source_bytes": 2093076,
+      "bytes_hashed": 2093076,
+      "files_reused": 0,
+      "new_blobs": 1,
+      "reused_blobs": 511,
+      "bytes_stored": 20,
+      "bytes_read": 2093076,
+      "bytes_staged": 20,
+      "inventory": "walk",
+      "strict": true,
+      "inventory_seconds": 0.046999999998661224,
+      "hash_seconds": 0.4220000000059372,
+      "stability_seconds": 0.09399999999732245,
+      "publish_seconds": 0.06199999999807915
+    },
+    "materialize_and_verify": {
+      "seconds": 3.31547639999917,
+      "files": 512,
+      "bytes_copied": 2093076
+    },
+    "lease_cold": {
+      "seconds": 1.3282704000012018,
+      "reused": false,
+      "files_reused": 0
+    },
+    "lease_clean_reuse": {
+      "seconds": 1.2016438999999082,
+      "reused": true,
+      "files_reused": 512
+    }
+  },
+  "peak_process_memory_bytes": 184791040,
+  "task_state_bytes": 890,
+  "checkpoint_record_bytes": 444,
+  "snapshot_manifest_bytes": 62548,
+  "limitations": [
+    "synthetic corpus; content uniqueness specified in corpus metadata",
+    "strict capture still hashes all source bytes",
+    "bytes_stored counts retained new object bodies, excluding staging writes and manifest/pointer overhead",
+    "peak process memory includes corpus generation and Python/runtime metadata",
+    "single sample per phase; not a P95 or end-to-end coding success claim",
+    "local journal backend; partitioned user-state ACL validation overhead is not measured",
+    "verification-copy measurements include hash checking; no real container/VM measured",
+    "lease_cold means first lease; CAS and OS caches may already be warm"
+  ]
+}

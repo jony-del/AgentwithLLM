@@ -14,6 +14,7 @@ from typing import Iterable, Iterator, Callable, Generator, Any, cast
 
 from agent_core.codeintel.budget import BudgetExceeded, QueryBudget
 from agent_core.codeintel.snapshots import IGNORED_DIRS
+from agent_core.codeintel.paths import excluded_path
 from agent_core.permission_safety import is_secret_path
 
 
@@ -24,6 +25,8 @@ def walk_files(root: Path, base: Path, budget: QueryBudget, *, ignored: frozense
     transaction = context.workspace_view if context else None
     if project and transaction is not None and hasattr(transaction, "query_files"):
         yield from transaction.query_files(base.relative_to(root), budget, ignored)
+        return
+    if excluded_path(base.relative_to(root).as_posix(), budget.config.exclude_paths, directory=base.is_dir()):
         return
     if base.is_file():
         budget.consume(candidates=1)
@@ -45,7 +48,10 @@ def walk_files(root: Path, base: Path, budget: QueryBudget, *, ignored: frozense
             path = Path(entry.path)
             if entry.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()) or is_secret_path(path):
                 continue
-            if entry.is_dir(follow_symlinks=False):
+            is_directory = entry.is_dir(follow_symlinks=False)
+            if excluded_path(path.relative_to(root).as_posix(), budget.config.exclude_paths, directory=is_directory):
+                continue
+            if is_directory:
                 if entry.name not in ignored:
                     pending.append(path)
             elif entry.is_file(follow_symlinks=False):
@@ -161,11 +167,14 @@ _REGEX_CHILD = (
     "    for i,s in enumerate(data.decode('utf-8','replace').splitlines(),1):\n"
     "        if '\\x00' in s: continue\n"
     "        if p.search(s): o.write(name.decode('utf-8','replace')+'\\x00'+str(i)+'\\x00'+s+'\\n')\n"
+    "    o.write(name.decode('utf-8','replace')+'\\x00done\\x00\\n')\n"
+    "    o.flush()\n"
 )
 
 
 def regex_files(pattern: str, producer: Callable[[], Iterable[tuple[str, bytes]]], root: Path,
-                budget: QueryBudget, ignore_case: bool = False) -> Generator[tuple[str, int, str], None, None]:
+                budget: QueryBudget, ignore_case: bool = False, *,
+                on_file_complete: Callable[[str], None] | None = None) -> Generator[tuple[str, int, str], None, None]:
     """Match a regex against many files through ONE killable child process.
 
     Input frames are ``name\\x00size\\n<bytes>``; matches come back as
@@ -174,7 +183,7 @@ def regex_files(pattern: str, producer: Callable[[], Iterable[tuple[str, bytes]]
     The producer is pull-driven from the feed thread under the caller's context, so
     matching overlaps with reading and partial matches survive a dead budget.
     """
-    command = [sys.executable, "-X", "utf8", "-c", _REGEX_CHILD, pattern, "1" if ignore_case else "0"]
+    command = [sys.executable, "-u", "-X", "utf8", "-c", _REGEX_CHILD, pattern, "1" if ignore_case else "0"]
     caller_context = contextvars.copy_context()
 
     def feed(stdin: Any) -> None:
@@ -194,5 +203,7 @@ def regex_files(pattern: str, producer: Callable[[], Iterable[tuple[str, bytes]]
             if not sep:
                 continue
             number, sep, content = rest.partition("\x00")
+            if sep and number == "done" and on_file_complete is not None:
+                on_file_complete(name)
             if sep and number.isdigit():
                 yield name, int(number), content

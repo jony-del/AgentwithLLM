@@ -9,8 +9,8 @@ from agent_core.codeintel.models import FileVersion, StaleEvidence
 from agent_core.permission_safety import is_secret_path
 
 IGNORED_DIRS = frozenset({".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
-                         ".ruff_cache", "node_modules", ".venv", "venv", "env", "dist", "build",
-                         ".idea", ".vscode", "runs", "memory", ".polaris"})
+                         ".ruff_cache", "node_modules", ".venv", "venv",
+                         ".idea", ".vscode", ".polaris"})
 
 
 def worktree_id(root: Path) -> str:

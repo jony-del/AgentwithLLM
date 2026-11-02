@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-02T01:09:02.889283+00:00",
+  "description": "Offline synthetic maintenance before/after, Windows, 2026-11-02; no LLM/network calls.",
+  "command": "python -B benchmarks/codeintel_maintenance.py --files 128 --lines-per-file 200 --samples 10 --output <report.json>",
+  "execution": {
+    "mode": "normal Windows process after automatic escalation review",
+    "reason": "restricted sandbox blocks asyncio Windows Proactor self-pipe socketpair/accept before benchmark starts"
+  },
+  "comparison_checks": {
+    "same_corpus": true,
+    "same_environment": true,
+    "same_common_config": true,
+    "both_fully_drained": true,
+    "new_after_config": {
+      "maintenance_seconds": 0.25,
+      "maintenance_files": 128,
+      "max_concurrent_requests": 4
+    }
+  },
+  "before": {
+    "schema_version": 1,
+    "captured_at": "2026-11-02T01:00:24.822954+00:00",
+    "environment": {
+      "python": "3.12.13",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "processor": "AMD64 Family 25 Model 117 Stepping 2, AuthenticAMD",
+      "cpu_count": 16
+    },
+    "config": {
+      "enabled": true,
+      "strict_versions": false,
+      "maintain": false,
+      "watch": false,
+      "reconcile_seconds": 60.0,
+      "query_seconds": 5.0,
+      "max_files": 2000,
+      "max_bytes": 67108864,
+      "max_file_bytes": 2097152,
+      "max_results": 100,
+      "max_candidates": 10000,
+      "max_context_tokens": 8000,
+      "max_depth": 2,
+      "max_edges": 2000,
+      "max_shards": 4,
+      "cache_entries": 128,
+      "max_index_bytes": 8589934592,
+      "exclude_paths": [
+        "build",
+        "dist",
+        "env",
+        "memory",
+        "runs"
+      ]
+    },
+    "corpus": {
+      "files": 128,
+      "initial_lines_per_file": 200,
+      "initial_loc": 25600,
+      "samples": 10
+    },
+    "build": {
+      "seconds": 2.840324699999883,
+      "ast_parse_count": 128,
+      "slices": 1
+    },
+    "unchanged_audit": {
+      "seconds": 0.9453985000000102,
+      "ast_parse_count": 128,
+      "slices": 1
+    },
+    "single_file_publish_and_drain": {
+      "samples": [
+        0.054425499999979365,
+        0.058971699999801785,
+        0.058077400000001944,
+        0.05587009999999282,
+        0.06526359999998022,
+        0.06328549999989264,
+        0.06231670000011036,
+        0.056183600000167644,
+        0.06270480000011958,
+        0.062479700000039884
+      ],
+      "count": 10,
+      "p50": 0.06064419999995607,
+      "p95": 0.06526359999998022,
+      "unit": "seconds",
+      "ast_parse_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "maintenance_slices": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "query_during_maintenance": {
+      "samples": [
+        0.026036399999838977,
+        0.024653100000023187,
+        0.009576599999945756,
+        0.012686799999983123,
+        0.00897009999994225,
+        0.010033300000031886,
+        0.016811299999972107,
+        0.01000649999991765,
+        0.009315700000115612,
+        0.013566100000161896
+      ],
+      "count": 10,
+      "p50": 0.011360050000007504,
+      "p95": 0.026036399999838977,
+      "unit": "seconds",
+      "overlap_observed": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "maintenance_seconds": [
+        0.05493890000002466,
+        0.059201999999913824,
+        0.059251699999776974,
+        0.07094119999987925,
+        0.056298599999990984,
+        0.05754700000011326,
+        0.056986599999845566,
+        0.05520240000009835,
+        0.05654359999994085,
+        0.05317579999996269
+      ]
+    },
+    "final_status": {
+      "schema_version": 1,
+      "workspace": "E:\\ZNGZ\\Code_copy\\learning_proj\\AgentwithLLM\\tmp\\maintenance-bench-9ll5b7oi\\repo",
+      "parser_fingerprint": "python-ast-v1:py3.12:manifests-v1:module-boundaries-v1",
+      "worktree_id": "39cef811070f9004d37f2f6d",
+      "generation": 426,
+      "catalog_complete": true,
+      "last_reconcile": 1793581219.8234568,
+      "fts": true,
+      "files": 128,
+      "pending": 0,
+      "states": {
+        "ready": 128
+      },
+      "modules": {
+        ".": 128
+      },
+      "structured_languages": [
+        "python"
+      ],
+      "reference_precision": "syntactic",
+      "watcher": "not_started"
+    },
+    "limitations": [
+      "synthetic Python-only workload; no LLM, network or real coding-task execution",
+      "P95 uses nearest-rank; sample count is explicit; OS and SQLite caches are not flushed",
+      "concurrency overlap describes async operation lifetimes, not simultaneous CPU execution",
+      "AST calls are counted by temporarily wrapping indexer.python_structure, then restoring it",
+      "query truth checks one unchanged file and current source locations, not corpus-wide Recall@K"
+    ]
+  },
+  "after": {
+    "schema_version": 1,
+    "captured_at": "2026-11-02T01:08:49.384014+00:00",
+    "environment": {
+      "python": "3.12.13",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "processor": "AMD64 Family 25 Model 117 Stepping 2, AuthenticAMD",
+      "cpu_count": 16
+    },
+    "config": {
+      "enabled": true,
+      "strict_versions": false,
+      "maintain": false,
+      "watch": false,
+      "reconcile_seconds": 60.0,
+      "query_seconds": 5.0,
+      "maintenance_seconds": 0.25,
+      "maintenance_files": 128,
+      "max_concurrent_requests": 4,
+      "max_files": 2000,
+      "max_bytes": 67108864,
+      "max_file_bytes": 2097152,
+      "max_results": 100,
+      "max_candidates": 10000,
+      "max_context_tokens": 8000,
+      "max_depth": 2,
+      "max_edges": 2000,
+      "max_shards": 4,
+      "cache_entries": 128,
+      "max_index_bytes": 8589934592,
+      "exclude_paths": [
+        "build",
+        "dist",
+        "env",
+        "memory",
+        "runs"
+      ]
+    },
+    "corpus": {
+      "files": 128,
+      "initial_lines_per_file": 200,
+      "initial_loc": 25600,
+      "samples": 10
+    },
+    "build": {
+      "seconds": 1.9409095000000889,
+      "ast_parse_count": 128,
+      "slices": 6
+    },
+    "unchanged_audit": {
+      "seconds": 0.29542080000010174,
+      "ast_parse_count": 0,
+      "slices": 2
+    },
+    "single_file_publish_and_drain": {
+      "samples": [
+        0.038467599999876256,
+        0.03919949999999517,
+        0.04808109999999033,
+        0.055443300000206364,
+        0.051226300000053016,
+        0.05401080000001457,
+        0.05921669999997903,
+        0.05149840000012773,
+        0.05384140000001025,
+        0.0495594000001347
+      ],
+      "count": 10,
+      "p50": 0.05136235000009037,
+      "p95": 0.05921669999997903,
+      "unit": "seconds",
+      "ast_parse_counts": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "maintenance_slices": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "query_during_maintenance": {
+      "samples": [
+        0.010719499999822801,
+        0.010846299999911935,
+        0.02173470000002453,
+        0.025695200000200202,
+        0.010037799999963681,
+        0.018752699999822653,
+        0.010734700000057273,
+        0.017720000000053915,
+        0.025221500000043306,
+        0.020537599999897793
+      ],
+      "count": 10,
+      "p50": 0.018236349999938284,
+      "p95": 0.025695200000200202,
+      "unit": "seconds",
+      "overlap_observed": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "maintenance_seconds": [
+        0.044946299999992334,
+        0.0449753000000328,
+        0.04830179999999018,
+        0.052353300000049785,
+        0.04611709999994673,
+        0.056685099999867816,
+        0.06151989999989382,
+        0.04751489999989644,
+        0.06012400000008711,
+        0.04761759999996684
+      ]
+    },
+    "final_status": {
+      "schema_version": 1,
+      "workspace": "E:\\ZNGZ\\Code_copy\\learning_proj\\AgentwithLLM\\tmp\\maintenance-bench-9k7spanr\\repo",
+      "parser_fingerprint": "python-ast-v1:py3.12:manifests-v1:module-boundaries-v1",
+      "worktree_id": "d57078660587c078b85bda4e",
+      "generation": 426,
+      "catalog_complete": true,
+      "last_reconcile": 1793581726.0801756,
+      "fts": true,
+      "files": 128,
+      "pending": 0,
+      "states": {
+        "ready": 128
+      },
+      "modules": {
+        ".": 128
+      },
+      "structured_languages": [
+        "python"
+      ],
+      "reference_precision": "syntactic",
+      "watcher": "not_started"
+    },
+    "limitations": [
+      "synthetic Python-only workload; no LLM, network or real coding-task execution",
+      "P95 uses nearest-rank; sample count is explicit; OS and SQLite caches are not flushed",
+      "concurrency overlap describes async operation lifetimes, not simultaneous CPU execution",
+      "AST calls are counted by temporarily wrapping indexer.python_structure, then restoring it",
+      "query truth checks one unchanged file and current source locations, not corpus-wide Recall@K"
+    ]
+  },
+  "observed_metrics": {
+    "build.seconds": {
+      "before": 2.840324699999883,
+      "after": 1.9409095000000889,
+      "absolute_delta": -0.8994151999997939,
+      "relative_delta_percent": -31.665928898897757
+    },
+    "build.ast_parse_count": {
+      "before": 128,
+      "after": 128,
+      "absolute_delta": 0,
+      "relative_delta_percent": 0.0
+    },
+    "build.slices": {
+      "before": 1,
+      "after": 6,
+      "absolute_delta": 5,
+      "relative_delta_percent": 500.0
+    },
+    "unchanged_audit.seconds": {
+      "before": 0.9453985000000102,
+      "after": 0.29542080000010174,
+      "absolute_delta": -0.6499776999999085,
+      "relative_delta_percent": -68.75171686859049
+    },
+    "unchanged_audit.ast_parse_count": {
+      "before": 128,
+      "after": 0,
+      "absolute_delta": -128,
+      "relative_delta_percent": -100.0
+    },
+    "unchanged_audit.slices": {
+      "before": 1,
+      "after": 2,
+      "absolute_delta": 1,
+      "relative_delta_percent": 100.0
+    },
+    "single_file_publish_and_drain.p50": {
+      "before": 0.06064419999995607,
+      "after": 0.05136235000009037,
+      "absolute_delta": -0.009281849999865699,
+      "relative_delta_percent": -15.305420798481013
+    },
+    "single_file_publish_and_drain.p95": {
+      "before": 0.06526359999998022,
+      "after": 0.05921669999997903,
+      "absolute_delta": -0.0060469000000011874,
+      "relative_delta_percent": -9.265348525063008
+    },
+    "query_during_maintenance.p50": {
+      "before": 0.011360050000007504,
+      "after": 0.018236349999938284,
+      "absolute_delta": 0.0068762999999307794,
+      "relative_delta_percent": 60.53054343886019
+    },
+    "query_during_maintenance.p95": {
+      "before": 0.026036399999838977,
+      "after": 0.025695200000200202,
+      "absolute_delta": -0.0003411999996387749,
+      "relative_delta_percent": -1.3104730286863202
+    }
+  },
+  "observations": [
+    "Unchanged audit AST calls decreased from 128 to 0, while all files were hash-audited and the pending queue fully drained. This directly demonstrates extraction reuse, not a skipped source audit.",
+    "Observed audit wall time decreased from 0.9453985 s to 0.2954208 s in one corpus run; timing is sensitive to filesystem/cache state.",
+    "Build work was split from 1 to 6 calls, with exactly 128 AST calls before and after. The final implementation checks its soft slice deadline between files and retains a hard query/parent deadline for an admitted file.",
+    "Single-file incremental updates still executed exactly 1 AST parse per sample before and after; extraction work did not improve on this workload.",
+    "Incremental P95 decreased from 65.2636 ms to 59.2167 ms in this run; the sample size and one before/after ordering do not establish statistical significance or general speedup.",
+    "Concurrent-query P95 was 26.0364 ms before and 25.6952 ms after, essentially unchanged for this sample. No material query-latency improvement is demonstrated.",
+    "Concurrent-query P50 increased from 11.36005 ms to 18.23635 ms in this run. This regression and nearly unchanged P95 mean the sample does not demonstrate improved concurrent-query efficiency; repeat randomized measurements before tuning.",
+    "Every concurrent query located the stable probe symbol at file f000000.py line 1, and every async maintenance/query lifetime overlapped. This is a limited retrieval truth check."
+  ],
+  "limitations": [
+    "Only 128 files / 25600 initial lines of synthetic Python; not a million-line, ten-million-line, cross-language or real task acceptance benchmark.",
+    "One full build and one unchanged audit per version; 10 incremental and 10 concurrent-query samples; nearest-rank P95 with 10 samples is the maximum observed value.",
+    "Before was run first, after second; OS/SQLite caches were not flushed; this run has no randomized repeated trials or confidence intervals.",
+    "The baseline source tree was not fingerprinted before editing core; full configuration, environment, timestamps, raw samples and counters are preserved.",
+    "The script uses default detailed status on each drain call; it does not isolate or benchmark the new light-status optimization used by background/CLI loops.",
+    "No write-contention saturation, watcher burst stress, cancellation latency, memory/index-size scaling or publish-lock waiting measurements are claimed.",
+    "Semantic correctness and real Coding task success are not measured; actual source hash verification remains mandatory.",
+    "The final after run replaces an intermediate run that re-extracted one file at a hard slice boundary; final numbers correspond to the corrected soft-boundary implementation."
+  ]
+}

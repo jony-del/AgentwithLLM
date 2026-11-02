@@ -1,0 +1,620 @@
+{
+  "schema_version": 1,
+  "measured_on": [
+    "2026-10-29",
+    "2026-10-30"
+  ],
+  "baseline_report": "source-snapshot-report.json",
+  "benchmark": "source_snapshots.py",
+  "method": {
+    "storage": "JournalStorage.local; no per-object private-root ACL checks",
+    "parallel_benchmarks": false,
+    "samples_per_phase": 1,
+    "os_cache": "not flushed",
+    "unique_final_date": "2026-10-29",
+    "repeated_and_bytes_final_date": "2026-10-30"
+  },
+  "cases": {
+    "file_count_boundary": {
+      "schema_version": 1,
+      "environment": {
+        "python": "3.12.13",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "storage_kind": "JournalStorage.local (no per-object private-root ACL checks)"
+      },
+      "corpus": {
+        "files": 21001,
+        "bytes_per_file": 16,
+        "source_bytes": 336016,
+        "unique_initial_contents": 8
+      },
+      "phases": {
+        "cold_capture": {
+          "seconds": 41.51599999999962,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 8,
+          "reused_blobs": 20993,
+          "bytes_stored": 128,
+          "bytes_read": 336016,
+          "bytes_staged": 128,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 1.6089999999994689,
+          "hash_seconds": 36.14100000000053,
+          "stability_seconds": 3.594000000000051,
+          "publish_seconds": 0.17199999999957072
+        },
+        "checkpoint": {
+          "seconds": 0.5333594000003359
+        },
+        "unchanged_strict": {
+          "seconds": 23.328999999999724,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 0,
+          "reused_blobs": 21001,
+          "bytes_stored": 0,
+          "bytes_read": 336016,
+          "bytes_staged": 0,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 1.6409999999996217,
+          "hash_seconds": 17.73400000000038,
+          "stability_seconds": 3.8599999999996726,
+          "publish_seconds": 0.09400000000005093
+        },
+        "single_file_change": {
+          "seconds": 23.640000000000327,
+          "files": 21001,
+          "source_bytes": 336020,
+          "bytes_hashed": 336020,
+          "files_reused": 0,
+          "new_blobs": 1,
+          "reused_blobs": 21000,
+          "bytes_stored": 20,
+          "bytes_read": 336020,
+          "bytes_staged": 20,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 1.6400000000003274,
+          "hash_seconds": 18.313000000000102,
+          "stability_seconds": 3.514999999999418,
+          "publish_seconds": 0.1720000000004802
+        },
+        "materialize_and_verify": {
+          "seconds": 58.41415599999982,
+          "files": 21001,
+          "bytes_copied": 336020
+        }
+      },
+      "peak_process_memory_bytes": 199933952,
+      "task_state_bytes": 921,
+      "checkpoint_record_bytes": 477,
+      "snapshot_manifest_bytes": 2557109,
+      "limitations": [
+        "synthetic corpus; content uniqueness specified in corpus metadata",
+        "strict capture still hashes all source bytes",
+        "bytes_stored counts retained new object bodies, excluding staging writes and manifest/pointer overhead",
+        "peak process memory includes corpus generation and Python/runtime metadata",
+        "single sample per phase; not a P95 or end-to-end coding success claim",
+        "local journal backend; partitioned user-state ACL validation overhead is not measured",
+        "verification-copy measurements include hash checking; no real container/VM measured"
+      ]
+    },
+    "unique_file_count": {
+      "schema_version": 1,
+      "environment": {
+        "python": "3.12.13",
+        "platform": "Windows-11-10.0.26200-SP0"
+      },
+      "corpus": {
+        "files": 21001,
+        "bytes_per_file": 16,
+        "source_bytes": 336016,
+        "unique_initial_contents": 21001
+      },
+      "phases": {
+        "cold_capture": {
+          "seconds": 374.98499999998603,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 21001,
+          "reused_blobs": 0,
+          "bytes_stored": 336016,
+          "bytes_read": 336016,
+          "bytes_staged": 336016,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 1.9059999999881256,
+          "hash_seconds": 366.3289999999979,
+          "stability_seconds": 4.203000000008615,
+          "publish_seconds": 2.5469999999913853
+        },
+        "checkpoint": {
+          "seconds": 2.744932000001427
+        },
+        "unchanged_strict": {
+          "seconds": 31.73399999999674,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 0,
+          "reused_blobs": 21001,
+          "bytes_stored": 0,
+          "bytes_read": 336016,
+          "bytes_staged": 0,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 1.9210000000020955,
+          "hash_seconds": 23.10999999998603,
+          "stability_seconds": 4.328000000008615,
+          "publish_seconds": 2.375
+        },
+        "single_file_change": {
+          "seconds": 31.703000000008615,
+          "files": 21001,
+          "source_bytes": 336020,
+          "bytes_hashed": 336020,
+          "files_reused": 0,
+          "new_blobs": 1,
+          "reused_blobs": 21000,
+          "bytes_stored": 20,
+          "bytes_read": 336020,
+          "bytes_staged": 20,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 2.25,
+          "hash_seconds": 22.73399999999674,
+          "stability_seconds": 4.282000000006519,
+          "publish_seconds": 2.437000000005355
+        },
+        "materialize_and_verify": {
+          "seconds": 361.8919356999977,
+          "files": 21001,
+          "bytes_copied": 336020
+        }
+      },
+      "peak_process_memory_bytes": 202334208,
+      "task_state_bytes": 922,
+      "checkpoint_record_bytes": 476,
+      "snapshot_manifest_bytes": 2557109,
+      "limitations": [
+        "synthetic corpus; content uniqueness specified in corpus metadata",
+        "strict capture still hashes all source bytes",
+        "bytes_stored counts retained new object bodies, excluding staging writes and manifest/pointer overhead",
+        "peak process memory includes corpus generation and Python/runtime metadata",
+        "single sample per phase; not a P95 or end-to-end coding success claim",
+        "verification-copy measurements include hash checking; no real container/VM measured"
+      ]
+    },
+    "source_bytes_boundary": {
+      "schema_version": 1,
+      "environment": {
+        "python": "3.12.13",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "storage_kind": "JournalStorage.local (no per-object private-root ACL checks)"
+      },
+      "corpus": {
+        "files": 33,
+        "bytes_per_file": 16777216,
+        "source_bytes": 553648128,
+        "unique_initial_contents": 8
+      },
+      "phases": {
+        "cold_capture": {
+          "seconds": 1.4529999999995198,
+          "files": 33,
+          "source_bytes": 553648128,
+          "bytes_hashed": 553648128,
+          "files_reused": 0,
+          "new_blobs": 8,
+          "reused_blobs": 25,
+          "bytes_stored": 134217728,
+          "bytes_read": 553648128,
+          "bytes_staged": 553648128,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 0.014999999999417923,
+          "hash_seconds": 1.4070000000001528,
+          "stability_seconds": 0.0,
+          "publish_seconds": 0.03099999999994907
+        },
+        "checkpoint": {
+          "seconds": 0.05313399999977264
+        },
+        "unchanged_strict": {
+          "seconds": 0.46900000000005093,
+          "files": 33,
+          "source_bytes": 553648128,
+          "bytes_hashed": 553648128,
+          "files_reused": 0,
+          "new_blobs": 0,
+          "reused_blobs": 33,
+          "bytes_stored": 0,
+          "bytes_read": 553648128,
+          "bytes_staged": 0,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 0.016000000000531145,
+          "hash_seconds": 0.40599999999994907,
+          "stability_seconds": 0.01599999999962165,
+          "publish_seconds": 0.03099999999994907
+        },
+        "single_file_change": {
+          "seconds": 0.5160000000005311,
+          "files": 33,
+          "source_bytes": 536870932,
+          "bytes_hashed": 536870932,
+          "files_reused": 0,
+          "new_blobs": 1,
+          "reused_blobs": 32,
+          "bytes_stored": 20,
+          "bytes_read": 536870932,
+          "bytes_staged": 20,
+          "inventory": "walk",
+          "strict": true,
+          "inventory_seconds": 0.016000000000531145,
+          "hash_seconds": 0.4529999999995198,
+          "stability_seconds": 0.015000000000327418,
+          "publish_seconds": 0.032000000000152795
+        },
+        "materialize_and_verify": {
+          "seconds": 1.4759350000003906,
+          "files": 33,
+          "bytes_copied": 536870932
+        }
+      },
+      "peak_process_memory_bytes": 198967296,
+      "task_state_bytes": 922,
+      "checkpoint_record_bytes": 477,
+      "snapshot_manifest_bytes": 4261,
+      "limitations": [
+        "synthetic corpus; content uniqueness specified in corpus metadata",
+        "strict capture still hashes all source bytes",
+        "bytes_stored counts retained new object bodies, excluding staging writes and manifest/pointer overhead",
+        "peak process memory includes corpus generation and Python/runtime metadata",
+        "single sample per phase; not a P95 or end-to-end coding success claim",
+        "local journal backend; partitioned user-state ACL validation overhead is not measured",
+        "verification-copy measurements include hash checking; no real container/VM measured"
+      ]
+    }
+  },
+  "comparisons": {
+    "file_count_boundary": {
+      "cold_capture": {
+        "baseline_seconds": 190.8119999999908,
+        "optimized_seconds": 41.51599999999962,
+        "baseline_over_optimized": 4.596107524809533
+      },
+      "checkpoint": {
+        "baseline_seconds": 105.18647070000588,
+        "optimized_seconds": 0.5333594000003359,
+        "baseline_over_optimized": 197.21499367957074
+      },
+      "unchanged_strict": {
+        "baseline_seconds": 64.2039999999979,
+        "optimized_seconds": 23.328999999999724,
+        "baseline_over_optimized": 2.7521111063482646
+      },
+      "single_file_change": {
+        "baseline_seconds": 64.09299999999348,
+        "optimized_seconds": 23.640000000000327,
+        "baseline_over_optimized": 2.711209813874475
+      },
+      "materialize_and_verify": {
+        "baseline_seconds": 209.10049080000317,
+        "optimized_seconds": 58.41415599999982,
+        "baseline_over_optimized": 3.5796201660433784
+      }
+    },
+    "source_bytes_boundary": {
+      "cold_capture": {
+        "baseline_seconds": 1.389999999999418,
+        "optimized_seconds": 1.4529999999995198,
+        "baseline_over_optimized": 0.9566414315209066
+      },
+      "checkpoint": {
+        "baseline_seconds": 0.182179699986591,
+        "optimized_seconds": 0.05313399999977264,
+        "baseline_over_optimized": 3.4286840815178707
+      },
+      "unchanged_strict": {
+        "baseline_seconds": 0.48399999999674037,
+        "optimized_seconds": 0.46900000000005093,
+        "baseline_over_optimized": 1.0319829424236413
+      },
+      "single_file_change": {
+        "baseline_seconds": 0.4850000000005821,
+        "optimized_seconds": 0.5160000000005311,
+        "baseline_over_optimized": 0.9399224806203156
+      },
+      "materialize_and_verify": {
+        "baseline_seconds": 1.4106655000068713,
+        "optimized_seconds": 1.4759350000003906,
+        "baseline_over_optimized": 0.9557775240823599
+      }
+    }
+  },
+  "unique_intermediate_comparison": {
+    "description": "Intermediate implementation after SourceTreePaths, before SnapshotReader; not the pre-optimization baseline",
+    "before_materialize_and_verify_seconds": 354.4251679000008,
+    "after_materialize_and_verify_seconds": 361.8919356999977,
+    "conclusion": "No large-corpus speedup demonstrated by SnapshotReader in these single samples."
+  },
+  "reader_profile": {
+    "files": 512,
+    "bytes_per_file": 16,
+    "unique_contents": 512,
+    "method": "One corpus and CAS; cProfile on materialize into a fresh directory for each run. full_resolution routes SnapshotReader.path through SnapshotStore.blob_path; batch_reader uses production path checks. source_unchanged must pass after every run. Order: full, batch, batch, full. Profile overhead and cache order are not controlled.",
+    "runs": [
+      {
+        "mode": "full_resolution",
+        "seconds": 3.4223573999997825,
+        "verified": true,
+        "hotspots": [
+          {
+            "function": "materialize",
+            "calls": 1,
+            "self_seconds": 0.021715,
+            "cumulative_seconds": 3.4212115
+          },
+          {
+            "function": "stream_hash",
+            "calls": 512,
+            "self_seconds": 0.012370800000000001,
+            "cumulative_seconds": 1.3061025000000002
+          },
+          {
+            "function": "<built-in method _io.open>",
+            "calls": 1025,
+            "self_seconds": 1.2581103,
+            "cumulative_seconds": 1.2900609
+          },
+          {
+            "function": "open",
+            "calls": 1024,
+            "self_seconds": 0.0013912,
+            "cumulative_seconds": 1.2793995
+          },
+          {
+            "function": "<lambda>",
+            "calls": 512,
+            "self_seconds": 0.0007814,
+            "cumulative_seconds": 1.1742601000000001
+          },
+          {
+            "function": "blob_path",
+            "calls": 512,
+            "self_seconds": 0.0024199,
+            "cumulative_seconds": 1.1734787
+          },
+          {
+            "function": "validate",
+            "calls": 517,
+            "self_seconds": 0.0085403,
+            "cumulative_seconds": 1.1702143
+          },
+          {
+            "function": "checked_path",
+            "calls": 1034,
+            "self_seconds": 0.0225115,
+            "cumulative_seconds": 1.0642654
+          }
+        ]
+      },
+      {
+        "mode": "batch_reader",
+        "seconds": 1.4558727000003273,
+        "verified": true,
+        "hotspots": [
+          {
+            "function": "materialize",
+            "calls": 1,
+            "self_seconds": 0.0177583,
+            "cumulative_seconds": 1.4555366
+          },
+          {
+            "function": "stat",
+            "calls": 4666,
+            "self_seconds": 0.0025374,
+            "cumulative_seconds": 0.5528134
+          },
+          {
+            "function": "<built-in method nt.stat>",
+            "calls": 4666,
+            "self_seconds": 0.4563954,
+            "cumulative_seconds": 0.550276
+          },
+          {
+            "function": "lstat",
+            "calls": 4142,
+            "self_seconds": 0.0023138,
+            "cumulative_seconds": 0.48903880000000005
+          },
+          {
+            "function": "stream_hash",
+            "calls": 512,
+            "self_seconds": 0.0091797,
+            "cumulative_seconds": 0.2844359
+          },
+          {
+            "function": "path",
+            "calls": 512,
+            "self_seconds": 0.0014524000000000002,
+            "cumulative_seconds": 0.27902530000000003
+          },
+          {
+            "function": "open",
+            "calls": 1024,
+            "self_seconds": 0.001103,
+            "cumulative_seconds": 0.2747712
+          },
+          {
+            "function": "<built-in method _io.open>",
+            "calls": 1025,
+            "self_seconds": 0.25418840000000004,
+            "cumulative_seconds": 0.2738728
+          }
+        ]
+      },
+      {
+        "mode": "batch_reader",
+        "seconds": 1.4565036000003602,
+        "verified": true,
+        "hotspots": [
+          {
+            "function": "materialize",
+            "calls": 1,
+            "self_seconds": 0.0176643,
+            "cumulative_seconds": 1.4561413
+          },
+          {
+            "function": "stat",
+            "calls": 4666,
+            "self_seconds": 0.0025350000000000004,
+            "cumulative_seconds": 0.5602528
+          },
+          {
+            "function": "<built-in method nt.stat>",
+            "calls": 4666,
+            "self_seconds": 0.4632719,
+            "cumulative_seconds": 0.5577178
+          },
+          {
+            "function": "lstat",
+            "calls": 4142,
+            "self_seconds": 0.0022765000000000003,
+            "cumulative_seconds": 0.49382370000000003
+          },
+          {
+            "function": "stream_hash",
+            "calls": 512,
+            "self_seconds": 0.009296500000000001,
+            "cumulative_seconds": 0.2893892
+          },
+          {
+            "function": "path",
+            "calls": 512,
+            "self_seconds": 0.0015575,
+            "cumulative_seconds": 0.2819681
+          },
+          {
+            "function": "open",
+            "calls": 1024,
+            "self_seconds": 0.0010710000000000001,
+            "cumulative_seconds": 0.27676500000000004
+          },
+          {
+            "function": "<built-in method _io.open>",
+            "calls": 1025,
+            "self_seconds": 0.2563279,
+            "cumulative_seconds": 0.2758103
+          }
+        ]
+      },
+      {
+        "mode": "full_resolution",
+        "seconds": 2.260563799999545,
+        "verified": true,
+        "hotspots": [
+          {
+            "function": "materialize",
+            "calls": 1,
+            "self_seconds": 0.019081400000000002,
+            "cumulative_seconds": 2.2603024
+          },
+          {
+            "function": "<lambda>",
+            "calls": 512,
+            "self_seconds": 0.0006598,
+            "cumulative_seconds": 1.1140862
+          },
+          {
+            "function": "blob_path",
+            "calls": 512,
+            "self_seconds": 0.0021457,
+            "cumulative_seconds": 1.1134264
+          },
+          {
+            "function": "validate",
+            "calls": 517,
+            "self_seconds": 0.0075788,
+            "cumulative_seconds": 1.1097712000000002
+          },
+          {
+            "function": "checked_path",
+            "calls": 1034,
+            "self_seconds": 0.0213014,
+            "cumulative_seconds": 1.0062373
+          },
+          {
+            "function": "stat",
+            "calls": 3642,
+            "self_seconds": 0.0022802,
+            "cumulative_seconds": 0.4114084
+          },
+          {
+            "function": "<built-in method nt.stat>",
+            "calls": 3642,
+            "self_seconds": 0.3328338,
+            "cumulative_seconds": 0.40912820000000005
+          },
+          {
+            "function": "resolve",
+            "calls": 1035,
+            "self_seconds": 0.0030421000000000003,
+            "cumulative_seconds": 0.37814390000000003
+          }
+        ]
+      }
+    ]
+  },
+  "limitations": [
+    "Synthetic high-file-count and byte-boundary tests, not 1M/10M LOC task acceptance.",
+    "Single samples across two days; ratios are descriptive, not P50/P95 or a performance SLA.",
+    "Local journal storage excludes production partitioned private-state ACL overhead.",
+    "Repeated corpus contains only eight distinct bodies; unique corpus has 21,001 distinct bodies.",
+    "Unique-file cold capture and verification copy remain slow; no unique pre-optimization baseline was measured.",
+    "Strict certification still hashes every included source byte.",
+    "Small-file staging is deduplicated; first capture of large duplicate objects still stages repeated bytes.",
+    "Peak process memory includes corpus generation and runtime metadata; staging metrics exclude filesystem and journal overhead.",
+    "No real model, container/VM, coding success rate or source-index retrieval performance measured."
+  ],
+  "validation": {
+    "date": "2026-10-30",
+    "pytest": [
+      {
+        "report": "snapshot-exploration-gates.xml",
+        "tests": "498",
+        "failures": "0",
+        "errors": "0",
+        "skipped": "1",
+        "time": "219.699",
+        "skip_reasons": [
+          "symlink creation unavailable"
+        ]
+      },
+      {
+        "report": "snapshot-exploration-cli.xml",
+        "tests": "10",
+        "failures": "0",
+        "errors": "0",
+        "skipped": "0",
+        "time": "3.530",
+        "skip_reasons": []
+      }
+    ],
+    "ruff": "agent_core tests installer benchmarks/source_snapshots.py: passed",
+    "mypy": "218 production source files: passed",
+    "git_diff_check": "passed under repository line-ending configuration",
+    "run_record_inspection": "Scripted ReAct provider: three successful tool rounds, matched tool-call IDs, repeat counters 0 then 1 in events and transcript. No real LLM measured."
+  }
+}

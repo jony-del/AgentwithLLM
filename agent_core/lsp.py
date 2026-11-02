@@ -196,17 +196,21 @@ class _Server:
             if self.config.workspace_folder else self.workspace
         )
         root_uri = self.server_uri(workspace)
-        await asyncio.wait_for(self.request(
+        initialized = await asyncio.wait_for(self.request(
             "initialize",
             {
                 "processId": None if self.guest_mode else os.getpid(),
                 "rootUri": root_uri,
                 "workspaceFolders": [{"uri": root_uri, "name": self.workspace.name}],
-                "capabilities": {"textDocument": {"publishDiagnostics": {"relatedInformation": True}}},
+                "capabilities": {"general": {"positionEncodings": ["utf-16"]},
+                                 "textDocument": {"publishDiagnostics": {"relatedInformation": True}}},
                 "initializationOptions": self.config.initialization_options,
             },
             allow_restart=False,
         ), timeout=self.config.startup_timeout)
+        capabilities = initialized.get("capabilities", {}) if isinstance(initialized, dict) else {}
+        if not isinstance(capabilities, dict) or capabilities.get("positionEncoding", "utf-16") != "utf-16":
+            raise ValueError("LSP server selected an unsupported position encoding")
         await self.notify("initialized", {})
         if self.config.settings:
             await self.notify(
@@ -404,7 +408,7 @@ class LSPManager:
         self._servers[config.name] = server
         try:
             await server.start()
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             await server.close()
             await self._event("lsp_server_state", {"server": config.name, "state": "failed", "error": str(exc)})
             raise

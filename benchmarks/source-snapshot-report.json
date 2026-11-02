@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "measured_on": "2026-10-29",
+  "cases": {
+    "file_count_boundary": {
+      "schema_version": 1,
+      "environment": {
+        "python": "3.12.13",
+        "platform": "Windows-11-10.0.26200-SP0"
+      },
+      "corpus": {
+        "files": 21001,
+        "bytes_per_file": 16,
+        "source_bytes": 336016,
+        "unique_initial_contents": 8
+      },
+      "phases": {
+        "cold_capture": {
+          "seconds": 190.8119999999908,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 8,
+          "reused_blobs": 20993,
+          "bytes_stored": 128,
+          "bytes_read": 336016,
+          "inventory": "walk",
+          "strict": true
+        },
+        "checkpoint": {
+          "seconds": 105.18647070000588
+        },
+        "unchanged_strict": {
+          "seconds": 64.2039999999979,
+          "files": 21001,
+          "source_bytes": 336016,
+          "bytes_hashed": 336016,
+          "files_reused": 0,
+          "new_blobs": 0,
+          "reused_blobs": 21001,
+          "bytes_stored": 0,
+          "bytes_read": 336016,
+          "inventory": "walk",
+          "strict": true
+        },
+        "single_file_change": {
+          "seconds": 64.09299999999348,
+          "files": 21001,
+          "source_bytes": 336020,
+          "bytes_hashed": 336040,
+          "files_reused": 0,
+          "new_blobs": 1,
+          "reused_blobs": 21000,
+          "bytes_stored": 20,
+          "bytes_read": 336040,
+          "inventory": "walk",
+          "strict": true
+        },
+        "materialize_and_verify": {
+          "seconds": 209.10049080000317,
+          "files": 21001,
+          "bytes_copied": 336020
+        }
+      },
+      "peak_process_memory_bytes": 187785216,
+      "task_state_bytes": 922,
+      "checkpoint_record_bytes": 477,
+      "snapshot_manifest_bytes": 2557109,
+      "limitations": [
+        "synthetic corpus with explicit content duplication",
+        "strict capture still hashes all source bytes",
+        "single sample per phase; not a P95 or end-to-end coding success claim",
+        "verification-copy measurements include hash checking; no real container/VM measured"
+      ]
+    },
+    "source_bytes_boundary": {
+      "schema_version": 1,
+      "environment": {
+        "python": "3.12.13",
+        "platform": "Windows-11-10.0.26200-SP0"
+      },
+      "corpus": {
+        "files": 33,
+        "bytes_per_file": 16777216,
+        "source_bytes": 553648128,
+        "unique_initial_contents": 8
+      },
+      "phases": {
+        "cold_capture": {
+          "seconds": 1.389999999999418,
+          "files": 33,
+          "source_bytes": 553648128,
+          "bytes_hashed": 553648128,
+          "files_reused": 0,
+          "new_blobs": 8,
+          "reused_blobs": 25,
+          "bytes_stored": 134217728,
+          "bytes_read": 553648128,
+          "inventory": "walk",
+          "strict": true
+        },
+        "checkpoint": {
+          "seconds": 0.182179699986591
+        },
+        "unchanged_strict": {
+          "seconds": 0.48399999999674037,
+          "files": 33,
+          "source_bytes": 553648128,
+          "bytes_hashed": 553648128,
+          "files_reused": 0,
+          "new_blobs": 0,
+          "reused_blobs": 33,
+          "bytes_stored": 0,
+          "bytes_read": 553648128,
+          "inventory": "walk",
+          "strict": true
+        },
+        "single_file_change": {
+          "seconds": 0.4850000000005821,
+          "files": 33,
+          "source_bytes": 536870932,
+          "bytes_hashed": 536870952,
+          "files_reused": 0,
+          "new_blobs": 1,
+          "reused_blobs": 32,
+          "bytes_stored": 20,
+          "bytes_read": 536870952,
+          "inventory": "walk",
+          "strict": true
+        },
+        "materialize_and_verify": {
+          "seconds": 1.4106655000068713,
+          "files": 33,
+          "bytes_copied": 536870932
+        }
+      },
+      "peak_process_memory_bytes": 197828608,
+      "task_state_bytes": 922,
+      "checkpoint_record_bytes": 477,
+      "snapshot_manifest_bytes": 4261,
+      "limitations": [
+        "synthetic corpus with explicit content duplication",
+        "strict capture still hashes all source bytes",
+        "single sample per phase; not a P95 or end-to-end coding success claim",
+        "verification-copy measurements include hash checking; no real container/VM measured"
+      ]
+    }
+  },
+  "interpretation": [
+    "Independent sequential runs, one sample per phase; no P50/P95 claim.",
+    "Both old capacity bounds were exceeded and integrity assertions passed; high-file-count latency remains substantial.",
+    "bytes_stored is retained new object-body bytes, excluding staging writes and manifest/pointer overhead.",
+    "Peak process memory includes synthetic corpus generation, Python runtime and metadata.",
+    "Eight initial unique contents per case: deduplication ratios do not represent real repositories.",
+    "Not a real-world million/ten-million LOC task success or real container/VM validation."
+  ]
+}

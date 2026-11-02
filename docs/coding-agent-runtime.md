@@ -97,7 +97,11 @@ status 为 `running/completed/unverified/blocked/failed/cancelled` 中相应终�
 保留至多八个有界 scope。稀缺预算优先保留较近目录的规则，规则仍属不可信仓库输入，
 不会提升权限。嵌套规则在整个 tool-result 批次之后插入，保持 provider 调用配对。
 
-`TaskStore` 使用 schema v3 私有原子记录，兼容读取 v1/v2，不存储权限授权。普通 `--resume` 仍恢复会话消息，
+`TaskStore` 带代码探索记录时写 schema v5；无探索记录时，有快照引用写 v4，其余写 v3。
+兼容读取 v1/v2/v3/v4，不存储权限授权。探索记录绑定工作区和读策略；恢复后只作为历史线索，
+不恢复 `code_read_versions`，修改前仍须重新读取并核对内容版本。
+v4 只引用不可变基线清单，避免每次计划/状态更新都复制整份文件映射。缺失或损坏的清单会阻止恢复，
+不会以空基线代替。普通 `--resume` 仍恢复会话消息，
 父任务使用稳定 session 记录，子任务使用各自 run partition，避免共享 session ID 时互相覆盖。
 明确续跑任务需同时选择原会话，例如：
 
@@ -112,8 +116,9 @@ polaris run "继续原任务" --resume SESSION_ID --resume-task
 失败记录保存参数指纹而非原始参数；同一代码和语义计划下三次相同失败会触发无进展检测，
 给出有限修复机会后返回 blocked。
 
-`create_checkpoint` 保存任务所有的源码 manifest 与内容寻址 blob；最大 20,000 文件/512 MiB，
-每个 store 总量 1 GiB、至多 128 个 manifest，达到上限明确失败，不自动删历史。
+`create_checkpoint` 保存任务所有权记录并引用不可变源码清单；已有快照不再重读所有工作区文件。
+文件数量、源码总量和存储配额由 `[snapshots]` 配置，检查点所有权记录仍至多 128 个；
+达到上限明确失败，不自动删历史。v2 检查点记录可读旧 v1 清单和原有 blob。
 同一内容去重；manifest 保留 hash，但受 read deny/ask 限制的源码字节不复制。
 Secret、运行状态和缓存排除，checkpoint 不备份 Git 对象、权限授权或外部系统状态。
 
@@ -221,7 +226,7 @@ Stop/后台观察 hook 完成后再次检查版本、任务条件及回答证据
 同一版本的失败行为裁决不会无限自动重试；修复后或手动 `run_verifier` 可产生新证据。
 
 `task_state(section="verifier_runs")`、`answer_reviews`、`observations` 可分页查询，
-完整记录保存于 task-state schema v3，事件日志包含 `verifier`、`verifier_probe`、
+完整记录保存于 task-state schema v3/v4/v5，事件日志包含 `verifier`、`verifier_probe`、
 `verifier_browser_probe` 和 `answer_review`。Verifier 记录使用 schema_version=1，运行日志仍使用 v2。
 阶段计划至少三步全部完成时提示验证；
 开启 stage_checks 后实际自动触发。提醒本身不等于通过证据。
@@ -309,6 +314,116 @@ Container 暂不支持 deny_read，配置该策略时明确失败，需选择支
 
 ## 快照测量与任务评估
 
+### 持久化源码快照与检查点
+
+`source_snapshots.py` 提供 `SnapshotStore`。严格版本捕获以 256 KiB 分块读取源码，
+将允许读取的内容写入私有 CAS；同一 SHA-256 只保留一个对象。清单包含 workspace、
+revision、相对路径到内容 hash 的映射以及复制时使用的文件 mode，不含源码正文。
+清单/最新指针通过临时文件、fsync 和原子替换发布；写入失败不发布部分成功，
+取消会等待文件工作线程退出。Windows 私有文件操作支持扩展长度路径，规范路径仍用于
+归属、重定向、硬链接和 ACL 校验，完整 SHA-256 不截短。
+
+重复严格捕获仍重新计算所有纳入源码的 hash，并复查文件、目录和成员稳定性；
+stat 缓存仅用于规划提示。已存在的对象与相同清单复用，只有新增内容需要持久化。
+重启后从最新清单获得对象复用提示，但不把它当作当前源码证明。
+检查点固定输入 revision 的历史字节，后续工作区变更不会改变它。来自旧 API、尚未持久化的
+revision 在建立检查点时逐文件重新核对并复制。受 read deny/ask 限制的字节不写入对象存储；
+使用已有对象时仍重新检查当前路径权限。
+
+行为 verifier 从对应快照构建独立可写副本，并逐块核对对象 hash。没有快照引用的旧调用仍
+通过有界分块复制读取工作区。不会用硬链接把可写副本连接到 CAS 或原仓库；测试修改副本
+不会污染基线。探测前后和最终保存仍严格检查原仓库，副本源码变更仍使证据失效。
+verifier 记录附带 `source_snapshot`，正文与工具输出的信任边界不变。
+
+默认 `[snapshots]` 上限为 500,000 文件、16 GiB 纳入源码、32 GiB 私有对象/清单存储、
+128 MiB 单清单、1,024 个独立清单；Git inventory 输出最多 128 MiB。配置只是资源上限，
+不代表这些规模已经验收。`enabled=false` 关闭严格捕获时的自动对象持久化，严格 hash
+检查仍执行，显式检查点仍可保存。`AGENT_SNAPSHOTS` 和
+`AGENT_SNAPSHOTS_MAX_FILES/MAX_SOURCE_BYTES/MAX_STORE_BYTES/MAX_MANIFEST_BYTES/MAX_MANIFESTS/MAX_GIT_OUTPUT_BYTES`
+可覆盖对应配置。单次显式回滚保留 128 路径／512 MiB 的独立操作预算，并按剩余预算读取。
+
+配额包括已有对象与清单，崩溃遗留的 staging 文件也计入；当前不自动垃圾回收或删除历史。
+清单与文件映射仍是 O(文件数) 的元数据，首次捕获、严格认证和验证副本构建仍有全量 I/O；
+这里消除的是重复正文持久化、重复检查点拷贝、逐次任务状态中的巨大基线 JSON，以及整文件
+`read_bytes()` 的内存峰值，不声称严格认证变为 O(变更量)。内容 revision 的 hash 算法保持
+兼容，文件 mode 用于副本重建，尚未扩展为所有文件系统元数据的版本认证。
+
+高文件数优化将清单的元数据验证与实际文件访问分开：历史清单只做格式、路径、身份和 hash
+校验，不再遍历当前源码；实际读取对象、恢复文件和构建副本仍执行权限及路径安全检查。
+对象枚举在批次边界检查公共目录，每个对象仍检查类型、重定向、硬链接和适用的 ACL，枚举
+结果仅供配额和去重提示。小文件先在最多 256 KiB 的缓冲区中计算 hash，去重后才创建暂存
+文件；重复捕获不写暂存正文。验证复制最多缓存 256 个、合计 8 MiB 已核验的小对象，并对
+每个目标路径重新检查权限。目标路径访问每次检查所有祖先的类型与身份，最后再次复核目录，
+不将路径缓存用作授权。`bytes_staged` 报告成功暂存的对象正文字节；不代表完整物理 I/O。
+`SnapshotReader` 在批次边界做完整规范路径检查，每次实际读取仍检查所有对象目录祖先的
+身份、重定向标记和适用的 ACL，以及对象自身的 ACL；流读取核对文件类型、硬链接数、
+打开对象身份和 hash。读取缓存仅保存本批次已核验的字节，不跨批次缓存授权。
+
+`RevisionTracker.last_metrics` 额外拆出 inventory/hash/stability/publish 四段耗时。
+基准新增 `--unique`（每个文件正文不同，至少 16 B）和 `--progress`，用于区分重复内容场景
+与没有去重收益的场景；同一进程中的严格 hash 仍读取全部源码。
+
+可执行的离线边界基准（输出目录内创建并清理独立临时仓库，不触碰当前项目源码）：
+
+```powershell
+.\.venv\Scripts\python.exe -B benchmarks/source_snapshots.py --files 21001 --bytes-per-file 16 --output tmp/snapshots-files.json
+.\.venv\Scripts\python.exe -B benchmarks/source_snapshots.py --files 21001 --bytes-per-file 16 --unique --progress --output tmp/snapshots-unique.json
+.\.venv\Scripts\python.exe -B benchmarks/source_snapshots.py --files 33 --bytes-per-file 16777216 --output tmp/snapshots-bytes.json
+```
+
+分别跨过原 20,000 文件和 512 MiB 上限，测量首次捕获、重复严格捕获、单文件变更、
+检查点和验证副本，核对复用对象数、实际新增存储、任务状态大小与进程峰值内存。
+这是每阶段单次合成样本；默认 8 种正文重复分布、`--unique` 每个文件正文不同，峰值内存包含
+数据生成。使用 `JournalStorage.local`，不包含分区用户态存储逐对象 ACL 检查成本，不替代真实仓库 P50/P95
+或 Coding 任务解决率测试。安全/兼容性回归见 `tests/test_source_snapshots.py`、
+`tests/test_revision_tracker.py`、`tests/test_checkpoints.py` 和 `tests/test_verifier.py`。
+
+2026-10-29 本机 Windows / Python 3.12.13 边界实测，原始数据见
+[`source-snapshot-report.json`](../benchmarks/source-snapshot-report.json)：
+
+| 合成仓库 | 首次严格捕获 | 重复严格捕获 | 单文件变更捕获 | 检查点 | 副本构建及复核 | 进程峰值内存 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 21,001 文件 × 16 B | 190.812 s | 64.204 s | 64.093 s | 105.186 s | 209.100 s | 179.1 MiB |
+| 33 文件 × 16 MiB（528 MiB） | 1.390 s | 0.484 s | 0.485 s | 0.182 s | 1.411 s | 188.7 MiB |
+
+两组均断言重复捕获不新增对象、单文件修改只新增一个对象、副本 hash 匹配以及任务恢复基线
+正确。`bytes_stored` 表示新增对象正文的净存储量，不包含暂存的重复正文写入、清单或指针；
+不能据此当作物理磁盘写入量。两组均只有 8 种初始正文，不能外推真实仓库去重率。
+峰值内存包括生成样本、Python 运行时和文件元数据，不是单独的读取缓冲区占用。
+
+上述为优化前基线，验证了旧容量边界已解除，同时暴露出高文件数场景中的重复元数据校验和
+重复暂存写入。后续优化保持权限、重定向、内容校验与最终严格认证；结果另行报告，不能将
+容量边界测试视为百万/千万 LOC 真实 Coding 任务验收。
+
+2026-10-29～30 完成高文件数优化后的单次测量，原始数据及逐阶段对比见
+[`source-snapshot-optimization-report.json`](../benchmarks/source-snapshot-optimization-report.json)：
+
+| 合成仓库 | 首次严格捕获 | 重复严格捕获 | 单文件变更捕获 | 检查点 | 副本构建及复核 | 进程峰值内存 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 21,001 文件 × 16 B，8 种正文 | 41.516 s | 23.329 s | 23.640 s | 0.533 s | 58.414 s | 190.7 MiB |
+| 21,001 文件 × 16 B，全部不同 | 374.985 s | 31.734 s | 31.703 s | 2.745 s | 361.892 s | 193.0 MiB |
+| 33 文件 × 16 MiB，8 种正文 | 1.453 s | 0.469 s | 0.516 s | 0.053 s | 1.476 s | 189.8 MiB |
+
+重复内容场景的检查点由 105.186 s 降至 0.533 s，副本由 209.100 s 降至 58.414 s；重复
+严格捕获仍完整 hash 全部源码，成功暂存正文为 0 B。小文件首次捕获仅暂存 128 B，单文件
+变更仅暂存新增的 20 B。大文件首次捕获仍暂存全部 528 MiB，其中重复正文随后丢弃。
+任务状态约 922 B，检查点所有权记录约 476 B，清单仍随文件数增长；状态尺寸不包含探索记录。
+
+全部不同内容场景的首次持久化和副本构建仍很慢，**高文件数低去重仓库尚不适合高频全量复制**。
+没有该场景在全部优化前的基线，不宣称整体加速比。加入 `SnapshotReader` 前后的中间版本
+单样本副本耗时为 354.425 / 361.892 s，未观察到大样本改善；另行以 512 个不同内容对象在
+同一 CAS 上交替对照，热缓存完整路径校验约 2.261 s、批次读取约 1.457 s，确认减少了局部
+路径处理开销，但不能据此外推大规模收益。报告保留全部对照顺序及剖析结果。
+
+上述结果跨两天、未清 OS 缓存，不是 P50/P95，也未计入用户态私有存储的逐对象 ACL 成本。
+下一轮性能工作应先测真实文件分布及私有存储，再决定是否需要对象打包或更细的存储布局；
+不得取消最终严格认证，或把合成重复内容的去重收益当作真实 Coding 任务解决能力。
+
+2026-10-30 回归：快照、检查点、验证、恢复、权限、ReAct、检索、上下文压缩与编辑等相关
+测试 497 passed / 1 skipped，CLI 与导入边界 10 passed；Ruff 全量检查、Mypy 的 218 个生产
+模块与 Git diff 检查通过。脚本化 ReAct 实际运行的事件日志和 transcript 已核对调用配对与
+重复查询计数；该运行只检验集成链路，不代表真实模型完成开发任务的成功率。
+
 `RevisionTracker` 默认遍历目录；`[context].git_aware_revisions=true` 显式启用 tracked +
 untracked 非忽略文件的 Git inventory，Git 不可用时记录降级并遍历。已跟踪的忽略文件仍纳入；
 Secret/显式运行状态排除。Git submodule 未递归解析时不能认证，需显式处理覆盖。
@@ -332,7 +447,7 @@ checkpoint 与快照计数，不写原始失败参数。`benchmarks/task_evaluat
 
 ## 仍需推进的能力
 
-- 快照上限为 20,000 文件/512 MiB，逐文件检查稳定性；不是原子文件系统快照。
+- 持久化快照固定已观察到的源码字节；采集过程仍不是原子文件系统快照。
   根目录运行状态、依赖和缓存目录、Secret 文件排除；符号链接文件拒绝认证。
   被排除的数据不属于当前完成证据的覆盖面。持续变化的构建产物可能需要第二次稳定验证。
   当前 logger、配置的 run/session/memory 目录被显式排除。其他长写入产物仍可能使证据失效。
@@ -351,3 +466,30 @@ checkpoint 与快照计数，不写原始失败参数。`benchmarks/task_evaluat
 74 passed；CLI/子进程 integration 16 passed。Ruff、Mypy（205 个生产文件）与 diff 检查通过。
 符号链接/平台依赖跳过不能替代真实系统验证。离线任务报告逐场景核对 final JSONL 与
 transcript 工具配对，未使用真实模型，也未声称生产成功率改善。
+
+
+## 验证副本复用（2026-11-01）
+
+`[verifier].reuse_workspace=true` 显式启用会话内单副本池；默认 false 保持每次结束删除副本的
+原行为。同一任务、工作区、内容版本和含模式信息的快照 ID 才能尝试复用；无快照的旧版本仍重建。
+每次租用串行化，重新检查当前读权限、完整文件/目录清单、文件模式、每个文件的完整哈希，
+拒绝符号链接/reparse point/硬链接。缓存文件独立于 CAS，不用可写 hardlink。
+发现源码改写、缺失文件、多余文件或目录（包括测试缓存），整份副本重建；当前没有按变更文件修补副本。
+
+异常/取消时等待文件工作线程结束后清理；会话关闭及切换执行工作区时释放池。
+每份 verifier record 的 `workspace_copy` 记录 reused/files_reused，复用副本不会复用模型结论或探针证据。
+每次仍运行独立探针、检查源码版本及完成门。复用只减少创建/写入成本，仍有 O(文件数+源码字节) 复核成本，
+并占用至多一份源码副本直到会话关闭。频繁生成缓存的测试未必受益。
+
+`benchmarks/source_snapshots.py` 新增 lease_cold/lease_clean_reuse 阶段，包含真实快照复制及完整复核，
+可用 `--files 21001 --bytes-per-file 16 --unique --output tmp/copy-reuse.json --progress` 测高文件数。
+该脚本只生成临时合成源，不调用模型。旧报告保留；不能把合成复用收益等同真实任务解决率。
+测试见 `tests/test_verifier_workspace.py`（含真实 CAS、权限变化、任务/版本切换、脏副本、硬链接、串行租用和取消）。
+
+
+本轮本机合成样本（512 个不同内容文件，每文件初始 4 KiB）：首次租用约 1.328 s，
+完整复核后复用约 1.202 s，复用 512 个文件。见
+[`source-snapshot-reuse-report.json`](../benchmarks/source-snapshot-reuse-report.json)。
+首次租用前 CAS/OS 缓存可能已热；这是单样本功能/计时检查，不是 P50/P95 或显著加速结论。
+回归已覆盖实际行为验证器连续两轮复用副本、分别执行新探针和会话关闭清理；
+复用默认关闭时不会新增缓存元数据扫描。

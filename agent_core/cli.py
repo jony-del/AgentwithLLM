@@ -16,6 +16,7 @@ from agent_core import credentials
 from agent_core.config import (
     resolve_capabilities_config,
     resolve_codeintel_config,
+    resolve_snapshot_config,
     resolve_compression_config,
     resolve_concurrency_config,
     resolve_config,
@@ -455,6 +456,7 @@ def build_agent(args: argparse.Namespace) -> "BuiltAgent":
         permission=values["permission"],
         memory=_memory_config(args),
         codeintel=resolve_codeintel_config(config_file),
+        snapshots=resolve_snapshot_config(config_file),
         output=resolve_output_config(config_file),
         compression=resolve_compression_config(config_file),
         tool_use_summary=resolve_tool_use_summary_config(config_file),
@@ -2081,15 +2083,16 @@ def code_command(args: argparse.Namespace) -> int:
         scope = ExecutionScope.for_workspace(session.workspace, deadline=time.monotonic() + args.seconds)
         try:
             if args.action in {"build", "reconcile"}:
-                status = await service.ensure_index(scope=scope, reconcile=True, audit=args.audit)
-                while not (status["catalog_complete"] and status["pending"] == 0):
+                status = await service.ensure_index(scope=scope, reconcile=True, audit=args.audit, detailed=False)
+                while not (status["catalog_complete"] and status["pending"] == 0 and not status.get("replay_pending")):
                     if (scope.remaining_budget() or 0) <= 0:
                         break
                     if status.get("stop_reason") == "index_disk_quota":
                         break
-                    status = await service.ensure_index(scope=scope)
+                    status = await service.ensure_index(scope=scope, detailed=False)
+                status = {**await service.status(), **status}
                 print(json.dumps(status, ensure_ascii=False, indent=2))
-                return 0 if status["catalog_complete"] and status["pending"] == 0 else 2
+                return 0 if status["catalog_complete"] and status["pending"] == 0 and not status.get("replay_pending") else 2
             if args.action == "search":
                 page = await service.search(SearchRequest(args.query, kind=args.kind, path=args.path), scope=scope)
                 print(json.dumps(page.to_dict(), ensure_ascii=False, indent=2))

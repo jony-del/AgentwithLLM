@@ -165,6 +165,9 @@ class SessionRuntime:
                     self.context.session_id,
                     self.context.agent_id,
                 )
+        if self.context.verifier_workspace is not None:
+            await self.context.verifier_workspace.close()
+            self.context.verifier_workspace = None
         lsp_manager = self.context.lsp_manager
         close = getattr(lsp_manager, "close", None)
         if callable(close):
@@ -330,6 +333,7 @@ class SessionContext:
     process_supervisor: Any | None = None
     background_tasks: Any | None = None
     lsp_manager: Any | None = None
+    verifier_workspace: Any | None = None
     worktree_manager: Any | None = None
     mcp_manager: Any | None = None
     tool_suite: Any | None = None
@@ -381,6 +385,8 @@ class SessionContext:
 
     def persist_task(self) -> None:
         if self.task_run is not None and self.task_store is not None:
+            if self.code_working_set is not None:
+                self.task_run.code_exploration = self.code_working_set.to_state()
             self.task_store.save(self.task_run)
 
     async def persist_task_async(self) -> None:

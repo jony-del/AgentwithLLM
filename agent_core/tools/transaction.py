@@ -84,22 +84,24 @@ def _identity_component(kind: str, value: str) -> str:
 
 
 def _secure_mkdir(path: Path) -> None:
+    from agent_core.recovery_paths import native_path
     checked_path(path, Path(path.anchor))
     missing: list[Path] = []
     current = path
-    while not current.exists():
+    while not os.path.exists(native_path(current)):
         missing.append(current)
         current = current.parent
     for directory in reversed(missing):
-        directory.mkdir(mode=0o700, exist_ok=True)
+        Path(native_path(directory)).mkdir(mode=0o700, exist_ok=True)
         checked_path(directory, Path(directory.anchor))
 
 
 def _open_state(storage: JournalStorage, path: Path, mode: str) -> Any:
     """Create private regular files and verify the opened object before writing."""
     storage.validate(path)
+    from agent_core.recovery_paths import native_path
     def opener(name: str, flags: int) -> int:
-        return os.open(name, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        return os.open(native_path(name), flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
     handle = open(path, mode, encoding=None if "b" in mode else "utf-8", opener=opener)
     try:
         storage.validate(path)

@@ -60,6 +60,7 @@ from agent_core.memory.retrieval import RepositoryMemoryRetriever
 from agent_core.memory.store import RepositoryMemoryStore
 from agent_core.memory.lifecycle import MemoryLifecycle
 from agent_core.codeintel.config import CodeIntelConfig
+from agent_core.source_snapshots import SnapshotConfig
 from agent_core.file_lock import FileLock
 from agent_core.managed_policy import (
     FileManagedPolicyProvider,
@@ -375,6 +376,7 @@ class ReActConfig:
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     codeintel: CodeIntelConfig = field(default_factory=CodeIntelConfig)
+    snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     output: OutputLimitConfig = field(default_factory=OutputLimitConfig)
     tool_use_summary: ToolUseSummaryConfig = field(default_factory=ToolUseSummaryConfig)
     # Skill / slash-command subsystem (loaded eagerly at startup when enabled).
@@ -730,7 +732,7 @@ class ReActAgent:
         if not self.config.codeintel.enabled:
             # Disabled means invisible: the tools must not be discoverable via
             # tool_search only to fail at call time.
-            for name in ("code_search", "code_relations", "code_context"):
+            for name in ("code_search", "code_relations", "code_context", "code_validate"):
                 self.registry.unregister(name)
         blanket_denied = {
             rule.tool_name for rule in self.config.permission_rules.deny if rule.content is None
@@ -1802,6 +1804,9 @@ class ReActAgent:
         self._background_durable_events = set(self._background_seen)
         await self._recover_background_notifications(scope)
         self.session.code_working_set = None
+        from agent_core.codeintel.runtime import ensure_working_set, codeintel_enabled
+        if codeintel_enabled(self.session):
+            ensure_working_set(self.session)
         await self.session.persist_task_async()
         await scope.run_awaitable(self._recall(canonical_task, messages))
         discovery = await scope.run_awaitable(asyncio.to_thread(
@@ -3735,12 +3740,11 @@ class ReActAgent:
             version = tool_result.metadata.get("file_version")
             if isinstance(version, dict) and codeintel_enabled(self.session):
                 from agent_core.codeintel.models import CodeHit, FileVersion
-                from agent_core.codeintel.working_set import TaskWorkingSet
+                from agent_core.codeintel.runtime import ensure_working_set
                 from agent_core.codeintel.backends import module
+                working_set = ensure_working_set(self.session)
                 remember_version(self.session, raw_path, version)
-                if self.session.code_working_set is None:
-                    self.session.code_working_set = TaskWorkingSet()
-                self.session.code_working_set.add(CodeHit(
+                working_set.add(CodeHit(
                     version["path"], tool_result.metadata.get("start_line"), tool_result.metadata.get("end_line"),
                     "", FileVersion(**version), module=module(version["path"])), reason="read_text_file")
             if tool_result.metadata.get("notebook"):
@@ -4039,7 +4043,9 @@ class ReActAgent:
             lambda *args: self._spawn_subagent(*args, _structured=True))
         self.session.teammate_result_factory = wraps(self._spawn_teammate)(
             lambda *args: self._spawn_teammate(*args, _structured=True))
-        self.session.checkpoint_store = CheckpointStore(self.executor.journal_storage, isolated=isolated)
+        self.session.checkpoint_store = CheckpointStore(self.executor.journal_storage, isolated=isolated, config=self.config.snapshots)
+        if self.session.task_store is not None:
+            self.session.task_store.snapshots = self.session.checkpoint_store.snapshots
         self.session.review_task = lambda current: review_task(self.session, self.provider, self._provider_config(), current)
         self.session.run_verifier = self._run_verifier
         self.session.review_answer = lambda current, answer: review_answer(
@@ -4091,7 +4097,10 @@ class ReActAgent:
             memory_root = Path(self.config.memory.dir).expanduser().resolve()
             if memory_root != workspace.resolve():
                 excluded.append(memory_root)
-        return RevisionTracker(workspace, excluded=tuple(excluded), git_aware=self.config.git_aware_revisions)
+        from agent_core.tools.codeintel import path_allowed
+        return RevisionTracker(workspace, excluded=tuple(excluded), git_aware=self.config.git_aware_revisions,
+            config=self.config.snapshots, snapshots=cast(CheckpointStore, self.session.checkpoint_store).snapshots,
+            allowed=lambda path: path_allowed(self.session, path, "create_checkpoint") and path_allowed(self.session, path, "run_verifier"))
 
     async def _bind_execution_workspace(self, workspace: Path) -> None:
         """Prepare recovery ownership before publishing a new execution workspace.
@@ -4120,6 +4129,9 @@ class ReActAgent:
         if self.session.lsp_manager is not None:
             await self.session.lsp_manager.close()
         self.session.lsp_manager = None
+        if self.session.verifier_workspace is not None:
+            await self.session.verifier_workspace.close()
+            self.session.verifier_workspace = None
         self.session.code_working_set = None
         self.session.code_read_versions.clear()
         self.session.read_file_state.clear()

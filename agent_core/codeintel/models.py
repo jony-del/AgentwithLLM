@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any
+import hashlib
+import json
 
 SCHEMA_VERSION = 1
 
@@ -29,6 +31,22 @@ class CodeHit:
     module: str = "."
     source_symbol: str | None = None
     target_symbol: str | None = None
+    # start/end identify the source fact (e.g. the entire function). These fields
+    # describe only the source lines actually present in text, never marker lines.
+    excerpt_start_line: int | None = None
+    excerpt_end_line: int | None = None
+    truncated: bool = False
+    next_start_line: int | None = None
+    symbol: dict[str, Any] | None = None
+
+
+def symbol_reference(version: FileVersion, qualified: str, kind: str, start: int, end: int,
+                     parser: str) -> dict[str, Any]:
+    """Version-scoped definition identity, not a rename-stable semantic identity."""
+    identity = [version.worktree_id, version.path, version.sha256, qualified, kind, start, end, parser]
+    return {"schema_version": 1, "id": hashlib.sha256(json.dumps(identity).encode()).hexdigest(),
+            "qualified_name": qualified, "container": qualified.rpartition(".")[0], "kind": kind,
+            "parser": parser, "resolution": "syntax_definition", "identity_scope": "file_content_version"}
 
 
 @dataclass(slots=True)
@@ -40,7 +58,7 @@ class SearchCoverage:
     # Precision disclosures that do not affect completeness (e.g. syntactic-only
     # relations); kept separate so complete reflects coverage, not precision caveats.
     advisories: list[str] = field(default_factory=list)
-    excluded: list[str] = field(default_factory=lambda: ["vcs/build/runtime directories", "secrets", "symlinks"])
+    excluded: list[str] = field(default_factory=lambda: ["vcs/cache/dependency directories", "configured workspace-relative roots", "secrets", "symlinks"])
     complete: bool = False
     freshness: str = "observed; external changes may await reconciliation"
 
@@ -60,6 +78,9 @@ class SearchPage:
     generation: int = 0
     cursor: str | None = None
     usage: dict[str, int | float] = field(default_factory=dict)
+    # Exhaustion of the selected indexed candidates, not proof of full repository
+    # coverage. Pending/unindexable files can keep coverage.complete false.
+    scan_complete: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema_version": SCHEMA_VERSION, **asdict(self)}
