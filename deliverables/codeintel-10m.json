@@ -9,21 +9,24 @@
     "language": "python",
     "shape": "function + integer assignments; synthetic, not a real monorepo"
   },
-  "generation_seconds": 9.592429099982837,
-  "build_seconds": 647.1166351000138,
-  "index_bytes": 1488101377,
+  "generation_seconds": 33.70993070000259,
+  "build_seconds": 2293.167794699999,
+  "index_bytes": 1485885441,
+  "peak_memory_bytes": {
+    "build": 22669944
+  },
   "query_seconds": {
     "symbol": {
-      "median": 0.009538050013361499,
-      "p95": 0.01231059999554418
+      "median": 0.016851150001457427,
+      "p95": 0.022244299994781613
     },
     "text": {
-      "median": 0.05908659999840893,
-      "p95": 0.06869229997391813
+      "median": 0.3761819999999716,
+      "p95": 0.4115429999947082
     },
     "no_match": {
-      "median": 0.008607649986515753,
-      "p95": 0.012281200004508719
+      "median": 0.013647499996295664,
+      "p95": 0.01597589999437332
     }
   },
   "queries": {
@@ -34,8 +37,8 @@
         "bytes": 16787,
         "candidates": 1,
         "edges": 0,
-        "output_bytes": 429,
-        "elapsed_ms": 0.0
+        "output_bytes": 850,
+        "elapsed_ms": 16.0
       },
       "coverage": {
         "requested": [
@@ -50,7 +53,8 @@
           "python_syntax_only; dynamic and other-language relations unresolved"
         ],
         "excluded": [
-          "vcs/build/runtime directories",
+          "vcs/cache/dependency directories",
+          "configured workspace-relative roots",
           "secrets",
           "symlinks"
         ],
@@ -59,14 +63,14 @@
       }
     },
     "text": {
-      "hits": 19,
+      "hits": 15,
       "usage": {
-        "files": 20,
-        "bytes": 335792,
-        "candidates": 20,
+        "files": 16,
+        "bytes": 268632,
+        "candidates": 16,
         "edges": 0,
-        "output_bytes": 7687,
-        "elapsed_ms": 63.0
+        "output_bytes": 7702,
+        "elapsed_ms": 359.0
       },
       "coverage": {
         "requested": [
@@ -83,7 +87,8 @@
         ],
         "advisories": [],
         "excluded": [
-          "vcs/build/runtime directories",
+          "vcs/cache/dependency directories",
+          "configured workspace-relative roots",
           "secrets",
           "symlinks"
         ],
@@ -99,7 +104,7 @@
         "candidates": 0,
         "edges": 0,
         "output_bytes": 0,
-        "elapsed_ms": 15.0
+        "elapsed_ms": 16.0
       },
       "coverage": {
         "requested": [
@@ -112,7 +117,8 @@
         "reasons": [],
         "advisories": [],
         "excluded": [
-          "vcs/build/runtime directories",
+          "vcs/cache/dependency directories",
+          "configured workspace-relative roots",
           "secrets",
           "symlinks"
         ],
@@ -121,18 +127,31 @@
       }
     }
   },
-  "incremental_seconds": 0.18060949997743592,
+  "incremental_seconds": 0.23141690000193194,
   "incremental_usage": {
     "files": 1,
     "bytes": 40,
     "candidates": 0,
     "edges": 0,
     "output_bytes": 0,
-    "elapsed_ms": 172.0
+    "elapsed_ms": 219.0
   },
   "config": {
     "query_seconds": 2,
     "max_files": 500,
     "max_bytes": 67108864
+  },
+  "provenance": {
+    "source_sha": "a946482c7dc57f8ace224b2297f70df3768c53ae",
+    "worktree_dirty": true,
+    "config_sha256": "a408ff623f3ed60e40a9807ca7ad0d5e0a967390f76e5be5ad42d643bcedf4ec",
+    "random_seed": null,
+    "corpus_generation": "deterministic",
+    "environment": {
+      "python": "3.12.13",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "processor": "AMD64 Family 25 Model 117 Stepping 2, AuthenticAMD",
+      "cpu_count": 16
+    }
   }
 }

@@ -240,9 +240,17 @@ async def test_replay_batch_failure_rolls_back_invalidations_and_sequence(tmp_pa
                 WHEN NEW.path='bad.py' BEGIN SELECT RAISE(ABORT, 'injected'); END""")
         with pytest.raises(sqlite3.IntegrityError, match="injected"):
             replay_commits(service.store, budget=QueryBudget(service.config))
+        # Per-batch atomicity: the completed first event persists; the failed batch
+        # rolls back without marking its event consumed or skipping its path.
         with service.store.connect() as db:
-            assert service.store.get(db, "commit_sequence") == "0"
-            assert not db.execute("SELECT 1 FROM pending").fetchone()
-            assert not db.execute("SELECT 1 FROM events").fetchone()
+            assert service.store.get(db, "commit_sequence") == "1"
+            assert [r[0] for r in db.execute("SELECT path FROM pending")] == ["a.py"]
+            assert [r[0] for r in db.execute("SELECT id FROM events")] == ["commit:first"]
+        with service.store.connect() as db:
+            db.execute("DROP TRIGGER fail_path")
+        assert not replay_commits(service.store, budget=QueryBudget(service.config))
+        with service.store.connect() as db:
+            assert service.store.get(db, "commit_sequence") == "2"
+            assert {r[0] for r in db.execute("SELECT path FROM pending")} == {"a.py", "bad.py"}
     finally:
         await service.close()

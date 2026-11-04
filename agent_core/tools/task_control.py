@@ -150,7 +150,8 @@ class TaskStateTool(SessionAwareMixin, Tool):
     description = "Read task state, historical code queries/evidence, checks, plans, reviews or checkpoints in bounded pages. Revalidate historical code before editing."
     input_schema = {"type": "object", "properties": {
         "section": {"enum": ["goal", "checks", "plan", "failures", "evidence", "reviews", "checkpoints",
-                              "verifier_runs", "answer_reviews", "observations", "code_queries", "code_evidence"]},
+                              "verifier_runs", "answer_reviews", "observations", "code_queries", "code_evidence",
+                              "code_candidates"]},
         "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 4096},
     }, "required": ["section"]}
     risk = ToolRisk.READ
@@ -164,12 +165,14 @@ class TaskStateTool(SessionAwareMixin, Tool):
         if section == "goal":
             source = task.contract.goal
             limit = min(4096, int(arguments.get("limit", 4096)))
-        elif section in {"code_queries", "code_evidence"}:
+        elif section in {"code_queries", "code_evidence", "code_candidates"}:
             from agent_core.codeintel.runtime import ensure_working_set, codeintel_enabled
             if not codeintel_enabled(self.session):
                 return ToolResult(self.name, "Code intelligence is disabled", ok=False)
             working = ensure_working_set(self.session)
-            source = list(working.exploration.queries.values() if section == "code_queries" else working.entries.values())
+            source = list(working.exploration.queries.values() if section == "code_queries"
+                          else working.entries.values() if section == "code_evidence"
+                          else working.candidates.values())
             limit = min(8, int(arguments.get("limit", 8)))
         else:
             source = ([asdict(x) for x in task.contract.checks] if section == "checks" else

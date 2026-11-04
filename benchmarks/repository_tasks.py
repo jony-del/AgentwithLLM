@@ -28,10 +28,16 @@ def main() -> None:
     parser.add_argument("--before", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--k", type=int, default=20)
+    parser.add_argument("--treatment", default="",
+                        help="comma-separated environment keys allowed to differ, e.g. model,hardware")
+    parser.add_argument("--unpaired", action="store_true",
+                        help="aggregate rate deltas only, without per-task pairing")
     args = parser.parse_args()
     report = evaluate(read(args.manifest), read(args.observations), k=args.k)
     if args.before:
-        report["comparison"] = compare(evaluate(read(args.manifest), read(args.before), k=args.k), report)
+        treatment = tuple(key.strip() for key in args.treatment.split(",") if key.strip())
+        report["comparison"] = compare(evaluate(read(args.manifest), read(args.before), k=args.k), report,
+                                       treatment=treatment, paired=not args.unpaired)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

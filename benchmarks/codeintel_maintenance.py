@@ -17,11 +17,13 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent_core.codeintel.config import CodeIntelConfig
 from agent_core.codeintel.models import ChangeSet, SearchRequest
 from agent_core.codeintel.service import CodeIntelligenceService
 import agent_core.codeintel.indexer as indexer
+from provenance import provenance
 
 
 def distribution(values: list[float]) -> dict:
@@ -31,6 +33,14 @@ def distribution(values: list[float]) -> dict:
 
 
 async def benchmark(base: Path, files: int, lines: int, samples: int) -> dict:
+    import tracemalloc
+    tracemalloc.start()
+    peak: dict[str, int] = {}
+
+    def mark(phase: str) -> None:
+        _, peak[phase] = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+
     root = base / "repo"
     root.mkdir()
     for number in range(files):
@@ -68,10 +78,12 @@ async def benchmark(base: Path, files: int, lines: int, samples: int) -> dict:
         start = time.perf_counter()
         slices = await drain()
         build = {"seconds": time.perf_counter() - start, "ast_parse_count": count, "slices": slices}
+        mark("build")
         await truth()
         before, start = count, time.perf_counter()
         slices = await drain(audit=True)
         audit = {"seconds": time.perf_counter() - start, "ast_parse_count": count - before, "slices": slices}
+        mark("audit")
         await truth()
         increment_times, increment_counts, increment_slices = [], [], []
         for sample in range(samples):
@@ -107,9 +119,12 @@ async def benchmark(base: Path, files: int, lines: int, samples: int) -> dict:
             maintenance_times.append(window["end"] - window["start"])
             overlap.append(query_start < window["end"] and query_end > window["start"])
         status = await service.status()
+        mark("queries")
+        index_dir = base / "index"
         return {"schema_version": 1, "captured_at": datetime.now(timezone.utc).isoformat(),
                 "environment": {"python": platform.python_version(), "platform": platform.platform(),
                                 "processor": platform.processor(), "cpu_count": os.cpu_count()},
+                "provenance": provenance(Path(__file__).resolve().parents[1], asdict(config), seed=None),
                 "config": asdict(config), "corpus": {"files": files, "initial_lines_per_file": lines,
                     "initial_loc": files * lines, "samples": samples},
                 "build": build, "unchanged_audit": audit,
@@ -117,12 +132,15 @@ async def benchmark(base: Path, files: int, lines: int, samples: int) -> dict:
                     "ast_parse_counts": increment_counts, "maintenance_slices": increment_slices},
                 "query_during_maintenance": {**distribution(query_times), "overlap_observed": overlap,
                     "maintenance_seconds": maintenance_times},
+                "peak_memory_bytes": peak,
+                "index_disk_bytes": sum(p.stat().st_size for p in index_dir.iterdir() if p.is_file()),
                 "final_status": status,
                 "limitations": ["synthetic Python-only workload; no LLM, network or real coding-task execution",
                     "P95 uses nearest-rank; sample count is explicit; OS and SQLite caches are not flushed",
                     "concurrency overlap describes async operation lifetimes, not simultaneous CPU execution",
                     "AST calls are counted by temporarily wrapping indexer.python_structure, then restoring it",
-                    "query truth checks one unchanged file and current source locations, not corpus-wide Recall@K"]}
+                    "query truth checks one unchanged file and current source locations, not corpus-wide Recall@K",
+                    "peak_memory_bytes is tracemalloc Python allocation per phase, not process RSS"]}
     finally:
         indexer.python_structure = original
         await service.close()
@@ -133,16 +151,32 @@ def main():
     parser.add_argument("--files", type=int, default=128)
     parser.add_argument("--lines-per-file", type=int, default=200)
     parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--allow-large", action="store_true",
+                        help="explicitly permit corpora beyond 20000 files / 2M initial lines")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    if not 2 <= args.files <= 20000 or not 3 <= args.lines_per_file <= 10000 or args.files * args.lines_per_file > 2000000:
-        parser.error("corpus must have 2..20000 files, 3..10000 lines/file, at most 2 million initial lines")
+    max_files, max_loc = (60000, 12_000_000) if args.allow_large else (20000, 2_000_000)
+    if not 2 <= args.files <= max_files or not 3 <= args.lines_per_file <= 10000 or args.files * args.lines_per_file > max_loc:
+        parser.error(f"corpus must have 2..{max_files} files, 3..10000 lines/file, at most {max_loc} initial lines"
+                     + ("" if args.allow_large else "; pass --allow-large to extend the quota explicitly"))
     if not 10 <= args.samples <= 100:
         parser.error("--samples must be between 10 and 100")
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="maintenance-bench-", dir=output.parent) as directory:
+    directory = Path(tempfile.mkdtemp(prefix="maintenance-bench-", dir=output.parent))
+    try:
         report = asyncio.run(benchmark(Path(directory), args.files, args.lines_per_file, args.samples))
+    finally:
+        # Windows may briefly hold SQLite handles; never let cleanup eat the report.
+        import shutil
+        for attempt in range(5):
+            try:
+                shutil.rmtree(directory)
+                break
+            except OSError:
+                time.sleep(1)
+        else:
+            print(f"warning: scratch cleanup deferred by a lingering file lock: {directory}", file=sys.stderr)
     output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps({"report": str(output), "build": report["build"], "unchanged_audit": report["unchanged_audit"],
                       "increment_p95": report["single_file_publish_and_drain"]["p95"],

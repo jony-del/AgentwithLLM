@@ -187,7 +187,8 @@ class TaskRun:
                            "recent_failures": self.failures[-3:], "detail_tool": "task_state",
                            "code_exploration": {"queries": len(self.code_exploration.get("queries", [])),
                                                 "evidence": len(self.code_exploration.get("evidence", [])),
-                                                "sections": ["code_queries", "code_evidence"],
+                                                "candidates": len(self.code_exploration.get("candidates", [])),
+                                                "sections": ["code_queries", "code_evidence", "code_candidates"],
                                                 "freshness": "historical; revalidate before editing"}}, ensure_ascii=False)
 
     @staticmethod

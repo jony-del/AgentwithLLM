@@ -104,6 +104,51 @@ inline and manifest-based v5 baselines, compaction recovery, and an actual ReAct
 tool round with persisted run events and transcript records. These deterministic
 checks do not measure a real model's strategy selection or task-solving success.
 
+### Candidate records and staged retrieval (S3/S4)
+
+`candidate_pool.py` + `TaskWorkingSet.candidates` merge text/symbol/relation/LSP
+evidence into one `CandidateRecord` (schema v1) per normalized identity: role
+(target/dependency/test/unknown), bounded evidence refs, supporting/contradicting
+notes, and split anchor vs relevance validation. Restored or version-moved
+candidates degrade to `needs_revalidation`; committed paths mark them `stale`.
+A candidate never grants an edit precondition — `code_validate` stays the gate.
+`task_state(section=code_candidates)` pages the pool; conflicts stay visible.
+
+`strategy.py::RetrievalController` routes planner retrieval by query shape
+(path-first for explicit paths, symbol→text for identifiers, text for natural
+language), dedupes identical in-plan queries, and caps stages. `plan_code_task`
+runs every stage under one shared `QueryBudget` (the calling tool's timeout owns
+wall time) and records `routing`/`budget` in its result; the plan payload shows a
+bounded candidate summary. Stage execution stays in the normal ReAct loop — the
+locked planner tool never nests the tool dispatcher, and LSP never bypasses
+permissions, hooks, locks or sandboxing. Semantic retrieval remains deferred.
+
+### Structured LSP symbols and bounded call hierarchy (S5)
+
+`document_symbols` gains an explicit `mode="structured"` integration: DocumentSymbol
+hierarchies and flat SymbolInformation flatten into versioned candidate evidence
+with server-declared UTF-16 ranges, containment/permission checks and a final
+source reread. Raw mode is unchanged. Servers that do not declare a capability
+return a structured `unavailable` record on strict (evidence) paths; legacy raw
+requests pass through. `incoming_calls`/`outgoing_calls` match multiple prepared
+items by the position's identifier and return an explicit `ambiguous` payload
+instead of silently taking the first. `LSPManager.open_document`/`notify_saved`
+accept the caller's budget; the standalone default budget remains for raw callers.
+
+### Static workspace/local-package graph (S6)
+
+`package_links` records per-manifest local edges: npm workspaces and name/path refs,
+Cargo workspace members and path dependencies, Go module name matches and local
+`replace`, and explicitly scoped Python refs (`tool.uv.sources` / Poetry `path`).
+Resolution uses only the indexed `module_roots` inventory (never a filesystem walk):
+`local_name`, `local_path`, `workspace_member`, or `unresolved` with an explainable
+reason (`ambiguous_local_name:N`, `no_indexed_package_at_path`, `path_escapes_workspace`,
+`package_removed`, `package_renamed`). New roots re-resolve pending links and re-queue
+affected manifests through the bounded pending path. Query kind `local_dependency`
+(incoming/outgoing) shares the cursor, budget and `max_depth`/`max_edges` bounds of
+relation expansion; external registry dependencies remain plain manifest edges and
+are never reported as local source links. No build/package script is executed.
+
 These milestones do not certify million-line end-to-end coding tasks. LSP location evidence,
 static package boundaries and literal/symbol candidate validation are now integrated (see below);
 full semantic graphs and measured indexing optimizations remain later work.
@@ -150,9 +195,11 @@ flowchart LR
 
 ## Contracts
 
-Persisted code schema and change outbox schema are version 1. Existing Message and
-ToolResult contracts remain unchanged. New fields are carried in namespaced metadata,
-with visible coverage/version details in the new code-tool result body.
+Persisted code schema is version 1. The change outbox is format 2 (normalized per-path
+rows with a consumption cursor); legacy format-1 JSON events remain readable and are
+migrated on replay. Existing Message and ToolResult contracts remain unchanged. New
+fields are carried in namespaced metadata, with visible coverage/version details in the
+new code-tool result body.
 
 `SearchPage` contains hits, generation, cursor, usage and `SearchCoverage`. Every code
 hit has path, range, original-byte hash, worktree ID and revision. Path-only hits have
@@ -382,11 +429,13 @@ query_seconds/max_files/父任务 deadline 更小的限制仍生效。锁等待�
 只更新 stat 并移除队列项；变化文件、策略过滤、模块改变、解析器升级和其他事件仍走提取流程。
 这减少 AST/FTS 重建，不取消源码新鲜度校验。
 
-transaction outbox 每次最多重放 64 条事件，失效标记和 commit_sequence 在同一事务提交，
-写事务开始后重读 sequence 防止并发回退；路径写入与提交前检查预算，失败整批回滚。
-查询有剩余事件时报告 commit_replay_pending，无法重放时报告 commit_replay_deferred，均不能声称完整覆盖。
-旧的单条巨型事件的 JSON 解析不可抢占，事件原子性也可能导致短预算反复重试；需提高维护/查询预算，
-若真实负载出现此问题再增加分路径游标。当前未引入新日志 schema。
+transaction outbox 按事件上限重放，且单个事件内部以有界路径批次（默认 256 条）逐批提交：
+每批在同一事务中重读消费游标、写入 pending 并推进游标；取消、deadline 或异常只回滚在途批次，
+已提交批次保留，下次从记录的 ordinal 恢复，事件在全部路径完成后才写入 dedupe 行。
+v2 outbox 为每条路径保存规范化行；旧的单条巨型 JSON 事件先做大小检查，再经 SQLite json_each
+单趟流式拆分迁移（超过 64 MiB 或格式不支持时报告 unsupported diagnostic，不悄悄 advance 或 skip）。
+查询有剩余事件或路径时报告 commit_replay_pending，无法重放时报告 commit_replay_deferred，
+均不能声称完整覆盖。
 
 `max_concurrent_requests=4` 限制每个共享 service 提交给线程池的工作数；等待准入消耗原预算，
 取消会移除等待者。状态、查询、发布和维护均被跟踪。关闭时先拒绝新请求，再等待后台任务及在途
@@ -400,7 +449,12 @@ transaction outbox 每次最多重放 64 条事件，失效标记和 commit_sequ
 
 离线回归见 tests/test_codeintel_maintenance.py 和 tests/test_codeintel_watcher.py。
 `benchmarks/codeintel_maintenance.py --files 128 --lines-per-file 200 --samples 10 --output tmp/maintenance.json`
-生成临时合成仓库，测构建、未变化审计、单文件更新与维护期间查询，并断言检索答案。
+生成临时合成仓库，测构建、未变化审计、单文件更新与维护期间查询，并断言检索答案；报告含
+provenance（源 SHA、配置 hash、工作树脏标记）、每阶段 tracemalloc 峰值内存与索引磁盘字节。
+默认配额为 2–20,000 文件且不超过 2M 初始行；`--allow-large` 显式扩展到 60,000 文件 / 12M 行
+（S7 高文件数压力矩阵用）。规模矩阵（1M/10M LOC、>20k 文件、重复/唯一/混合内容、深层模块、
+多语言清单、变更/删除/时间戳保持、并发查询、publish burst、取消/恢复、受限读策略）由
+`benchmarks/codeintel_scale.py` 执行，每 cell 至少 50 个查询样本与 1–5 次独立重建。
 前后报告见 [`codeintel-maintenance-report.json`](../benchmarks/codeintel-maintenance-report.json)。
 计时为同机单轮小样本，真实百万/千万 LOC 与超过 20,000 文件的开发任务验收仍待真实仓库和模型环境。
 
@@ -413,3 +467,29 @@ transaction outbox 每次最多重放 64 条事件，失效标记和 commit_sequ
 两批相关回归分别 98 项和 113 项通过（包含重叠用例），Ruff 与 Mypy（223 个生产模块）通过。
 普通受限 Windows 环境无法初始化 asyncio Proactor socketpair，离线基准及 async 回归在自动审核允许的
 正常 Windows 进程中运行；没有启用真实模型或外部服务。
+
+## S7 规模矩阵实测（2026-11-03，本机 Windows 11 / 16 核，工作树含 S1–S6 改动）
+
+合成语料、种子 7、每 cell 3 次独立重建、51 个查询样本；原始数据与 provenance
+（源 SHA `a946482c`、配置 hash、环境指纹）见 `deliverables/codeintel-scale-*.json`、
+`deliverables/codeintel-10m.json`、`deliverables/codeintel-maintenance-21k.json`。
+
+| cell | 构建(秒, 3 次) | 符号 recall@20 | 符号 recall（翻页） | 文本 recall@20 | 符号 P95 |
+|---|---|---|---|---|---|
+| 1M / 1,000 文件 | 216/210/224 | 1.0 | 1.0 | 1.0 | 14 ms |
+| 1M / 重复符号名 | 225/219/213 | 0.80 | 1.0 | 0.75 | 156 ms |
+| 1M / 受限读策略 | 217/228/225 | 1.0 | 1.0 | 1.0 | 14 ms |
+| 1M / 21,000 文件 | 558/543/574 | 1.0 | 1.0 | 1.0 | 23 ms |
+| 10M / 10,000 文件 | 2659/2542/2539 | 1.0 | 1.0 | 1.0 | 20 ms |
+| 10M / 21,000 文件 | 2423/2334/2306 | 1.0 | 1.0 | 1.0 | 28 ms |
+
+10M 平面基准：构建 2293 s，索引 1.49 GB，符号 P50/P95 = 16.9/22.2 ms，文本 P95 = 412 ms，
+构建期 Python 峰值分配 23 MB。21k 文件维护基准：构建 484 s，未变化 audit 97 s（0 次 AST 重解析），
+单文件增量 P95 87 ms，维护期查询 P95 36 ms，索引 201 MB。
+
+重复符号 cell 的 recall@20=0.8 是单页 8000 字节输出预算的截断视图；翻页后全部找回
+（recall_retrieved=1.0）。增量、删除、时间戳保持改写、publish burst、维护期并发查询、
+取消后恢复、关闭重开 resume 均在每个 cell 内执行成功；no-match 查询零误中。
+这些是同机合成语料实测值，不是真实仓库/真实模型的任务解决率；token、工具/LLM 调用、
+patch 成功率与隐藏测试通过率在离线环境不可测，按 null 记录。实测未显示需要
+embedding/rerank、物理分片或常驻 daemon 的证据（S9 不启动）。

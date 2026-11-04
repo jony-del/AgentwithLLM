@@ -306,9 +306,10 @@ class CodeIntelligenceService:
                 self.store.enqueue(changes.event_id, tuple(paths), changes.source)
         await self._run(work, budget)
 
-    async def validate_candidate(self, path, expected_version, anchor, symbol=None, *, scope=None):
+    async def validate_candidate(self, path, expected_version, anchor, symbol=None, *, scope=None,
+                                 budget: QueryBudget | None = None):
         from agent_core.codeintel.candidates import validate_candidate
-        budget = QueryBudget(self.config, scope)
+        budget = budget if budget is not None else QueryBudget(self.config, scope)
         def work():
             relative = contained(self.workspace, path).relative_to(self.workspace).as_posix()
             if self.allowed is not None and not self.allowed(relative):
@@ -317,8 +318,9 @@ class CodeIntelligenceService:
         return await self._run(work, budget)
 
     async def read_region(self, path: str, start: int = 1, limit: int = 200, *,
-                          expected_version: dict[str, Any] | None = None, scope: Any = None) -> CodeHit:
-        budget = QueryBudget(self.config, scope)
+                          expected_version: dict[str, Any] | None = None, scope: Any = None,
+                          budget: QueryBudget | None = None) -> CodeHit:
+        budget = budget if budget is not None else QueryBudget(self.config, scope)
         def work() -> CodeHit:
             relative = contained(self.workspace, path).relative_to(self.workspace).as_posix()
             if self.allowed is not None and not self.allowed(relative):
@@ -350,8 +352,9 @@ class CodeIntelligenceService:
         return await self._run(work, budget)
 
     async def search(self, request: SearchRequest, *, scope: Any = None,
-                     allowed: Callable[[str], bool] | None = None) -> SearchPage:
-        budget = QueryBudget(self.config, scope)
+                     allowed: Callable[[str], bool] | None = None,
+                     budget: QueryBudget | None = None) -> SearchPage:
+        budget = budget if budget is not None else QueryBudget(self.config, scope)
         def stage(modules: tuple[str, ...] | None = None) -> SearchPage:
             page = self._search(request, budget, allowed, resolved_modules=modules)
             if (request.kind == "auto" and request.query.isidentifier() and not page.hits
@@ -411,7 +414,7 @@ class CodeIntelligenceService:
         if kind == "auto":
             from agent_core.codeintel.backends import LANGUAGES
             kind = "path" if "/" in request.query or "*" in request.query or Path(request.query).suffix in LANGUAGES else "symbol" if request.query.isidentifier() else "text"
-        if kind not in {"path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency"}:
+        if kind not in {"path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency", "local_dependency"}:
             raise ValueError(f"unsupported query kind: {kind}")
         if len(request.query) > 4096:
             raise ValueError("query exceeds 4096 characters")
@@ -429,7 +432,7 @@ class CodeIntelligenceService:
             query_generation, kind = cursor["generation"], cursor["kind"]
             if request.expand_scope:
                 modules = tuple(cursor["modules"])
-            if kind not in {"path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency"}:
+            if kind not in {"path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency", "local_dependency"}:
                 raise ValueError("invalid cursor strategy")
         progress = after
         page.coverage.requested = [f"module:{name} under {path}" for name in modules] or [path]
@@ -496,20 +499,38 @@ class CodeIntelligenceService:
                 args.extend([kind, request.query, "%." + _like(request.query)])
                 extra = "e.line AS match_line,e.line AS match_end,e.target AS match_name,e.precision AS precision"
                 relation_fields = "e.source AS source_symbol,e.target AS target_symbol"
+            elif kind == "local_dependency":
+                # Static workspace/local-package graph edges recorded per manifest;
+                # workspace_member_scope rows are glob markers, never evidence.
+                join = "JOIN package_links pl ON pl.manifest=f.path"
+                fact_id = "pl.rowid"
+                clauses.append("pl.resolution != 'workspace_member_scope'")
+                if request.direction == "outgoing":
+                    clauses.append("(pl.from_name=? OR pl.from_root=?)")
+                    args.extend([request.query, request.query])
+                else:
+                    clauses.append("(pl.to_name=? OR pl.to_root=?)")
+                    args.extend([request.query, request.query])
+                extra = ("pl.line AS match_line,pl.line AS match_end,pl.to_name AS match_name,"
+                         "CASE pl.resolution WHEN 'unresolved' THEN 'manifest_unresolved:' || pl.reason "
+                         "ELSE 'manifest_local:' || pl.resolution END AS precision")
+                relation_fields = "pl.from_name AS source_symbol,COALESCE(pl.to_root, pl.to_name) AS target_symbol"
             elif kind == "text":
                 clauses.append("f.state IN ('ready','text_only')")
                 if not request.regex and not request.ignore_case and len(request.query) >= 3 and self.store.get(db, "fts") == "1":
                     clauses.append("f.id IN (SELECT rowid FROM text_fts WHERE text_fts MATCH ?)")
                     args.append('"' + request.query.replace('"', '""') + '"')
             if fact_id != "0" and after.path and not after.file_complete:
-                line_column = "s.line" if kind == "symbol" else "e.line"
+                line_column = "s.line" if kind == "symbol" else "pl.line" if kind == "local_dependency" else "e.line"
                 clauses.append(f"(f.path > ? OR {line_column} > ? OR ({line_column} = ? AND {fact_id} > ?))")
                 args.extend([after.path, after.line, after.line, after.fact])
             # A bounded query can never imply absence in skipped/unsupported files.
             if db.execute("SELECT 1 FROM files WHERE state='skipped' LIMIT 1").fetchone():
                 page.coverage.add_reason("excluded_unindexable_files")
             if kind not in {"path", "text"}:
-                advisory = "python_syntax_only; dynamic and other-language relations unresolved"
+                advisory = ("static manifest workspace/local-package resolution; external registries and executed builds excluded"
+                            if kind == "local_dependency" else
+                            "python_syntax_only; dynamic and other-language relations unresolved")
                 if advisory not in page.coverage.advisories:
                     page.coverage.advisories.append(advisory)
             sql = "SELECT f.path,f.hash,f.revision,f.module,f.state," + extra + "," + relation_fields + "," + fact_id + " AS fact_id FROM files f " + join
@@ -672,8 +693,9 @@ class CodeIntelligenceService:
 
     async def expand_relations(self, seeds: list[str], *, relation: str = "references", depth: int = 1,
                                scope: Any = None, direction: str = "incoming", path: str = ".",
-                               modules: tuple[str, ...] = (), allowed: Callable[[str], bool] | None = None) -> SearchPage:
-        budget = QueryBudget(self.config, scope)
+                               modules: tuple[str, ...] = (), allowed: Callable[[str], bool] | None = None,
+                               budget: QueryBudget | None = None) -> SearchPage:
+        budget = budget if budget is not None else QueryBudget(self.config, scope)
         def work() -> SearchPage:
             result = SearchPage()
             frontier, visited = list(seeds), set()

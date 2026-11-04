@@ -81,3 +81,68 @@ class ExplorationState:
             self.queries[record["query_id"]]["freshness"] = "needs_revalidation"
             self.queries[record["query_id"]].update(modules=record.get("modules", []), checked=record.get("checked", []),
                                                    scope_truncated=record.get("scope_truncated", False))
+
+
+class RetrievalController:
+    """Stage router for bounded retrieval: orders stages, converges repeats, never loops.
+
+    Decisions are advisory records for the caller's normal tool flow; the controller
+    itself executes nothing, so permissions, locks, budgets, logging and sandboxing all
+    stay with the ordinary tool pipeline. Hard gates: repeated no-gain queries are
+    deduped, total stages per plan are capped, and one shared budget covers every stage.
+    """
+
+    MAX_STAGES = 16
+
+    def __init__(self) -> None:
+        self.stages = 0
+        self.seen: set[str] = set()
+        self.decisions: list[dict[str, Any]] = []
+
+    def _record(self, decision: str, reason: str, query: str = "") -> dict[str, Any]:
+        entry = {"stage_seq": self.stages, "decision": decision, "reason": reason[:256]}
+        if query:
+            entry["query_fingerprint"] = fingerprint(query)[:16]
+        self.decisions.append(entry)
+        return entry
+
+    def stages_for(self, query: str) -> list[str]:
+        """Initial stage route: explicit paths scope first; identifiers hit symbols then
+        text; natural language goes lexical. Semantic retrieval is deferred by design."""
+        if self.stages >= self.MAX_STAGES:
+            self._record("stop", "stage budget exhausted", query)
+            return []
+        path_shaped = "/" in query or "*" in query or "." in query.rsplit("/", 1)[-1]
+        if path_shaped:
+            route = ["path", "text"]
+        elif query.isidentifier():
+            route = ["symbol", "text"]
+        else:
+            route = ["text"]
+        self._record("route", f"{route[0]}-first", query)
+        return route
+
+    def allow_execution(self, request: SearchRequest, *, tool: str = "code_search") -> bool:
+        """An identical (tool, request) already executed in this controller's scope
+        converges instead of re-executing; across calls, searches always re-run."""
+        key = fingerprint([tool, asdict(request), 1])
+        if key in self.seen:
+            self._record("dedupe", "identical query already executed in this plan; converging")
+            return False
+        self.seen.add(key)
+        return True
+
+    def proceed(self, page: SearchPage) -> bool:
+        """Whether to continue to the next stage after a page: stop on complete zero-hit
+        coverage (nothing more exists in this scope) or a missing cursor on a finished scan."""
+        if self.stages >= self.MAX_STAGES:
+            self._record("stop", "stage budget exhausted")
+            return False
+        if not page.hits and page.scan_complete and page.coverage.complete:
+            self._record("stop", "complete coverage with no hits; remaining stages cannot help")
+            return False
+        return True
+
+    def stage_done(self, stage: str, page: SearchPage) -> None:
+        self.stages += 1
+        self._record("stage", f"{stage}: hits={len(page.hits)} complete={page.coverage.complete}")

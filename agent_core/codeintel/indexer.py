@@ -7,7 +7,7 @@ from typing import Callable, Any
 from agent_core.codeintel.backends import language, module, python_structure, manifest_dependencies
 from agent_core.codeintel.budget import BudgetExceeded, QueryBudget
 from agent_core.codeintel.models import StaleEvidence
-from agent_core.codeintel.modules import resolve_module, update_boundary
+from agent_core.codeintel.modules import resolve_module, update_boundary, update_package_links
 from agent_core.codeintel.paths import excluded_path
 from agent_core.codeintel.snapshots import BudgetError, contained, read_snapshot
 from agent_core.codeintel.store import CodeStore
@@ -93,6 +93,7 @@ def update_pending(store: CodeStore, budget: QueryBudget, allowed: Callable[[str
                 row = db.execute("SELECT id FROM files WHERE path=?", (raw,)).fetchone()
                 if row and store.get(db, "fts") == "1":
                     db.execute("DELETE FROM text_fts WHERE rowid=?", (row[0],))
+                update_package_links(db, raw, "")
                 update_boundary(db, raw, "", "")
                 db.execute("DELETE FROM files WHERE path=?", (raw,))
                 db.execute("DELETE FROM pending WHERE path=?", (raw,))
@@ -130,6 +131,7 @@ def update_pending(store: CodeStore, budget: QueryBudget, allowed: Callable[[str
                 # Another producer reported a newer revision while this file was parsed.
                 return False
             update_boundary(db, raw, text, digest)
+            update_package_links(db, raw, text)
             epoch = int(store.get(db, "scan_epoch"))
             db.execute("""INSERT INTO files(path,language,module,size,mtime_ns,seen) VALUES(?,?,?,?,?,?)
                 ON CONFLICT(path) DO NOTHING""", (raw, language(raw), module(raw),

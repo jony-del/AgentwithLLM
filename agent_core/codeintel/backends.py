@@ -21,7 +21,7 @@ PARSER_FINGERPRINT = "python-ast-v1"
 def parser_fingerprint() -> str:
     # AST grammar changes with the interpreter; static manifest extraction is
     # versioned independently even though both currently publish in one batch.
-    return f"{PARSER_FINGERPRINT}:py{sys.version_info.major}.{sys.version_info.minor}:manifests-v1:module-boundaries-v1"
+    return f"{PARSER_FINGERPRINT}:py{sys.version_info.major}.{sys.version_info.minor}:manifests-v2:module-boundaries-v1"
 
 
 def language(path: str) -> str:
@@ -101,6 +101,114 @@ def python_structure(text: str) -> tuple[list[dict[str, Any]], list[dict[str, An
 
     Visitor().visit(tree)
     return symbols, edges
+
+
+def manifest_links(path: str, text: str) -> list[dict[str, Any]]:
+    """Structured dependency references from a manifest: name, version/path/workspace
+    markers and workspace-member globs. Static parse only; never executes scripts."""
+    name = PurePosixPath(path).name
+    refs: list[dict[str, Any]] = []
+
+    def line_of(needle: str) -> int:
+        return next((i for i, body in enumerate(text.splitlines(), 1) if needle in body), 1)
+
+    def ref(target: str, kind: str, *, version: str | None = None, path_ref: str | None = None,
+            member_glob: str | None = None) -> None:
+        refs.append({"name": target, "kind": kind, "line": line_of(target),
+                     "version": version, "path": path_ref, "member_glob": member_glob})
+
+    if name == "package.json":
+        value = json.loads(text)
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            entries = value.get(section, {})
+            if not isinstance(entries, dict):
+                continue
+            for key, spec in entries.items():
+                spec_text = str(spec)
+                if spec_text.startswith(("file:", "link:")):
+                    ref(str(key), "package_dependency", path_ref=spec_text.split(":", 1)[1])
+                elif spec_text.startswith("workspace:"):
+                    ref(str(key), "package_dependency", version="workspace")
+                else:
+                    ref(str(key), "package_dependency", version=spec_text[:128])
+        workspaces = value.get("workspaces")
+        globs = workspaces.get("packages", []) if isinstance(workspaces, dict) else workspaces
+        if isinstance(globs, list):
+            for pattern in globs:
+                if isinstance(pattern, str) and pattern.strip():
+                    ref(pattern.strip(), "workspace_member", member_glob=pattern.strip()[:256])
+    elif name == "pyproject.toml":
+        value = tomllib.loads(text)
+        for item in value.get("project", {}).get("dependencies", []):
+            target = re.split(r"[<>=!~;\[]", str(item), maxsplit=1)[0].strip()
+            if target:
+                ref(target, "package_dependency", version=str(item)[:128])
+        for item in value.get("build-system", {}).get("requires", []):
+            target = re.split(r"[<>=!~;\[]", str(item), maxsplit=1)[0].strip()
+            if target:
+                ref(target, "build_dependency", version=str(item)[:128])
+        # Explicitly scoped local sources only: uv sources and Poetry path dependencies.
+        uv_sources = value.get("tool", {}).get("uv", {}).get("sources", {})
+        if isinstance(uv_sources, dict):
+            for key, source in uv_sources.items():
+                if isinstance(source, dict) and isinstance(source.get("path"), str):
+                    ref(str(key), "package_dependency", path_ref=source["path"][:512])
+        poetry_deps = value.get("tool", {}).get("poetry", {}).get("dependencies", {})
+        if isinstance(poetry_deps, dict):
+            for key, spec in poetry_deps.items():
+                if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                    ref(str(key), "package_dependency", path_ref=spec["path"][:512])
+    elif name == "Cargo.toml":
+        value = tomllib.loads(text)
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            entries = value.get(section, {})
+            if not isinstance(entries, dict):
+                continue
+            kind = "build_dependency" if section == "build-dependencies" else "package_dependency"
+            for key, spec in entries.items():
+                if isinstance(spec, dict):
+                    if isinstance(spec.get("path"), str):
+                        ref(str(key), kind, path_ref=spec["path"][:512])
+                    else:
+                        ref(str(key), kind, version=str(spec.get("version", ""))[:128])
+                else:
+                    ref(str(key), kind, version=str(spec)[:128])
+        workspace = value.get("workspace", {})
+        if isinstance(workspace, dict) and isinstance(workspace.get("members"), list):
+            for pattern in workspace["members"]:
+                if isinstance(pattern, str) and pattern.strip():
+                    ref(pattern.strip(), "workspace_member", member_glob=pattern.strip()[:256])
+    elif name == "go.mod":
+        block = None
+        replaced: set[str] = set()
+        deferred_requires: list[dict[str, Any]] = []
+        for line_number, raw_line in enumerate(text.splitlines(), 1):
+            line = raw_line.split("//", 1)[0].strip()
+            if line in {"require (", "replace ("}:
+                block = line.split()[0]
+                continue
+            if line == ")":
+                block = None
+                continue
+            parts = line.split()
+            if line.startswith("require ") or block == "require":
+                parts = line.removeprefix("require ").split()
+                if parts:
+                    deferred_requires.append({"name": parts[0], "kind": "package_dependency", "line": line_number,
+                                              "version": (parts[1][:128] if len(parts) > 1 else None),
+                                              "path": None, "member_glob": None})
+            elif line.startswith("replace ") or block == "replace":
+                parts = line.removeprefix("replace ").split()
+                if "=>" in parts:
+                    arrow = parts.index("=>")
+                    target = parts[arrow + 1] if len(parts) > arrow + 1 else ""
+                    if target.startswith(("./", "../")):
+                        replaced.add(parts[0])
+                        refs.append({"name": parts[0], "kind": "package_dependency", "line": line_number,
+                                     "version": None, "path": target[:512], "member_glob": None})
+        # A local path replace owns the module link; the require entry stays an edge only.
+        refs.extend(r for r in deferred_requires if r["name"] not in replaced)
+    return refs
 
 
 def manifest_dependencies(path: str, text: str) -> list[dict[str, Any]]:

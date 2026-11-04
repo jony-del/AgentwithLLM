@@ -102,6 +102,7 @@ class _Server:
     initialized: bool = False
     documents: dict[str, int] = field(default_factory=dict)
     diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    capabilities: dict[str, Any] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stderr_tail: bytearray = field(default_factory=bytearray)
     sandbox: Any = None
@@ -211,6 +212,7 @@ class _Server:
         capabilities = initialized.get("capabilities", {}) if isinstance(initialized, dict) else {}
         if not isinstance(capabilities, dict) or capabilities.get("positionEncoding", "utf-16") != "utf-16":
             raise ValueError("LSP server selected an unsupported position encoding")
+        self.capabilities = capabilities
         await self.notify("initialized", {})
         if self.config.settings:
             await self.notify(
@@ -428,16 +430,20 @@ class LSPManager:
             raise ValueError("LSP path escapes workspace")
         return path
 
-    async def open_document(self, path: str | Path) -> tuple[_Server, Path]:
+    async def open_document(self, path: str | Path, *, budget: Any = None) -> tuple[_Server, Path]:
         resolved = self._resolve(path)
         server = await self._server_for(resolved)
         uri = server.server_uri(resolved)
-        from agent_core.codeintel.budget import QueryBudget
-        from agent_core.codeintel.config import CodeIntelConfig
+        if budget is None:
+            # Standalone/raw callers have no outer budget; the default keeps the
+            # read bounded. Integrated callers must pass their shared budget.
+            from agent_core.codeintel.budget import QueryBudget
+            from agent_core.codeintel.config import CodeIntelConfig
+            from agent_core.tools.base import current_execution_scope
+            budget = QueryBudget(CodeIntelConfig(), current_execution_scope())
         from agent_core.codeintel.snapshots import read_snapshot
-        from agent_core.tools.base import current_execution_scope
         raw, fingerprint = await asyncio.to_thread(read_snapshot, self.workspace,
-            resolved.relative_to(self.workspace).as_posix(), QueryBudget(CodeIntelConfig(), current_execution_scope()))
+            resolved.relative_to(self.workspace).as_posix(), budget)
         text = raw.decode("utf-8")
         if uri not in server.documents:
             language = server.config.extensions.get(resolved.suffix.lower(), resolved.suffix.lstrip("."))
@@ -453,7 +459,7 @@ class LSPManager:
         self._document_hashes[uri] = fingerprint.sha256
         return server, resolved
 
-    async def notify_saved(self, path: str | Path) -> None:
+    async def notify_saved(self, path: str | Path, *, budget: Any = None) -> None:
         resolved = self._resolve(path)
         if not resolved.exists():
             for existing in self._servers.values():
@@ -469,16 +475,18 @@ class LSPManager:
             return
         uri = server.server_uri(resolved)
         if uri not in server.documents:
-            await self.open_document(resolved)
+            await self.open_document(resolved, budget=budget)
             return
         version = server.documents[uri] + 1
         server.documents[uri] = version
-        from agent_core.codeintel.budget import QueryBudget
-        from agent_core.codeintel.config import CodeIntelConfig
+        if budget is None:
+            from agent_core.codeintel.budget import QueryBudget
+            from agent_core.codeintel.config import CodeIntelConfig
+            from agent_core.tools.base import current_execution_scope
+            budget = QueryBudget(CodeIntelConfig(), current_execution_scope())
         from agent_core.codeintel.snapshots import read_snapshot
-        from agent_core.tools.base import current_execution_scope
         raw, fingerprint = await asyncio.to_thread(read_snapshot, self.workspace,
-            resolved.relative_to(self.workspace).as_posix(), QueryBudget(CodeIntelConfig(), current_execution_scope()))
+            resolved.relative_to(self.workspace).as_posix(), budget)
         text = raw.decode("utf-8")
         await server.notify("textDocument/didChange", {
             "textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": text}]
@@ -486,7 +494,18 @@ class LSPManager:
         await server.notify("textDocument/didSave", {"textDocument": {"uri": uri}, "text": text})
         self._document_hashes[uri] = fingerprint.sha256
 
-    async def request(self, operation: str, *, path: str | None = None, line: int = 0, character: int = 0, query: str = "") -> Any:
+    # Operation -> declared server capability; absent capability means unavailable.
+    CAPABILITIES = {
+        "definition": "definitionProvider", "references": "referencesProvider",
+        "hover": "hoverProvider", "document_symbols": "documentSymbolProvider",
+        "implementation": "implementationProvider", "workspace_symbols": "workspaceSymbolProvider",
+        "prepare_call_hierarchy": "callHierarchyProvider",
+        "incoming_calls": "callHierarchyProvider", "outgoing_calls": "callHierarchyProvider",
+    }
+
+    async def request(self, operation: str, *, path: str | None = None, line: int = 0,
+                      character: int = 0, query: str = "", budget: Any = None,
+                      strict_capability: bool = False) -> Any:
         if operation == "workspace_symbols":
             if not self.config.servers:
                 raise ValueError("no LSP servers configured")
@@ -496,10 +515,17 @@ class LSPManager:
                 server = _Server(config, self.workspace, sandbox=self.sandbox)
                 self._servers[config.name] = server
                 await server.start()
+            if strict_capability and not server.capabilities.get("workspaceSymbolProvider"):
+                return {"unavailable": True, "operation": operation, "server": config.name,
+                        "detail": "server does not declare workspaceSymbolProvider"}
             return server.host_payload(await server.request("workspace/symbol", {"query": query}))
         if path is None:
             raise ValueError(f"path is required for {operation}")
-        server, resolved = await self.open_document(path)
+        server, resolved = await self.open_document(path, budget=budget)
+        capability = self.CAPABILITIES.get(operation)
+        if strict_capability and capability is not None and not server.capabilities.get(capability):
+            return {"unavailable": True, "operation": operation, "server": server.config.name,
+                    "detail": f"server does not declare {capability}"}
         uri = server.server_uri(resolved)
         text_document = {"uri": uri}
         position = {"line": max(0, line), "character": max(0, character)}
@@ -524,13 +550,56 @@ class LSPManager:
             params = {"textDocument": text_document, "position": position, "context": {"includeDeclaration": True}}
         elif operation in {"incoming_calls", "outgoing_calls"}:
             prepared = await server.request("textDocument/prepareCallHierarchy", {"textDocument": text_document, "position": position})
-            item = prepared[0] if isinstance(prepared, list) and prepared else None
-            if item is None:
+            items = prepared if isinstance(prepared, list) else ([] if prepared is None else [prepared])
+            if not items:
                 return []
+            if len(items) > 1:
+                item = await self._disambiguate_call_item(server, resolved, position, items, budget)
+                if item is None:
+                    return {"ambiguous": True, "operation": operation,
+                            "detail": "prepareCallHierarchy returned multiple items; none uniquely matches the position",
+                            "candidates": [{"name": str(i.get("name", ""))[:256], "kind": i.get("kind"),
+                                            "uri": str(i.get("uri", ""))[:1024]} for i in items[:16]]}
+            else:
+                item = items[0]
             params = {"item": item}
         else:
             params = {"textDocument": text_document, "position": position}
         return server.host_payload(await server.request(method, params))
+
+    async def _disambiguate_call_item(self, server: _Server, resolved: Path, position: dict[str, int],
+                                      items: list[Any], budget: Any) -> Any:
+        """Match prepared call-hierarchy items by the identifier at the position;
+        only a unique match is used — never a silent first item."""
+        identifier = await self._identifier_at(resolved, position, budget)
+        if not identifier:
+            return None
+        matches = [item for item in items if isinstance(item, dict) and item.get("name") == identifier]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _identifier_at(self, resolved: Path, position: dict[str, int], budget: Any) -> str:
+        import re
+        from agent_core.codeintel.budget import QueryBudget
+        from agent_core.codeintel.config import CodeIntelConfig
+        from agent_core.codeintel.snapshots import read_snapshot
+        from agent_core.tools.base import current_execution_scope
+        if budget is None:
+            budget = QueryBudget(CodeIntelConfig(), current_execution_scope())
+        raw, _ = await asyncio.to_thread(read_snapshot, self.workspace,
+            resolved.relative_to(self.workspace).as_posix(), budget)
+        lines = raw.decode("utf-8").split("\n")
+        if position["line"] >= len(lines):
+            return ""
+        text = lines[position["line"]].rstrip("\r")
+        units = text.encode("utf-16-le")
+        if position["character"] * 2 > len(units):
+            return ""
+        column = len(units[: position["character"] * 2].decode("utf-16-le", errors="strict"))
+        spans = [(m.start(), m.end()) for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text)]
+        for start, end in spans:
+            if start <= column <= end:
+                return text[start:end]
+        return ""
 
     async def close(self) -> None:
         await asyncio.gather(*(server.close() for server in self._servers.values()), return_exceptions=True)

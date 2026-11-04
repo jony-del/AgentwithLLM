@@ -28,6 +28,8 @@ class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             "line": {"type": "integer", "minimum": 0},
             "character": {"type": "integer", "minimum": 0},
             "query": {"type": "string"},
+            "mode": {"type": "string", "enum": ["raw", "structured"],
+                     "description": "document_symbols only: structured integrates versioned candidate evidence; raw keeps the legacy payload."},
         },
         "required": ["operation"],
     }
@@ -55,19 +57,24 @@ class LSPTool(SessionAwareMixin, SandboxAwareMixin, Tool):
             )
             self.session.lsp_manager = manager
         try:
-            from agent_core.codeintel.lsp_evidence import OPERATIONS, query_evidence
+            from agent_core.codeintel.lsp_evidence import OPERATIONS, query_document_symbols, query_evidence
             from agent_core.codeintel.runtime import codeintel_enabled
-            if arguments.get("operation") in OPERATIONS and codeintel_enabled(self.session):
+            operation = str(arguments.get("operation"))
+            structured_symbols = operation == "document_symbols" and arguments.get("mode") == "structured"
+            if codeintel_enabled(self.session) and (operation in OPERATIONS or structured_symbols):
                 if not arguments.get("path"):
                     raise ValueError("path is required for LSP evidence")
-                page = await query_evidence(self.session, manager, str(arguments["operation"]),
-                    path=str(arguments["path"]), line=int(str(arguments.get("line", 0))),
-                    character=int(str(arguments.get("character", 0))))
+                if structured_symbols:
+                    page = await query_document_symbols(self.session, manager, path=str(arguments["path"]))
+                else:
+                    page = await query_evidence(self.session, manager, operation,
+                        path=str(arguments["path"]), line=int(str(arguments.get("line", 0))),
+                        character=int(str(arguments.get("character", 0))))
                 body = page.to_dict()
                 return ToolResult(self.name, json.dumps(body, ensure_ascii=False), metadata={
                     "codeintel": body, "code_recovery": {"tool": self.name, "arguments": dict(arguments)}})
             response = await manager.request(
-                str(arguments.get("operation", "")),
+                operation,
                 path=str(arguments["path"]) if arguments.get("path") else None,
                 line=int(str(arguments.get("line", 0))),
                 character=int(str(arguments.get("character", 0))),

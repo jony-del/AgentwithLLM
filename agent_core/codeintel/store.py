@@ -85,6 +85,16 @@ class CodeStore:
                 CREATE TABLE IF NOT EXISTS scan_dirs(path TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS module_roots(manifest TEXT PRIMARY KEY, root TEXT NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS module_root ON module_roots(root);
+                CREATE TABLE IF NOT EXISTS package_links(
+                    manifest TEXT NOT NULL, from_root TEXT NOT NULL, from_name TEXT NOT NULL,
+                    to_root TEXT, to_name TEXT NOT NULL, kind TEXT NOT NULL,
+                    version TEXT, path TEXT, line INTEGER NOT NULL,
+                    resolution TEXT NOT NULL, reason TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS package_link_target ON package_links(to_name, to_root);
+                CREATE INDEX IF NOT EXISTS package_link_source ON package_links(from_root, from_name);
+                CREATE INDEX IF NOT EXISTS package_link_manifest ON package_links(manifest);
+                CREATE INDEX IF NOT EXISTS package_link_resolution ON package_links(resolution, to_name);
             """)
             version = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             if version and version[0] != str(SCHEMA_VERSION):

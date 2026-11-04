@@ -5,9 +5,11 @@ from dataclasses import asdict, replace
 import json
 from typing import Any
 
-from agent_core.codeintel.models import SearchRequest
+from agent_core.codeintel.budget import BudgetExceeded, QueryBudget
+from agent_core.codeintel.models import SearchRequest, StaleEvidence
 from agent_core.codeintel.runtime import get_service, remember_version
 from agent_core.codeintel.snapshots import contained
+from agent_core.codeintel.strategy import RetrievalController
 from agent_core.execution import current_execution_scope
 from agent_core.models import Message
 from agent_core.providers.base import LLMProvider, ProviderConfig
@@ -26,25 +28,56 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
     await session.capture_revision(strict=False)  # Inventory/cache hint, never completion proof.
     service = await get_service(session)
     scope = current_execution_scope()
+    # One shared budget covers every retrieval stage of this plan; stages never
+    # re-acquire independent quotas. The calling tool's own execution timeout owns
+    # wall-clock time when a scope deadline exists.
+    budget = QueryBudget(service.config, scope)
+    if scope is not None and scope.deadline is not None:
+        budget.deadline = scope.deadline
+    controller = RetrievalController()
     def allowed(path: str) -> bool:
         return path_allowed(session, path, "plan_code_task")
     pages = []
     hits = []
     assert session.code_working_set is not None
+    exhausted = None
     for query in queries:
-        for kind in ("symbol", "text"):
+        if exhausted is not None:
+            break
+        for kind in controller.stages_for(query):
             request = SearchRequest(query, kind=kind, limit=24)
-            page = await service.search(request, scope=scope, allowed=allowed)
+            if not controller.allow_execution(request, tool="plan_code_task"):
+                continue
+            try:
+                page = await service.search(request, scope=scope, allowed=allowed, budget=budget)
+            except BudgetExceeded as exc:
+                exhausted = f"budget_exhausted:{exc}"
+                controller._record("stop", exhausted, query)
+                break
             count = sum(session.code_working_set.add(hit, reason="planning") for hit in page.hits)
+            for hit in page.hits:
+                session.code_working_set.add_candidate(hit, origin="plan_code_task",
+                                                       evidence_ref=f"plan_code_task:{kind}")
             body = page.to_dict()
             body["exploration"] = session.code_working_set.exploration.record(request, page, tool="plan_code_task", new_evidence=count)
             pages.append(body)
             hits.extend(page.hits)
-    relations = await service.expand_relations(queries, depth=1, scope=scope, allowed=allowed)
-    pages.append(relations.to_dict())
-    hits.extend(relations.hits)
-    for hit in relations.hits:
-        session.code_working_set.add(hit, reason="planning_relation")
+            controller.stage_done(kind, page)
+            if not controller.proceed(page):
+                break
+    if exhausted is None:
+        try:
+            relations = await service.expand_relations(queries, depth=1, scope=scope, allowed=allowed, budget=budget)
+            pages.append(relations.to_dict())
+            hits.extend(relations.hits)
+            controller.stage_done("relations", relations)
+            for hit in relations.hits:
+                session.code_working_set.add(hit, reason="planning_relation")
+                session.code_working_set.add_candidate(hit, origin="plan_code_task",
+                                                       evidence_ref="plan_code_task:relations")
+        except BudgetExceeded as exc:
+            exhausted = f"budget_exhausted:{exc}"
+            controller._record("stop", exhausted)
     contexts: list[dict[str, Any]] = []
     versions = {}
     for hit in hits:
@@ -52,16 +85,30 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
             continue
         if not allowed(hit.path):
             raise PermissionError("planning evidence restricted by read policy")
-        region = await service.read_region(hit.path, max(1, (hit.start_line or 1) - 10), 120,
-                                           expected_version=hit.version.to_dict(), scope=scope)
+        try:
+            region = await service.read_region(hit.path, max(1, (hit.start_line or 1) - 10), 120,
+                                               expected_version=hit.version.to_dict(), scope=scope, budget=budget)
+        except BudgetExceeded as exc:
+            exhausted = f"budget_exhausted:{exc}"
+            controller._record("stop", exhausted)
+            break
+        except StaleEvidence:
+            controller._record("skip", "candidate moved before context read", hit.path)
+            continue
         remember_version(session, region.path, region.version.to_dict())
         session.code_working_set.add(region, reason="planning_context")
         versions[hit.path] = region.version.sha256
         contexts.append(asdict(region))
     if not contexts:
-        raise ValueError("no permitted code evidence matched; refine the symbol queries")
+        detail = f"; retrieval {exhausted}" if exhausted else ""
+        raise ValueError(f"no permitted code evidence matched; refine the symbol queries{detail}")
+    candidates_summary = [{"path": r["path"], "role": r["role"], "state": r["validation_state"],
+                           "evidence": len(r["evidence_refs"]), "conflicts": len(r["contradicting"])}
+                          for r in list(session.code_working_set.candidates.values())[:8]]
     payload = json.dumps({"contract": asdict(task.contract), "evidence": contexts,
                           "coverage": [page["coverage"] for page in pages],
+                          "candidates": candidates_summary,
+                          "routing": controller.decisions[-16:],
                           "exploration_hints": [page["exploration"] for page in pages if "exploration" in page]}, ensure_ascii=False)
     if len(payload.encode("utf-8")) > 96 * 1024:
         raise ValueError("planning context budget exceeded; narrow the queries")
@@ -108,6 +155,7 @@ async def plan_code_task(session: Any, provider: LLMProvider, config: ProviderCo
     await session.persist_task_async()
     record = {"steps": [asdict(step) for step in steps], "revision": final.digest,
               "evidence_versions": versions, "coverage": [page["coverage"] for page in pages],
+              "routing": controller.decisions, "budget": budget.usage(),
               "precision": "Python AST/syntactic evidence; multilingual literal/manifest evidence; LSP location evidence available through lsp tool, not automatically queried by this planner"}
     if session.logger is not None:
         await session.logger.write("semantic_plan", {**record, "usage": asdict(result.usage) if result.usage else None})

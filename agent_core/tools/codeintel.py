@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 from typing import Any
 
-from agent_core.codeintel.models import SearchRequest
+from agent_core.codeintel.models import SearchRequest, StaleEvidence
 from agent_core.codeintel.runtime import get_service, remember_version
 from agent_core.models import ToolResult, ToolRisk
 from agent_core.permission_safety import ordinary_read_permission
@@ -45,7 +45,7 @@ class CodeSearchTool(_CodeTool):
                    "Use polaris code build to construct the index.")
     input_schema = {"type": "object", "properties": {
         "query": {"type": "string", "minLength": 1},
-        "kind": {"enum": ["auto", "path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency"]},
+        "kind": {"enum": ["auto", "path", "text", "symbol", "references", "calls", "imports", "inherits", "package_dependency", "build_dependency", "local_dependency"]},
         "path": {"type": "string"}, "modules": {"type": "array", "items": {"type": "string"}},
         "language": {"type": "string"}, "expand": {"type": "boolean"},
         "regex": {"type": "boolean"}, "ignore_case": {"type": "boolean"},
@@ -71,6 +71,8 @@ class CodeSearchTool(_CodeTool):
         new_evidence = 0
         for hit in page.hits:
             new_evidence += self.session.code_working_set.add(hit)
+            self.session.code_working_set.add_candidate(hit, origin=self.name,
+                                                        evidence_ref=f"{self.name}:{request.kind}")
             remember_version(self.session, hit.path, hit.version.to_dict())
         body = page.to_dict()
         body["exploration"] = self.session.code_working_set.exploration.record(
@@ -90,7 +92,7 @@ class CodeRelationsTool(CodeSearchTool):
     description = "Find syntactic references/calls/imports/inheritance with versioned source evidence and explicit coverage."
     input_schema = {**CodeSearchTool.input_schema, "properties": {
         **CodeSearchTool.input_schema["properties"],
-        "kind": {"enum": ["references", "calls", "imports", "inherits", "package_dependency", "build_dependency"]},
+        "kind": {"enum": ["references", "calls", "imports", "inherits", "package_dependency", "build_dependency", "local_dependency"]},
         "depth": {"type": "integer", "minimum": 1}}}
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -104,6 +106,8 @@ class CodeRelationsTool(CodeSearchTool):
             new_evidence = 0
             for hit in page.hits:
                 new_evidence += self.session.code_working_set.add(hit, reason="relation_expansion")
+                self.session.code_working_set.add_candidate(hit, origin=self.name,
+                    evidence_ref=f"{self.name}:{arguments.get('kind', 'references')}:d{int(arguments.get('depth', 1))}")
                 remember_version(self.session, hit.path, hit.version.to_dict())
             body = page.to_dict()
             request = SearchRequest(str(arguments["query"]), kind=str(arguments.get("kind", "references")),
@@ -133,6 +137,7 @@ class CodeContextTool(_CodeTool):
         hit = await service.read_region(path, int(arguments.get("start", 1)), int(arguments.get("limit", 200)),
             expected_version=arguments.get("expected_version"), scope=current_execution_scope())
         self.session.code_working_set.add(hit, reason="explicit_read")
+        self.session.code_working_set.add_candidate(hit, origin=self.name, evidence_ref="code_context:region")
         remember_version(self.session, hit.path, hit.version.to_dict())
         return ToolResult(self.name, json.dumps(asdict(hit), ensure_ascii=False),
                           metadata={"file_version": hit.version.to_dict(), "code_recovery": {
@@ -155,8 +160,23 @@ class CodeValidateTool(_CodeTool):
         if not path_allowed(self.session, path, self.name):
             return ToolResult(self.name, "Candidate is restricted by read policy.", ok=False)
         service = await get_service(self.session)
-        result = await service.validate_candidate(path, arguments["expected_version"], arguments["anchor"],
-            arguments.get("symbol"), scope=current_execution_scope())
+        symbol = arguments.get("symbol")
+        normalized_symbol = ({k: symbol[k] for k in ("qualified_name", "kind") if symbol.get(k)}
+                             if isinstance(symbol, dict) else None)
+        try:
+            result = await service.validate_candidate(path, arguments["expected_version"], arguments["anchor"],
+                symbol, scope=current_execution_scope())
+        except (StaleEvidence, ValueError) as exc:
+            # Conflicting outcomes stay visible on the candidate record.
+            if self.session.code_working_set is not None and isinstance(arguments.get("expected_version"), dict):
+                self.session.code_working_set.record_validation(
+                    path, ok=False, version=arguments["expected_version"], detail=str(exc)[:256],
+                    symbol=normalized_symbol)
+            raise
+        if self.session.code_working_set is not None:
+            self.session.code_working_set.record_validation(
+                result["path"], ok=True, version=result["expected_version"],
+                anchor_sha256=result["anchor_sha256"], symbol=normalized_symbol)
         remember_version(self.session, result["path"], result["expected_version"])
         return ToolResult(self.name, json.dumps(result, ensure_ascii=False), metadata={
             "file_version": result["expected_version"], "code_recovery": {"tool": self.name, "arguments": dict(arguments)}})
